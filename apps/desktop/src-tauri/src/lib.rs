@@ -19,7 +19,6 @@ use lumen_asr::{
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
 use std::sync::Mutex;
-use tauri::Manager;
 
 pub struct AppState {
     pub store: Mutex<Option<Store>>,
@@ -142,24 +141,10 @@ pub fn run() {
             learning::process_edit,
         ])
         .setup(|app| {
-            // Accessory by default so hotkey + capsule do not steal key focus
-            // from the app the user is typing into (iTerm, browser, etc.).
-            if let Err(e) = app
-                .handle()
-                .set_activation_policy(tauri::ActivationPolicy::Accessory)
-            {
-                tracing::warn!(error = %e, "set_activation_policy Accessory failed");
-            }
-
-            // When user opens the main settings window, allow normal activation.
-            if let Some(main) = app.get_webview_window("main") {
-                let handle = app.handle().clone();
-                main.on_window_event(move |ev| {
-                    if let tauri::WindowEvent::Focused(true) = ev {
-                        let _ = handle.set_activation_policy(tauri::ActivationPolicy::Regular);
-                    }
-                });
-            }
+            // Keep Regular activation policy. Accessory was tried to avoid
+            // stealing focus but made the main window/Dock vanish (felt like a crash).
+            // Focus preservation is done by: non-focusable capsule + restore
+            // typing-target app before paste.
 
             if let Err(e) = capsule::ensure_capsule(app.handle()) {
                 tracing::warn!(error = %e, "capsule window create failed");
@@ -170,9 +155,11 @@ pub fn run() {
 
             let debug_dir = session_debug::debug_root();
             let _ = std::fs::create_dir_all(&debug_dir);
+            let log_path = lumen_platform::default_data_dir().join("logs/lumen.log");
             tracing::info!(
                 name = app.package_info().name,
                 debug = %debug_dir.display(),
+                log = %log_path.display(),
                 "Lumen ASR desktop starting (session debug enabled)"
             );
             Ok(())

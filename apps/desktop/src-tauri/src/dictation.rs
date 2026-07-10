@@ -51,8 +51,6 @@ fn restore_target_app_before_insert(app: Option<&AppHandle>) -> Option<String> {
     if let Some(app) = app {
         crate::capsule::set_capsule_visible(app, false, "idle");
         crate::capsule::ensure_main_stays_background(app);
-        // Accessory: do not fight the target for activation.
-        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     }
 
     let target = TARGET.lock().ok().and_then(|g| g.clone());
@@ -440,8 +438,6 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
     }
     // Capture typing target *before* any of our windows show / activate.
     remember_target_app();
-    // Accessory: windows must not steal key focus from iTerm/etc.
-    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     crate::capsule::ensure_main_stays_background(&app);
 
     let show_capsule = state
@@ -483,7 +479,6 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
     // Prefer hiding overlays during process so paste target stays frontmost.
     crate::capsule::set_capsule_visible(&app, false, "processing");
     let _ = show_capsule;
-    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
     match stop_and_transcribe_inner(&state, true, Some(&app)).await {
         Ok(outcome) => {
