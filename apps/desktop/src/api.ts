@@ -93,6 +93,7 @@ export const api = {
     model?: string;
     apiKey?: string;
     timeoutSecs?: number;
+    cleanup?: string;
   }) => invoke<CorrectorStatus>("save_corrector_config", { input }),
   correctText: (text: string) =>
     invoke<CorrectTextOutcome>("correct_text", { input: { text } }),

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct AppConfig {
     pub corrector: CorrectorConfig,
+    pub output: OutputConfig,
     pub inject: InjectConfig,
     pub hotkey: HotkeyConfig,
     pub learning: LearningConfig,
@@ -20,12 +21,36 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             corrector: CorrectorConfig::default(),
+            output: OutputConfig::default(),
             inject: InjectConfig::default(),
             hotkey: HotkeyConfig::default(),
             learning: LearningConfig::default(),
             onboarding: OnboardingConfig::default(),
             audio: AudioConfig::default(),
         }
+    }
+}
+
+/// Post-ASR text shaping (cleanup level for P0; style/polish later).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutputConfig {
+    /// none | light | medium | strong — default medium.
+    pub cleanup: String,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            cleanup: "medium".into(),
+        }
+    }
+}
+
+impl OutputConfig {
+    pub fn cleanup_level(&self) -> lumen_prompts::CleanupLevel {
+        lumen_prompts::CleanupLevel::parse(&self.cleanup)
+            .unwrap_or(lumen_prompts::CleanupLevel::Medium)
     }
 }
 

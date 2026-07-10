@@ -258,6 +258,7 @@ pub fn apply_corrector_suggestion(
         has_api_key: !guard.corrector.api_key.is_empty(),
         timeout_secs: guard.corrector.timeout_secs,
         label: crate::corrector_svc::engine_label(&guard),
+        cleanup: guard.output.cleanup_level().as_str().into(),
     })
 }
 

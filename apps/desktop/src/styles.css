@@ -702,6 +702,53 @@ code {
   margin-top: 10px;
 }
 
+.cleanup-level-block {
+  margin: 12px 0 16px;
+}
+
+.cleanup-seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.cleanup-seg-btn {
+  min-width: 3.2rem;
+  height: var(--control-h);
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.cleanup-seg-btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+
+.cleanup-seg-btn.active {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.cleanup-hint {
+  margin: 0 0 6px;
+  font-size: 0.85rem;
+}
+
+.cleanup-example {
+  font-size: 0.8rem;
+  line-height: 1.45;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
 .chip {
   display: inline-block;
   font-size: 0.72rem;

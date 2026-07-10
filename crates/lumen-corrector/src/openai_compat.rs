@@ -3,7 +3,9 @@
 use crate::{CorrectRequest, CorrectResult, Corrector, CorrectorError, DictionaryContext};
 use async_trait::async_trait;
 use lumen_core::CorrectorEngineId;
-use lumen_prompts::{corrector_user_message, format_dictionary_block, CORRECTOR_SYSTEM_ZH};
+use lumen_prompts::{
+    build_system_prompt, corrector_user_message, format_dictionary_block, CleanupLevel,
+};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -69,6 +71,16 @@ impl Corrector for OpenAiCompatCorrector {
     async fn correct(&self, req: CorrectRequest) -> Result<CorrectResult, CorrectorError> {
         let dict_block = dict_block_opt(&req.dictionary);
         let user = corrector_user_message(&req.text, dict_block.as_deref());
+        let system = if req.system_prompt.trim().is_empty() {
+            build_system_prompt(CleanupLevel::Medium)
+        } else {
+            req.system_prompt.clone()
+        };
+        let temperature = if req.temperature > 0.0 {
+            req.temperature
+        } else {
+            0.3
+        };
 
         let url = format!(
             "{}/chat/completions",
@@ -77,9 +89,9 @@ impl Corrector for OpenAiCompatCorrector {
 
         let body = json!({
             "model": self.config.model,
-            "temperature": 0.3,
+            "temperature": temperature,
             "messages": [
-                { "role": "system", "content": CORRECTOR_SYSTEM_ZH },
+                { "role": "system", "content": system },
                 { "role": "user", "content": user }
             ]
         });

@@ -17,6 +17,8 @@ pub struct CorrectorStatus {
     pub has_api_key: bool,
     pub timeout_secs: u64,
     pub label: String,
+    /// none | light | medium | strong
+    pub cleanup: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +30,7 @@ pub struct CorrectorConfigInput {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub timeout_secs: Option<u64>,
+    pub cleanup: Option<String>,
 }
 
 #[tauri::command]
@@ -70,6 +73,13 @@ pub fn save_corrector_config(
     if let Some(v) = input.timeout_secs {
         guard.corrector.timeout_secs = v.max(5);
     }
+    if let Some(v) = input.cleanup {
+        if lumen_prompts::CleanupLevel::parse(&v).is_some() {
+            guard.output.cleanup = v.to_ascii_lowercase();
+        } else {
+            return Err(format!("unknown cleanup level: {v}"));
+        }
+    }
 
     guard.save()?;
     Ok(status_from(&guard))
@@ -84,6 +94,7 @@ fn status_from(cfg: &AppConfig) -> CorrectorStatus {
         has_api_key: !cfg.corrector.api_key.is_empty(),
         timeout_secs: cfg.corrector.timeout_secs,
         label: engine_label(cfg),
+        cleanup: cfg.output.cleanup_level().as_str().into(),
     }
 }
 

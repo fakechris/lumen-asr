@@ -36,6 +36,16 @@ pub struct DictionaryContext {
 pub struct CorrectRequest {
     pub text: String,
     pub dictionary: DictionaryContext,
+    /// Full system prompt (empty → backend default light-ish base).
+    #[serde(default)]
+    pub system_prompt: String,
+    /// Sampling temperature hint for the provider.
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+}
+
+fn default_temperature() -> f32 {
+    0.3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,20 +62,58 @@ pub trait Corrector: Send + Sync {
     async fn correct(&self, req: CorrectRequest) -> Result<CorrectResult, CorrectorError>;
 }
 
+/// Apply preprocess + replacements only (no model).
+pub fn preprocess_only(text: &str, dictionary: &DictionaryContext) -> CorrectResult {
+    let pre = preprocess(text);
+    let pre = apply_replacements(&pre, &dictionary.replacements);
+    CorrectResult {
+        text: pre,
+        engine: CorrectorEngineId::None,
+        model_applied: false,
+    }
+}
+
 /// Apply preprocess, then corrector; on error return preprocessed text.
+///
+/// `system_prompt` empty → use built-in base prompt (legacy).
 pub async fn correct_or_fallback(
     corrector: &dyn Corrector,
     text: &str,
     dictionary: DictionaryContext,
 ) -> CorrectResult {
+    correct_or_fallback_with(
+        corrector,
+        text,
+        dictionary,
+        lumen_prompts::build_system_prompt(lumen_prompts::CleanupLevel::Medium),
+        lumen_prompts::CleanupLevel::Medium.temperature(),
+    )
+    .await
+}
+
+/// Preprocess then model with explicit system prompt + temperature.
+pub async fn correct_or_fallback_with(
+    corrector: &dyn Corrector,
+    text: &str,
+    dictionary: DictionaryContext,
+    system_prompt: String,
+    temperature: f32,
+) -> CorrectResult {
     let pre = preprocess(text);
-    // Deterministic replacements before model (high-precision user rules).
     let pre = apply_replacements(&pre, &dictionary.replacements);
+
+    let system_prompt = if system_prompt.trim().is_empty() {
+        lumen_prompts::build_system_prompt(lumen_prompts::CleanupLevel::Medium)
+    } else {
+        system_prompt
+    };
 
     match corrector
         .correct(CorrectRequest {
             text: pre.clone(),
             dictionary,
+            system_prompt,
+            temperature,
         })
         .await
     {

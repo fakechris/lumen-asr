@@ -2183,6 +2183,9 @@ dependencies = [
 [[package]]
 name = "lumen-prompts"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "lumen-store"

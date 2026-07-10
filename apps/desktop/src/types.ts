@@ -21,6 +21,8 @@ export type CorrectorStatus = {
   hasApiKey: boolean;
   timeoutSecs: number;
   label: string;
+  /** none | light | medium | strong */
+  cleanup?: string;
 };
 
 export type CorrectTextOutcome = {

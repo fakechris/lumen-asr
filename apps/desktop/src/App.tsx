@@ -1006,6 +1006,7 @@ function SettingsPanel({
   const [model, setModel] = useState("qwen2.5:7b");
   const [apiKey, setApiKey] = useState("");
   const [timeoutSecs, setTimeoutSecs] = useState(60);
+  const [cleanup, setCleanup] = useState("medium");
   const [probe, setProbe] = useState<string>("");
   const [perm, setPerm] = useState<import("./api").PermissionStatus | null>(null);
   const [autoInsert, setAutoInsert] = useState(true);
@@ -1031,6 +1032,7 @@ function SettingsPanel({
         setBaseUrl(c.baseUrl);
         setModel(c.model);
         setTimeoutSecs(c.timeoutSecs);
+        setCleanup(c.cleanup || "medium");
         const p = await api.getPermissionStatus();
         setPerm(p);
         const inj = await api.getInjectConfig();
@@ -1064,12 +1066,14 @@ function SettingsPanel({
         baseUrl,
         model,
         timeoutSecs,
+        cleanup,
       };
       if (apiKey.trim()) {
         input.apiKey = apiKey.trim();
       }
       const c = await api.saveCorrectorConfig(input);
       setCfg(c);
+      setCleanup(c.cleanup || cleanup);
       setApiKey("");
       onSaved();
       setProbe("已保存");
@@ -1298,7 +1302,7 @@ function SettingsPanel({
       <section className="card settings-section">
         <h2>AI 修正（Corrector）</h2>
         <p className="muted-text">
-          默认 Ollama OpenAI-compatible 接口。失败时自动回退到规则预处理 + 词典替换，不中断会话。
+          识别原文始终保留。整理强度控制默认改写多少；模型失败时回退规则预处理。
         </p>
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text">
@@ -1310,6 +1314,40 @@ function SettingsPanel({
             />{" "}
             启用模型修正
           </label>
+        </div>
+        <div className="cleanup-level-block">
+          <div className="field-label">自动整理强度</div>
+          <div className="cleanup-seg" role="group" aria-label="整理强度">
+            {(
+              [
+                ["none", "无", "原样，只做空格标点"],
+                ["light", "轻", "去口头禅、纠错"],
+                ["medium", "中", "更清楚（默认）"],
+                ["strong", "强", "更短更顺"],
+              ] as const
+            ).map(([id, label, tip]) => (
+              <button
+                key={id}
+                type="button"
+                className={`cleanup-seg-btn ${cleanup === id ? "active" : ""}`}
+                disabled={busy}
+                title={tip}
+                onClick={() => setCleanup(id)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="muted-text cleanup-hint">
+            {cleanup === "none" && "不调用模型。历史里仍可复制整理后文本（若曾有）。"}
+            {cleanup === "light" && "修正错字与口头禅，尽量保留原句。"}
+            {cleanup === "medium" && "默认：理顺语序、轻度删冗余，不增删事实。"}
+            {cleanup === "strong" && "更积极改写可读性；仍禁止回答问题或编造内容。"}
+          </p>
+          <div className="cleanup-example muted-text">
+            例：嗯我们那个还约咖啡吗我觉得可能要早点出门因为会堵车
+            <br />→ 轻：去「嗯/那个」+ 标点 · 中：更顺 · 强：压成更短几句
+          </div>
         </div>
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text" style={{ minWidth: 72 }}>
@@ -1889,6 +1927,30 @@ function HistoryPanel({
               >
                 {copied ? "已复制" : "复制文本"}
               </button>
+              {selected.asr_raw &&
+                selected.asr_raw.trim() &&
+                selected.asr_raw.trim() !== text && (
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={busy}
+                    onClick={() =>
+                      void (async () => {
+                        try {
+                          await navigator.clipboard.writeText(selected.asr_raw!.trim());
+                          setCopied(true);
+                          setRetryNote("已复制识别原文（未整理）");
+                          window.setTimeout(() => setCopied(false), 1600);
+                        } catch (e) {
+                          onError(String(e));
+                        }
+                      })()
+                    }
+                    title="复制 ASR 原文，相当于还原 AI 整理前的文本"
+                  >
+                    复制原文
+                  </button>
+                )}
               {hasAudio && !needsRecovery && (
                 <>
                   <button

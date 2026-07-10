@@ -6,3 +6,4 @@ license.workspace = true
 description = "System prompts for Lumen corrector and related LLM tasks"
 
 [dependencies]
+serde = { workspace = true }

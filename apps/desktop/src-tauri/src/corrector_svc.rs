@@ -2,11 +2,12 @@
 
 use crate::config::{AppConfig, CorrectorConfig};
 use lumen_corrector::{
-    correct_or_fallback, CorrectResult, Corrector, DictionaryContext, NullCorrector,
-    OpenAiCompatConfig, OpenAiCompatCorrector,
+    correct_or_fallback_with, preprocess_only, CorrectResult, Corrector, DictionaryContext,
+    NullCorrector, OpenAiCompatConfig, OpenAiCompatCorrector,
 };
 use lumen_core::CorrectorEngineId;
 use lumen_dictionary::{split_for_injection, DictionaryEntry};
+use lumen_prompts::build_system_prompt;
 use std::time::Duration;
 
 pub fn dictionary_context(entries: &[DictionaryEntry]) -> DictionaryContext {
@@ -65,18 +66,42 @@ pub async fn run_correct(
     entries: &[DictionaryEntry],
 ) -> CorrectResult {
     let dict = dictionary_context(entries);
+    let level = app.output.cleanup_level();
+
+    // cleanup=none → rules only, keep ASR mistakes.
+    if !level.uses_model() || !app.corrector.enabled || app.corrector.provider == "none" {
+        let mut r = preprocess_only(text, &dict);
+        if !level.uses_model() {
+            r.engine = CorrectorEngineId::None;
+        }
+        return r;
+    }
+
+    let system = build_system_prompt(level);
+    let temperature = level.temperature();
     match build_corrector(&app.corrector) {
-        Ok(c) => correct_or_fallback(c.as_ref(), text, dict).await,
+        Ok(c) => {
+            correct_or_fallback_with(c.as_ref(), text, dict, system, temperature).await
+        }
         Err(e) => {
             tracing::warn!(error = %e, "corrector build failed, preprocess only");
-            correct_or_fallback(&NullCorrector, text, dict).await
+            correct_or_fallback_with(&NullCorrector, text, dict, system, temperature).await
         }
     }
 }
 
 pub fn engine_label(app: &AppConfig) -> String {
+    let level = app.output.cleanup_level();
+    if !level.uses_model() {
+        return format!("cleanup:{}", level.as_str());
+    }
     if !app.corrector.enabled || app.corrector.provider == "none" {
         return "none".into();
     }
-    format!("{}:{}", app.corrector.provider, app.corrector.model)
+    format!(
+        "{}:{}|{}",
+        app.corrector.provider,
+        app.corrector.model,
+        level.as_str()
+    )
 }
