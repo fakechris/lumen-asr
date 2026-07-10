@@ -88,12 +88,10 @@ impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // Option+Space — avoids Spotlight (⌘Space). Prefer a chord with a
-            // non-modifier key when possible; pure Alt+Shift is debounced but
-            // still easy to trigger accidentally while typing.
+            // Option+Space — avoids Spotlight (⌘Space).
             toggle: "Alt+Space".into(),
-            // Capsule can fight for focus on some macOS builds — off by default.
-            show_capsule: false,
+            // Floating status capsule — required UX feedback while holding hotkey.
+            show_capsule: true,
             // Product default: hold to talk (Wispr / Typeless-like).
             mode: "hold".into(),
         }

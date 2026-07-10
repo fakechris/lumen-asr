@@ -471,11 +471,12 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    // Always show capsule while recording — primary UX feedback for hotkey users.
     let show_capsule = state
         .config
         .lock()
         .map(|c| c.hotkey.show_capsule)
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     // Start mic FIRST (never block on osascript before audio is live).
     match start_recording_inner(&state) {
@@ -487,7 +488,11 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
                 .spawn(|| {
                     remember_target_app();
                 });
-            crate::capsule::set_capsule_visible(&app, show_capsule, "listening");
+            // Force-show capsule on hotkey start so user always sees a popup.
+            crate::capsule::set_capsule_visible(&app, true, "listening");
+            if !show_capsule {
+                tracing::debug!("config show_capsule=false but forcing visible for hotkey feedback");
+            }
             emit_dictation(
                 &app,
                 DictationUiEvent::Listening {
@@ -561,7 +566,8 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
             message: "转写与修正中…".into(),
         },
     );
-    crate::capsule::set_capsule_visible(&app, false, "processing");
+    // Keep capsule visible during processing so user sees work in progress.
+    crate::capsule::set_capsule_visible(&app, true, "processing");
 
     let result = stop_and_transcribe_inner(&state, true, Some(&app)).await;
     if let Ok(mut g) = RECORD_STARTED.lock() {
