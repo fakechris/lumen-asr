@@ -1,5 +1,6 @@
-//! Recording + local ASR IPC (M2).
+//! Recording + local ASR + model corrector IPC (M2–M3).
 
+use crate::corrector_svc::{engine_label, run_correct};
 use crate::AppState;
 use lumen_asr::{
     prepare_for_asr, sensevoice_status, whisper_status, AsrEngine, AsrRequest, AudioDeviceInfo,
@@ -66,8 +67,13 @@ pub fn start_recording(state: State<'_, AppState>) -> Result<(), String> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscribeOutcome {
+    /// Final text after corrector (or ASR if corrector off/failed soft).
     pub text: String,
-    pub engine: String,
+    pub asr_text: String,
+    pub corrected_text: String,
+    pub model_applied: bool,
+    pub asr_engine: String,
+    pub corrector_engine: String,
     pub sample_rate: u32,
     pub num_samples: usize,
     pub duration_ms: u64,
@@ -130,15 +136,44 @@ pub async fn stop_and_transcribe(
         }
     };
 
-    let text = result.text.trim().to_string();
+    let asr_text = result.text.trim().to_string();
+
+    // Dictionary for corrector injection
+    let entries = {
+        let store_guard = state
+            .store
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
+        match store_guard.as_ref() {
+            Some(s) => s.list_dictionary().unwrap_or_default(),
+            None => vec![],
+        }
+    };
+
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?
+        .clone();
+
+    let corr = run_correct(&cfg, &asr_text, &entries).await;
+    let corrected_text = corr.text.trim().to_string();
+    let corrector_engine = if corr.model_applied {
+        engine_label(&cfg)
+    } else if !cfg.corrector.enabled || cfg.corrector.provider == "none" {
+        "none".into()
+    } else {
+        format!("{}:fallback", engine_label(&cfg))
+    };
+
     let mut rec = SessionRecord::new();
     rec.status = SessionStatus::Completed;
     rec.insert_strategy = InsertStrategy::None;
-    rec.asr_raw = Some(text.clone());
-    rec.corrected = Some(text.clone());
-    rec.pasted = Some(text.clone());
+    rec.asr_raw = Some(asr_text.clone());
+    rec.corrected = Some(corrected_text.clone());
+    rec.pasted = Some(corrected_text.clone());
     rec.asr_engine = Some(engine_kind.as_str().into());
-    rec.corrector_engine = Some("none".into());
+    rec.corrector_engine = Some(corrector_engine.clone());
     rec.focus = FocusInfo {
         app_name: Some("Lumen ASR".into()),
         bundle_id: None,
@@ -156,8 +191,12 @@ pub async fn stop_and_transcribe(
     }
 
     Ok(TranscribeOutcome {
-        text,
-        engine: engine_kind.as_str().into(),
+        text: corrected_text.clone(),
+        asr_text,
+        corrected_text,
+        model_applied: corr.model_applied,
+        asr_engine: engine_kind.as_str().into(),
+        corrector_engine,
         sample_rate,
         num_samples,
         duration_ms,

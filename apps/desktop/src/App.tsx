@@ -3,6 +3,7 @@ import { api } from "./api";
 import type {
   AsrStatus,
   AudioDevice,
+  CorrectorStatus,
   DictionaryEntry,
   EditEvent,
   Health,
@@ -128,6 +129,7 @@ export default function App() {
               ["history", "历史"],
               ["dictionary", "词典"],
               ["learn", "编辑学习"],
+              ["settings", "设置"],
             ] as const
           ).map(([id, label]) => (
             <button
@@ -284,6 +286,15 @@ export default function App() {
             }
           />
         )}
+
+        {tab === "settings" && (
+          <SettingsPanel
+            busy={busy}
+            onBusy={setBusy}
+            onError={setError}
+            onSaved={() => void refreshHealth()}
+          />
+        )}
       </main>
     </div>
   );
@@ -306,6 +317,7 @@ function RecordPanel({
   const [recording, setRecording] = useState(false);
   const [seconds, setSeconds] = useState(0);
   const [text, setText] = useState("");
+  const [asrText, setAsrText] = useState("");
   const [meta, setMeta] = useState<string>("");
 
   const refreshStatus = useCallback(async () => {
@@ -370,6 +382,7 @@ function RecordPanel({
     onBusy(true);
     onError(null);
     setText("");
+    setAsrText("");
     setMeta("");
     try {
       await api.startRecording();
@@ -388,9 +401,13 @@ function RecordPanel({
     try {
       const out = await api.stopAndTranscribe(true);
       setRecording(false);
+      setAsrText(out.asrText);
       setText(out.text);
+      const corr = out.modelApplied
+        ? `corrector ${out.correctorEngine}`
+        : `corrector fallback (${out.correctorEngine})`;
       setMeta(
-        `${out.engine} · ${(out.durationMs / 1000).toFixed(1)}s · ${out.numSamples} samples @ ${out.sampleRate} Hz`
+        `ASR ${out.asrEngine} · ${corr} · ${(out.durationMs / 1000).toFixed(1)}s · ${out.numSamples} samples`
       );
       await onSaved();
       await refreshStatus();
@@ -402,6 +419,27 @@ function RecordPanel({
       } catch {
         /* ignore */
       }
+    } finally {
+      onBusy(false);
+    }
+  }
+
+  async function reCorrect() {
+    if (!text.trim() && !asrText.trim()) return;
+    onBusy(true);
+    onError(null);
+    try {
+      const src = asrText || text;
+      const out = await api.correctText(src);
+      setText(out.text);
+      setMeta(
+        (meta ? meta + " · " : "") +
+          (out.modelApplied
+            ? `re-correct ${out.correctorEngine}`
+            : `re-correct fallback (${out.correctorEngine})`)
+      );
+    } catch (e) {
+      onError(String(e));
     } finally {
       onBusy(false);
     }
@@ -519,6 +557,15 @@ function RecordPanel({
       <section className="card">
         <h2>转写结果</h2>
         {meta && <p className="muted-text">{meta}</p>}
+        {asrText && asrText !== text && (
+          <div className="field-block">
+            <div className="field-label">ASR 原文</div>
+            <pre className="field-value">{asrText}</pre>
+          </div>
+        )}
+        <div className="field-label" style={{ marginBottom: 6 }}>
+          最终文本（已修正）
+        </div>
         <textarea
           className="textarea"
           rows={8}
@@ -526,6 +573,215 @@ function RecordPanel({
           onChange={(e) => setText(e.target.value)}
           placeholder={recording ? "录音中…" : "转写文本将显示在这里"}
         />
+        <div className="actions">
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={busy || (!text.trim() && !asrText.trim())}
+            onClick={() => void reCorrect()}
+          >
+            重新 AI 修正
+          </button>
+        </div>
+      </section>
+    </>
+  );
+}
+
+function SettingsPanel({
+  busy,
+  onBusy,
+  onError,
+  onSaved,
+}: {
+  busy: boolean;
+  onBusy: (b: boolean) => void;
+  onError: (e: string | null) => void;
+  onSaved: () => void;
+}) {
+  const [cfg, setCfg] = useState<CorrectorStatus | null>(null);
+  const [enabled, setEnabled] = useState(true);
+  const [provider, setProvider] = useState("ollama");
+  const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:11434/v1");
+  const [model, setModel] = useState("qwen2.5:7b");
+  const [apiKey, setApiKey] = useState("");
+  const [timeoutSecs, setTimeoutSecs] = useState(60);
+  const [probe, setProbe] = useState<string>("");
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const c = await api.getCorrectorConfig();
+        setCfg(c);
+        setEnabled(c.enabled);
+        setProvider(c.provider);
+        setBaseUrl(c.baseUrl);
+        setModel(c.model);
+        setTimeoutSecs(c.timeoutSecs);
+      } catch (e) {
+        onError(String(e));
+      }
+    })();
+  }, [onError]);
+
+  async function save() {
+    onBusy(true);
+    onError(null);
+    try {
+      const input: Parameters<typeof api.saveCorrectorConfig>[0] = {
+        enabled,
+        provider,
+        baseUrl,
+        model,
+        timeoutSecs,
+      };
+      if (apiKey.trim()) {
+        input.apiKey = apiKey.trim();
+      }
+      const c = await api.saveCorrectorConfig(input);
+      setCfg(c);
+      setApiKey("");
+      onSaved();
+      setProbe("已保存");
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      onBusy(false);
+    }
+  }
+
+  async function probeCorrect() {
+    onBusy(true);
+    onError(null);
+    setProbe("");
+    try {
+      const out = await api.correctText("你好  世界 用脱肯鉴权");
+      setProbe(
+        `${out.modelApplied ? "模型已应用" : "回退(预处理)"} · ${out.correctorEngine}\n→ ${out.text}`
+      );
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      onBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <section className="card">
+        <h2>AI 修正（Corrector）</h2>
+        <p className="muted-text">
+          默认 Ollama OpenAI-compatible 接口。失败时自动回退到规则预处理 + 词典替换，不中断会话。
+        </p>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={enabled}
+              disabled={busy}
+              onChange={(e) => setEnabled(e.target.checked)}
+            />{" "}
+            启用模型修正
+          </label>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            Provider
+          </label>
+          <select
+            className="input"
+            value={provider}
+            disabled={busy}
+            onChange={(e) => setProvider(e.target.value)}
+          >
+            <option value="ollama">Ollama</option>
+            <option value="openai_compatible">OpenAI-compatible</option>
+            <option value="none">none（仅规则）</option>
+          </select>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            Base URL
+          </label>
+          <input
+            className="input"
+            value={baseUrl}
+            disabled={busy}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            placeholder="http://127.0.0.1:11434/v1"
+          />
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            Model
+          </label>
+          <input
+            className="input"
+            value={model}
+            disabled={busy}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder="qwen2.5:7b"
+          />
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            API Key
+          </label>
+          <input
+            className="input"
+            type="password"
+            value={apiKey}
+            disabled={busy}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={cfg?.hasApiKey ? "已保存（留空不改）" : "可选"}
+          />
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            Timeout
+          </label>
+          <input
+            className="input"
+            type="number"
+            min={5}
+            value={timeoutSecs}
+            disabled={busy}
+            onChange={(e) => setTimeoutSecs(Number(e.target.value) || 60)}
+          />
+        </div>
+        {cfg && (
+          <p className="muted-text" style={{ fontSize: "0.85rem" }}>
+            当前：<code>{cfg.label}</code>
+          </p>
+        )}
+        <div className="actions">
+          <button type="button" className="btn" disabled={busy} onClick={() => void save()}>
+            保存
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={busy}
+            onClick={() => void probeCorrect()}
+          >
+            测试修正
+          </button>
+        </div>
+        {probe && <pre className="field-value" style={{ marginTop: 12 }}>{probe}</pre>}
+      </section>
+      <section className="card muted">
+        <h2>说明</h2>
+        <ul style={{ margin: 0, paddingLeft: "1.2rem", lineHeight: 1.7 }}>
+          <li>
+            Ollama 需本机运行，例如：
+            <code>ollama pull qwen2.5:7b</code>
+          </li>
+          <li>词典 term/replacement 会注入 prompt，并先做确定性替换</li>
+          <li>
+            配置文件：
+            <code>~/Library/Application Support/LumenAsr/config.toml</code>
+          </li>
+        </ul>
       </section>
     </>
   );
@@ -568,6 +824,10 @@ function Overview({
             <dd>{health.sensevoice_ready ? "就绪" : "未就绪"}</dd>
             <dt>Whisper</dt>
             <dd>{health.whisper_ready ? "就绪" : "未就绪"}</dd>
+            <dt>Corrector</dt>
+            <dd>
+              {health.corrector_enabled ? health.corrector_label : "关闭"}
+            </dd>
           </dl>
         ) : (
           <p className="muted-text">加载中…</p>
@@ -610,7 +870,7 @@ function Overview({
           <li className="done">M0 — 架构骨架</li>
           <li className="done">M1 — Store / 词典 IPC + 本页 UI</li>
           <li className="done">M2 — SenseVoice (sherpa) + 麦克风</li>
-          <li>M3 — Ollama 修正</li>
+          <li className="done">M3 — Ollama 修正</li>
           <li>M4 — paste-first 注入 + 权限</li>
           <li>M5 — 热键 + 胶囊</li>
           <li>M6 — 粘贴后编辑捕获</li>

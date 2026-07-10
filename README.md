@@ -57,7 +57,8 @@ npm run tauri dev
 | `list_dictionary` / `add_*` / `delete_dictionary_entry` | Dictionary CRUD |
 | `list_audio_devices` / `set_audio_device` | Mic selection |
 | `set_asr_engine` / `get_asr_status` | SenseVoice / Whisper |
-| `start_recording` / `stop_and_transcribe` / `cancel_recording` | Capture + local ASR |
+| `start_recording` / `stop_and_transcribe` / `cancel_recording` | Capture + local ASR + correct |
+| `get_corrector_config` / `save_corrector_config` / `correct_text` | Model corrector settings |
 
 ### Models
 
@@ -70,6 +71,24 @@ Default SenseVoice dir resolution (first match wins):
 Expected files: `model.int8.onnx` (or `model.onnx`) + `tokens.txt`.
 
 Whisper: `LUMEN_WHISPER_DIR` or `.../models/whisper` with encoder/decoder/tokens onnx.
+
+### Corrector (M3)
+
+Default: Ollama at `http://127.0.0.1:11434/v1`, model `qwen2.5:7b` (override with `LUMEN_CORRECTOR_MODEL`).
+
+Config: `~/Library/Application Support/LumenAsr/config.toml`
+
+```toml
+[corrector]
+enabled = true
+provider = "ollama"          # ollama | openai_compatible | none
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen2.5:7b"
+api_key = ""
+timeout_secs = 60
+```
+
+On failure: rule preprocess + dictionary replacements only (session still completes).
 
 Data directory (runtime):
 

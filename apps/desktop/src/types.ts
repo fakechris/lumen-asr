@@ -9,6 +9,24 @@ export type Health = {
   sensevoice_ready: boolean;
   whisper_ready: boolean;
   recording: boolean;
+  corrector_enabled: boolean;
+  corrector_label: string;
+};
+
+export type CorrectorStatus = {
+  enabled: boolean;
+  provider: string;
+  baseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+  timeoutSecs: number;
+  label: string;
+};
+
+export type CorrectTextOutcome = {
+  text: string;
+  modelApplied: boolean;
+  correctorEngine: string;
 };
 
 export type AudioDevice = {
@@ -26,7 +44,11 @@ export type AsrStatus = {
 
 export type TranscribeOutcome = {
   text: string;
-  engine: string;
+  asrText: string;
+  correctedText: string;
+  modelApplied: boolean;
+  asrEngine: string;
+  correctorEngine: string;
   sampleRate: number;
   numSamples: number;
   durationMs: number;
@@ -82,4 +104,10 @@ export type LearnCandidate = {
   reason: string;
 };
 
-export type TabId = "record" | "overview" | "history" | "dictionary" | "learn";
+export type TabId =
+  | "record"
+  | "overview"
+  | "history"
+  | "dictionary"
+  | "learn"
+  | "settings";

@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AsrStatus,
   AudioDevice,
+  CorrectorStatus,
+  CorrectTextOutcome,
   DictionaryEntry,
   EditEvent,
   Health,
@@ -23,6 +25,18 @@ export const api = {
   stopAndTranscribe: (save = true) =>
     invoke<TranscribeOutcome>("stop_and_transcribe", { save }),
   cancelRecording: () => invoke<void>("cancel_recording"),
+
+  getCorrectorConfig: () => invoke<CorrectorStatus>("get_corrector_config"),
+  saveCorrectorConfig: (input: {
+    enabled?: boolean;
+    provider?: string;
+    baseUrl?: string;
+    model?: string;
+    apiKey?: string;
+    timeoutSecs?: number;
+  }) => invoke<CorrectorStatus>("save_corrector_config", { input }),
+  correctText: (text: string) =>
+    invoke<CorrectTextOutcome>("correct_text", { input: { text } }),
 
   listSessions: (limit = 50) =>
     invoke<SessionRecord[]>("list_sessions", { limit }),

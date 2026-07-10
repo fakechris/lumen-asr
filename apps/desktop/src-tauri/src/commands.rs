@@ -37,6 +37,8 @@ pub struct Health {
     pub sensevoice_ready: bool,
     pub whisper_ready: bool,
     pub recording: bool,
+    pub corrector_enabled: bool,
+    pub corrector_label: String,
 }
 
 #[tauri::command]
@@ -55,6 +57,13 @@ pub fn app_health(state: State<'_, AppState>) -> Health {
 
     let sv = lumen_asr::sensevoice_status();
     let wh = lumen_asr::whisper_status();
+    let (corrector_enabled, corrector_label) = match state.config.lock() {
+        Ok(c) => (
+            c.corrector.enabled,
+            crate::corrector_svc::engine_label(&c),
+        ),
+        Err(_) => (false, "unknown".into()),
+    };
 
     Health {
         app: "Lumen ASR".into(),
@@ -67,6 +76,8 @@ pub fn app_health(state: State<'_, AppState>) -> Health {
         sensevoice_ready: sv.ready,
         whisper_ready: wh.ready,
         recording: state.audio.is_recording(),
+        corrector_enabled,
+        corrector_label,
     }
 }
 

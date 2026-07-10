@@ -2035,8 +2035,10 @@ version = "0.1.0"
 dependencies = [
  "lumen-asr",
  "lumen-core",
+ "lumen-corrector",
  "lumen-dictionary",
  "lumen-platform",
+ "lumen-prompts",
  "lumen-store",
  "serde",
  "serde_json",
@@ -2044,6 +2046,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-shell",
  "tokio",
+ "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
  "uuid",

@@ -1,6 +1,10 @@
 mod commands;
+mod config;
+mod corrector_cmd;
+mod corrector_svc;
 mod dictation;
 
+use config::AppConfig;
 use lumen_asr::{
     default_sensevoice_dir, default_whisper_dir, AudioCapture, EngineKind, SenseVoiceSherpaAsr,
     WhisperAsr,
@@ -15,6 +19,7 @@ pub struct AppState {
     pub engine: Mutex<EngineKind>,
     pub sensevoice: Mutex<SenseVoiceSherpaAsr>,
     pub whisper: Mutex<WhisperAsr>,
+    pub config: Mutex<AppConfig>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -29,6 +34,14 @@ pub fn run() {
     let data_dir = default_data_dir();
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::fs::create_dir_all(data_dir.join("models"));
+
+    let app_config = AppConfig::load();
+    tracing::info!(
+        provider = %app_config.corrector.provider,
+        model = %app_config.corrector.model,
+        enabled = app_config.corrector.enabled,
+        "corrector config"
+    );
 
     let store = match Store::open(default_db_path()) {
         Ok(s) => {
@@ -54,6 +67,7 @@ pub fn run() {
             engine: Mutex::new(EngineKind::SenseVoice),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sv_dir)),
             whisper: Mutex::new(WhisperAsr::new(wh_dir)),
+            config: Mutex::new(app_config),
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_health,
@@ -77,11 +91,15 @@ pub fn run() {
             dictation::start_recording,
             dictation::stop_and_transcribe,
             dictation::cancel_recording,
+            corrector_cmd::get_corrector_config,
+            corrector_cmd::save_corrector_config,
+            corrector_cmd::correct_text,
+            corrector_cmd::default_corrector_config,
         ])
         .setup(|app| {
             tracing::info!(
                 name = app.package_info().name,
-                "Lumen ASR desktop starting (M2)"
+                "Lumen ASR desktop starting (M3)"
             );
             Ok(())
         })
