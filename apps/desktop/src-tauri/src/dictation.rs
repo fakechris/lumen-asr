@@ -56,40 +56,50 @@ fn remember_target_app() {
     }
 }
 
-/// Put typing target frontmost and hide our overlays before ⌘V.
+/// Prepare for insert the way competitors do:
+/// - Hide our UI
+/// - **Do not** `open -a` target unless *we* stole frontmost (kills iTerm focus)
+/// - Rely on type/paste into whatever currently has key focus
 fn restore_target_app_before_insert(app: Option<&AppHandle>) -> Option<String> {
-    // Hide capsule first so it cannot remain key window.
     if let Some(app) = app {
-        crate::capsule::set_capsule_visible(app, false, "idle");
+        crate::capsule::set_capsule_visible(app, false, "pre-insert");
         crate::capsule::ensure_main_stays_background(app);
     }
 
     let target = TARGET.lock().ok().and_then(|g| g.clone());
-    let mut notes_front: Option<String> = None;
+    let current = frontmost_app_name();
+    tracing::info!(
+        target = ?target.as_ref().and_then(|t| t.name.clone()),
+        frontmost = ?current,
+        "pre-insert focus state"
+    );
 
-    if let Some(ref t) = target {
-        if !is_self_target(t) {
-            tracing::info!(name = ?t.name, bundle = ?t.bundle_id, "activating typing target");
-            let ok = activate_target(t);
-            tracing::info!(ok, "activate_target result");
-            // Wait for key window — iTerm/Electron need a beat.
-            std::thread::sleep(std::time::Duration::from_millis(220));
-        }
-    }
+    // Only re-activate if Lumen (or empty) is frontmost — never force iTerm
+    // via `open -a` when it already is frontmost (drops the text field caret).
+    let need_activate = match &current {
+        Some(c) if is_self_app_name(c) => true,
+        None => true,
+        Some(_) => false,
+    };
 
-    // Verify
-    if let Some(cur) = frontmost_app_name() {
-        notes_front = Some(cur.clone());
-        if is_self_app_name(&cur) {
-            tracing::warn!(%cur, "frontmost is still Lumen before paste — retry activate");
-            if let Some(ref t) = target {
-                let _ = activate_target(t);
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                notes_front = frontmost_app_name();
+    if need_activate {
+        if let Some(ref t) = target {
+            if !is_self_target(t) {
+                tracing::info!(
+                    name = ?t.name,
+                    bundle = ?t.bundle_id,
+                    "Lumen stole frontmost — restoring target"
+                );
+                let ok = activate_target(t);
+                tracing::info!(ok, "activate_target result");
+                std::thread::sleep(std::time::Duration::from_millis(180));
             }
         }
+    } else {
+        tracing::info!("target already frontmost — skip activate (preserve caret)");
     }
-    notes_front
+
+    frontmost_app_name()
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -308,17 +318,16 @@ pub async fn stop_and_transcribe_inner(
     let mut frontmost_before_insert = None;
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
         frontmost_before_insert = restore_target_app_before_insert(app);
-        // Block on async runtime — short sleeps already done in restore.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Let focus settle after capsule hide; modifiers clear inside inject.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
-        // Re-check we are not pasting into ourselves.
         if let Some(cur) = frontmost_app_name() {
             if is_self_app_name(&cur) {
-                notes.push(format!("still frontmost self before paste: {cur}"));
-                tracing::error!(%cur, "refusing to paste into Lumen — retry activate");
+                notes.push(format!("frontmost is self before insert: {cur}"));
+                tracing::warn!(%cur, "frontmost still Lumen — one restore attempt");
                 if let Some(ref t) = target {
                     let _ = activate_target(t);
-                    tokio::time::sleep(std::time::Duration::from_millis(280)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
         }
@@ -331,7 +340,7 @@ pub async fn stop_and_transcribe_inner(
                 tracing::info!(
                     ?insert_strategy,
                     frontmost = ?frontmost_app_name(),
-                    "auto-insert done"
+                    "auto-insert done (type→paste competitor path)"
                 );
             }
             Err(e) => {

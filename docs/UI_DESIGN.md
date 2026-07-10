@@ -102,9 +102,22 @@ Never require typing `CommandOrControl+…`.
 
 System light/dark, SF / `-apple-system`, accent ≈ `#007aff` / `#0a84ff`. See `styles.css`.
 
-## 7. Later (not blocking this pass)
+## 7. Text insert (competitor-aligned)
 
-- Bare `Fn` / right-⌘ push-to-talk via CGEventTap (闪电说-class)  
-- Hold vs toggle modes  
+| Product | Primary insert | Fallback | Focus rule |
+|---------|----------------|----------|------------|
+| **OpenLess / 闪电说** | CGEvent Unicode type at cursor | Clipboard + ⌘V | Never activate unless self stole frontmost |
+| **Wispr / Superwhisper** | Clipboard + auto-paste | — | Menu-bar / accessory style; type into frontmost |
+| **Lumen (current)** | **Type unicode first**, then clipboard ⌘V | AX (unused for terminals) | Hide capsule → only `open -a` if frontmost is Lumen |
+
+Implementation notes:
+
+1. Wait until physical Alt/Shift/Ctrl are up before synthesizing keys (hotkey chord would turn ⌘V into ⌥⇧⌘V).
+2. Do **not** force-activate iTerm when it is already frontmost — `open -a` drops the caret.
+3. Capsule is non-focusable feedback only.
+
+## 8. Later (not blocking this pass)
+
+- Bare `Fn` / right-⌘ via CGEventTap  
+- True `NSPanel` non-activating HUD  
 - Menu bar extra  
-- Transparent titlebar + vibrancy without breaking drag  

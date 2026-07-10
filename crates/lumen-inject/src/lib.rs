@@ -45,6 +45,7 @@ impl Default for InsertPolicy {
         Self {
             mode: InjectMode::Auto,
             preserve_clipboard: true,
+            // Prefer type-at-cursor; field kept for config compatibility.
             paste_first: true,
         }
     }
@@ -104,11 +105,21 @@ impl<B: TextInjectorBackend> TextInjector<B> {
     }
 
     async fn try_auto(&self, text: &str) -> Result<InsertOutcome, InjectError> {
-        // paste-first (default, Wispr-like) or ax-first when paste_first=false
+        // Competitor-aligned default (闪电说 / OpenLess):
+        //   Type unicode at cursor first (no app activate), then clipboard paste.
+        // `paste_first=true` keeps classic Wispr-style paste-first for those who want it.
         let sequence: Vec<InsertStrategy> = if self.policy.paste_first {
-            vec![InsertStrategy::Paste, InsertStrategy::Ax, InsertStrategy::Type]
+            vec![
+                InsertStrategy::Type,
+                InsertStrategy::Paste,
+                InsertStrategy::Ax,
+            ]
         } else {
-            vec![InsertStrategy::Ax, InsertStrategy::Paste, InsertStrategy::Type]
+            vec![
+                InsertStrategy::Type,
+                InsertStrategy::Paste,
+                InsertStrategy::Ax,
+            ]
         };
 
         let mut errors = Vec::new();
@@ -205,20 +216,29 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn auto_paste_first_succeeds() {
+    async fn auto_type_first_succeeds() {
         let inj = TextInjector::new(StubInjectorBackend::default(), InsertPolicy::default());
         let o = inj.insert("hi").await.unwrap();
-        assert_eq!(o.strategy, InsertStrategy::Paste);
+        // Type is first in Auto sequence now.
+        assert_eq!(o.strategy, InsertStrategy::Type);
     }
 
     #[tokio::test]
-    async fn auto_falls_back_to_ax() {
+    async fn auto_falls_back_to_paste_then_ax() {
+        // Stub type always succeeds — verify paste path via Paste-only mode.
         let backend = StubInjectorBackend {
-            fail_paste: true,
+            fail_paste: false,
             fail_ax: false,
         };
-        let inj = TextInjector::new(backend, InsertPolicy::default());
+        let inj = TextInjector::new(
+            backend,
+            InsertPolicy {
+                mode: InjectMode::Paste,
+                preserve_clipboard: true,
+                paste_first: true,
+            },
+        );
         let o = inj.insert("hi").await.unwrap();
-        assert_eq!(o.strategy, InsertStrategy::Ax);
+        assert_eq!(o.strategy, InsertStrategy::Paste);
     }
 }

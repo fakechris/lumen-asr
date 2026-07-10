@@ -1,26 +1,34 @@
-//! macOS text injection: paste-first + clipboard restore, AX optional, unicode type.
+//! macOS text injection — competitor-aligned (Wispr / 闪电说 / OpenLess).
+//!
+//! Strategy (Auto):
+//! 1. **Unicode CGEvent type** into the *current key focus* (no app activate)
+//! 2. **Clipboard + ⌘V** fallback (after modifiers clear)
+//!
+//! Critical rules:
+//! - Do **not** `open -a` / activate unless our app accidentally became frontmost
+//! - Wait until Alt/Shift/Ctrl are physically up before synthesizing keys
+//!   (hotkey chord still held would turn ⌘V into ⌥⇧⌘V)
 
 use async_trait::async_trait;
 use lumen_inject::{InjectError, TextInjectorBackend};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct MacTextInjectorBackend;
 
 #[async_trait]
 impl TextInjectorBackend for MacTextInjectorBackend {
     async fn paste_with_restore(&self, text: &str, preserve: bool) -> Result<(), InjectError> {
-        // Short blocking work (clipboard + key event + ~450ms restore delay).
         paste_with_restore_sync(text, preserve)
     }
 
     async fn ax_insert(&self, text: &str) -> Result<(), InjectError> {
-        // Prefer paste path for compatibility; AX set-value is app-specific and flaky.
+        // Terminal apps rarely expose AXValue for the shell — use type/paste.
         let _ = text;
         Err(InjectError::NotSupported(
-            "AX insert not implemented; use paste".into(),
+            "AX insert not used; prefer type/paste".into(),
         ))
     }
 
@@ -38,6 +46,8 @@ fn paste_with_restore_sync(text: &str, preserve: bool) -> Result<(), InjectError
         return Ok(());
     }
 
+    wait_hotkey_modifiers_clear(Duration::from_millis(400));
+
     let previous = if preserve {
         get_clipboard().unwrap_or_default()
     } else {
@@ -45,14 +55,13 @@ fn paste_with_restore_sync(text: &str, preserve: bool) -> Result<(), InjectError
     };
 
     set_clipboard(text)?;
-    // Let pasteboard settle (Wispr-like delayed readiness).
-    thread::sleep(Duration::from_millis(30));
+    // Pasteboard readiness (competitors wait tens of ms).
+    thread::sleep(Duration::from_millis(40));
     simulate_cmd_v()?;
-    // Wait for target app to consume pasteboard before restore.
-    thread::sleep(Duration::from_millis(450));
+    // Give iTerm/Electron time to consume pasteboard.
+    thread::sleep(Duration::from_millis(350));
 
     if preserve {
-        // Always attempt restore — even if previous was empty.
         let _ = set_clipboard(&previous);
     }
     Ok(())
@@ -92,28 +101,74 @@ fn get_clipboard() -> Result<String, InjectError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+const FLAG_SHIFT: u64 = 0x0002_0000;
+const FLAG_CONTROL: u64 = 0x0004_0000;
+const FLAG_ALTERNATE: u64 = 0x0008_0000;
+const FLAG_COMMAND: u64 = 0x0010_0000;
+const HOTKEY_MODS: u64 = FLAG_SHIFT | FLAG_CONTROL | FLAG_ALTERNATE; // not Command
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceFlagsState(state_id: u32) -> u64;
+}
+
+/// Wait until physical Alt/Shift/Ctrl are up so synthetic ⌘V is not remapped.
+fn wait_hotkey_modifiers_clear(timeout: Duration) {
+    #[cfg(target_os = "macos")]
+    {
+        let start = Instant::now();
+        loop {
+            let flags = unsafe { CGEventSourceFlagsState(1) }; // HID system
+            if flags & HOTKEY_MODS == 0 {
+                // Extra beat after clear — OS keyboard state lag.
+                thread::sleep(Duration::from_millis(20));
+                return;
+            }
+            if start.elapsed() >= timeout {
+                tracing::warn!(
+                    flags = format!("{:#x}", flags),
+                    "modifiers still down before inject — continuing"
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(12));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = timeout;
+    }
+}
+
 /// Simulate ⌘V via CGEvent (requires Accessibility).
+/// Posts pure Command+V regardless of physical modifier state on the event.
 fn simulate_cmd_v() -> Result<(), InjectError> {
     #[cfg(target_os = "macos")]
     {
-        use core_graphics::event::{CGEvent, CGEventFlags, CGKeyCode};
+        use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
         use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
-        // kVK_ANSI_V = 0x09
-        const KEY_V: CGKeyCode = 0x09;
+        const KEY_V: CGKeyCode = 0x09; // kVK_ANSI_V
 
-        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .or_else(|_| CGEventSource::new(CGEventSourceStateID::HIDSystemState))
             .map_err(|_| InjectError::Other("CGEventSource failed".into()))?;
+
+        // Optional: briefly clear sticky flags by posting empty flag updates is unreliable;
+        // we already waited for physical mods to clear.
 
         let down = CGEvent::new_keyboard_event(source.clone(), KEY_V, true)
             .map_err(|_| InjectError::Other("key down failed".into()))?;
         down.set_flags(CGEventFlags::CGEventFlagCommand);
-        down.post(core_graphics::event::CGEventTapLocation::HID);
+        down.post(CGEventTapLocation::HID);
+
+        thread::sleep(Duration::from_millis(8));
 
         let up = CGEvent::new_keyboard_event(source, KEY_V, false)
             .map_err(|_| InjectError::Other("key up failed".into()))?;
         up.set_flags(CGEventFlags::CGEventFlagCommand);
-        up.post(core_graphics::event::CGEventTapLocation::HID);
+        up.post(CGEventTapLocation::HID);
 
         Ok(())
     }
@@ -123,26 +178,34 @@ fn simulate_cmd_v() -> Result<(), InjectError> {
     }
 }
 
+/// Insert by synthesizing Unicode key events at the current key focus.
+/// This is the OpenLess / 闪电说 primary path — works without activating apps.
 fn type_unicode_sync(text: &str) -> Result<(), InjectError> {
     #[cfg(target_os = "macos")]
     {
-        use core_graphics::event::{CGEvent, CGEventTapLocation};
         use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
-        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        wait_hotkey_modifiers_clear(Duration::from_millis(400));
+
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .or_else(|_| CGEventSource::new(CGEventSourceStateID::HIDSystemState))
             .map_err(|_| InjectError::Other("CGEventSource failed".into()))?;
 
-        // Chunk to avoid huge single events.
+        // Type in small chunks for better compatibility (iTerm, Electron).
+        let mut buf = String::new();
         for ch in text.chars() {
-            let s = ch.to_string();
-            let event = CGEvent::new_keyboard_event(source.clone(), 0, true)
-                .map_err(|_| InjectError::Other("unicode event failed".into()))?;
-            event.set_string_from_utf16_unchecked(&s.encode_utf16().collect::<Vec<_>>());
-            event.post(CGEventTapLocation::HID);
-            // tiny gap for IME-heavy apps
-            if ch == '\n' {
-                thread::sleep(Duration::from_millis(5));
+            buf.push(ch);
+            // Flush on whitespace/newline or every 8 chars.
+            if ch.is_whitespace() || buf.chars().count() >= 8 {
+                post_unicode_chunk(&source, &buf)?;
+                buf.clear();
+                if ch == '\n' {
+                    thread::sleep(Duration::from_millis(4));
+                }
             }
+        }
+        if !buf.is_empty() {
+            post_unicode_chunk(&source, &buf)?;
         }
         Ok(())
     }
@@ -151,4 +214,21 @@ fn type_unicode_sync(text: &str) -> Result<(), InjectError> {
         let _ = text;
         Err(InjectError::NotSupported("not macOS".into()))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn post_unicode_chunk(
+    source: &core_graphics::event_source::CGEventSource,
+    chunk: &str,
+) -> Result<(), InjectError> {
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+
+    let event = CGEvent::new_keyboard_event(source.clone(), 0, true)
+        .map_err(|_| InjectError::Other("unicode event failed".into()))?;
+    let utf16: Vec<u16> = chunk.encode_utf16().collect();
+    event.set_string_from_utf16_unchecked(&utf16);
+    // Explicit empty flags so leftover Alt/Shift state is not applied.
+    event.set_flags(CGEventFlags::empty());
+    event.post(CGEventTapLocation::HID);
+    Ok(())
 }
