@@ -92,7 +92,7 @@ impl Default for HotkeyConfig {
             toggle: "Alt+Space".into(),
             // Floating status capsule — required UX feedback while holding hotkey.
             show_capsule: true,
-            // Product default: hold to talk (Wispr / Typeless-like).
+            // Product default: hold to talk (push-to-talk).
             mode: "hold".into(),
         }
     }

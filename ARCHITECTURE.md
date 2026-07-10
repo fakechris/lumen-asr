@@ -70,7 +70,7 @@ policy.mode:
   Type  → CGEvent unicode string
 ```
 
-Clipboard restore delay: ~300–500ms (Wispr uses 500ms).  
+Clipboard restore delay: ~300–500ms.  
 Always log which strategy succeeded for history/`debug_info`.
 
 ## 5. Data model (SQLite)

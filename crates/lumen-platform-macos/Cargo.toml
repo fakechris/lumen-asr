@@ -16,3 +16,6 @@ cpal = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-graphics = "0.24"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray"] }
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication"] }

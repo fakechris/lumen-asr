@@ -3,8 +3,9 @@
 //! Default product mode: **hold** (push-to-talk) — press starts, release stops.
 //! Optional **toggle** mode for click-style chords.
 //!
-//! - Normal chords (modifier + key) → `tauri-plugin-global-shortcut` Pressed/Released
-//! - Modifier-only (e.g. Alt+Shift) → macOS HID flag watcher press/release edges
+//! On macOS, all chords (including modifier-only like Alt+Shift) use CGEventTap
+//! for reliable press/release edges. Falls back to HID flag polling / global
+//! shortcut plugin if the tap cannot be created.
 
 use crate::config::HotkeyConfig;
 use crate::dictation;
@@ -135,6 +136,7 @@ fn spawn_toggle(app: AppHandle) {
 pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String> {
     let _ = app.global_shortcut().unregister_all();
     mod_chord::stop_watcher();
+    lumen_platform_macos::stop_monitor();
 
     if !cfg.enabled || cfg.toggle.trim().is_empty() {
         tracing::info!("global hotkey disabled");
@@ -144,6 +146,55 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
     let toggle = cfg.toggle.trim();
     let hold = cfg.is_hold_mode();
 
+    // Primary path on macOS: CGEventTap (press/hold/release for all chord types).
+    #[cfg(target_os = "macos")]
+    {
+        use lumen_platform_macos::{HotkeyEdge, HotkeyMode, HotkeySpec};
+
+        let mode = if hold {
+            HotkeyMode::Hold
+        } else {
+            HotkeyMode::Toggle
+        };
+        match HotkeySpec::parse(toggle, mode) {
+            Ok(spec) => {
+                let app_c = app.clone();
+                let hold_mode = hold;
+                match lumen_platform_macos::start_monitor(spec, move |edge| {
+                    match edge {
+                        HotkeyEdge::Press => {
+                            if hold_mode {
+                                spawn_start(app_c.clone());
+                            } else {
+                                spawn_toggle(app_c.clone());
+                            }
+                        }
+                        HotkeyEdge::Release => {
+                            if hold_mode {
+                                spawn_stop(app_c.clone());
+                            }
+                        }
+                    }
+                }) {
+                    Ok(()) => {
+                        tracing::info!(hotkey = %toggle, hold, "event-tap hotkey registered");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "event-tap unavailable — falling back"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "event-tap parse failed — falling back");
+            }
+        }
+    }
+
+    // Fallback: modifier-only via HID flag polling.
     if let Some(chord) = ModChord::parse_modifier_only(toggle) {
         let app_press = app.clone();
         let app_release = app.clone();
@@ -160,10 +211,11 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
                 move || { /* release ignored in toggle mode */ },
             );
         }
-        tracing::info!(hotkey = %toggle, hold, "modifier-only hotkey registered");
+        tracing::info!(hotkey = %toggle, hold, "modifier-only hotkey registered (fallback)");
         return Ok(());
     }
 
+    // Fallback: normal chords via global-shortcut plugin.
     let shortcut: Shortcut = toggle
         .parse()
         .map_err(|e| format!("invalid hotkey '{toggle}': {e}"))?;
@@ -190,7 +242,7 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
         })
         .map_err(|e| format!("register hotkey failed: {e}"))?;
 
-    tracing::info!(hotkey = %toggle, hold, "global hotkey registered");
+    tracing::info!(hotkey = %toggle, hold, "global hotkey registered (fallback)");
     Ok(())
 }
 
@@ -198,6 +250,7 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
 pub fn pause_hotkeys(app: AppHandle) -> Result<(), String> {
     let _ = app.global_shortcut().unregister_all();
     mod_chord::stop_watcher();
+    lumen_platform_macos::stop_monitor();
     tracing::info!("global hotkeys paused for capture");
     Ok(())
 }

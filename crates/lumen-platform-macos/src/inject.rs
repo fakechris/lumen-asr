@@ -1,11 +1,11 @@
-//! macOS text injection — competitor-aligned (Wispr / 闪电说 / OpenLess).
+//! macOS text injection.
 //!
 //! Strategy (Auto):
-//! 1. **Unicode CGEvent type** into the *current key focus* (no app activate)
+//! 1. **Unicode CGEvent type** into the current key focus (no app activate)
 //! 2. **Clipboard + ⌘V** fallback (after modifiers clear)
 //!
-//! Critical rules:
-//! - Do **not** `open -a` / activate unless our app accidentally became frontmost
+//! Rules:
+//! - Do not `open -a` / activate unless our app accidentally became frontmost
 //! - Wait until Alt/Shift/Ctrl are physically up before synthesizing keys
 //!   (hotkey chord still held would turn ⌘V into ⌥⇧⌘V)
 
@@ -55,10 +55,10 @@ fn paste_with_restore_sync(text: &str, preserve: bool) -> Result<(), InjectError
     };
 
     set_clipboard(text)?;
-    // Pasteboard readiness (competitors wait tens of ms).
+    // Pasteboard readiness.
     thread::sleep(Duration::from_millis(40));
     simulate_cmd_v()?;
-    // Give iTerm/Electron time to consume pasteboard.
+    // Give terminal/Electron time to consume pasteboard.
     thread::sleep(Duration::from_millis(350));
 
     if preserve {
@@ -104,7 +104,6 @@ fn get_clipboard() -> Result<String, InjectError> {
 const FLAG_SHIFT: u64 = 0x0002_0000;
 const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALTERNATE: u64 = 0x0008_0000;
-const FLAG_COMMAND: u64 = 0x0010_0000;
 const HOTKEY_MODS: u64 = FLAG_SHIFT | FLAG_CONTROL | FLAG_ALTERNATE; // not Command
 
 #[cfg(target_os = "macos")]
@@ -142,7 +141,6 @@ fn wait_hotkey_modifiers_clear(timeout: Duration) {
 }
 
 /// Simulate ⌘V via CGEvent (requires Accessibility).
-/// Posts pure Command+V regardless of physical modifier state on the event.
 fn simulate_cmd_v() -> Result<(), InjectError> {
     #[cfg(target_os = "macos")]
     {
@@ -154,9 +152,6 @@ fn simulate_cmd_v() -> Result<(), InjectError> {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .or_else(|_| CGEventSource::new(CGEventSourceStateID::HIDSystemState))
             .map_err(|_| InjectError::Other("CGEventSource failed".into()))?;
-
-        // Optional: briefly clear sticky flags by posting empty flag updates is unreliable;
-        // we already waited for physical mods to clear.
 
         let down = CGEvent::new_keyboard_event(source.clone(), KEY_V, true)
             .map_err(|_| InjectError::Other("key down failed".into()))?;
@@ -179,7 +174,6 @@ fn simulate_cmd_v() -> Result<(), InjectError> {
 }
 
 /// Insert by synthesizing Unicode key events at the current key focus.
-/// This is the OpenLess / 闪电说 primary path — works without activating apps.
 fn type_unicode_sync(text: &str) -> Result<(), InjectError> {
     #[cfg(target_os = "macos")]
     {
@@ -191,11 +185,10 @@ fn type_unicode_sync(text: &str) -> Result<(), InjectError> {
             .or_else(|_| CGEventSource::new(CGEventSourceStateID::HIDSystemState))
             .map_err(|_| InjectError::Other("CGEventSource failed".into()))?;
 
-        // Type in small chunks for better compatibility (iTerm, Electron).
+        // Type in small chunks for better compatibility (terminals, Electron).
         let mut buf = String::new();
         for ch in text.chars() {
             buf.push(ch);
-            // Flush on whitespace/newline or every 8 chars.
             if ch.is_whitespace() || buf.chars().count() >= 8 {
                 post_unicode_chunk(&source, &buf)?;
                 buf.clear();

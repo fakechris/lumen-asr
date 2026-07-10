@@ -56,18 +56,16 @@ Corrector prompt: voice-input **text organizer**, not a chat assistant (strict r
 
 Modes (later): Raw / Light / Structured — MVP ships **Light** only.
 
-## 7. Text insertion (researched)
-
-Industry pattern (clipboard paste + restore is the most compatible default; AX for context/verify when available).
+## 7. Text insertion
 
 ### Our policy
 
 ```
 injection_mode = auto  (product default behavior)
 
-1. Clipboard paste + restore     ← default / most compatible (paste-first)
-2. AX insert_at_cursor           ← optional optimize when editable AX value works
-3. Unicode CGEvent type          ← last resort
+1. Unicode CGEvent type          ← primary (insert at current key focus)
+2. Clipboard paste + restore     ← fallback
+3. AX insert_at_cursor           ← optional when editable AX value works
 ```
 
 Config knobs:

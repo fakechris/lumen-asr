@@ -36,7 +36,7 @@ pub enum InjectMode {
 pub struct InsertPolicy {
     pub mode: InjectMode,
     pub preserve_clipboard: bool,
-    /// When mode is Auto, try paste before AX (Wispr-like). Default true.
+    /// When mode is Auto, try paste before AX. Default true.
     pub paste_first: bool,
 }
 
@@ -105,9 +105,8 @@ impl<B: TextInjectorBackend> TextInjector<B> {
     }
 
     async fn try_auto(&self, text: &str) -> Result<InsertOutcome, InjectError> {
-        // Competitor-aligned default (闪电说 / OpenLess):
-        //   Type unicode at cursor first (no app activate), then clipboard paste.
-        // `paste_first=true` keeps classic Wispr-style paste-first for those who want it.
+        // Product default: type unicode at cursor first (no app activate),
+        // then clipboard paste, then AX. Field `paste_first` kept for config compat.
         let sequence: Vec<InsertStrategy> = if self.policy.paste_first {
             vec![
                 InsertStrategy::Type,

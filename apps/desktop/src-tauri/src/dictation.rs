@@ -31,6 +31,7 @@ static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 /// Only discard as bounce if shorter than this *and* almost no audio.
 const BOUNCE_MS: u128 = 80;
 
+/// Snapshot frontmost app into process-local cache (sync, preferred at press).
 fn remember_target_app() {
     let t = frontmost_target();
     match &t {
@@ -56,10 +57,11 @@ fn remember_target_app() {
     }
 }
 
-/// Prepare for insert the way competitors do:
+/// Prepare for insert:
 /// - Hide our UI
-/// - **Do not** `open -a` target unless *we* stole frontmost (kills iTerm focus)
-/// - Rely on type/paste into whatever currently has key focus
+/// - Only re-activate cached target if *we* became frontmost
+/// - Never force-activate when the typing target is already frontmost
+///   (avoids dropping the text-field caret)
 fn restore_target_app_before_insert(app: Option<&AppHandle>) -> Option<String> {
     if let Some(app) = app {
         crate::capsule::set_capsule_visible(app, false, "pre-insert");
@@ -74,8 +76,6 @@ fn restore_target_app_before_insert(app: Option<&AppHandle>) -> Option<String> {
         "pre-insert focus state"
     );
 
-    // Only re-activate if Lumen (or empty) is frontmost — never force iTerm
-    // via `open -a` when it already is frontmost (drops the text field caret).
     let need_activate = match &current {
         Some(c) if is_self_app_name(c) => true,
         None => true,
@@ -340,7 +340,7 @@ pub async fn stop_and_transcribe_inner(
                 tracing::info!(
                     ?insert_strategy,
                     frontmost = ?frontmost_app_name(),
-                    "auto-insert done (type→paste competitor path)"
+                    "auto-insert done (type→paste)"
                 );
             }
             Err(e) => {
@@ -487,17 +487,14 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
         .map(|c| c.hotkey.show_capsule)
         .unwrap_or(true);
 
-    // Start mic FIRST (never block on osascript before audio is live).
+    // Capture typing target first (NSWorkspace is ~ms) so insert restores correctly.
+    remember_target_app();
+
+    // Then start mic; never show UI before we know the target.
     match start_recording_inner(&state) {
         Ok(()) => {
             tracing::info!("dictation recording live");
-            // Capture target without blocking the hotkey path.
-            let _ = std::thread::Builder::new()
-                .name("lumen-focus".into())
-                .spawn(|| {
-                    remember_target_app();
-                });
-            // Force-show capsule on hotkey start so user always sees a popup.
+            // Force-show capsule on hotkey start so user always sees feedback.
             crate::capsule::set_capsule_visible(&app, true, "listening");
             if !show_capsule {
                 tracing::debug!("config show_capsule=false but forcing visible for hotkey feedback");

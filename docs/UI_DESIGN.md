@@ -1,25 +1,19 @@
 # Lumen ASR — Desktop UI Design (macOS-first)
 
-> Shell IA and interaction patterns aligned with Wispr Flow / Typeless / 闪电说.
+> Shell IA and interaction patterns for a local-first dictation app.
 
 ## 1. Framework (what we use)
 
 | Layer | Choice | Why |
 |-------|--------|-----|
-| Shell | **Tauri 2** (Rust + WebView) | Same class as 闪电说 / OpenLess — not Electron for binary size |
+| Shell | **Tauri 2** (Rust + WebView) | Small binary, Rust platform code, multi-window |
 | UI | React | Settings + history density; not “fake web page” chrome |
-| Global hotkey | `tauri-plugin-global-shortcut` | Chord register; capture UI pauses registration while recording |
+| Global hotkey | **CGEventTap** (primary) + fallbacks | Reliable press/hold/release, including modifier-only chords |
 | Window chrome | **System titlebar (Visible)** | Native drag, traffic lights, double-click maximize, Mission Control — Overlay + custom drag is fragile |
 
-**Non-goal for MVP:** pure SwiftUI rewrite. Competitors with Electron/Tauri still feel native when they keep OS chrome and use click-to-record shortcuts.
+**Non-goal for MVP:** pure SwiftUI rewrite. Keep OS chrome and click-to-record shortcuts so the shell feels native.
 
-## 2. Competitor patterns we copy
-
-| Product | Default hotkey | Set hotkey UX | Window |
-|---------|----------------|---------------|--------|
-| **Typeless** | `Fn` (push-to-talk); extra chords in Settings | Click / add shortcut — press keys | OS + Electron chrome, fully draggable |
-| **闪电说** | `Fn` / right ⌘ free mode | Config + pause/resume global hooks while UI edits | Tauri multi-window, native-feeling shell |
-| **Wispr Flow** | Often right-modifier / Fn class | Click field → press new chord | Native Mac window affordances |
+## 2. Interaction principles
 
 ### Anti-patterns we remove
 
@@ -48,11 +42,11 @@ Why:
 - Avoids Spotlight (`⌘Space`)
 - Avoids common IME / input source chords when possible
 - Easy one-hand reach on Mac keyboards
-- Works with global-shortcut (true bare `Fn` needs lower-level hooks; later)
+- Event tap supports modifier + key and modifier-only chords (true bare `Fn` later)
 
 Users with an existing `config.toml` keep their saved chord until they re-record.
 
-### Capture UX (must match competitors)
+### Capture UX
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -102,22 +96,24 @@ Never require typing `CommandOrControl+…`.
 
 System light/dark, SF / `-apple-system`, accent ≈ `#007aff` / `#0a84ff`. See `styles.css`.
 
-## 7. Text insert (competitor-aligned)
+## 7. Text insert
 
-| Product | Primary insert | Fallback | Focus rule |
-|---------|----------------|----------|------------|
-| **OpenLess / 闪电说** | CGEvent Unicode type at cursor | Clipboard + ⌘V | Never activate unless self stole frontmost |
-| **Wispr / Superwhisper** | Clipboard + auto-paste | — | Menu-bar / accessory style; type into frontmost |
-| **Lumen (current)** | **Type unicode first**, then clipboard ⌘V | AX (unused for terminals) | Hide capsule → only `open -a` if frontmost is Lumen |
+| Step | Behavior |
+|------|----------|
+| Primary | CGEvent Unicode type at current key focus |
+| Fallback | Clipboard + ⌘V (with restore) |
+| Focus | Cache frontmost app at record start; re-activate only if Lumen stole frontmost |
 
 Implementation notes:
 
 1. Wait until physical Alt/Shift/Ctrl are up before synthesizing keys (hotkey chord would turn ⌘V into ⌥⇧⌘V).
-2. Do **not** force-activate iTerm when it is already frontmost — `open -a` drops the caret.
+2. Do **not** force-activate the typing target when it is already frontmost — relaunch/activate can drop the caret.
 3. Capsule is non-focusable feedback only.
+4. Capture focus **synchronously** at press (NSWorkspace), before showing UI.
 
 ## 8. Later (not blocking this pass)
 
-- Bare `Fn` / right-⌘ via CGEventTap  
+- Bare `Fn` / right-⌘  
 - True `NSPanel` non-activating HUD  
 - Menu bar extra  
+
