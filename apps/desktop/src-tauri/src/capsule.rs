@@ -59,17 +59,7 @@ pub fn set_capsule_visible(app: &AppHandle, visible: bool, _phase: &str) {
     }
 }
 
-/// If the main settings window somehow became key, leave it alone but never
-/// force-focus it. Used as a no-steal guard after hotkey sessions.
-pub fn ensure_main_stays_background(app: &AppHandle) {
-    // Intentionally do **not** call set_focus / show on main.
-    // If we ever need to unfocus main when it stole key, try set_focusable dance:
-    if let Some(main) = app.get_webview_window(MAIN_LABEL) {
-        // Only demote if it is focused — best-effort, platform-dependent.
-        if main.is_focused().unwrap_or(false) {
-            tracing::debug!("main window is focused during dictation — demoting focusable briefly");
-            let _ = main.set_focusable(false);
-            let _ = main.set_focusable(true);
-        }
-    }
+/// No-op focus guard. (Previously toggled main focusable which could glitch the UI.)
+pub fn ensure_main_stays_background(_app: &AppHandle) {
+    // Do not call set_focus / set_focusable on main during hotkey dictation.
 }

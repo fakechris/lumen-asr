@@ -1,12 +1,13 @@
 //! Modifier-only global chords (e.g. Alt+Shift).
 //!
 //! `global-hotkey` requires a main key, so pure modifier combos use HID flag
-//! polling. Supports rising (press) and falling (release) edges for push-to-talk.
+//! polling with **debounce / hysteresis** to avoid flag flicker thrashing
+//! (rapid start→stop→start that freezes the app and feels like a crash).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Which modifiers must be held (exact match — no extra mods).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +58,7 @@ impl ModChord {
         }
     }
 
+    /// Exact match of the four modifiers (no extras).
     pub fn matches_exact(self, flags: u64) -> bool {
         let alt = flags & FLAG_ALTERNATE != 0;
         let shift = flags & FLAG_SHIFT != 0;
@@ -67,20 +69,6 @@ impl ModChord {
             && control == self.control
             && meta == self.meta
     }
-
-    /// Target mods are all down (extra mods allowed). Better for hold while speaking
-    /// if OS briefly sets sticky flags.
-    pub fn matches_subset(self, flags: u64) -> bool {
-        let alt = flags & FLAG_ALTERNATE != 0;
-        let shift = flags & FLAG_SHIFT != 0;
-        let control = flags & FLAG_CONTROL != 0;
-        let meta = flags & FLAG_COMMAND != 0;
-        (!self.alt || alt)
-            && (!self.shift || shift)
-            && (!self.control || control)
-            && (!self.meta || meta)
-            && (self.alt || self.shift || self.control || self.meta)
-    }
 }
 
 const FLAG_SHIFT: u64 = 0x0002_0000;
@@ -88,6 +76,12 @@ const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALTERNATE: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
 const HID_SYSTEM_STATE: u32 = 1;
+
+/// Samples at ~12ms: need this many consecutive hits to fire edge.
+const DEBOUNCE_ON: u8 = 4; // ~48ms stable before press
+const DEBOUNCE_OFF: u8 = 5; // ~60ms stable before release
+/// Ignore release if the chord was held less than this (bounce / accidental tap).
+const MIN_HOLD: Duration = Duration::from_millis(350);
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -119,7 +113,7 @@ pub fn stop_watcher() {
     }
 }
 
-/// Watch modifier chord. `on_press` = rising edge, `on_release` = falling edge.
+/// Watch modifier chord with debounce. `on_press` / `on_release` fire on stable edges.
 pub fn start_watcher<F, G>(chord: ModChord, on_press: F, on_release: G)
 where
     F: Fn() + Send + 'static,
@@ -137,28 +131,62 @@ where
     thread::Builder::new()
         .name("lumen-mod-chord".into())
         .spawn(move || {
-            let mut prev_match = false;
-            let start = std::time::Instant::now();
+            let mut latched = false; // debounced "held" state
+            let mut on_count: u8 = 0;
+            let mut off_count: u8 = 0;
+            let mut held_since: Option<Instant> = None;
+            let boot = Instant::now();
+
             while !stop.load(Ordering::SeqCst) {
-                if start.elapsed() < Duration::from_millis(250) {
+                // Ignore first 300ms after register (setup keys).
+                if boot.elapsed() < Duration::from_millis(300) {
                     thread::sleep(Duration::from_millis(20));
                     continue;
                 }
-                let flags = read_mod_flags();
-                // Subset match: all required mods down (extras OK) so holding is stable.
-                let now = chord.matches_subset(flags);
-                if now && !prev_match {
+
+                let now = chord.matches_exact(read_mod_flags());
+                if now {
+                    on_count = on_count.saturating_add(1);
+                    off_count = 0;
+                } else {
+                    off_count = off_count.saturating_add(1);
+                    on_count = 0;
+                }
+
+                if !latched && on_count >= DEBOUNCE_ON {
+                    latched = true;
+                    held_since = Some(Instant::now());
+                    on_count = 0;
+                    tracing::debug!(?chord, "mod-chord press (debounced)");
                     on_press();
-                } else if !now && prev_match {
+                } else if latched && off_count >= DEBOUNCE_OFF {
+                    latched = false;
+                    off_count = 0;
+                    let held = held_since
+                        .map(|t| t.elapsed())
+                        .unwrap_or(Duration::ZERO);
+                    held_since = None;
+                    if held < MIN_HOLD {
+                        tracing::info!(
+                            ?held,
+                            "mod-chord release ignored (held < {:?})",
+                            MIN_HOLD
+                        );
+                        // Signal cancel via a short-hold release callback path:
+                        // dictation layer treats quick stop as cancel if still recording briefly.
+                        // Still call on_release so recording is cleaned up rather than stuck.
+                    } else {
+                        tracing::debug!(?chord, ?held, "mod-chord release (debounced)");
+                    }
                     on_release();
                 }
-                prev_match = now;
+
                 thread::sleep(Duration::from_millis(12));
             }
         })
         .ok();
 
-    tracing::info!(?chord, "modifier-only chord watcher started (press+release)");
+    tracing::info!(?chord, "modifier-only chord watcher started (debounced PTT)");
 }
 
 #[cfg(test)]

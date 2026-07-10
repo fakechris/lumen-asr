@@ -13,12 +13,23 @@ use lumen_platform_macos::{
     FrontmostTarget,
 };
 use serde::Serialize;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Frontmost app captured when hotkey dictation starts — restored before paste.
 static TARGET: Mutex<Option<FrontmostTarget>> = Mutex::new(None);
+
+/// Serial dictation lifecycle — prevents overlapping start/stop thrash (felt like crash).
+const PHASE_IDLE: u8 = 0;
+const PHASE_RECORDING: u8 = 1;
+const PHASE_PROCESSING: u8 = 2;
+static PHASE: AtomicU8 = AtomicU8::new(PHASE_IDLE);
+static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Ignore stop if held shorter than this (bounce / accidental tap).
+const MIN_HOLD_MS: u128 = 350;
 
 fn remember_target_app() {
     let t = frontmost_target();
@@ -432,43 +443,104 @@ pub fn emit_dictation(app: &AppHandle, event: DictationUiEvent) {
 
 /// Start recording if idle (push-to-talk press / toggle start).
 pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    if state.audio.is_recording() {
+    // Only one session at a time.
+    if PHASE
+        .compare_exchange(
+            PHASE_IDLE,
+            PHASE_RECORDING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        tracing::debug!(
+            phase = PHASE.load(Ordering::SeqCst),
+            "dictation_start ignored (not idle)"
+        );
         return Ok(());
     }
+
+    let state = app.state::<AppState>();
+    if state.audio.is_recording() {
+        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        return Ok(());
+    }
+
     // Capture typing target *before* any of our windows show / activate.
     remember_target_app();
-    crate::capsule::ensure_main_stays_background(&app);
 
     let show_capsule = state
         .config
         .lock()
         .map(|c| c.hotkey.show_capsule)
-        .unwrap_or(true);
+        .unwrap_or(false);
 
-    start_recording_inner(&state)?;
-    // Capsule is optional visual only — never focusable.
-    crate::capsule::set_capsule_visible(&app, show_capsule, "listening");
-    emit_dictation(
-        &app,
-        DictationUiEvent::Listening {
-            message: "按住说话…".into(),
-        },
-    );
-    Ok(())
+    match start_recording_inner(&state) {
+        Ok(()) => {
+            if let Ok(mut g) = RECORD_STARTED.lock() {
+                *g = Some(Instant::now());
+            }
+            // Capsule optional; default off to avoid focus fights.
+            crate::capsule::set_capsule_visible(&app, show_capsule, "listening");
+            emit_dictation(
+                &app,
+                DictationUiEvent::Listening {
+                    message: "按住说话…".into(),
+                },
+            );
+            Ok(())
+        }
+        Err(e) => {
+            PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+            Err(e)
+        }
+    }
 }
 
 /// Stop recording + ASR + correct + paste into target (push-to-talk release / toggle stop).
 pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    if !state.audio.is_recording() {
+    // Only stop if we are actively recording.
+    if PHASE
+        .compare_exchange(
+            PHASE_RECORDING,
+            PHASE_PROCESSING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        tracing::debug!(
+            phase = PHASE.load(Ordering::SeqCst),
+            "dictation_stop ignored (not recording)"
+        );
         return Ok(());
     }
-    let show_capsule = state
-        .config
+
+    let held_ms = RECORD_STARTED
         .lock()
-        .map(|c| c.hotkey.show_capsule)
-        .unwrap_or(true);
+        .ok()
+        .and_then(|g| g.map(|t| t.elapsed().as_millis()))
+        .unwrap_or(0);
+
+    let state = app.state::<AppState>();
+
+    // Bounce: discard short holds without ASR / paste.
+    if held_ms < MIN_HOLD_MS {
+        tracing::info!(held_ms, "short hold — cancel without ASR");
+        let _ = cancel_recording_inner(&state);
+        crate::capsule::set_capsule_visible(&app, false, "idle");
+        if let Ok(mut g) = RECORD_STARTED.lock() {
+            *g = None;
+        }
+        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        emit_dictation(&app, DictationUiEvent::Idle);
+        return Ok(());
+    }
+
+    if !state.audio.is_recording() {
+        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        return Ok(());
+    }
 
     emit_dictation(
         &app,
@@ -476,11 +548,14 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
             message: "转写与修正中…".into(),
         },
     );
-    // Prefer hiding overlays during process so paste target stays frontmost.
     crate::capsule::set_capsule_visible(&app, false, "processing");
-    let _ = show_capsule;
 
-    match stop_and_transcribe_inner(&state, true, Some(&app)).await {
+    let result = stop_and_transcribe_inner(&state, true, Some(&app)).await;
+    if let Ok(mut g) = RECORD_STARTED.lock() {
+        *g = None;
+    }
+
+    match result {
         Ok(outcome) => {
             if outcome.watch_post_paste {
                 crate::learning::spawn_post_paste_watch(
@@ -493,7 +568,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
             crate::capsule::set_capsule_visible(&app, false, "idle");
             emit_dictation(&app, DictationUiEvent::Done { outcome });
             emit_dictation(&app, DictationUiEvent::Idle);
-            crate::capsule::ensure_main_stays_background(&app);
+            PHASE.store(PHASE_IDLE, Ordering::SeqCst);
             Ok(())
         }
         Err(e) => {
@@ -505,6 +580,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
                 },
             );
             emit_dictation(&app, DictationUiEvent::Idle);
+            PHASE.store(PHASE_IDLE, Ordering::SeqCst);
             Err(e)
         }
     }
@@ -512,11 +588,13 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
 
 /// Legacy toggle: start if idle, stop if recording (UI button / toggle mode).
 pub async fn toggle_dictation(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    if state.audio.is_recording() {
-        dictation_stop(app).await
-    } else {
-        dictation_start(app).await
+    match PHASE.load(Ordering::SeqCst) {
+        PHASE_RECORDING => dictation_stop(app).await,
+        PHASE_IDLE => dictation_start(app).await,
+        _ => {
+            tracing::debug!("toggle ignored (processing)");
+            Ok(())
+        }
     }
 }
 

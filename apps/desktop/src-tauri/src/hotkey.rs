@@ -93,7 +93,9 @@ pub fn reregister(app: &AppHandle) -> Result<(), String> {
 }
 
 fn spawn_start(app: AppHandle) {
+    // Fire-and-forget; dictation layer serializes with PHASE atomics.
     tauri::async_runtime::spawn(async move {
+        tracing::info!("hotkey → start");
         if let Err(e) = dictation::dictation_start(app.clone()).await {
             tracing::warn!(error = %e, "dictation start failed");
             dictation::emit_dictation(
@@ -106,6 +108,7 @@ fn spawn_start(app: AppHandle) {
 
 fn spawn_stop(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        tracing::info!("hotkey → stop");
         if let Err(e) = dictation::dictation_stop(app.clone()).await {
             tracing::warn!(error = %e, "dictation stop failed");
             dictation::emit_dictation(
@@ -118,6 +121,7 @@ fn spawn_stop(app: AppHandle) {
 
 fn spawn_toggle(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        tracing::info!("hotkey → toggle");
         if let Err(e) = dictation::toggle_dictation(app.clone()).await {
             tracing::warn!(error = %e, "dictation toggle failed");
             dictation::emit_dictation(
