@@ -93,7 +93,7 @@ pub fn candidates_from_edit(before: &str, after: &str) -> Vec<LearnCandidate> {
         return out;
     }
 
-    // Fallback: do not auto-propose huge rewrites (align with 闪电说 policy).
+    // Fallback: do not auto-propose huge rewrites (over-broad pairs are unsafe).
     vec![]
 }
 

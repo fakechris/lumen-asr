@@ -1,6 +1,6 @@
 # Lumen ASR — Product Spec (MVP)
 
-> Locked from competitive research (Wispr Flow / Typeless / 闪电说) and productization review.  
+> Locked product decisions for Lumen ASR.  
 > Date: 2026-07-09
 
 ## 1. One-liner
@@ -52,17 +52,13 @@ Cloud ASR is **out of MVP** (port may exist later).
 | **Model corrector** | Primary path — Ollama or any OpenAI-compatible HTTP API |
 | Fallback | On error / empty / filter → return preprocess output (never hard-fail the session) |
 
-Corrector prompt: voice-input **text organizer**, not a chat assistant (red-line rules from 闪电说 research). Dictionary terms + replacements injected into prompt.
+Corrector prompt: voice-input **text organizer**, not a chat assistant (strict red-line rules). Dictionary terms + replacements injected into prompt.
 
 Modes (later): Raw / Light / Structured — MVP ships **Light** only.
 
 ## 7. Text insertion (researched)
 
-Competitive evidence:
-
-- **Wispr:** primary path = clipboard paste + delayed render + restore (~500ms); AX for context/verify/edit capture
-- **闪电说:** `injection_mode: paste`; AX insert first where possible, `clipboard_fallback`
-- **Typeless:** paste + history with `edited_text` extraction pipeline
+Industry pattern (clipboard paste + restore is the most compatible default; AX for context/verify when available).
 
 ### Our policy
 

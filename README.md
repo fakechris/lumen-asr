@@ -1,6 +1,6 @@
 # Lumen ASR
 
-Local-first macOS voice dictation — a productized alternative to Wispr Flow / Typeless / 闪电说.
+Local-first macOS voice dictation.
 
 **Status:** greenfield scaffold (product architecture + crate boundaries).  
 **Default stack:** Tauri 2 · Rust workspace · React · SenseVoice (sherpa) · model corrector · paste-first inject.
@@ -65,10 +65,6 @@ Data directory (runtime):
   models/
   recordings/   # optional
 ```
-
-## Relation to demo
-
-The reverse-engineered `shandianshuo` / LumenAsr demo is **reference only** (prompts, competitor notes). This repo is the product codebase.
 
 ## License
 

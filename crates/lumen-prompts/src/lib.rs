@@ -1,4 +1,4 @@
-//! Corrector prompts (adapted from 闪电说 reverse-engineering research).
+//! Corrector prompts for voice-input text organization.
 //!
 //! The model is a **voice-input text organizer**, never a chat assistant.
 

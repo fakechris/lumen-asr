@@ -92,7 +92,7 @@ pub struct CreateSessionInput {
     pub record_edit_if_changed: Option<bool>,
 }
 
-/// Save a completed (or partial) session — used by UI demo seed and later by dictation loop.
+/// Save a completed (or partial) session — used by sample seed and the dictation loop.
 #[tauri::command]
 pub fn save_session(
     state: State<'_, AppState>,
@@ -135,7 +135,7 @@ pub fn save_session(
     })
 }
 
-/// Seed one sample history row for empty-state demos.
+/// Seed one sample history row for empty-state UI testing.
 #[tauri::command]
 pub fn seed_demo_session(state: State<'_, AppState>) -> Result<SessionRecord, String> {
     save_session(
