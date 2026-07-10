@@ -17,6 +17,9 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lumen-platform = { workspace = true }
 lumen-store = { workspace = true }
+lumen-core = { workspace = true }
+lumen-dictionary = { workspace = true }
+uuid = { workspace = true }
 
 [features]
 default = ["custom-protocol"]

@@ -1,28 +1,11 @@
+mod commands;
+
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
-use serde::Serialize;
 use std::sync::Mutex;
+
 pub struct AppState {
     pub store: Mutex<Option<Store>>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Health {
-    pub app: String,
-    pub version: String,
-    pub data_dir: String,
-    pub db_ok: bool,
-}
-
-#[tauri::command]
-fn app_health(state: tauri::State<'_, AppState>) -> Health {
-    let db_ok = state.store.lock().map(|g| g.is_some()).unwrap_or(false);
-    Health {
-        app: "Lumen ASR".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        data_dir: default_data_dir().display().to_string(),
-        db_ok,
-    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -53,11 +36,26 @@ pub fn run() {
         .manage(AppState {
             store: Mutex::new(store),
         })
-        .invoke_handler(tauri::generate_handler![app_health])
+        .invoke_handler(tauri::generate_handler![
+            commands::app_health,
+            commands::list_sessions,
+            commands::get_session,
+            commands::delete_session,
+            commands::save_session,
+            commands::seed_demo_session,
+            commands::list_edit_events,
+            commands::record_edit_event,
+            commands::suggest_from_edit,
+            commands::confirm_learn,
+            commands::list_dictionary,
+            commands::add_dictionary_term,
+            commands::add_dictionary_replacement,
+            commands::delete_dictionary_entry,
+        ])
         .setup(|app| {
             tracing::info!(
                 name = app.package_info().name,
-                "Lumen ASR desktop starting"
+                "Lumen ASR desktop starting (M1)"
             );
             Ok(())
         })

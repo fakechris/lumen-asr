@@ -37,14 +37,24 @@ docs/                  # Extra design notes
 ## Quick start
 
 ```bash
-# Workspace compile (library crates)
-cargo check --workspace
+# Library crates + unit tests
+cargo test --workspace --exclude lumen-asr-desktop
 
-# Desktop app (once frontend deps installed)
+# Desktop app
 cd apps/desktop
 npm install
 npm run tauri dev
 ```
+
+### M1 IPC (desktop)
+
+| Command | Purpose |
+|---------|---------|
+| `list_sessions` / `get_session` / `delete_session` | History |
+| `save_session` / `seed_demo_session` | Write sessions |
+| `list_edit_events` / `record_edit_event` | Edit audit trail |
+| `suggest_from_edit` / `confirm_learn` | Edit → dictionary candidates |
+| `list_dictionary` / `add_dictionary_term` / `add_dictionary_replacement` / `delete_dictionary_entry` | Dictionary CRUD |
 
 Data directory (runtime):
 

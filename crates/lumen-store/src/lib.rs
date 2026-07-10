@@ -10,8 +10,20 @@ use lumen_core::{
 };
 use lumen_dictionary::DictionaryEntry;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// One user edit associated with a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditEventRecord {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub source: EditSource,
+    pub before_text: String,
+    pub after_text: String,
+    pub created_at: DateTime<Utc>,
+}
 
 pub struct Store {
     conn: Connection,
@@ -85,6 +97,30 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn get_session(&self, id: Uuid) -> Result<Option<SessionRecord>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT id, created_at, focused_app, focused_bundle_id,
+                       asr_raw, corrected, pasted, asr_engine, corrector_engine,
+                       insert_strategy, audio_path, status
+                FROM sessions WHERE id=?1
+                "#,
+                params![id.to_string()],
+                map_session,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_session(&self, id: Uuid) -> Result<bool> {
+        // edit_events cascade via FK
+        let n = self
+            .conn
+            .execute("DELETE FROM sessions WHERE id=?1", params![id.to_string()])?;
+        Ok(n > 0)
+    }
+
     pub fn add_edit_event(
         &self,
         session_id: Uuid,
@@ -108,6 +144,19 @@ impl Store {
             ],
         )?;
         Ok(id)
+    }
+
+    pub fn list_edit_events(&self, session_id: Uuid) -> Result<Vec<EditEventRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, session_id, source, before_text, after_text, created_at
+            FROM edit_events
+            WHERE session_id=?1
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![session_id.to_string()], map_edit)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn upsert_dictionary_entry(&self, e: &DictionaryEntry) -> Result<()> {
@@ -206,6 +255,25 @@ fn map_dict(row: &rusqlite::Row<'_>) -> rusqlite::Result<DictionaryEntry> {
         confirmed: row.get::<_, i64>(7)? != 0,
         updated_at: parse_dt(&row.get::<_, String>(8)?),
     })
+}
+
+fn map_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EditEventRecord> {
+    Ok(EditEventRecord {
+        id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+        session_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
+        source: parse_edit_source(&row.get::<_, String>(2)?),
+        before_text: row.get(3)?,
+        after_text: row.get(4)?,
+        created_at: parse_dt(&row.get::<_, String>(5)?),
+    })
+}
+
+fn parse_edit_source(s: &str) -> EditSource {
+    match s {
+        "post_paste_ax" => EditSource::PostPasteAx,
+        "manual" => EditSource::Manual,
+        _ => EditSource::PreInsertUi,
+    }
 }
 
 fn parse_dt(s: &str) -> DateTime<Utc> {
@@ -318,5 +386,17 @@ mod tests {
         store
             .add_edit_event(rec.id, EditSource::PreInsertUi, "a", "b")
             .unwrap();
+
+        let got = store.get_session(rec.id).unwrap().expect("session");
+        assert_eq!(got.asr_raw.as_deref(), Some("hello"));
+
+        let edits = store.list_edit_events(rec.id).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].before_text, "a");
+        assert_eq!(edits[0].after_text, "b");
+
+        assert!(store.delete_session(rec.id).unwrap());
+        assert!(store.get_session(rec.id).unwrap().is_none());
+        assert!(store.list_edit_events(rec.id).unwrap().is_empty());
     }
 }

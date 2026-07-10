@@ -1854,6 +1854,8 @@ dependencies = [
 name = "lumen-asr-desktop"
 version = "0.1.0"
 dependencies = [
+ "lumen-core",
+ "lumen-dictionary",
  "lumen-platform",
  "lumen-store",
  "serde",
@@ -1863,6 +1865,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
