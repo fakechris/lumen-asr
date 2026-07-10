@@ -60,3 +60,70 @@ pub fn open_url(url: &str) -> Result<(), PlatformError> {
         Err(PlatformError::Message("not macOS".into()))
     }
 }
+
+/// Frontmost process name via System Events (best-effort).
+pub fn frontmost_app_name() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                r#"tell application "System Events" to get name of first application process whose frontmost is true"#,
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Activate an app by process/app name without failing the session if it errors.
+/// Used to put focus back on the typing target before paste (must not leave Lumen frontmost).
+pub fn activate_app_by_name(name: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if name.is_empty() {
+            return false;
+        }
+        // Prefer `open -a` which works for most bundle display names / app names.
+        if std::process::Command::new("open")
+            .args(["-a", name])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let script = format!(
+            r#"tell application "{}" to activate"#,
+            name.replace('"', "\\\"")
+        );
+        std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+/// True if `name` looks like our own app (never restore focus to ourselves before paste).
+pub fn is_self_app_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("lumen") || n.contains("lumen-asr") || n.contains("lumen asr")
+}

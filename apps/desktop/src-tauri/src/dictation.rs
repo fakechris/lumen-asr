@@ -7,8 +7,48 @@ use lumen_asr::{
     EngineKind, EngineStatus,
 };
 use lumen_core::{FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
+use lumen_platform_macos::{activate_app_by_name, frontmost_app_name, is_self_app_name};
 use serde::Serialize;
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Frontmost app captured when hotkey dictation starts — restored before paste
+/// so Lumen never steals the typing target.
+static TARGET_APP: Mutex<Option<String>> = Mutex::new(None);
+
+fn remember_target_app() {
+    if let Some(name) = frontmost_app_name() {
+        if !is_self_app_name(&name) {
+            tracing::info!(%name, "dictation target app remembered");
+            if let Ok(mut g) = TARGET_APP.lock() {
+                *g = Some(name);
+            }
+            return;
+        }
+    }
+    if let Ok(mut g) = TARGET_APP.lock() {
+        *g = None;
+    }
+}
+
+fn restore_target_app_before_insert() {
+    let target = TARGET_APP.lock().ok().and_then(|g| g.clone());
+    let current = frontmost_app_name();
+    // If something (capsule/main) stole focus, put the typing app back.
+    let need_restore = match (&target, &current) {
+        (Some(t), Some(c)) => is_self_app_name(c) || c != t,
+        (Some(_), None) => true,
+        _ => current.as_ref().map(|c| is_self_app_name(c)).unwrap_or(false),
+    };
+    if need_restore {
+        if let Some(name) = target {
+            tracing::info!(%name, "restoring focus to target app before insert");
+            let _ = activate_app_by_name(&name);
+            // Give the target a beat to become key window.
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -192,10 +232,14 @@ pub async fn stop_and_transcribe_inner(
         format!("{}:fallback", engine_label(&cfg))
     };
 
+    let target_name = TARGET_APP.lock().ok().and_then(|g| g.clone());
+
     let mut insert_strategy = InsertStrategy::None;
     let mut did_insert = false;
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Critical: paste into the *typing target*, not Lumen if we stole focus.
+        restore_target_app_before_insert();
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         match crate::inject_cmd::insert_with_config(&cfg.inject, &corrected_text).await {
             Ok(out) => {
                 insert_strategy = out.strategy;
@@ -217,7 +261,7 @@ pub async fn stop_and_transcribe_inner(
     rec.asr_engine = Some(engine_kind.as_str().into());
     rec.corrector_engine = Some(corrector_engine.clone());
     rec.focus = FocusInfo {
-        app_name: Some("Lumen ASR".into()),
+        app_name: target_name.or_else(|| Some("unknown".into())),
         bundle_id: None,
         window_title: None,
     };
@@ -282,59 +326,92 @@ pub fn emit_dictation(app: &AppHandle, event: DictationUiEvent) {
     let _ = app.emit("dictation", &event);
 }
 
-pub async fn toggle_dictation(app: AppHandle) -> Result<(), String> {
+/// Start recording if idle (push-to-talk press / toggle start).
+pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+    if state.audio.is_recording() {
+        return Ok(());
+    }
+    // Capture typing target *before* any of our windows show.
+    remember_target_app();
+    // Never bring the main settings window forward during hotkey use.
+    crate::capsule::ensure_main_stays_background(&app);
+
     let show_capsule = state
         .config
         .lock()
         .map(|c| c.hotkey.show_capsule)
         .unwrap_or(true);
 
-    if state.audio.is_recording() {
-        emit_dictation(
-            &app,
-            DictationUiEvent::Processing {
-                message: "转写与修正中…".into(),
-            },
-        );
-        crate::capsule::set_capsule_visible(&app, show_capsule, "processing");
-        match stop_and_transcribe_inner(&state, true).await {
-            Ok(outcome) => {
-                if outcome.watch_post_paste {
-                    crate::learning::spawn_post_paste_watch(
-                        app.clone(),
-                        outcome.session.id,
-                        outcome.corrected_text.clone(),
-                        outcome.post_paste_seconds,
-                    );
-                }
-                crate::capsule::set_capsule_visible(&app, false, "idle");
-                emit_dictation(&app, DictationUiEvent::Done { outcome });
-                emit_dictation(&app, DictationUiEvent::Idle);
-            }
-            Err(e) => {
-                crate::capsule::set_capsule_visible(&app, false, "idle");
-                emit_dictation(
-                    &app,
-                    DictationUiEvent::Error {
-                        message: e.clone(),
-                    },
-                );
-                emit_dictation(&app, DictationUiEvent::Idle);
-                return Err(e);
-            }
-        }
-    } else {
-        start_recording_inner(&state)?;
-        crate::capsule::set_capsule_visible(&app, show_capsule, "listening");
-        emit_dictation(
-            &app,
-            DictationUiEvent::Listening {
-                message: "正在录音…".into(),
-            },
-        );
-    }
+    start_recording_inner(&state)?;
+    crate::capsule::set_capsule_visible(&app, show_capsule, "listening");
+    emit_dictation(
+        &app,
+        DictationUiEvent::Listening {
+            message: "按住说话…".into(),
+        },
+    );
     Ok(())
+}
+
+/// Stop recording + ASR + correct + paste into target (push-to-talk release / toggle stop).
+pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if !state.audio.is_recording() {
+        return Ok(());
+    }
+    let show_capsule = state
+        .config
+        .lock()
+        .map(|c| c.hotkey.show_capsule)
+        .unwrap_or(true);
+
+    emit_dictation(
+        &app,
+        DictationUiEvent::Processing {
+            message: "转写与修正中…".into(),
+        },
+    );
+    crate::capsule::set_capsule_visible(&app, show_capsule, "processing");
+    match stop_and_transcribe_inner(&state, true).await {
+        Ok(outcome) => {
+            if outcome.watch_post_paste {
+                crate::learning::spawn_post_paste_watch(
+                    app.clone(),
+                    outcome.session.id,
+                    outcome.corrected_text.clone(),
+                    outcome.post_paste_seconds,
+                );
+            }
+            crate::capsule::set_capsule_visible(&app, false, "idle");
+            // Done is for history UI only — do not focus main window.
+            emit_dictation(&app, DictationUiEvent::Done { outcome });
+            emit_dictation(&app, DictationUiEvent::Idle);
+            crate::capsule::ensure_main_stays_background(&app);
+            Ok(())
+        }
+        Err(e) => {
+            crate::capsule::set_capsule_visible(&app, false, "idle");
+            emit_dictation(
+                &app,
+                DictationUiEvent::Error {
+                    message: e.clone(),
+                },
+            );
+            emit_dictation(&app, DictationUiEvent::Idle);
+            Err(e)
+        }
+    }
+}
+
+/// Legacy toggle: start if idle, stop if recording (UI button / toggle mode).
+pub async fn toggle_dictation(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if state.audio.is_recording() {
+        dictation_stop(app).await
+    } else {
+        dictation_start(app).await
+    }
 }
 
 #[tauri::command]

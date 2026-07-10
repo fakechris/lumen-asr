@@ -1,9 +1,7 @@
 //! Modifier-only global chords (e.g. Alt+Shift).
 //!
-//! `global-hotkey` / Tauri global-shortcut **require a main key**, so pure
-//! modifier combos cannot be registered there. On macOS we poll HID modifier
-//! flags (same approach class as competitor "hold Option" detectors) and fire
-//! on the rising edge of an exact chord match.
+//! `global-hotkey` requires a main key, so pure modifier combos use HID flag
+//! polling. Supports rising (press) and falling (release) edges for push-to-talk.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,7 +26,6 @@ impl ModChord {
     }
 
     /// Parse strings that contain **only** modifiers, e.g. `"Alt+Shift"`.
-    /// Returns None if empty, has a main key, or fewer than 2 modifiers.
     pub fn parse_modifier_only(s: &str) -> Option<Self> {
         let mut chord = ModChord {
             alt: false,
@@ -48,7 +45,6 @@ impl ModChord {
                 "CONTROL" | "CTRL" => chord.control = true,
                 "COMMAND" | "CMD" | "SUPER" | "META" => chord.meta = true,
                 "COMMANDORCONTROL" | "COMMANDORCTRL" | "CMDORCTRL" | "CMDORCONTROL" => {
-                    // Platform-agnostic token → Command on macOS path.
                     chord.meta = true;
                 }
                 _ => saw_key = true,
@@ -71,14 +67,27 @@ impl ModChord {
             && control == self.control
             && meta == self.meta
     }
+
+    /// Target mods are all down (extra mods allowed). Better for hold while speaking
+    /// if OS briefly sets sticky flags.
+    pub fn matches_subset(self, flags: u64) -> bool {
+        let alt = flags & FLAG_ALTERNATE != 0;
+        let shift = flags & FLAG_SHIFT != 0;
+        let control = flags & FLAG_CONTROL != 0;
+        let meta = flags & FLAG_COMMAND != 0;
+        (!self.alt || alt)
+            && (!self.shift || shift)
+            && (!self.control || control)
+            && (!self.meta || meta)
+            && (self.alt || self.shift || self.control || self.meta)
+    }
 }
 
-// CGEventFlagMask* (Carbon / CoreGraphics)
 const FLAG_SHIFT: u64 = 0x0002_0000;
 const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALTERNATE: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
-const HID_SYSTEM_STATE: u32 = 1; // kCGEventSourceStateHIDSystemState
+const HID_SYSTEM_STATE: u32 = 1;
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -102,7 +111,6 @@ struct WatcherState {
 
 static WATCHER: Mutex<Option<WatcherState>> = Mutex::new(None);
 
-/// Stop any running modifier-only watcher.
 pub fn stop_watcher() {
     if let Ok(mut guard) = WATCHER.lock() {
         if let Some(w) = guard.take() {
@@ -111,10 +119,11 @@ pub fn stop_watcher() {
     }
 }
 
-/// Start watching for an exact modifier chord. Fires `on_press` on rising edge.
-pub fn start_watcher<F>(chord: ModChord, on_press: F)
+/// Watch modifier chord. `on_press` = rising edge, `on_release` = falling edge.
+pub fn start_watcher<F, G>(chord: ModChord, on_press: F, on_release: G)
 where
     F: Fn() + Send + 'static,
+    G: Fn() + Send + 'static,
 {
     stop_watcher();
     let stop = Arc::new(AtomicBool::new(false));
@@ -129,7 +138,6 @@ where
         .name("lumen-mod-chord".into())
         .spawn(move || {
             let mut prev_match = false;
-            // Ignore first 200ms so the keys used to *set* the hotkey don't fire it.
             let start = std::time::Instant::now();
             while !stop.load(Ordering::SeqCst) {
                 if start.elapsed() < Duration::from_millis(250) {
@@ -137,19 +145,20 @@ where
                     continue;
                 }
                 let flags = read_mod_flags();
-                let now = chord.matches_exact(flags);
+                // Subset match: all required mods down (extras OK) so holding is stable.
+                let now = chord.matches_subset(flags);
                 if now && !prev_match {
                     on_press();
-                    // Debounce re-entry while still held.
-                    thread::sleep(Duration::from_millis(280));
+                } else if !now && prev_match {
+                    on_release();
                 }
                 prev_match = now;
-                thread::sleep(Duration::from_millis(16));
+                thread::sleep(Duration::from_millis(12));
             }
         })
         .ok();
 
-    tracing::info!(?chord, "modifier-only chord watcher started");
+    tracing::info!(?chord, "modifier-only chord watcher started (press+release)");
 }
 
 #[cfg(test)]

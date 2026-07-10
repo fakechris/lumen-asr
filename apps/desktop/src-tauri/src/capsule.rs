@@ -1,10 +1,13 @@
 //! Floating capsule overlay window (M5).
+//!
+//! Must **never** steal keyboard focus from the app the user is typing into.
 
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const CAPSULE_LABEL: &str = "capsule";
+pub const MAIN_LABEL: &str = "main";
 
-/// Create the always-on-top capsule window (initially hidden).
+/// Create the always-on-top capsule window (initially hidden, non-focusable).
 pub fn ensure_capsule(app: &AppHandle) -> tauri::Result<()> {
     if app.get_webview_window(CAPSULE_LABEL).is_some() {
         return Ok(());
@@ -25,9 +28,9 @@ pub fn ensure_capsule(app: &AppHandle) -> tauri::Result<()> {
     .skip_taskbar(true)
     .visible(false)
     .focused(false)
+    .focusable(false)
     .build()?;
 
-    // Center near top of primary monitor.
     if let Some(monitor) = win.current_monitor().ok().flatten() {
         let size = monitor.size();
         let scale = monitor.scale_factor();
@@ -37,17 +40,36 @@ pub fn ensure_capsule(app: &AppHandle) -> tauri::Result<()> {
         let _ = win.set_position(tauri::LogicalPosition::new(x, y));
     }
 
+    let _ = win.set_focusable(false);
     Ok(())
 }
 
-/// Show/hide capsule without stealing keyboard focus from the typing target.
+/// Show/hide capsule without activating the app or stealing key focus.
 pub fn set_capsule_visible(app: &AppHandle, visible: bool, _phase: &str) {
     let Some(win) = app.get_webview_window(CAPSULE_LABEL) else {
         return;
     };
+    let _ = win.set_focusable(false);
     if visible {
+        // show() can still order the window front; keep it non-focusable.
         let _ = win.show();
+        let _ = win.set_focusable(false);
     } else {
         let _ = win.hide();
+    }
+}
+
+/// If the main settings window somehow became key, leave it alone but never
+/// force-focus it. Used as a no-steal guard after hotkey sessions.
+pub fn ensure_main_stays_background(app: &AppHandle) {
+    // Intentionally do **not** call set_focus / show on main.
+    // If we ever need to unfocus main when it stole key, try set_focusable dance:
+    if let Some(main) = app.get_webview_window(MAIN_LABEL) {
+        // Only demote if it is focused — best-effort, platform-dependent.
+        if main.is_focused().unwrap_or(false) {
+            tracing::debug!("main window is focused during dictation — demoting focusable briefly");
+            let _ = main.set_focusable(false);
+            let _ = main.set_focusable(true);
+        }
     }
 }

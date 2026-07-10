@@ -75,18 +75,24 @@ export const api = {
 
   toggleDictation: () => invoke<void>("toggle_dictation_cmd"),
   getHotkeyConfig: () =>
-    invoke<{ enabled: boolean; toggle: string; showCapsule: boolean }>(
-      "get_hotkey_config"
-    ),
+    invoke<{
+      enabled: boolean;
+      toggle: string;
+      showCapsule: boolean;
+      mode: string;
+    }>("get_hotkey_config"),
   saveHotkeyConfig: (input: {
     enabled?: boolean;
     toggle?: string;
     showCapsule?: boolean;
+    mode?: string;
   }) =>
-    invoke<{ enabled: boolean; toggle: string; showCapsule: boolean }>(
-      "save_hotkey_config",
-      { input }
-    ),
+    invoke<{
+      enabled: boolean;
+      toggle: string;
+      showCapsule: boolean;
+      mode: string;
+    }>("save_hotkey_config", { input }),
   pauseHotkeys: () => invoke<void>("pause_hotkeys"),
   resumeHotkeys: () => invoke<void>("resume_hotkeys"),
 

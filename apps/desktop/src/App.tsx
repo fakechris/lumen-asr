@@ -174,10 +174,10 @@ export default function App() {
         setBusy(true);
       } else if (p.phase === "done" && p.outcome) {
         setBusy(false);
+        // Update history quietly — do not force-activate or jump UI aggressively.
         void refreshHealth();
         void refreshSessions();
-        setTab("record");
-        // Stash baseline for post-dictation edit learning in Record tab via custom event
+        // Stash for Record tab if user opens it; hotkey path must not steal OS focus.
         window.dispatchEvent(
           new CustomEvent("lumen-dictation-done", { detail: p.outcome })
         );
@@ -1000,6 +1000,7 @@ function SettingsPanel({
   const [hotkeyEnabled, setHotkeyEnabled] = useState(true);
   const [hotkeyToggle, setHotkeyToggle] = useState("Alt+Space");
   const [showCapsule, setShowCapsule] = useState(true);
+  const [hotkeyMode, setHotkeyMode] = useState("hold");
   const [learning, setLearning] = useState<LearningConfig | null>(null);
   const [autoPromote, setAutoPromote] = useState(false);
   const [promoteN, setPromoteN] = useState(3);
@@ -1026,6 +1027,7 @@ function SettingsPanel({
         setHotkeyEnabled(hk.enabled);
         setHotkeyToggle(hk.toggle);
         setShowCapsule(hk.showCapsule);
+        setHotkeyMode(hk.mode || "hold");
         const ln = await api.getLearningConfig();
         setLearning(ln);
         setAutoPromote(ln.autoPromote);
@@ -1166,6 +1168,7 @@ function SettingsPanel({
         enabled={hotkeyEnabled}
         toggle={hotkeyToggle}
         showCapsule={showCapsule}
+        mode={hotkeyMode}
         busy={busy}
         onBusy={onBusy}
         onError={onError}
@@ -1173,6 +1176,7 @@ function SettingsPanel({
           setHotkeyEnabled(next.enabled);
           setHotkeyToggle(next.toggle);
           setShowCapsule(next.showCapsule);
+          setHotkeyMode(next.mode);
         }}
         onSaved={onSaved}
       />

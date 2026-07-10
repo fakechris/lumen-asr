@@ -100,9 +100,12 @@ On failure: rule preprocess + dictionary replacements only (session still comple
 
 ### Hotkey + capsule (M5)
 
-- Global toggle: default **`Alt+Space`** (⌥Space) — avoids Spotlight `⌘Space`
-- **Settings → 点击录制**: press a new chord (no typing `CommandOrControl+…`)
-- Floating capsule overlay while listening / processing
+- Default **push-to-talk**: hold to speak, release to stop + paste into the focused field
+- Optional **toggle** mode in Settings
+- Default chord **`Alt+Space`** (⌥Space) — avoids Spotlight `⌘Space`
+- **Settings → 点击录制**: press a new chord (supports modifier-only like ⌥⇧)
+- Floating capsule is non-focusable (must not steal the typing target)
+- History is saved in Lumen; insert goes to the frontmost app you were in
 - Config:
 
 ```toml
@@ -110,6 +113,7 @@ On failure: rule preprocess + dictionary replacements only (session still comple
 enabled = true
 toggle = "Alt+Space"
 show_capsule = true
+mode = "hold"   # or "toggle"
 ```
 
 ### Edit learning (M6)

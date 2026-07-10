@@ -1,7 +1,10 @@
-//! Global toggle hotkey registration (M5).
+//! Global hotkey registration.
 //!
-//! - Normal chords (modifier + key) → `tauri-plugin-global-shortcut`
-//! - Modifier-only (e.g. Alt+Shift) → macOS HID flag watcher (`mod_chord`)
+//! Default product mode: **hold** (push-to-talk) — press starts, release stops.
+//! Optional **toggle** mode for click-style chords.
+//!
+//! - Normal chords (modifier + key) → `tauri-plugin-global-shortcut` Pressed/Released
+//! - Modifier-only (e.g. Alt+Shift) → macOS HID flag watcher press/release edges
 
 use crate::config::HotkeyConfig;
 use crate::dictation;
@@ -17,6 +20,7 @@ pub struct HotkeyDto {
     pub enabled: bool,
     pub toggle: String,
     pub show_capsule: bool,
+    pub mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,6 +29,7 @@ pub struct HotkeyInput {
     pub enabled: Option<bool>,
     pub toggle: Option<String>,
     pub show_capsule: Option<bool>,
+    pub mode: Option<String>,
 }
 
 #[tauri::command]
@@ -37,6 +42,7 @@ pub fn get_hotkey_config(state: State<'_, AppState>) -> Result<HotkeyDto, String
         enabled: cfg.hotkey.enabled,
         toggle: cfg.hotkey.toggle.clone(),
         show_capsule: cfg.hotkey.show_capsule,
+        mode: cfg.hotkey.mode.clone(),
     })
 }
 
@@ -60,13 +66,20 @@ pub fn save_hotkey_config(
         if let Some(v) = input.show_capsule {
             guard.hotkey.show_capsule = v;
         }
+        if let Some(v) = input.mode {
+            let m = v.to_ascii_lowercase();
+            guard.hotkey.mode = if m == "toggle" || m == "click" {
+                "toggle".into()
+            } else {
+                "hold".into()
+            };
+        }
         guard.save()?;
     }
     reregister(&app)?;
     get_hotkey_config(state)
 }
 
-/// Register (or clear) the global toggle shortcut from current config.
 pub fn reregister(app: &AppHandle) -> Result<(), String> {
     let cfg = {
         let state = app.state::<AppState>();
@@ -79,8 +92,43 @@ pub fn reregister(app: &AppHandle) -> Result<(), String> {
     reregister_with(app, &cfg)
 }
 
+fn spawn_start(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = dictation::dictation_start(app.clone()).await {
+            tracing::warn!(error = %e, "dictation start failed");
+            dictation::emit_dictation(
+                &app,
+                dictation::DictationUiEvent::Error { message: e },
+            );
+        }
+    });
+}
+
+fn spawn_stop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = dictation::dictation_stop(app.clone()).await {
+            tracing::warn!(error = %e, "dictation stop failed");
+            dictation::emit_dictation(
+                &app,
+                dictation::DictationUiEvent::Error { message: e },
+            );
+        }
+    });
+}
+
+fn spawn_toggle(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = dictation::toggle_dictation(app.clone()).await {
+            tracing::warn!(error = %e, "dictation toggle failed");
+            dictation::emit_dictation(
+                &app,
+                dictation::DictationUiEvent::Error { message: e },
+            );
+        }
+    });
+}
+
 pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String> {
-    // Clear plugin shortcuts + any modifier-only watcher.
     let _ = app.global_shortcut().unregister_all();
     mod_chord::stop_watcher();
 
@@ -90,23 +138,25 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
     }
 
     let toggle = cfg.toggle.trim();
+    let hold = cfg.is_hold_mode();
 
-    // Pure modifier chords (⌥⇧, ⌃⇧, …) — global-hotkey cannot parse these.
     if let Some(chord) = ModChord::parse_modifier_only(toggle) {
-        let handle = app.clone();
-        mod_chord::start_watcher(chord, move || {
-            let handle = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = dictation::toggle_dictation(handle.clone()).await {
-                    tracing::warn!(error = %e, "mod-chord toggle failed");
-                    dictation::emit_dictation(
-                        &handle,
-                        dictation::DictationUiEvent::Error { message: e },
-                    );
-                }
-            });
-        });
-        tracing::info!(hotkey = %toggle, "modifier-only hotkey watcher registered");
+        let app_press = app.clone();
+        let app_release = app.clone();
+        if hold {
+            mod_chord::start_watcher(
+                chord,
+                move || spawn_start(app_press.clone()),
+                move || spawn_stop(app_release.clone()),
+            );
+        } else {
+            mod_chord::start_watcher(
+                chord,
+                move || spawn_toggle(app_press.clone()),
+                move || { /* release ignored in toggle mode */ },
+            );
+        }
+        tracing::info!(hotkey = %toggle, hold, "modifier-only hotkey registered");
         return Ok(());
     }
 
@@ -115,30 +165,31 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
         .map_err(|e| format!("invalid hotkey '{toggle}': {e}"))?;
 
     let handle = app.clone();
+    let hold_mode = hold;
     app.global_shortcut()
         .on_shortcut(shortcut, move |_app, _shortcut, event| {
-            if event.state != ShortcutState::Pressed {
-                return;
-            }
             let handle = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = dictation::toggle_dictation(handle.clone()).await {
-                    tracing::warn!(error = %e, "hotkey toggle failed");
-                    dictation::emit_dictation(
-                        &handle,
-                        dictation::DictationUiEvent::Error { message: e },
-                    );
+            match event.state {
+                ShortcutState::Pressed => {
+                    if hold_mode {
+                        spawn_start(handle);
+                    } else {
+                        spawn_toggle(handle);
+                    }
                 }
-            });
+                ShortcutState::Released => {
+                    if hold_mode {
+                        spawn_stop(handle);
+                    }
+                }
+            }
         })
         .map_err(|e| format!("register hotkey failed: {e}"))?;
 
-    tracing::info!(hotkey = %toggle, "global hotkey registered");
+    tracing::info!(hotkey = %toggle, hold, "global hotkey registered");
     Ok(())
 }
 
-/// Pause global shortcuts while the UI is capturing a new chord
-/// (competitor pattern: click-to-record must not fire dictation).
 #[tauri::command]
 pub fn pause_hotkeys(app: AppHandle) -> Result<(), String> {
     let _ = app.global_shortcut().unregister_all();
@@ -147,13 +198,11 @@ pub fn pause_hotkeys(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Re-register from saved config after capture cancel / complete.
 #[tauri::command]
 pub fn resume_hotkeys(app: AppHandle) -> Result<(), String> {
     reregister(&app)
 }
 
-/// Initial plugin setup helper — call after manage(AppState).
 pub fn setup_hotkeys(app: &AppHandle) -> Result<(), String> {
     reregister(app)
 }

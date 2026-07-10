@@ -15,6 +15,7 @@ type Props = {
   enabled: boolean;
   toggle: string;
   showCapsule: boolean;
+  mode: string;
   busy: boolean;
   onBusy: (b: boolean) => void;
   onError: (e: string | null) => void;
@@ -22,6 +23,7 @@ type Props = {
     enabled: boolean;
     toggle: string;
     showCapsule: boolean;
+    mode: string;
   }) => void;
   onSaved: () => void;
 };
@@ -34,6 +36,7 @@ export function HotkeyRecorder({
   enabled,
   toggle,
   showCapsule,
+  mode,
   busy,
   onBusy,
   onError,
@@ -74,8 +77,9 @@ export function HotkeyRecorder({
           enabled,
           toggle: shortcut,
           showCapsule,
+          mode,
         });
-        onChange({ enabled, toggle: shortcut, showCapsule });
+        onChange({ enabled, toggle: shortcut, showCapsule, mode });
         setRecording(false);
         setLive(emptyChord());
         chordRef.current = emptyChord();
@@ -97,7 +101,7 @@ export function HotkeyRecorder({
         onBusy(false);
       }
     },
-    [enabled, showCapsule, onBusy, onError, onChange, onSaved]
+    [enabled, showCapsule, mode, onBusy, onError, onChange, onSaved]
   );
 
   const startRecording = useCallback(async () => {
@@ -196,11 +200,10 @@ export function HotkeyRecorder({
     <section className="card settings-section">
       <h2>全局热键</h2>
       <p className="muted-text">
-        在任意 App 中切换录音/停止。点「录制」后，
-        <strong>像平时使用一样一次按好组合键</strong>
-        （支持 ⌥Space，也支持仅修饰键如 ⌥⇧）。
-        默认 <span className="kbd">⌥Space</span>，避开 Spotlight 的{" "}
-        <span className="kbd">⌘Space</span>。
+        在任意 App 的输入框里使用：
+        <strong>按住说话，松手停止并粘贴</strong>
+        （默认）。转写结果会贴进当前输入框，本 App 只记历史，不抢前台。
+        默认热键 <span className="kbd">⌥Space</span>。
       </p>
 
       <div className="form-row" style={{ marginBottom: 12 }}>
@@ -211,7 +214,7 @@ export function HotkeyRecorder({
             disabled={busy || recording}
             onChange={(e) => {
               const v = e.target.checked;
-              onChange({ enabled: v, toggle, showCapsule });
+              onChange({ enabled: v, toggle, showCapsule, mode });
               void (async () => {
                 onBusy(true);
                 try {
@@ -219,6 +222,7 @@ export function HotkeyRecorder({
                     enabled: v,
                     toggle,
                     showCapsule,
+                    mode,
                   });
                   onSaved();
                 } catch (err) {
@@ -234,6 +238,40 @@ export function HotkeyRecorder({
       </div>
 
       <div className="form-row" style={{ marginBottom: 12 }}>
+        <label className="muted-text" style={{ minWidth: 72 }}>
+          触发方式
+        </label>
+        <select
+          className="input"
+          value={mode === "toggle" ? "toggle" : "hold"}
+          disabled={busy || recording}
+          onChange={(e) => {
+            const v = e.target.value;
+            onChange({ enabled, toggle, showCapsule, mode: v });
+            void (async () => {
+              onBusy(true);
+              try {
+                await api.saveHotkeyConfig({
+                  enabled,
+                  toggle,
+                  showCapsule,
+                  mode: v,
+                });
+                onSaved();
+              } catch (err) {
+                onError(String(err));
+              } finally {
+                onBusy(false);
+              }
+            })();
+          }}
+        >
+          <option value="hold">按住说话 · 松手停止（推荐）</option>
+          <option value="toggle">按一下开始 · 再按一下停止</option>
+        </select>
+      </div>
+
+      <div className="form-row" style={{ marginBottom: 12 }}>
         <label className="muted-text">
           <input
             type="checkbox"
@@ -241,7 +279,7 @@ export function HotkeyRecorder({
             disabled={busy || recording}
             onChange={(e) => {
               const v = e.target.checked;
-              onChange({ enabled, toggle, showCapsule: v });
+              onChange({ enabled, toggle, showCapsule: v, mode });
               void (async () => {
                 onBusy(true);
                 try {
@@ -249,6 +287,7 @@ export function HotkeyRecorder({
                     enabled,
                     toggle,
                     showCapsule: v,
+                    mode,
                   });
                   onSaved();
                 } catch (err) {
@@ -259,7 +298,7 @@ export function HotkeyRecorder({
               })();
             }}
           />{" "}
-          显示浮动胶囊
+          显示浮动胶囊（不抢焦点）
         </label>
       </div>
 

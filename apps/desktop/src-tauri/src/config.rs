@@ -80,6 +80,8 @@ pub struct HotkeyConfig {
     pub toggle: String,
     /// Show floating capsule while recording / processing.
     pub show_capsule: bool,
+    /// `hold` = push-to-talk (press start, release stop). `toggle` = press to start/stop.
+    pub mode: String,
 }
 
 impl Default for HotkeyConfig {
@@ -87,10 +89,17 @@ impl Default for HotkeyConfig {
         Self {
             enabled: true,
             // Option+Space — avoids Spotlight (⌘Space). User re-records in Settings.
-            // Bare Fn / right-⌘ push-to-talk needs lower-level hooks (later).
             toggle: "Alt+Space".into(),
             show_capsule: true,
+            // Product default: hold to talk (Wispr / Typeless-like).
+            mode: "hold".into(),
         }
+    }
+}
+
+impl HotkeyConfig {
+    pub fn is_hold_mode(&self) -> bool {
+        !matches!(self.mode.to_ascii_lowercase().as_str(), "toggle" | "click")
     }
 }
 
