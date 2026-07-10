@@ -71,6 +71,15 @@ export type HotkeyValidation = {
   errors: string[];
 };
 
+export type HotkeyIntent = {
+  id: string;
+  chord: string;
+  mode: string;
+  intent: string;
+  targetLanguage: string;
+  enabled: boolean;
+};
+
 export const api = {
   health: () => invoke<Health>("app_health"),
 
@@ -94,6 +103,12 @@ export const api = {
     apiKey?: string;
     timeoutSecs?: number;
     cleanup?: string;
+    style?: string;
+    casing?: string;
+    punctuation?: string;
+    polish?: string[];
+    customEnabled?: boolean;
+    customInstruction?: string;
   }) => invoke<CorrectorStatus>("save_corrector_config", { input }),
   correctText: (text: string) =>
     invoke<CorrectTextOutcome>("correct_text", { input: { text } }),
@@ -168,18 +183,21 @@ export const api = {
       toggle: string;
       showCapsule: boolean;
       mode: string;
+      intents: HotkeyIntent[];
     }>("get_hotkey_config"),
   saveHotkeyConfig: (input: {
     enabled?: boolean;
     toggle?: string;
     showCapsule?: boolean;
     mode?: string;
+    intents?: HotkeyIntent[];
   }) =>
     invoke<{
       enabled: boolean;
       toggle: string;
       showCapsule: boolean;
       mode: string;
+      intents: HotkeyIntent[];
     }>("save_hotkey_config", { input }),
   pauseHotkeys: () => invoke<void>("pause_hotkeys"),
   resumeHotkeys: () => invoke<void>("resume_hotkeys"),

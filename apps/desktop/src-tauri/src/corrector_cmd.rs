@@ -19,6 +19,12 @@ pub struct CorrectorStatus {
     pub label: String,
     /// none | light | medium | strong
     pub cleanup: String,
+    pub style: String,
+    pub casing: String,
+    pub punctuation: String,
+    pub polish: Vec<String>,
+    pub custom_enabled: bool,
+    pub custom_instruction: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +37,12 @@ pub struct CorrectorConfigInput {
     pub api_key: Option<String>,
     pub timeout_secs: Option<u64>,
     pub cleanup: Option<String>,
+    pub style: Option<String>,
+    pub casing: Option<String>,
+    pub punctuation: Option<String>,
+    pub polish: Option<Vec<String>>,
+    pub custom_enabled: Option<bool>,
+    pub custom_instruction: Option<String>,
 }
 
 #[tauri::command]
@@ -80,12 +92,47 @@ pub fn save_corrector_config(
             return Err(format!("unknown cleanup level: {v}"));
         }
     }
+    if let Some(v) = input.style {
+        if lumen_prompts::Style::parse(&v).is_some() {
+            guard.output.style = v.to_ascii_lowercase();
+        } else {
+            return Err(format!("unknown style: {v}"));
+        }
+    }
+    if let Some(v) = input.casing {
+        if lumen_prompts::Casing::parse(&v).is_some() {
+            guard.output.casing = v.to_ascii_lowercase();
+        } else {
+            return Err(format!("unknown casing: {v}"));
+        }
+    }
+    if let Some(v) = input.punctuation {
+        if lumen_prompts::PunctPolicy::parse(&v).is_some() {
+            guard.output.punctuation = v.to_ascii_lowercase();
+        } else {
+            return Err(format!("unknown punctuation: {v}"));
+        }
+    }
+    if let Some(v) = input.polish {
+        for p in &v {
+            if lumen_prompts::PolishRule::parse(p).is_none() {
+                return Err(format!("unknown polish rule: {p}"));
+            }
+        }
+        guard.output.polish = v;
+    }
+    if let Some(v) = input.custom_enabled {
+        guard.output.custom_enabled = v;
+    }
+    if let Some(v) = input.custom_instruction {
+        guard.output.custom_instruction = v;
+    }
 
     guard.save()?;
     Ok(status_from(&guard))
 }
 
-fn status_from(cfg: &AppConfig) -> CorrectorStatus {
+pub(crate) fn status_from(cfg: &AppConfig) -> CorrectorStatus {
     CorrectorStatus {
         enabled: cfg.corrector.enabled,
         provider: cfg.corrector.provider.clone(),
@@ -95,6 +142,17 @@ fn status_from(cfg: &AppConfig) -> CorrectorStatus {
         timeout_secs: cfg.corrector.timeout_secs,
         label: engine_label(cfg),
         cleanup: cfg.output.cleanup_level().as_str().into(),
+        style: cfg.output.style().as_str().into(),
+        casing: cfg.output.casing().as_str().into(),
+        punctuation: cfg.output.punctuation().as_str().into(),
+        polish: cfg
+            .output
+            .polish_rules()
+            .iter()
+            .map(|r| r.as_str().to_string())
+            .collect(),
+        custom_enabled: cfg.output.custom_enabled,
+        custom_instruction: cfg.output.custom_instruction.clone(),
     }
 }
 

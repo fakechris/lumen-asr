@@ -7,7 +7,9 @@ use lumen_corrector::{
 };
 use lumen_core::CorrectorEngineId;
 use lumen_dictionary::{split_for_injection, DictionaryEntry};
-use lumen_prompts::build_system_prompt;
+use lumen_prompts::{
+    build_system_prompt_from, effective_cleanup, IntentSpec, PromptBuildInput,
+};
 use std::time::Duration;
 
 pub fn dictionary_context(entries: &[DictionaryEntry]) -> DictionaryContext {
@@ -65,19 +67,30 @@ pub async fn run_correct(
     text: &str,
     entries: &[DictionaryEntry],
 ) -> CorrectResult {
-    let dict = dictionary_context(entries);
-    let level = app.output.cleanup_level();
+    run_correct_with_intent(app, text, entries, IntentSpec::Default).await
+}
 
-    // cleanup=none → rules only, keep ASR mistakes.
-    if !level.uses_model() || !app.corrector.enabled || app.corrector.provider == "none" {
+pub async fn run_correct_with_intent(
+    app: &AppConfig,
+    text: &str,
+    entries: &[DictionaryEntry],
+    intent: IntentSpec,
+) -> CorrectResult {
+    let dict = dictionary_context(entries);
+    let input: PromptBuildInput = app.output.prompt_input(intent);
+    let level = effective_cleanup(&input);
+
+    // No model: cleanup none (and not translate).
+    let system = build_system_prompt_from(&input);
+    if system.is_empty()
+        || !app.corrector.enabled
+        || app.corrector.provider == "none"
+    {
         let mut r = preprocess_only(text, &dict);
-        if !level.uses_model() {
-            r.engine = CorrectorEngineId::None;
-        }
+        r.engine = CorrectorEngineId::None;
         return r;
     }
 
-    let system = build_system_prompt(level);
     let temperature = level.temperature();
     match build_corrector(&app.corrector) {
         Ok(c) => {

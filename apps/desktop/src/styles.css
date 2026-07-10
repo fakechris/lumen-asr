@@ -749,6 +749,28 @@ code {
   background: color-mix(in srgb, var(--text) 3%, transparent);
 }
 
+.polish-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: center;
+  margin: 8px 0;
+}
+
+.polish-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.intent-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
 .chip {
   display: inline-block;
   font-size: 0.72rem;

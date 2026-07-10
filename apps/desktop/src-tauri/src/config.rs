@@ -31,18 +31,34 @@ impl Default for AppConfig {
     }
 }
 
-/// Post-ASR text shaping (cleanup level for P0; style/polish later).
+/// Post-ASR text shaping profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OutputConfig {
     /// none | light | medium | strong — default medium.
     pub cleanup: String,
+    /// formal | neutral | casual | very_casual
+    pub style: String,
+    /// preserve | sentence | lower
+    pub casing: String,
+    /// preserve | standard | light
+    pub punctuation: String,
+    /// multi: concise, clarity, reorder, structure, keep_tone
+    pub polish: Vec<String>,
+    pub custom_enabled: bool,
+    pub custom_instruction: String,
 }
 
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             cleanup: "medium".into(),
+            style: "neutral".into(),
+            casing: "sentence".into(),
+            punctuation: "standard".into(),
+            polish: vec![],
+            custom_enabled: false,
+            custom_instruction: String::new(),
         }
     }
 }
@@ -51,6 +67,50 @@ impl OutputConfig {
     pub fn cleanup_level(&self) -> lumen_prompts::CleanupLevel {
         lumen_prompts::CleanupLevel::parse(&self.cleanup)
             .unwrap_or(lumen_prompts::CleanupLevel::Medium)
+    }
+
+    pub fn style(&self) -> lumen_prompts::Style {
+        lumen_prompts::Style::parse(&self.style).unwrap_or_default()
+    }
+
+    pub fn casing(&self) -> lumen_prompts::Casing {
+        lumen_prompts::Casing::parse(&self.casing).unwrap_or_default()
+    }
+
+    pub fn punctuation(&self) -> lumen_prompts::PunctPolicy {
+        lumen_prompts::PunctPolicy::parse(&self.punctuation).unwrap_or_default()
+    }
+
+    pub fn polish_rules(&self) -> Vec<lumen_prompts::PolishRule> {
+        self.polish
+            .iter()
+            .filter_map(|s| lumen_prompts::PolishRule::parse(s))
+            .collect()
+    }
+
+    pub fn prompt_input(
+        &self,
+        intent: lumen_prompts::IntentSpec,
+    ) -> lumen_prompts::PromptBuildInput {
+        let custom = if self.custom_enabled {
+            let t = self.custom_instruction.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        } else {
+            None
+        };
+        lumen_prompts::PromptBuildInput {
+            cleanup: self.cleanup_level(),
+            style: self.style(),
+            casing: self.casing(),
+            punctuation: self.punctuation(),
+            polish: self.polish_rules(),
+            custom,
+            intent,
+        }
     }
 }
 
@@ -148,18 +208,49 @@ pub struct HotkeyConfig {
     pub show_capsule: bool,
     /// `hold` = push-to-talk (press start, release stop). `toggle` = press to start/stop.
     pub mode: String,
+    /// Independent intent chords (translate, raw, …).
+    pub intents: Vec<HotkeyIntentConfig>,
+}
+
+/// Secondary hold-to-talk with a different post-ASR intent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HotkeyIntentConfig {
+    pub id: String,
+    pub chord: String,
+    /// hold | toggle (default hold)
+    pub mode: String,
+    /// default | translate | raw
+    pub intent: String,
+    /// For intent=translate
+    pub target_language: String,
+    pub enabled: bool,
+}
+
+impl Default for HotkeyIntentConfig {
+    fn default() -> Self {
+        Self {
+            id: "translate".into(),
+            chord: "Alt+Shift+T".into(),
+            mode: "hold".into(),
+            intent: "translate".into(),
+            target_language: "en".into(),
+            enabled: false,
+        }
+    }
 }
 
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // Option+Space — avoids Spotlight (⌘Space).
             toggle: "Alt+Space".into(),
-            // Floating status capsule — required UX feedback while holding hotkey.
             show_capsule: true,
-            // Product default: hold to talk (push-to-talk).
             mode: "hold".into(),
+            intents: vec![HotkeyIntentConfig {
+                enabled: false,
+                ..HotkeyIntentConfig::default()
+            }],
         }
     }
 }
@@ -170,6 +261,22 @@ impl Default for HotkeyConfig {
 impl HotkeyConfig {
     pub fn is_hold_mode(&self) -> bool {
         !matches!(self.mode.to_ascii_lowercase().as_str(), "toggle" | "click")
+    }
+}
+
+impl HotkeyIntentConfig {
+    pub fn to_intent_spec(&self) -> lumen_prompts::IntentSpec {
+        match self.intent.to_ascii_lowercase().as_str() {
+            "translate" => lumen_prompts::IntentSpec::Translate {
+                target_language: if self.target_language.trim().is_empty() {
+                    "en".into()
+                } else {
+                    self.target_language.clone()
+                },
+            },
+            "raw" => lumen_prompts::IntentSpec::Raw,
+            _ => lumen_prompts::IntentSpec::Default,
+        }
     }
 }
 

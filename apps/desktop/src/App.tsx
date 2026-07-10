@@ -1007,6 +1007,12 @@ function SettingsPanel({
   const [apiKey, setApiKey] = useState("");
   const [timeoutSecs, setTimeoutSecs] = useState(60);
   const [cleanup, setCleanup] = useState("medium");
+  const [style, setStyle] = useState("neutral");
+  const [casing, setCasing] = useState("sentence");
+  const [punctuation, setPunctuation] = useState("standard");
+  const [polish, setPolish] = useState<string[]>([]);
+  const [customEnabled, setCustomEnabled] = useState(false);
+  const [customInstruction, setCustomInstruction] = useState("");
   const [probe, setProbe] = useState<string>("");
   const [perm, setPerm] = useState<import("./api").PermissionStatus | null>(null);
   const [autoInsert, setAutoInsert] = useState(true);
@@ -1016,6 +1022,7 @@ function SettingsPanel({
   const [hotkeyToggle, setHotkeyToggle] = useState("Alt+Space");
   const [showCapsule, setShowCapsule] = useState(true);
   const [hotkeyMode, setHotkeyMode] = useState("hold");
+  const [intents, setIntents] = useState<import("./api").HotkeyIntent[]>([]);
   const [learning, setLearning] = useState<LearningConfig | null>(null);
   const [autoPromote, setAutoPromote] = useState(false);
   const [promoteN, setPromoteN] = useState(3);
@@ -1033,6 +1040,12 @@ function SettingsPanel({
         setModel(c.model);
         setTimeoutSecs(c.timeoutSecs);
         setCleanup(c.cleanup || "medium");
+        setStyle(c.style || "neutral");
+        setCasing(c.casing || "sentence");
+        setPunctuation(c.punctuation || "standard");
+        setPolish(c.polish || []);
+        setCustomEnabled(!!c.customEnabled);
+        setCustomInstruction(c.customInstruction || "");
         const p = await api.getPermissionStatus();
         setPerm(p);
         const inj = await api.getInjectConfig();
@@ -1044,6 +1057,7 @@ function SettingsPanel({
         setHotkeyToggle(hk.toggle);
         setShowCapsule(hk.showCapsule);
         setHotkeyMode(hk.mode || "hold");
+        setIntents(hk.intents || []);
         const ln = await api.getLearningConfig();
         setLearning(ln);
         setAutoPromote(ln.autoPromote);
@@ -1067,6 +1081,12 @@ function SettingsPanel({
         model,
         timeoutSecs,
         cleanup,
+        style,
+        casing,
+        punctuation,
+        polish,
+        customEnabled,
+        customInstruction,
       };
       if (apiKey.trim()) {
         input.apiKey = apiKey.trim();
@@ -1074,6 +1094,12 @@ function SettingsPanel({
       const c = await api.saveCorrectorConfig(input);
       setCfg(c);
       setCleanup(c.cleanup || cleanup);
+      setStyle(c.style || style);
+      setCasing(c.casing || casing);
+      setPunctuation(c.punctuation || punctuation);
+      setPolish(c.polish || polish);
+      setCustomEnabled(!!c.customEnabled);
+      setCustomInstruction(c.customInstruction || "");
       setApiKey("");
       onSaved();
       setProbe("已保存");
@@ -1253,6 +1279,121 @@ function SettingsPanel({
       />
 
       <section className="card settings-section">
+        <h2>意图快捷键</h2>
+        <p className="muted-text">
+          与主热键独立。例如按住「翻译」键说话 → 先轻度整理再译成目标语言。
+        </p>
+        {intents.map((it, idx) => (
+          <div key={it.id + idx} className="intent-row">
+            <label className="muted-text">
+              <input
+                type="checkbox"
+                checked={it.enabled}
+                disabled={busy}
+                onChange={(e) => {
+                  const next = [...intents];
+                  next[idx] = { ...it, enabled: e.target.checked };
+                  setIntents(next);
+                }}
+              />{" "}
+              启用
+            </label>
+            <input
+              className="input"
+              style={{ maxWidth: 140 }}
+              value={it.chord}
+              disabled={busy}
+              onChange={(e) => {
+                const next = [...intents];
+                next[idx] = { ...it, chord: e.target.value };
+                setIntents(next);
+              }}
+              placeholder="Alt+Shift+T"
+            />
+            <select
+              className="input"
+              style={{ maxWidth: 120 }}
+              value={it.intent}
+              disabled={busy}
+              onChange={(e) => {
+                const next = [...intents];
+                next[idx] = { ...it, intent: e.target.value };
+                setIntents(next);
+              }}
+            >
+              <option value="translate">翻译</option>
+              <option value="raw">仅原文</option>
+              <option value="default">默认整理</option>
+            </select>
+            {it.intent === "translate" && (
+              <input
+                className="input"
+                style={{ maxWidth: 80 }}
+                value={it.targetLanguage}
+                disabled={busy}
+                onChange={(e) => {
+                  const next = [...intents];
+                  next[idx] = { ...it, targetLanguage: e.target.value };
+                  setIntents(next);
+                }}
+                placeholder="en"
+                title="目标语言"
+              />
+            )}
+          </div>
+        ))}
+        <div className="actions" style={{ marginTop: 10 }}>
+          <button
+            type="button"
+            className="btn"
+            disabled={busy}
+            onClick={() =>
+              void (async () => {
+                onBusy(true);
+                try {
+                  const h = await api.saveHotkeyConfig({
+                    enabled: hotkeyEnabled,
+                    toggle: hotkeyToggle,
+                    showCapsule,
+                    mode: hotkeyMode,
+                    intents,
+                  });
+                  setIntents(h.intents || []);
+                  onSaved();
+                } catch (e) {
+                  onError(String(e));
+                } finally {
+                  onBusy(false);
+                }
+              })()
+            }
+          >
+            保存意图快捷键
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={busy}
+            onClick={() =>
+              setIntents((prev) => [
+                ...prev,
+                {
+                  id: `intent_${prev.length + 1}`,
+                  chord: "Alt+Shift+T",
+                  mode: "hold",
+                  intent: "translate",
+                  targetLanguage: "en",
+                  enabled: true,
+                },
+              ])
+            }
+          >
+            添加
+          </button>
+        </div>
+      </section>
+
+      <section className="card settings-section">
         <h2>插入策略</h2>
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text">
@@ -1350,6 +1491,99 @@ function SettingsPanel({
           </div>
         </div>
         <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            语气
+          </label>
+          <select
+            className="input"
+            value={style}
+            disabled={busy}
+            onChange={(e) => setStyle(e.target.value)}
+          >
+            <option value="formal">正式</option>
+            <option value="neutral">中性</option>
+            <option value="casual">轻松</option>
+            <option value="very_casual">很随意</option>
+          </select>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            英文大小写
+          </label>
+          <select
+            className="input"
+            value={casing}
+            disabled={busy}
+            onChange={(e) => setCasing(e.target.value)}
+          >
+            <option value="sentence">句首大写</option>
+            <option value="preserve">保持原样</option>
+            <option value="lower">尽量小写</option>
+          </select>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            标点
+          </label>
+          <select
+            className="input"
+            value={punctuation}
+            disabled={busy}
+            onChange={(e) => setPunctuation(e.target.value)}
+          >
+            <option value="standard">标准</option>
+            <option value="light">从简</option>
+            <option value="preserve">贴近输入</option>
+          </select>
+        </div>
+        <div className="polish-checks">
+          <div className="field-label">额外整理</div>
+          {(
+            [
+              ["concise", "更短"],
+              ["clarity", "更清楚"],
+              ["reorder", "理顺语序"],
+              ["structure", "加结构"],
+              ["keep_tone", "保留语气"],
+            ] as const
+          ).map(([id, label]) => (
+            <label key={id} className="muted-text polish-check">
+              <input
+                type="checkbox"
+                checked={polish.includes(id)}
+                disabled={busy}
+                onChange={(e) => {
+                  setPolish((prev) =>
+                    e.target.checked ? [...prev, id] : prev.filter((x) => x !== id)
+                  );
+                }}
+              />{" "}
+              {label}
+            </label>
+          ))}
+        </div>
+        <div className="form-row" style={{ marginBottom: 8, marginTop: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={customEnabled}
+              disabled={busy}
+              onChange={(e) => setCustomEnabled(e.target.checked)}
+            />{" "}
+            自定义补充说明（叠加在红线之上）
+          </label>
+        </div>
+        {customEnabled && (
+          <textarea
+            className="textarea"
+            rows={3}
+            value={customInstruction}
+            disabled={busy}
+            onChange={(e) => setCustomInstruction(e.target.value)}
+            placeholder="例如：保留英文专有名词；适合即时消息"
+          />
+        )}
+        <div className="form-row" style={{ marginBottom: 10, marginTop: 12 }}>
           <label className="muted-text" style={{ minWidth: 72 }}>
             Provider
           </label>

@@ -1,6 +1,6 @@
 //! Recording + local ASR + model corrector IPC (M2–M5).
 
-use crate::corrector_svc::{engine_label, run_correct};
+use crate::corrector_svc::{engine_label, run_correct_with_intent};
 use crate::session_debug::{self, SessionDebugMeta};
 use crate::AppState;
 use lumen_asr::{
@@ -12,6 +12,7 @@ use lumen_platform_macos::{
     activate_target, frontmost_app_name, frontmost_target, is_self_app_name, is_self_target,
     FrontmostTarget,
 };
+use lumen_prompts::IntentSpec;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -20,6 +21,22 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Frontmost app captured when hotkey dictation starts — restored before paste.
 static TARGET: Mutex<Option<FrontmostTarget>> = Mutex::new(None);
+
+/// Intent bound to the current dictation session (default / translate / raw).
+static SESSION_INTENT: Mutex<IntentSpec> = Mutex::new(IntentSpec::Default);
+
+pub fn set_session_intent(intent: IntentSpec) {
+    if let Ok(mut g) = SESSION_INTENT.lock() {
+        *g = intent;
+    }
+}
+
+fn take_session_intent() -> IntentSpec {
+    SESSION_INTENT
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or(IntentSpec::Default)
+}
 
 /// Serial dictation lifecycle — prevents overlapping start/stop thrash (felt like crash).
 const PHASE_IDLE: u8 = 0;
@@ -298,7 +315,8 @@ pub async fn stop_and_transcribe_inner(
         .map_err(|_| "config lock poisoned".to_string())?
         .clone();
 
-    let corr = run_correct(&cfg, &asr_text, &entries).await;
+    let intent = take_session_intent();
+    let corr = run_correct_with_intent(&cfg, &asr_text, &entries, intent).await;
     let corrected_text = corr.text.trim().to_string();
     let corrector_engine = if corr.model_applied {
         engine_label(&cfg)
@@ -588,7 +606,7 @@ pub async fn retry_session_transcription(
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?
         .clone();
-    let corr = run_correct(&cfg, &asr_text, &entries).await;
+    let corr = run_correct_with_intent(&cfg, &asr_text, &entries, IntentSpec::Default).await;
     let corrected_text = corr.text.trim().to_string();
     let corrector_engine = if corr.model_applied {
         engine_label(&cfg)
@@ -662,6 +680,13 @@ pub fn emit_dictation(app: &AppHandle, event: DictationUiEvent) {
 
 /// Start recording if idle (push-to-talk press / toggle start).
 pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
+    dictation_start_with_intent(app, IntentSpec::Default).await
+}
+
+pub async fn dictation_start_with_intent(
+    app: AppHandle,
+    intent: IntentSpec,
+) -> Result<(), String> {
     // Only one session at a time.
     if PHASE
         .compare_exchange(
@@ -678,6 +703,8 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
         );
         return Ok(());
     }
+
+    set_session_intent(intent);
 
     // Stamp immediately so a racing stop does not see held_ms=0.
     if let Ok(mut g) = RECORD_STARTED.lock() {

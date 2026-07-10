@@ -4,7 +4,10 @@ mod hotkey_tap;
 mod inject;
 mod permissions;
 
-pub use hotkey_tap::{start_monitor, stop_monitor, HotkeyEdge, HotkeyMode, HotkeySpec};
+pub use hotkey_tap::{
+    start_monitor, start_multi_monitor, stop_monitor, HotkeyBinding, HotkeyEdge, HotkeyMode,
+    HotkeySpec,
+};
 pub use inject::MacTextInjectorBackend;
 pub use permissions::{
     ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,

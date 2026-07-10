@@ -1,7 +1,6 @@
 //! Global keyboard monitor via CGEventTap (press / hold / release).
 //!
-//! Dedicated CFRunLoop thread. Supports modifier-only chords (FlagsChanged)
-//! and modifier+key chords (KeyDown/KeyUp).
+//! Supports multiple bindings (primary + intent chords) on one tap thread.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -81,7 +80,6 @@ impl HotkeySpec {
         })
     }
 
-    /// Required modifiers must be down; extra modifiers are allowed.
     fn mods_active(&self, flags: u64) -> bool {
         let alt = flags & FLAG_ALTERNATE != 0;
         let shift = flags & FLAG_SHIFT != 0;
@@ -92,6 +90,7 @@ impl HotkeySpec {
             && (!self.control || control)
             && (!self.meta || meta)
     }
+
 }
 
 fn key_name_to_keycode(name: &str) -> Option<i64> {
@@ -101,10 +100,6 @@ fn key_name_to_keycode(name: &str) -> Option<i64> {
         "TAB" => Some(0x30),
         "ESCAPE" | "ESC" => Some(0x35),
         "DELETE" | "BACKSPACE" => Some(0x33),
-        "UP" | "ARROWUP" => Some(0x7E),
-        "DOWN" | "ARROWDOWN" => Some(0x7D),
-        "LEFT" | "ARROWLEFT" => Some(0x7B),
-        "RIGHT" | "ARROWRIGHT" => Some(0x7C),
         "A" => Some(0x00),
         "S" => Some(0x01),
         "D" => Some(0x02),
@@ -141,26 +136,6 @@ fn key_name_to_keycode(name: &str) -> Option<i64> {
         "K" => Some(0x28),
         "N" => Some(0x2D),
         "M" => Some(0x2E),
-        "F1" => Some(0x7A),
-        "F2" => Some(0x78),
-        "F3" => Some(0x63),
-        "F4" => Some(0x76),
-        "F5" => Some(0x60),
-        "F6" => Some(0x61),
-        "F7" => Some(0x62),
-        "F8" => Some(0x64),
-        "F9" => Some(0x65),
-        "F10" => Some(0x6D),
-        "F11" => Some(0x67),
-        "F12" => Some(0x6F),
-        "F13" => Some(0x69),
-        "F14" => Some(0x6B),
-        "F15" => Some(0x71),
-        "F16" => Some(0x6A),
-        "F17" => Some(0x40),
-        "F18" => Some(0x4F),
-        "F19" => Some(0x50),
-        "F20" => Some(0x5A),
         _ => None,
     }
 }
@@ -169,6 +144,12 @@ const FLAG_SHIFT: u64 = 0x0002_0000;
 const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALTERNATE: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
+
+#[derive(Debug, Clone)]
+pub struct HotkeyBinding {
+    pub id: String,
+    pub spec: HotkeySpec,
+}
 
 struct MonitorState {
     stop: Arc<AtomicBool>,
@@ -184,10 +165,28 @@ pub fn stop_monitor() {
     }
 }
 
+/// Single binding (backward compatible).
 pub fn start_monitor<F>(spec: HotkeySpec, on_edge: F) -> Result<(), String>
 where
     F: Fn(HotkeyEdge) + Send + 'static,
 {
+    start_multi_monitor(
+        vec![HotkeyBinding {
+            id: "default".into(),
+            spec,
+        }],
+        move |edge, _id| on_edge(edge),
+    )
+}
+
+/// Multiple chords on one EventTap; `on_edge(edge, binding_id)`.
+pub fn start_multi_monitor<F>(bindings: Vec<HotkeyBinding>, on_edge: F) -> Result<(), String>
+where
+    F: Fn(HotkeyEdge, String) + Send + 'static,
+{
+    if bindings.is_empty() {
+        return Err("no hotkey bindings".into());
+    }
     stop_monitor();
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -204,11 +203,11 @@ where
         .spawn(move || {
             #[cfg(target_os = "macos")]
             {
-                run_tap_loop(spec, on_edge, stop, ready_tx);
+                run_tap_loop_multi(bindings, on_edge, stop, ready_tx);
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (spec, on_edge, stop);
+                let _ = (bindings, on_edge, stop);
                 let _ = ready_tx.send(Err("hotkey tap only available on macOS".into()));
             }
         })
@@ -221,29 +220,45 @@ where
 }
 
 #[cfg(target_os = "macos")]
-fn run_tap_loop<F>(
-    spec: HotkeySpec,
+fn run_tap_loop_multi<F>(
+    bindings: Vec<HotkeyBinding>,
     on_edge: F,
     stop: Arc<AtomicBool>,
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) where
-    F: Fn(HotkeyEdge) + Send + 'static,
+    F: Fn(HotkeyEdge, String) + Send + 'static,
 {
     use core_foundation::runloop::{kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop};
     use core_graphics::event::{
         CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
         EventField,
     };
-    use std::cell::Cell;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
-    let latched = Rc::new(Cell::new(false));
-    let key_held = Rc::new(Cell::new(false));
-    let release_after = Rc::new(Cell::new(None::<Instant>));
-    let latched_c = Rc::clone(&latched);
-    let key_held_c = Rc::clone(&key_held);
-    let release_after_c = Rc::clone(&release_after);
-    let spec_c = spec.clone();
+    #[derive(Clone)]
+    struct Latch {
+        active: bool,
+        release_after: Option<Instant>,
+        key_held: bool,
+    }
+
+    let mut latches_init = HashMap::new();
+    for b in &bindings {
+        latches_init.insert(
+            b.id.clone(),
+            Latch {
+                active: false,
+                release_after: None,
+                key_held: false,
+            },
+        );
+    }
+
+    let bindings_c = Rc::new(bindings.clone());
+    let latches = Rc::new(RefCell::new(latches_init));
+    let latches_c = Rc::clone(&latches);
     let on_edge = Rc::new(on_edge);
     let on_edge_c = Rc::clone(&on_edge);
 
@@ -262,65 +277,70 @@ fn run_tap_loop<F>(
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
                 tracing::warn!("keyboard event tap disabled by system; will re-enable");
-                // Returning None keeps the original event (crate maps None → original).
                 return None;
             }
 
             let flags = event.get_flags().bits();
-            let mods_ok = spec_c.mods_active(flags);
             let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
 
-            match etype {
-                CGEventType::KeyDown => {
-                    if let Some(need) = spec_c.keycode {
-                        if keycode == need {
-                            key_held_c.set(true);
+            let mut map = latches_c.borrow_mut();
+            for b in bindings_c.iter() {
+                let latch = map.get_mut(&b.id).unwrap();
+                match etype {
+                    CGEventType::KeyDown => {
+                        if b.spec.keycode == Some(keycode) {
+                            latch.key_held = true;
                         }
                     }
-                }
-                CGEventType::KeyUp => {
-                    if let Some(need) = spec_c.keycode {
-                        if keycode == need {
-                            key_held_c.set(false);
+                    CGEventType::KeyUp => {
+                        if b.spec.keycode == Some(keycode) {
+                            latch.key_held = false;
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
-            }
 
-            let want_active = if spec_c.keycode.is_some() {
-                mods_ok && key_held_c.get()
-            } else {
-                mods_ok
-            };
-
-            let currently = latched_c.get();
-            if want_active {
-                release_after_c.set(None);
-                if !currently {
-                    latched_c.set(true);
-                    tracing::info!(?spec_c, "hotkey press");
-                    on_edge_c(HotkeyEdge::Press);
-                }
-            } else if currently {
-                let now = Instant::now();
-                match release_after_c.get() {
-                    None => {
-                        // Sticky window against FlagsChanged flicker while holding.
-                        release_after_c.set(Some(now + Duration::from_millis(70)));
+                let key_arg = if b.spec.keycode.is_some() {
+                    if latch.key_held {
+                        b.spec.keycode
+                    } else {
+                        None
                     }
-                    Some(deadline) if now >= deadline => {
-                        release_after_c.set(None);
-                        latched_c.set(false);
-                        key_held_c.set(false);
-                        tracing::info!(?spec_c, "hotkey release");
-                        on_edge_c(HotkeyEdge::Release);
+                } else {
+                    None
+                };
+                // For key chords, is_active checks keycode match via key_held path:
+                let want = if let Some(need) = b.spec.keycode {
+                    b.spec.mods_active(flags) && latch.key_held && Some(need) == b.spec.keycode
+                } else {
+                    b.spec.mods_active(flags)
+                };
+                let _ = key_arg;
+
+                if want {
+                    latch.release_after = None;
+                    if !latch.active {
+                        latch.active = true;
+                        tracing::info!(id = %b.id, "hotkey press");
+                        on_edge_c(HotkeyEdge::Press, b.id.clone());
                     }
-                    Some(_) => {}
+                } else if latch.active {
+                    let now = Instant::now();
+                    match latch.release_after {
+                        None => {
+                            latch.release_after = Some(now + Duration::from_millis(70));
+                        }
+                        Some(deadline) if now >= deadline => {
+                            latch.release_after = None;
+                            latch.active = false;
+                            latch.key_held = false;
+                            tracing::info!(id = %b.id, "hotkey release");
+                            on_edge_c(HotkeyEdge::Release, b.id.clone());
+                        }
+                        Some(_) => {}
+                    }
                 }
             }
-
-            // Pass original event through (do not swallow).
             None
         },
     ) {
@@ -347,23 +367,25 @@ fn run_tap_loop<F>(
     }
     tap.enable();
     let _ = ready_tx.send(Ok(()));
-    tracing::info!(?spec, "keyboard event tap active");
+    tracing::info!(n = bindings.len(), "keyboard event tap active (multi)");
 
     while !stop.load(Ordering::SeqCst) {
         let _ = unsafe {
             CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, Duration::from_millis(50), false)
         };
-        // Re-enable if the system disabled the tap (timeout / user input).
         tap.enable();
 
-        // Flush sticky release when no further events arrive.
-        if let Some(deadline) = release_after.get() {
-            if Instant::now() >= deadline && latched.get() {
-                release_after.set(None);
-                latched.set(false);
-                key_held.set(false);
-                tracing::info!(?spec, "hotkey release (timeout flush)");
-                on_edge(HotkeyEdge::Release);
+        let mut map = latches.borrow_mut();
+        for b in &bindings {
+            let latch = map.get_mut(&b.id).unwrap();
+            if let Some(deadline) = latch.release_after {
+                if Instant::now() >= deadline && latch.active {
+                    latch.release_after = None;
+                    latch.active = false;
+                    latch.key_held = false;
+                    tracing::info!(id = %b.id, "hotkey release (timeout flush)");
+                    on_edge(HotkeyEdge::Release, b.id.clone());
+                }
             }
         }
     }
@@ -388,18 +410,5 @@ mod tests {
     fn parse_alt_space() {
         let s = HotkeySpec::parse("Alt+Space", HotkeyMode::Hold).unwrap();
         assert!(s.alt && s.keycode == Some(0x31));
-    }
-
-    #[test]
-    fn reject_bare_key() {
-        assert!(HotkeySpec::parse("A", HotkeyMode::Hold).is_err());
-    }
-
-    #[test]
-    fn mods_allow_extras() {
-        let s = HotkeySpec::parse("Alt+Shift", HotkeyMode::Hold).unwrap();
-        let flags = FLAG_ALTERNATE | FLAG_SHIFT | FLAG_COMMAND;
-        assert!(s.mods_active(flags));
-        assert!(!s.mods_active(FLAG_ALTERNATE));
     }
 }

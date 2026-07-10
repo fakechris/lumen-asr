@@ -23,6 +23,12 @@ export type CorrectorStatus = {
   label: string;
   /** none | light | medium | strong */
   cleanup?: string;
+  style?: string;
+  casing?: string;
+  punctuation?: string;
+  polish?: string[];
+  customEnabled?: boolean;
+  customInstruction?: string;
 };
 
 export type CorrectTextOutcome = {
