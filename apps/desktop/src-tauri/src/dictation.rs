@@ -86,14 +86,27 @@ pub struct TranscribeOutcome {
     pub num_samples: usize,
     pub duration_ms: u64,
     pub session: SessionRecord,
+    /// When true, UI/backend should start post-paste edit watch.
+    pub watch_post_paste: bool,
+    pub post_paste_seconds: u64,
 }
 
 #[tauri::command]
 pub async fn stop_and_transcribe(
+    app: AppHandle,
     state: State<'_, AppState>,
     save: Option<bool>,
 ) -> Result<TranscribeOutcome, String> {
-    stop_and_transcribe_inner(&state, save.unwrap_or(true)).await
+    let outcome = stop_and_transcribe_inner(&state, save.unwrap_or(true)).await?;
+    if outcome.watch_post_paste {
+        crate::learning::spawn_post_paste_watch(
+            app,
+            outcome.session.id,
+            outcome.corrected_text.clone(),
+            outcome.post_paste_seconds,
+        );
+    }
+    Ok(outcome)
 }
 
 pub async fn stop_and_transcribe_inner(
@@ -180,11 +193,13 @@ pub async fn stop_and_transcribe_inner(
     };
 
     let mut insert_strategy = InsertStrategy::None;
+    let mut did_insert = false;
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         match crate::inject_cmd::insert_with_config(&cfg.inject, &corrected_text).await {
             Ok(out) => {
                 insert_strategy = out.strategy;
+                did_insert = !matches!(insert_strategy, InsertStrategy::None | InsertStrategy::CopyOnly);
                 tracing::info!(?insert_strategy, "auto-insert done");
             }
             Err(e) => {
@@ -217,6 +232,12 @@ pub async fn stop_and_transcribe_inner(
         }
     }
 
+    // M6: optional post-paste watch for user corrections in the target app.
+    if did_insert && cfg.learning.post_paste_capture {
+        // Need AppHandle — not available here. Caller with AppHandle should spawn.
+        // Stored flag on outcome for UI/hotkey path.
+    }
+
     Ok(TranscribeOutcome {
         text: corrected_text.clone(),
         asr_text,
@@ -228,6 +249,8 @@ pub async fn stop_and_transcribe_inner(
         num_samples,
         duration_ms,
         session: rec,
+        watch_post_paste: did_insert && cfg.learning.post_paste_capture,
+        post_paste_seconds: cfg.learning.post_paste_seconds,
     })
 }
 
@@ -277,6 +300,14 @@ pub async fn toggle_dictation(app: AppHandle) -> Result<(), String> {
         crate::capsule::set_capsule_visible(&app, show_capsule, "processing");
         match stop_and_transcribe_inner(&state, true).await {
             Ok(outcome) => {
+                if outcome.watch_post_paste {
+                    crate::learning::spawn_post_paste_watch(
+                        app.clone(),
+                        outcome.session.id,
+                        outcome.corrected_text.clone(),
+                        outcome.post_paste_seconds,
+                    );
+                }
                 crate::capsule::set_capsule_visible(&app, false, "idle");
                 emit_dictation(&app, DictationUiEvent::Done { outcome });
                 emit_dictation(&app, DictationUiEvent::Idle);

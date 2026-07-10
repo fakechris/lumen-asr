@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub corrector: CorrectorConfig,
     pub inject: InjectConfig,
     pub hotkey: HotkeyConfig,
+    pub learning: LearningConfig,
 }
 
 impl Default for AppConfig {
@@ -19,6 +20,7 @@ impl Default for AppConfig {
             corrector: CorrectorConfig::default(),
             inject: InjectConfig::default(),
             hotkey: HotkeyConfig::default(),
+            learning: LearningConfig::default(),
         }
     }
 }
@@ -87,6 +89,29 @@ impl Default for HotkeyConfig {
             // Cmd+Shift+Space is easy to reach; user can change in Settings.
             toggle: "CommandOrControl+Shift+Space".into(),
             show_capsule: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LearningConfig {
+    /// When true, promote a replacement after it appears `auto_promote_threshold` times.
+    pub auto_promote: bool,
+    pub auto_promote_threshold: u32,
+    /// After successful paste, poll frontmost field for user edits (best-effort AX/osascript).
+    pub post_paste_capture: bool,
+    /// Seconds to watch after paste before giving up.
+    pub post_paste_seconds: u64,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            auto_promote: false,
+            auto_promote_threshold: 3,
+            post_paste_capture: true,
+            post_paste_seconds: 20,
         }
     }
 }

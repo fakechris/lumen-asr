@@ -9,6 +9,7 @@ import type {
   EditEvent,
   Health,
   LearnCandidate,
+  LearningConfig,
   SessionRecord,
   TabId,
 } from "./types";
@@ -45,6 +46,11 @@ export default function App() {
   const [learnBefore, setLearnBefore] = useState("");
   const [learnAfter, setLearnAfter] = useState("");
   const [candidates, setCandidates] = useState<LearnCandidate[]>([]);
+  const [sessionLearn, setSessionLearn] = useState<{
+    sessionId: string;
+    baseline: string;
+    candidates: LearnCandidate[];
+  } | null>(null);
 
   const refreshHealth = useCallback(async () => {
     try {
@@ -70,6 +76,33 @@ export default function App() {
     }
   }, []);
 
+  // Post-paste learn suggestions from native watch
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    listen<{
+      sessionId: string;
+      beforeText: string;
+      afterText: string;
+      candidates: LearnCandidate[];
+      message: string;
+    }>("learn-suggestion", (e) => {
+      const p = e.payload;
+      setLearnBefore(p.beforeText);
+      setLearnAfter(p.afterText);
+      setCandidates(p.candidates || []);
+      setSessionLearn({
+        sessionId: p.sessionId,
+        baseline: p.beforeText,
+        candidates: p.candidates || [],
+      });
+      setTab("learn");
+      setError(null);
+    }).then((fn) => {
+      un = fn;
+    });
+    return () => un?.();
+  }, []);
+
   // Global hotkey / capsule events
   useEffect(() => {
     let un: (() => void) | undefined;
@@ -81,6 +114,7 @@ export default function App() {
         asrText?: string;
         asrEngine?: string;
         correctorEngine?: string;
+        session?: SessionRecord;
       };
     }>("dictation", (e) => {
       const p = e.payload;
@@ -94,6 +128,10 @@ export default function App() {
         void refreshHealth();
         void refreshSessions();
         setTab("record");
+        // Stash baseline for post-dictation edit learning in Record tab via custom event
+        window.dispatchEvent(
+          new CustomEvent("lumen-dictation-done", { detail: p.outcome })
+        );
       } else if (p.phase === "error") {
         setBusy(false);
         setError(p.message || "dictation error");
@@ -200,6 +238,13 @@ export default function App() {
               await refreshSessions();
               await refreshHealth();
             }}
+            onLearnCandidates={(sessionId, baseline, cands, before, after) => {
+              setSessionLearn({ sessionId, baseline, candidates: cands });
+              setLearnBefore(before);
+              setLearnAfter(after);
+              setCandidates(cands);
+              if (cands.length > 0) setTab("learn");
+            }}
           />
         )}
 
@@ -299,12 +344,23 @@ export default function App() {
             before={learnBefore}
             after={learnAfter}
             candidates={candidates}
+            sessionId={sessionLearn?.sessionId}
             busy={busy}
             onBefore={setLearnBefore}
             onAfter={setLearnAfter}
             onSuggest={() =>
-              run("suggest", async () => {
-                setCandidates(await api.suggestFromEdit(learnBefore, learnAfter));
+              run("process edit", async () => {
+                const res = await api.processEdit({
+                  beforeText: learnBefore,
+                  afterText: learnAfter,
+                  sessionId: sessionLearn?.sessionId,
+                  source: "manual",
+                  recordEvent: true,
+                });
+                setCandidates(res.candidates);
+                if (res.autoPromoted?.length) {
+                  await refreshDict();
+                }
               })
             }
             onConfirm={(c) =>
@@ -314,9 +370,21 @@ export default function App() {
                   term: c.term ?? undefined,
                   fromText: c.from_text ?? undefined,
                   toText: c.to_text ?? undefined,
+                  sessionId: sessionLearn?.sessionId,
                   beforeText: learnBefore,
                   afterText: learnAfter,
                 });
+                setCandidates((prev) =>
+                  prev.filter(
+                    (x) =>
+                      !(
+                        x.kind === c.kind &&
+                        x.term === c.term &&
+                        x.from_text === c.from_text &&
+                        x.to_text === c.to_text
+                      )
+                  )
+                );
                 await refreshDict();
                 await refreshHealth();
               })
@@ -342,11 +410,19 @@ function RecordPanel({
   onError,
   onBusy,
   onSaved,
+  onLearnCandidates,
 }: {
   busy: boolean;
   onError: (e: string | null) => void;
   onBusy: (b: boolean) => void;
   onSaved: () => Promise<void>;
+  onLearnCandidates: (
+    sessionId: string,
+    baseline: string,
+    candidates: LearnCandidate[],
+    before: string,
+    after: string
+  ) => void;
 }) {
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [device, setDevice] = useState<string>("");
@@ -356,6 +432,9 @@ function RecordPanel({
   const [text, setText] = useState("");
   const [asrText, setAsrText] = useState("");
   const [meta, setMeta] = useState<string>("");
+  const [baseline, setBaseline] = useState("");
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [liveCandidates, setLiveCandidates] = useState<LearnCandidate[]>([]);
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -383,6 +462,32 @@ function RecordPanel({
       await refreshStatus();
     })();
   }, [onError, refreshStatus]);
+
+  // Hotkey dictation done → fill result + baseline for learning
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const detail = (ev as CustomEvent).detail as {
+        text?: string;
+        asrText?: string;
+        correctedText?: string;
+        session?: SessionRecord;
+        asrEngine?: string;
+        correctorEngine?: string;
+      };
+      if (!detail) return;
+      const finalText = detail.text || detail.correctedText || "";
+      setText(finalText);
+      setAsrText(detail.asrText || "");
+      setBaseline(finalText);
+      setSessionId(detail.session?.id ?? null);
+      setLiveCandidates([]);
+      setMeta(
+        `hotkey · ASR ${detail.asrEngine || "?"} · ${detail.correctorEngine || ""}`
+      );
+    };
+    window.addEventListener("lumen-dictation-done", handler);
+    return () => window.removeEventListener("lumen-dictation-done", handler);
+  }, []);
 
   useEffect(() => {
     if (!recording) {
@@ -440,6 +545,9 @@ function RecordPanel({
       setRecording(false);
       setAsrText(out.asrText);
       setText(out.text);
+      setBaseline(out.text);
+      setSessionId(out.session?.id ?? null);
+      setLiveCandidates([]);
       const corr = out.modelApplied
         ? `corrector ${out.correctorEngine}`
         : `corrector fallback (${out.correctorEngine})`;
@@ -458,6 +566,28 @@ function RecordPanel({
       }
     } finally {
       onBusy(false);
+    }
+  }
+
+  async function onTextBlurLearn() {
+    if (!baseline || !text.trim() || text.trim() === baseline.trim()) {
+      setLiveCandidates([]);
+      return;
+    }
+    try {
+      const res = await api.processEdit({
+        beforeText: baseline,
+        afterText: text,
+        sessionId: sessionId ?? undefined,
+        source: "pre_insert_ui",
+        recordEvent: true,
+      });
+      setLiveCandidates(res.candidates);
+      if (res.candidates.length > 0 && sessionId) {
+        onLearnCandidates(sessionId, baseline, res.candidates, baseline, text);
+      }
+    } catch {
+      /* ignore soft learn failures */
     }
   }
 
@@ -625,8 +755,55 @@ function RecordPanel({
           rows={8}
           value={text}
           onChange={(e) => setText(e.target.value)}
+          onBlur={() => void onTextBlurLearn()}
           placeholder={recording ? "录音中…" : "转写文本将显示在这里"}
         />
+        {liveCandidates.length > 0 && (
+          <div className="field-block" style={{ marginTop: 10 }}>
+            <div className="field-label">检测到编辑 → 可学习</div>
+            <ul className="list">
+              {liveCandidates.map((c, i) => (
+                <li key={i} className="candidate">
+                  <div>
+                    <span className="chip">{c.kind}</span>{" "}
+                    {c.kind === "term"
+                      ? c.term
+                      : `${c.from_text ?? ""} → ${c.to_text ?? ""}`}
+                  </div>
+                  <button
+                    type="button"
+                    className="btn small"
+                    disabled={busy}
+                    onClick={() =>
+                      void (async () => {
+                        onBusy(true);
+                        try {
+                          await api.confirmLearn({
+                            kind: c.kind,
+                            term: c.term ?? undefined,
+                            fromText: c.from_text ?? undefined,
+                            toText: c.to_text ?? undefined,
+                            sessionId: sessionId ?? undefined,
+                            beforeText: baseline,
+                            afterText: text,
+                          });
+                          setLiveCandidates((prev) => prev.filter((_, j) => j !== i));
+                          await onSaved();
+                        } catch (e) {
+                          onError(String(e));
+                        } finally {
+                          onBusy(false);
+                        }
+                      })()
+                    }
+                  >
+                    加入词典
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <div className="actions">
           <button
             type="button"
@@ -644,9 +821,17 @@ function RecordPanel({
           >
             插入到当前应用
           </button>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={busy || !baseline || text.trim() === baseline.trim()}
+            onClick={() => void onTextBlurLearn()}
+          >
+            从编辑生成候选
+          </button>
         </div>
         <p className="muted-text" style={{ marginTop: 8, fontSize: "0.85rem" }}>
-          插入前请先点回目标 App 光标处。需要辅助功能权限；可在设置中开关「停止后自动插入」。
+          改字后失焦会分析词典候选。插入需要辅助功能；粘贴后系统可监听目标框再学习（设置中开关）。
         </p>
       </section>
     </>
@@ -684,6 +869,11 @@ function SettingsPanel({
   const [hotkeyEnabled, setHotkeyEnabled] = useState(true);
   const [hotkeyToggle, setHotkeyToggle] = useState("CommandOrControl+Shift+Space");
   const [showCapsule, setShowCapsule] = useState(true);
+  const [learning, setLearning] = useState<LearningConfig | null>(null);
+  const [autoPromote, setAutoPromote] = useState(false);
+  const [promoteN, setPromoteN] = useState(3);
+  const [postPaste, setPostPaste] = useState(true);
+  const [postPasteSecs, setPostPasteSecs] = useState(20);
 
   useEffect(() => {
     void (async () => {
@@ -705,6 +895,12 @@ function SettingsPanel({
         setHotkeyEnabled(hk.enabled);
         setHotkeyToggle(hk.toggle);
         setShowCapsule(hk.showCapsule);
+        const ln = await api.getLearningConfig();
+        setLearning(ln);
+        setAutoPromote(ln.autoPromote);
+        setPromoteN(ln.autoPromoteThreshold);
+        setPostPaste(ln.postPasteCapture);
+        setPostPasteSecs(ln.postPasteSeconds);
       } catch (e) {
         onError(String(e));
       }
@@ -780,6 +976,97 @@ function SettingsPanel({
 
   return (
     <>
+      <section className="card">
+        <h2>编辑学习</h2>
+        <p className="muted-text">
+          转写结果改字、或粘贴后在目标 App 再改，可生成词典候选。默认需手动确认。
+        </p>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={autoPromote}
+              disabled={busy}
+              onChange={(e) => setAutoPromote(e.target.checked)}
+            />{" "}
+            自动晋升（同一替换累计达到阈值）
+          </label>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            阈值 N
+          </label>
+          <input
+            className="input"
+            type="number"
+            min={2}
+            value={promoteN}
+            disabled={busy}
+            onChange={(e) => setPromoteN(Number(e.target.value) || 3)}
+          />
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={postPaste}
+              disabled={busy}
+              onChange={(e) => setPostPaste(e.target.checked)}
+            />{" "}
+            粘贴后监听目标输入框改动（需辅助功能）
+          </label>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            监听秒数
+          </label>
+          <input
+            className="input"
+            type="number"
+            min={5}
+            max={120}
+            value={postPasteSecs}
+            disabled={busy}
+            onChange={(e) => setPostPasteSecs(Number(e.target.value) || 20)}
+          />
+        </div>
+        {learning && (
+          <p className="muted-text" style={{ fontSize: "0.85rem" }}>
+            当前：autoPromote={String(learning.autoPromote)} N=
+            {learning.autoPromoteThreshold} postPaste=
+            {String(learning.postPasteCapture)}
+          </p>
+        )}
+        <div className="actions">
+          <button
+            type="button"
+            className="btn"
+            disabled={busy}
+            onClick={() =>
+              void (async () => {
+                onBusy(true);
+                try {
+                  const ln = await api.saveLearningConfig({
+                    autoPromote,
+                    autoPromoteThreshold: promoteN,
+                    postPasteCapture: postPaste,
+                    postPasteSeconds: postPasteSecs,
+                  });
+                  setLearning(ln);
+                  onSaved();
+                } catch (e) {
+                  onError(String(e));
+                } finally {
+                  onBusy(false);
+                }
+              })()
+            }
+          >
+            保存学习设置
+          </button>
+        </div>
+      </section>
+
       <section className="card">
         <h2>全局热键</h2>
         <p className="muted-text">
@@ -1155,7 +1442,7 @@ function Overview({
           <li className="done">M3 — Ollama 修正</li>
           <li className="done">M4 — paste-first 注入 + 权限</li>
           <li className="done">M5 — 热键 + 胶囊</li>
-          <li>M6 — 粘贴后编辑捕获</li>
+          <li className="done">M6 — 编辑学习 / 粘贴后捕获</li>
         </ol>
         <p className="muted-text">
           词典条目数：{dictCount} · 热键默认 ⌘⇧Space 切换录音
@@ -1435,6 +1722,7 @@ function LearnPanel({
   before,
   after,
   candidates,
+  sessionId,
   busy,
   onBefore,
   onAfter,
@@ -1444,6 +1732,7 @@ function LearnPanel({
   before: string;
   after: string;
   candidates: LearnCandidate[];
+  sessionId?: string;
   busy: boolean;
   onBefore: (v: string) => void;
   onAfter: (v: string) => void;
@@ -1454,7 +1743,13 @@ function LearnPanel({
     <section className="card">
       <h2>从编辑生成候选</h2>
       <p className="muted-text">
-        产品策略：只建议短词/短语；需你确认后才写入词典（默认不自动学）。
+        只建议短词/短语级改动；确认后写入词典。可开「自动晋升」：同一替换出现 N 次后自动入库。
+        {sessionId ? (
+          <>
+            {" "}
+            关联会话 <code>{sessionId.slice(0, 8)}…</code>
+          </>
+        ) : null}
       </p>
       <div className="learn-grid">
         <label>

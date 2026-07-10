@@ -1,6 +1,6 @@
 //! Dictionary entries and edit-learning candidates.
 //!
-//! Product policy (MVP):
+//! Product policy:
 //! - Always record edit events at the store layer.
 //! - Generate *candidates* here; promote only on user confirm (or optional N threshold).
 
@@ -61,8 +61,12 @@ pub struct LearnCandidate {
     pub reason: String,
 }
 
-/// Very small phrase-level heuristic: if texts differ and both are short, propose replacement.
-/// Longer diffs only propose if a single contiguous change region is found.
+/// Extract learnable dictionary candidates from a user edit.
+///
+/// Strategy:
+/// 1. Prefer common-prefix/suffix middle span when it yields a shorter pair (phrase edits)
+/// 2. Else short whole-string edits (≤32 chars each) → replacement (+ term if stable)
+/// 3. Never propose whole-paragraph rewrites
 pub fn candidates_from_edit(before: &str, after: &str) -> Vec<LearnCandidate> {
     let before = before.trim();
     let after = after.trim();
@@ -70,31 +74,131 @@ pub fn candidates_from_edit(before: &str, after: &str) -> Vec<LearnCandidate> {
         return vec![];
     }
 
-    // Identical except whole string swap under length cap → one replacement.
     const MAX_PAIR_CHARS: usize = 32;
-    if before.chars().count() <= MAX_PAIR_CHARS && after.chars().count() <= MAX_PAIR_CHARS {
-        // If `after` looks like a proper term (no spaces, short), also offer term.
-        let mut out = vec![LearnCandidate {
-            kind: DictEntryKind::Replacement,
-            term: None,
-            from_text: Some(before.to_string()),
-            to_text: Some(after.to_string()),
-            reason: "user edited short phrase".into(),
-        }];
-        if !after.contains(char::is_whitespace) && after.chars().count() <= 24 {
-            out.push(LearnCandidate {
-                kind: DictEntryKind::Term,
-                term: Some(after.to_string()),
-                from_text: None,
-                to_text: None,
-                reason: "edited result looks like a stable term".into(),
-            });
-        }
+    const MAX_MIDDLE_CHARS: usize = 24;
+
+    // Prefer affix middle even when both sides are short (e.g. Chinese phrases ≤32 chars).
+    if let Some(out) = middle_span_candidates(before, after, MAX_MIDDLE_CHARS) {
         return out;
     }
 
-    // Fallback: do not auto-propose huge rewrites (over-broad pairs are unsafe).
+    if before.chars().count() <= MAX_PAIR_CHARS && after.chars().count() <= MAX_PAIR_CHARS {
+        return short_pair_candidates(before, after);
+    }
+
     vec![]
+}
+
+/// Strip shared prefix/suffix; if the remaining middles are short and non-empty, propose them.
+/// Returns None when affix strip is unhelpful (no shared context, or middles too long).
+fn middle_span_candidates(
+    before: &str,
+    after: &str,
+    max_middle: usize,
+) -> Option<Vec<LearnCandidate>> {
+    let (pre_len, suf_len) = common_affix_lens(before, after);
+    // Need real shared context — pure whole-string swaps have pre=0,suf=0.
+    if pre_len == 0 && suf_len == 0 {
+        return None;
+    }
+
+    let b_chars: Vec<char> = before.chars().collect();
+    let a_chars: Vec<char> = after.chars().collect();
+    if pre_len + suf_len >= b_chars.len() || pre_len + suf_len >= a_chars.len() {
+        return None;
+    }
+
+    let from: String = b_chars[pre_len..b_chars.len() - suf_len].iter().collect();
+    let to: String = a_chars[pre_len..a_chars.len() - suf_len].iter().collect();
+    let from = from.trim();
+    let to = to.trim();
+    if from.is_empty() || to.is_empty() || from == to {
+        return None;
+    }
+    // Only prefer middle span when it is strictly shorter than the full strings
+    // (otherwise short_pair on the full text is equivalent / clearer).
+    let from_n = from.chars().count();
+    let to_n = to.chars().count();
+    if from_n >= b_chars.len() && to_n >= a_chars.len() {
+        return None;
+    }
+    if from_n > max_middle || to_n > max_middle {
+        return None;
+    }
+    // Avoid learning single punctuation-only swaps.
+    if from.chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+        && to.chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+    {
+        return None;
+    }
+
+    let mut out = vec![LearnCandidate {
+        kind: DictEntryKind::Replacement,
+        term: None,
+        from_text: Some(from.to_string()),
+        to_text: Some(to.to_string()),
+        reason: "changed span inside longer text".into(),
+    }];
+    if !to.contains(char::is_whitespace)
+        && to_n <= 24
+        && to.chars().any(|c| c.is_alphanumeric() || is_cjk(c))
+    {
+        out.push(LearnCandidate {
+            kind: DictEntryKind::Term,
+            term: Some(to.to_string()),
+            from_text: None,
+            to_text: None,
+            reason: "edited span looks like a stable term".into(),
+        });
+    }
+    Some(out)
+}
+
+fn short_pair_candidates(before: &str, after: &str) -> Vec<LearnCandidate> {
+    let mut out = vec![LearnCandidate {
+        kind: DictEntryKind::Replacement,
+        term: None,
+        from_text: Some(before.to_string()),
+        to_text: Some(after.to_string()),
+        reason: "user edited short phrase".into(),
+    }];
+    if !after.contains(char::is_whitespace)
+        && after.chars().count() <= 24
+        && after.chars().any(|c| c.is_alphanumeric() || is_cjk(c))
+    {
+        out.push(LearnCandidate {
+            kind: DictEntryKind::Term,
+            term: Some(after.to_string()),
+            from_text: None,
+            to_text: None,
+            reason: "edited result looks like a stable term".into(),
+        });
+    }
+    out
+}
+
+fn is_cjk(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c)
+        || ('\u{3400}'..='\u{4dbf}').contains(&c)
+        || ('\u{f900}'..='\u{faff}').contains(&c)
+}
+
+/// Character counts of shared prefix and suffix (non-overlapping).
+fn common_affix_lens(a: &str, b: &str) -> (usize, usize) {
+    let ac: Vec<char> = a.chars().collect();
+    let bc: Vec<char> = b.chars().collect();
+    let mut pre = 0usize;
+    while pre < ac.len() && pre < bc.len() && ac[pre] == bc[pre] {
+        pre += 1;
+    }
+    let mut suf = 0usize;
+    while suf < ac.len().saturating_sub(pre)
+        && suf < bc.len().saturating_sub(pre)
+        && ac[ac.len() - 1 - suf] == bc[bc.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+    (pre, suf)
 }
 
 /// Build prompt/hotword views from confirmed entries.
@@ -146,5 +250,16 @@ mod tests {
         let before = "a".repeat(80);
         let after = "b".repeat(80);
         assert!(candidates_from_edit(&before, &after).is_empty());
+    }
+
+    #[test]
+    fn middle_span_extracted() {
+        let c = candidates_from_edit("请用脱肯鉴权登录系统", "请用Token鉴权登录系统");
+        let rep = c
+            .iter()
+            .find(|x| x.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+        assert_eq!(rep.from_text.as_deref(), Some("脱肯"));
+        assert_eq!(rep.to_text.as_deref(), Some("Token"));
     }
 }

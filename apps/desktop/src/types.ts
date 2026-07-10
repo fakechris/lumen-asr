@@ -53,6 +53,22 @@ export type TranscribeOutcome = {
   numSamples: number;
   durationMs: number;
   session: SessionRecord;
+  watchPostPaste?: boolean;
+  postPasteSeconds?: number;
+};
+
+export type ProcessEditResult = {
+  editEventId?: string | null;
+  candidates: LearnCandidate[];
+  autoPromoted: DictionaryEntry[];
+  message: string;
+};
+
+export type LearningConfig = {
+  autoPromote: boolean;
+  autoPromoteThreshold: number;
+  postPasteCapture: boolean;
+  postPasteSeconds: number;
 };
 
 export type FocusInfo = {

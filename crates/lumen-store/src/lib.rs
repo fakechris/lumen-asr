@@ -221,6 +221,66 @@ impl Store {
             .optional()
             .map_err(Into::into)
     }
+
+    /// Find a replacement entry by exact from/to pair.
+    pub fn find_replacement(&self, from: &str, to: &str) -> Result<Option<DictionaryEntry>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT id, kind, term, from_text, to_text, source, hit_count, confirmed, updated_at
+                FROM dictionary_entries
+                WHERE kind='replacement' AND from_text=?1 AND to_text=?2
+                LIMIT 1
+                "#,
+                params![from, to],
+                map_dict,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn find_term(&self, term: &str) -> Result<Option<DictionaryEntry>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT id, kind, term, from_text, to_text, source, hit_count, confirmed, updated_at
+                FROM dictionary_entries
+                WHERE kind='term' AND term=?1
+                LIMIT 1
+                "#,
+                params![term],
+                map_dict,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Count edit_events whose before/after contain the same replacement middle
+    /// (exact match on before_text/after_text pair, or exact from→to as full strings).
+    pub fn count_identical_edits(&self, before: &str, after: &str) -> Result<u32> {
+        let n: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM edit_events
+            WHERE before_text=?1 AND after_text=?2
+            "#,
+            params![before, after],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
+    }
+
+    pub fn list_recent_edit_events(&self, limit: u32) -> Result<Vec<EditEventRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, session_id, source, before_text, after_text, created_at
+            FROM edit_events
+            ORDER BY created_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit], map_edit)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {

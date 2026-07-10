@@ -6,6 +6,7 @@ mod corrector_svc;
 mod dictation;
 mod hotkey;
 mod inject_cmd;
+mod learning;
 mod permissions_cmd;
 
 use config::AppConfig;
@@ -110,6 +111,9 @@ pub fn run() {
             inject_cmd::insert_text,
             hotkey::get_hotkey_config,
             hotkey::save_hotkey_config,
+            learning::get_learning_config,
+            learning::save_learning_config,
+            learning::process_edit,
         ])
         .setup(|app| {
             if let Err(e) = capsule::ensure_capsule(app.handle()) {
@@ -120,7 +124,7 @@ pub fn run() {
             }
             tracing::info!(
                 name = app.package_info().name,
-                "Lumen ASR desktop starting (M5)"
+                "Lumen ASR desktop starting (M6)"
             );
             Ok(())
         })

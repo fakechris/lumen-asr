@@ -2074,6 +2074,7 @@ dependencies = [
 name = "lumen-asr-desktop"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "lumen-asr",
  "lumen-core",
  "lumen-corrector",

@@ -111,6 +111,21 @@ toggle = "CommandOrControl+Shift+Space"
 show_capsule = true
 ```
 
+### Edit learning (M6)
+
+- Phrase-level diff: common prefix/suffix → short middle `from→to` candidates
+- **Pre-insert**: edit transcript in Record tab → blur / 「从编辑生成候选」→ confirm into dictionary
+- **Post-paste** (optional): after insert, poll focused field via Accessibility ~N seconds; emit `learn-suggestion`
+- **Auto-promote** (optional, default off): same replacement reaches threshold N → confirmed
+
+```toml
+[learning]
+auto_promote = false
+auto_promote_threshold = 3
+post_paste_capture = true
+post_paste_seconds = 20
+```
+
 Data directory (runtime):
 
 ```

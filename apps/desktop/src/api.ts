@@ -84,6 +84,22 @@ export const api = {
     showCapsule?: boolean;
   }) => invoke("save_hotkey_config", { input }),
 
+  getLearningConfig: () =>
+    invoke<import("./types").LearningConfig>("get_learning_config"),
+  saveLearningConfig: (input: {
+    autoPromote?: boolean;
+    autoPromoteThreshold?: number;
+    postPasteCapture?: boolean;
+    postPasteSeconds?: number;
+  }) => invoke<import("./types").LearningConfig>("save_learning_config", { input }),
+  processEdit: (input: {
+    beforeText: string;
+    afterText: string;
+    sessionId?: string;
+    source?: string;
+    recordEvent?: boolean;
+  }) => invoke<import("./types").ProcessEditResult>("process_edit", { input }),
+
   listSessions: (limit = 50) =>
     invoke<SessionRecord[]>("list_sessions", { limit }),
 
