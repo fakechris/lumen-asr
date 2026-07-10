@@ -28,11 +28,72 @@ function formatTime(iso: string): string {
   }
 }
 
+/** Pretty-print Tauri shortcut strings for the status bar. */
+function formatHotkeyLabel(raw: string): string {
+  return raw
+    .replace(/CommandOrControl/gi, "⌘")
+    .replace(/Command/gi, "⌘")
+    .replace(/Control/gi, "⌃")
+    .replace(/Ctrl/gi, "⌃")
+    .replace(/Option|Alt/gi, "⌥")
+    .replace(/Shift/gi, "⇧")
+    .replace(/Super|Meta/gi, "⌘")
+    .replace(/Space/gi, "Space")
+    .replace(/\+/g, "");
+}
+
+const NAV: { id: TabId; label: string; icon: string; title: string; blurb: string }[] = [
+  {
+    id: "record",
+    label: "录音",
+    icon: "🎙",
+    title: "录音",
+    blurb: "本地转写 · 热键或按钮开始",
+  },
+  {
+    id: "history",
+    label: "历史",
+    icon: "🕐",
+    title: "历史",
+    blurb: "会话记录与编辑事件",
+  },
+  {
+    id: "dictionary",
+    label: "词典",
+    icon: "📖",
+    title: "词典",
+    blurb: "术语与替换规则",
+  },
+  {
+    id: "learn",
+    label: "学习",
+    icon: "✨",
+    title: "编辑学习",
+    blurb: "从改写生成词典候选",
+  },
+  {
+    id: "settings",
+    label: "设置",
+    icon: "⚙",
+    title: "设置",
+    blurb: "权限 · 热键 · 插入 · 修正 · 学习",
+  },
+  {
+    id: "overview",
+    label: "概览",
+    icon: "⌂",
+    title: "概览",
+    blurb: "状态与快捷入口",
+  },
+];
+
 export default function App() {
   const [tab, setTab] = useState<TabId>("record");
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [hotkeyLabel, setHotkeyLabel] = useState("⌘⇧Space");
+  const [hotkeyEnabled, setHotkeyEnabledUi] = useState(true);
 
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -146,12 +207,32 @@ export default function App() {
 
   useEffect(() => {
     void refreshHealth();
+    void (async () => {
+      try {
+        const hk = await api.getHotkeyConfig();
+        setHotkeyEnabledUi(hk.enabled);
+        setHotkeyLabel(formatHotkeyLabel(hk.toggle));
+      } catch {
+        /* ignore */
+      }
+    })();
   }, [refreshHealth]);
 
   useEffect(() => {
     if (tab === "history" || tab === "overview") void refreshSessions();
     if (tab === "dictionary" || tab === "overview" || tab === "learn")
       void refreshDict();
+    if (tab === "settings") {
+      void (async () => {
+        try {
+          const hk = await api.getHotkeyConfig();
+          setHotkeyEnabledUi(hk.enabled);
+          setHotkeyLabel(formatHotkeyLabel(hk.toggle));
+        } catch {
+          /* ignore */
+        }
+      })();
+    }
   }, [tab, refreshSessions, refreshDict]);
 
   useEffect(() => {
@@ -179,228 +260,290 @@ export default function App() {
     }
   }
 
+  const nav = NAV.find((n) => n.id === tab) ?? NAV[0];
+
   return (
-    <div className="shell">
-      <header>
-        <div className="header-row">
-          <div>
-            <h1>Lumen ASR</h1>
-            <p className="tagline">Local-first voice dictation · macOS</p>
-          </div>
-          {health && (
-            <div className="badge-row">
-              <span className={`badge ${health.db_ok ? "ok" : "bad"}`}>
-                DB {health.db_ok ? "ok" : "down"}
-              </span>
-              <span className="badge">v{health.version}</span>
-            </div>
-          )}
-        </div>
-        <nav className="tabs">
-          {(
-            [
-              ["record", "录音"],
-              ["overview", "概览"],
-              ["history", "历史"],
-              ["dictionary", "词典"],
-              ["learn", "编辑学习"],
-              ["settings", "设置"],
-            ] as const
-          ).map(([id, label]) => (
+    <div className="app-frame">
+      <div className="titlebar">
+        Lumen ASR
+        <span className="titlebar-sub">Local-first dictation</span>
+      </div>
+
+      <div className="app-body">
+        <nav className="sidebar" aria-label="主导航">
+          {NAV.map((item) => (
             <button
-              key={id}
+              key={item.id}
               type="button"
-              className={`tab ${tab === id ? "active" : ""}`}
-              onClick={() => setTab(id)}
+              className={`nav-item ${tab === item.id ? "active" : ""}`}
+              onClick={() => setTab(item.id)}
             >
-              {label}
+              <span className="nav-icon" aria-hidden>
+                {item.icon}
+              </span>
+              <span>{item.label}</span>
             </button>
           ))}
+          <div className="sidebar-spacer" />
+          <div className="sidebar-meta">
+            {hotkeyEnabled ? (
+              <>
+                热键 <code>{hotkeyLabel}</code>
+                <br />
+                切换录音 / 停止
+              </>
+            ) : (
+              <>热键已关闭</>
+            )}
+          </div>
         </nav>
-      </header>
 
-      {error && (
-        <div className="banner error" role="alert">
-          {error}
-          <button type="button" className="linkish" onClick={() => setError(null)}>
-            关闭
-          </button>
-        </div>
-      )}
+        <div className="content">
+          {error && (
+            <div className="banner error" role="alert">
+              {error}
+              <button type="button" className="linkish" onClick={() => setError(null)}>
+                关闭
+              </button>
+            </div>
+          )}
 
-      <main>
-        {tab === "record" && (
-          <RecordPanel
-            busy={busy}
-            onError={setError}
-            onBusy={setBusy}
-            onSaved={async () => {
-              await refreshSessions();
-              await refreshHealth();
-            }}
-            onLearnCandidates={(sessionId, baseline, cands, before, after) => {
-              setSessionLearn({ sessionId, baseline, candidates: cands });
-              setLearnBefore(before);
-              setLearnAfter(after);
-              setCandidates(cands);
-              if (cands.length > 0) setTab("learn");
-            }}
-          />
-        )}
+          <div className="content-scroll">
+            <div className="content-header">
+              <div>
+                <h1>{nav.title}</h1>
+                <p>{nav.blurb}</p>
+              </div>
+              {health && (
+                <div className="actions" style={{ marginTop: 0 }}>
+                  <span className="chip">v{health.version}</span>
+                </div>
+              )}
+            </div>
 
-        {tab === "overview" && (
-          <Overview
-            health={health}
-            sessions={sessions}
-            dictCount={dict.length}
-            busy={busy}
-            onSeed={() =>
-              run("seed", async () => {
-                await api.seedDemoSession();
-                await refreshSessions();
-                await refreshHealth();
-              })
-            }
-            onGoto={(t) => setTab(t)}
-          />
-        )}
+            {tab === "record" && (
+              <RecordPanel
+                busy={busy}
+                onError={setError}
+                onBusy={setBusy}
+                hotkeyLabel={hotkeyLabel}
+                onSaved={async () => {
+                  await refreshSessions();
+                  await refreshHealth();
+                }}
+                onLearnCandidates={(sessionId, baseline, cands, before, after) => {
+                  setSessionLearn({ sessionId, baseline, candidates: cands });
+                  setLearnBefore(before);
+                  setLearnAfter(after);
+                  setCandidates(cands);
+                  if (cands.length > 0) setTab("learn");
+                }}
+              />
+            )}
 
-        {tab === "history" && (
-          <HistoryPanel
-            sessions={sessions}
-            selected={selected}
-            edits={edits}
-            busy={busy}
-            onSelect={setSelectedId}
-            onSeed={() =>
-              run("seed", async () => {
-                const s = await api.seedDemoSession();
-                await refreshSessions();
-                setSelectedId(s.id);
-                await refreshHealth();
-              })
-            }
-            onDelete={(id) =>
-              run("delete session", async () => {
-                await api.deleteSession(id);
-                if (selectedId === id) setSelectedId(null);
-                await refreshSessions();
-                await refreshHealth();
-              })
-            }
-            onRecordEdit={(sessionId, before, after) =>
-              run("record edit", async () => {
-                await api.recordEditEvent({
-                  sessionId,
-                  beforeText: before,
-                  afterText: after,
-                  source: "pre_insert_ui",
-                });
-                setEdits(await api.listEditEvents(sessionId));
-              })
-            }
-          />
-        )}
-
-        {tab === "dictionary" && (
-          <DictionaryPanel
-            entries={dict}
-            termInput={termInput}
-            fromInput={fromInput}
-            toInput={toInput}
-            busy={busy}
-            onTermInput={setTermInput}
-            onFromInput={setFromInput}
-            onToInput={setToInput}
-            onAddTerm={() =>
-              run("add term", async () => {
-                await api.addTerm(termInput);
-                setTermInput("");
-                await refreshDict();
-                await refreshHealth();
-              })
-            }
-            onAddReplacement={() =>
-              run("add replacement", async () => {
-                await api.addReplacement(fromInput, toInput);
-                setFromInput("");
-                setToInput("");
-                await refreshDict();
-                await refreshHealth();
-              })
-            }
-            onDelete={(id) =>
-              run("delete entry", async () => {
-                await api.deleteDictionaryEntry(id);
-                await refreshDict();
-                await refreshHealth();
-              })
-            }
-          />
-        )}
-
-        {tab === "learn" && (
-          <LearnPanel
-            before={learnBefore}
-            after={learnAfter}
-            candidates={candidates}
-            sessionId={sessionLearn?.sessionId}
-            busy={busy}
-            onBefore={setLearnBefore}
-            onAfter={setLearnAfter}
-            onSuggest={() =>
-              run("process edit", async () => {
-                const res = await api.processEdit({
-                  beforeText: learnBefore,
-                  afterText: learnAfter,
-                  sessionId: sessionLearn?.sessionId,
-                  source: "manual",
-                  recordEvent: true,
-                });
-                setCandidates(res.candidates);
-                if (res.autoPromoted?.length) {
-                  await refreshDict();
+            {tab === "overview" && (
+              <Overview
+                health={health}
+                sessions={sessions}
+                dictCount={dict.length}
+                busy={busy}
+                onSeed={() =>
+                  run("seed", async () => {
+                    await api.seedDemoSession();
+                    await refreshSessions();
+                    await refreshHealth();
+                  })
                 }
-              })
-            }
-            onConfirm={(c) =>
-              run("confirm learn", async () => {
-                await api.confirmLearn({
-                  kind: c.kind,
-                  term: c.term ?? undefined,
-                  fromText: c.from_text ?? undefined,
-                  toText: c.to_text ?? undefined,
-                  sessionId: sessionLearn?.sessionId,
-                  beforeText: learnBefore,
-                  afterText: learnAfter,
-                });
-                setCandidates((prev) =>
-                  prev.filter(
-                    (x) =>
-                      !(
-                        x.kind === c.kind &&
-                        x.term === c.term &&
-                        x.from_text === c.from_text &&
-                        x.to_text === c.to_text
-                      )
-                  )
-                );
-                await refreshDict();
-                await refreshHealth();
-              })
-            }
-          />
-        )}
+                onGoto={(t) => setTab(t)}
+              />
+            )}
 
-        {tab === "settings" && (
-          <SettingsPanel
-            busy={busy}
-            onBusy={setBusy}
-            onError={setError}
-            onSaved={() => void refreshHealth()}
-          />
+            {tab === "history" && (
+              <HistoryPanel
+                sessions={sessions}
+                selected={selected}
+                edits={edits}
+                busy={busy}
+                onSelect={setSelectedId}
+                onSeed={() =>
+                  run("seed", async () => {
+                    const s = await api.seedDemoSession();
+                    await refreshSessions();
+                    setSelectedId(s.id);
+                    await refreshHealth();
+                  })
+                }
+                onDelete={(id) =>
+                  run("delete session", async () => {
+                    await api.deleteSession(id);
+                    if (selectedId === id) setSelectedId(null);
+                    await refreshSessions();
+                    await refreshHealth();
+                  })
+                }
+                onRecordEdit={(sessionId, before, after) =>
+                  run("record edit", async () => {
+                    await api.recordEditEvent({
+                      sessionId,
+                      beforeText: before,
+                      afterText: after,
+                      source: "pre_insert_ui",
+                    });
+                    setEdits(await api.listEditEvents(sessionId));
+                  })
+                }
+              />
+            )}
+
+            {tab === "dictionary" && (
+              <DictionaryPanel
+                entries={dict}
+                termInput={termInput}
+                fromInput={fromInput}
+                toInput={toInput}
+                busy={busy}
+                onTermInput={setTermInput}
+                onFromInput={setFromInput}
+                onToInput={setToInput}
+                onAddTerm={() =>
+                  run("add term", async () => {
+                    await api.addTerm(termInput);
+                    setTermInput("");
+                    await refreshDict();
+                    await refreshHealth();
+                  })
+                }
+                onAddReplacement={() =>
+                  run("add replacement", async () => {
+                    await api.addReplacement(fromInput, toInput);
+                    setFromInput("");
+                    setToInput("");
+                    await refreshDict();
+                    await refreshHealth();
+                  })
+                }
+                onDelete={(id) =>
+                  run("delete entry", async () => {
+                    await api.deleteDictionaryEntry(id);
+                    await refreshDict();
+                    await refreshHealth();
+                  })
+                }
+              />
+            )}
+
+            {tab === "learn" && (
+              <LearnPanel
+                before={learnBefore}
+                after={learnAfter}
+                candidates={candidates}
+                sessionId={sessionLearn?.sessionId}
+                busy={busy}
+                onBefore={setLearnBefore}
+                onAfter={setLearnAfter}
+                onSuggest={() =>
+                  run("process edit", async () => {
+                    const res = await api.processEdit({
+                      beforeText: learnBefore,
+                      afterText: learnAfter,
+                      sessionId: sessionLearn?.sessionId,
+                      source: "manual",
+                      recordEvent: true,
+                    });
+                    setCandidates(res.candidates);
+                    if (res.autoPromoted?.length) {
+                      await refreshDict();
+                    }
+                  })
+                }
+                onConfirm={(c) =>
+                  run("confirm learn", async () => {
+                    await api.confirmLearn({
+                      kind: c.kind,
+                      term: c.term ?? undefined,
+                      fromText: c.from_text ?? undefined,
+                      toText: c.to_text ?? undefined,
+                      sessionId: sessionLearn?.sessionId,
+                      beforeText: learnBefore,
+                      afterText: learnAfter,
+                    });
+                    setCandidates((prev) =>
+                      prev.filter(
+                        (x) =>
+                          !(
+                            x.kind === c.kind &&
+                            x.term === c.term &&
+                            x.from_text === c.from_text &&
+                            x.to_text === c.to_text
+                          )
+                      )
+                    );
+                    await refreshDict();
+                    await refreshHealth();
+                  })
+                }
+              />
+            )}
+
+            {tab === "settings" && (
+              <SettingsPanel
+                busy={busy}
+                onBusy={setBusy}
+                onError={setError}
+                onSaved={() => {
+                  void refreshHealth();
+                  void (async () => {
+                    try {
+                      const hk = await api.getHotkeyConfig();
+                      setHotkeyEnabledUi(hk.enabled);
+                      setHotkeyLabel(formatHotkeyLabel(hk.toggle));
+                    } catch {
+                      /* ignore */
+                    }
+                  })();
+                }}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+
+      <footer className="statusbar">
+        <span
+          className={`dot ${busy ? "busy" : health?.db_ok ? "ok" : "bad"}`}
+          title={busy ? "busy" : health?.db_ok ? "db ok" : "db down"}
+        />
+        <span>
+          {busy ? "处理中" : health?.db_ok ? "就绪" : "数据库不可用"}
+        </span>
+        <span className="sep">·</span>
+        <span>
+          ASR{" "}
+          <strong>
+            {health?.sensevoice_ready
+              ? "SenseVoice"
+              : health?.whisper_ready
+                ? "Whisper?"
+                : "模型未就绪"}
+          </strong>
+        </span>
+        <span className="sep">·</span>
+        <span>
+          修正 <strong>{health?.corrector_label || "—"}</strong>
+        </span>
+        <span className="sep">·</span>
+        {hotkeyEnabled ? (
+          <span>
+            热键 <span className="kbd">{hotkeyLabel}</span>
+          </span>
+        ) : (
+          <span>热键关</span>
         )}
-      </main>
+        <span style={{ flex: 1 }} />
+        <span>
+          {health ? `${health.session_count} 会话 · ${health.dictionary_count} 词条` : ""}
+        </span>
+      </footer>
     </div>
   );
 }
@@ -411,11 +554,13 @@ function RecordPanel({
   onBusy,
   onSaved,
   onLearnCandidates,
+  hotkeyLabel,
 }: {
   busy: boolean;
   onError: (e: string | null) => void;
   onBusy: (b: boolean) => void;
   onSaved: () => Promise<void>;
+  hotkeyLabel: string;
   onLearnCandidates: (
     sessionId: string,
     baseline: string,
@@ -650,7 +795,9 @@ function RecordPanel({
       <section className="card">
         <h2>本地转写</h2>
         <p className="muted-text">
-          默认 SenseVoice。也可用全局热键（默认 ⌘⇧Space）切换录音/停止。模型就绪后即可用。
+          默认 SenseVoice。全局热键{" "}
+          <span className="kbd">{hotkeyLabel}</span> 可在任意 App
+          切换录音/停止。模型就绪后即可用。
         </p>
         <div className="form-row" style={{ marginBottom: 12 }}>
           <label className="muted-text" style={{ minWidth: 64 }}>
@@ -976,7 +1123,7 @@ function SettingsPanel({
 
   return (
     <>
-      <section className="card">
+      <section className="card settings-section">
         <h2>编辑学习</h2>
         <p className="muted-text">
           转写结果改字、或粘贴后在目标 App 再改，可生成词典候选。默认需手动确认。
@@ -1067,10 +1214,10 @@ function SettingsPanel({
         </div>
       </section>
 
-      <section className="card">
+      <section className="card settings-section">
         <h2>全局热键</h2>
         <p className="muted-text">
-          默认 <code>⌘⇧Space</code> 切换录音/停止转写。需在系统设置中允许本应用接收全局快捷键（如有拦截软件请放行）。
+          默认 <span className="kbd">⌘⇧Space</span> 切换录音/停止转写。保存后立即重新注册。若被其他软件占用请改 chord 或放行。
         </p>
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text">
@@ -1135,10 +1282,10 @@ function SettingsPanel({
         </div>
       </section>
 
-      <section className="card">
+      <section className="card settings-section">
         <h2>权限</h2>
         <p className="muted-text">
-          麦克风用于录音；辅助功能用于把文字粘贴进其他 App（⌘V 模拟）。
+          麦克风用于录音；辅助功能用于把文字粘贴进其他 App（⌘V 模拟）。建议先完成这两项再测热键。
         </p>
         {perm && (
           <dl className="meta">
@@ -1190,7 +1337,7 @@ function SettingsPanel({
         </div>
       </section>
 
-      <section className="card">
+      <section className="card settings-section">
         <h2>插入策略</h2>
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text">
@@ -1237,7 +1384,7 @@ function SettingsPanel({
         </div>
       </section>
 
-      <section className="card">
+      <section className="card settings-section">
         <h2>AI 修正（Corrector）</h2>
         <p className="muted-text">
           默认 Ollama OpenAI-compatible 接口。失败时自动回退到规则预处理 + 词典替换，不中断会话。
