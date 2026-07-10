@@ -1,9 +1,14 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import {
-  eventToShortcut,
+  absorbKeyDown,
+  chordToShortcut,
+  emptyChord,
+  formatChordLive,
   formatHotkeyLabel,
   HOTKEY_PRESETS,
+  isValidChord,
+  type ChordState,
 } from "./hotkeyFormat";
 
 type Props = {
@@ -22,8 +27,8 @@ type Props = {
 };
 
 /**
- * Competitor-style hotkey setup: click → press keys → save.
- * Never asks the user to type "CommandOrControl+…".
+ * Click → press the whole combination naturally → release to confirm.
+ * Supports modifier+key (⌥Space) and modifier-only (⌥⇧).
  */
 export function HotkeyRecorder({
   enabled,
@@ -37,24 +42,31 @@ export function HotkeyRecorder({
 }: Props) {
   const [recording, setRecording] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
+  const [live, setLive] = useState<ChordState>(emptyChord());
+  const chordRef = useRef<ChordState>(emptyChord());
+  const downCodesRef = useRef<Set<string>>(new Set());
+  const committedRef = useRef(false);
 
-  const stopRecording = useCallback(
-    async (resume: boolean) => {
-      setRecording(false);
-      setHint(null);
-      if (resume) {
-        try {
-          await api.resumeHotkeys();
-        } catch {
-          /* ignore */
-        }
+  const stopRecording = useCallback(async (resume: boolean) => {
+    setRecording(false);
+    setLive(emptyChord());
+    chordRef.current = emptyChord();
+    downCodesRef.current.clear();
+    committedRef.current = false;
+    if (resume) {
+      try {
+        await api.resumeHotkeys();
+      } catch {
+        /* ignore */
       }
-    },
-    []
-  );
+    }
+  }, []);
 
   const applyShortcut = useCallback(
     async (shortcut: string) => {
+      // During an active capture gesture, ignore double-commit from keydown+keyup.
+      if (committedRef.current) return;
+      committedRef.current = true;
       onBusy(true);
       onError(null);
       try {
@@ -65,17 +77,22 @@ export function HotkeyRecorder({
         });
         onChange({ enabled, toggle: shortcut, showCapsule });
         setRecording(false);
+        setLive(emptyChord());
+        chordRef.current = emptyChord();
+        downCodesRef.current.clear();
         setHint(`已设置为 ${formatHotkeyLabel(shortcut)}`);
         onSaved();
+        // Keep committed=true until next startRecording so residual keyup is ignored.
       } catch (e) {
         onError(String(e));
-        // Re-bind previous on failure
+        committedRef.current = false;
         try {
           await api.resumeHotkeys();
         } catch {
           /* ignore */
         }
         setRecording(false);
+        setLive(emptyChord());
       } finally {
         onBusy(false);
       }
@@ -85,7 +102,11 @@ export function HotkeyRecorder({
 
   const startRecording = useCallback(async () => {
     onError(null);
-    setHint("请按下新的组合键… Esc 取消");
+    committedRef.current = false;
+    chordRef.current = emptyChord();
+    downCodesRef.current.clear();
+    setLive(emptyChord());
+    setHint("按下你要用的快捷键，松开后生效 · Esc 取消");
     setRecording(true);
     try {
       await api.pauseHotkeys();
@@ -102,6 +123,7 @@ export function HotkeyRecorder({
     const onKeyDown = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
+      if (e.repeat) return;
 
       if (e.key === "Escape") {
         void stopRecording(true);
@@ -109,19 +131,52 @@ export function HotkeyRecorder({
         return;
       }
 
-      const sc = eventToShortcut(e);
-      if (!sc) {
-        setHint("请按住修饰键（⌥ ⌃ ⌘ ⇧）再按主键，或按 F 键");
-        return;
+      downCodesRef.current.add(e.code);
+      const next = absorbKeyDown(chordRef.current, e);
+      chordRef.current = next;
+      setLive(next);
+      setHint(`按住中：${formatChordLive(next)}  · 松开确认`);
+
+      // With a main key (e.g. Space), commit as soon as the full combo is down —
+      // same moment the user "presses the shortcut".
+      if (next.key && isValidChord(next)) {
+        const sc = chordToShortcut(next);
+        if (sc) void applyShortcut(sc);
       }
-      void applyShortcut(sc);
+    };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      downCodesRef.current.delete(e.code);
+
+      // When all keys released: if we only had modifiers (⌥⇧), commit now.
+      if (downCodesRef.current.size === 0) {
+        const chord = chordRef.current;
+        if (!chord.key && isValidChord(chord)) {
+          const sc = chordToShortcut(chord);
+          if (sc) {
+            void applyShortcut(sc);
+            return;
+          }
+        }
+        // Incomplete gesture (e.g. only Alt) — reset and keep listening.
+        if (!committedRef.current) {
+          chordRef.current = emptyChord();
+          setLive(emptyChord());
+          setHint("按下你要用的快捷键，松开后生效 · Esc 取消");
+        }
+      }
     };
 
     window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+    };
   }, [recording, applyShortcut, stopRecording]);
 
-  // If user navigates away mid-record, resume hotkeys
   useEffect(() => {
     return () => {
       if (recording) {
@@ -131,13 +186,21 @@ export function HotkeyRecorder({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recording]);
 
+  const chipLabel = recording
+    ? live.alt || live.shift || live.control || live.command || live.key
+      ? formatChordLive(live)
+      : "按下快捷键…"
+    : formatHotkeyLabel(toggle);
+
   return (
     <section className="card settings-section">
       <h2>全局热键</h2>
       <p className="muted-text">
-        在任意 App 中切换录音/停止。与竞品一致：点击后直接按下组合键，无需手输字符串。
-        默认 <span className="kbd">⌥Space</span>（避开 Spotlight 的{" "}
-        <span className="kbd">⌘Space</span>）。
+        在任意 App 中切换录音/停止。点「录制」后，
+        <strong>像平时使用一样一次按好组合键</strong>
+        （支持 ⌥Space，也支持仅修饰键如 ⌥⇧）。
+        默认 <span className="kbd">⌥Space</span>，避开 Spotlight 的{" "}
+        <span className="kbd">⌘Space</span>。
       </p>
 
       <div className="form-row" style={{ marginBottom: 12 }}>
@@ -208,12 +271,13 @@ export function HotkeyRecorder({
           onClick={() => {
             if (recording) {
               void stopRecording(true);
+              setHint("已取消");
             } else {
               void startRecording();
             }
           }}
         >
-          {recording ? "按下组合键…" : formatHotkeyLabel(toggle)}
+          {chipLabel}
         </button>
         <button
           type="button"
@@ -251,7 +315,10 @@ export function HotkeyRecorder({
             type="button"
             className={`preset-chip ${toggle === p.value ? "active" : ""}`}
             disabled={busy || recording}
-            onClick={() => void applyShortcut(p.value)}
+            onClick={() => {
+              committedRef.current = false;
+              void applyShortcut(p.value);
+            }}
           >
             {p.label}
           </button>
@@ -259,8 +326,8 @@ export function HotkeyRecorder({
       </div>
 
       <p className="muted-text" style={{ marginTop: 12, fontSize: "0.85rem" }}>
-        若录制失败：组合键可能被系统或其他软件占用。裸 <code>Fn</code>{" "}
-        / 右 ⌘ 按住说话需更底层钩子，后续版本支持。
+        仅修饰键（如 ⌥⇧）在 macOS 上通过系统修饰键状态监听，无需再按字母键。
+        裸 <code>Fn</code> / 右 ⌘ 按住说话仍需后续底层钩子。
       </p>
     </section>
   );

@@ -7,6 +7,7 @@ mod dictation;
 mod hotkey;
 mod inject_cmd;
 mod learning;
+mod mod_chord;
 mod permissions_cmd;
 
 use config::AppConfig;

@@ -1,7 +1,11 @@
 //! Global toggle hotkey registration (M5).
+//!
+//! - Normal chords (modifier + key) → `tauri-plugin-global-shortcut`
+//! - Modifier-only (e.g. Alt+Shift) → macOS HID flag watcher (`mod_chord`)
 
 use crate::config::HotkeyConfig;
 use crate::dictation;
+use crate::mod_chord::{self, ModChord};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
@@ -76,18 +80,39 @@ pub fn reregister(app: &AppHandle) -> Result<(), String> {
 }
 
 pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String> {
-    // Unregister all shortcuts managed by the plugin for a clean slate.
+    // Clear plugin shortcuts + any modifier-only watcher.
     let _ = app.global_shortcut().unregister_all();
+    mod_chord::stop_watcher();
 
     if !cfg.enabled || cfg.toggle.trim().is_empty() {
         tracing::info!("global hotkey disabled");
         return Ok(());
     }
 
-    let shortcut: Shortcut = cfg
-        .toggle
+    let toggle = cfg.toggle.trim();
+
+    // Pure modifier chords (⌥⇧, ⌃⇧, …) — global-hotkey cannot parse these.
+    if let Some(chord) = ModChord::parse_modifier_only(toggle) {
+        let handle = app.clone();
+        mod_chord::start_watcher(chord, move || {
+            let handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = dictation::toggle_dictation(handle.clone()).await {
+                    tracing::warn!(error = %e, "mod-chord toggle failed");
+                    dictation::emit_dictation(
+                        &handle,
+                        dictation::DictationUiEvent::Error { message: e },
+                    );
+                }
+            });
+        });
+        tracing::info!(hotkey = %toggle, "modifier-only hotkey watcher registered");
+        return Ok(());
+    }
+
+    let shortcut: Shortcut = toggle
         .parse()
-        .map_err(|e| format!("invalid hotkey '{}': {e}", cfg.toggle))?;
+        .map_err(|e| format!("invalid hotkey '{toggle}': {e}"))?;
 
     let handle = app.clone();
     app.global_shortcut()
@@ -108,7 +133,7 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
         })
         .map_err(|e| format!("register hotkey failed: {e}"))?;
 
-    tracing::info!(hotkey = %cfg.toggle, "global hotkey registered");
+    tracing::info!(hotkey = %toggle, "global hotkey registered");
     Ok(())
 }
 
@@ -117,6 +142,7 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
 #[tauri::command]
 pub fn pause_hotkeys(app: AppHandle) -> Result<(), String> {
     let _ = app.global_shortcut().unregister_all();
+    mod_chord::stop_watcher();
     tracing::info!("global hotkeys paused for capture");
     Ok(())
 }
