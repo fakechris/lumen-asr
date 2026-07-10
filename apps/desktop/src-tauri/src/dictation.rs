@@ -28,8 +28,8 @@ const PHASE_PROCESSING: u8 = 2;
 static PHASE: AtomicU8 = AtomicU8::new(PHASE_IDLE);
 static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Ignore stop if held shorter than this (bounce / accidental tap).
-const MIN_HOLD_MS: u128 = 350;
+/// Only discard as bounce if shorter than this *and* almost no audio.
+const BOUNCE_MS: u128 = 80;
 
 fn remember_target_app() {
     let t = frontmost_target();
@@ -453,21 +453,23 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
         )
         .is_err()
     {
-        tracing::debug!(
+        tracing::info!(
             phase = PHASE.load(Ordering::SeqCst),
             "dictation_start ignored (not idle)"
         );
         return Ok(());
     }
 
-    let state = app.state::<AppState>();
-    if state.audio.is_recording() {
-        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
-        return Ok(());
+    // Stamp immediately so a racing stop does not see held_ms=0.
+    if let Ok(mut g) = RECORD_STARTED.lock() {
+        *g = Some(Instant::now());
     }
 
-    // Capture typing target *before* any of our windows show / activate.
-    remember_target_app();
+    let state = app.state::<AppState>();
+    if state.audio.is_recording() {
+        // Already capturing — stay in RECORDING.
+        return Ok(());
+    }
 
     let show_capsule = state
         .config
@@ -475,12 +477,16 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
         .map(|c| c.hotkey.show_capsule)
         .unwrap_or(false);
 
+    // Start mic FIRST (never block on osascript before audio is live).
     match start_recording_inner(&state) {
         Ok(()) => {
-            if let Ok(mut g) = RECORD_STARTED.lock() {
-                *g = Some(Instant::now());
-            }
-            // Capsule optional; default off to avoid focus fights.
+            tracing::info!("dictation recording live");
+            // Capture target without blocking the hotkey path.
+            let _ = std::thread::Builder::new()
+                .name("lumen-focus".into())
+                .spawn(|| {
+                    remember_target_app();
+                });
             crate::capsule::set_capsule_visible(&app, show_capsule, "listening");
             emit_dictation(
                 &app,
@@ -491,6 +497,10 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
             Ok(())
         }
         Err(e) => {
+            tracing::warn!(error = %e, "start_recording failed");
+            if let Ok(mut g) = RECORD_STARTED.lock() {
+                *g = None;
+            }
             PHASE.store(PHASE_IDLE, Ordering::SeqCst);
             Err(e)
         }
@@ -509,7 +519,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
         )
         .is_err()
     {
-        tracing::debug!(
+        tracing::info!(
             phase = PHASE.load(Ordering::SeqCst),
             "dictation_stop ignored (not recording)"
         );
@@ -524,11 +534,9 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
 
     let state = app.state::<AppState>();
 
-    // Bounce: discard short holds without ASR / paste.
-    if held_ms < MIN_HOLD_MS {
-        tracing::info!(held_ms, "short hold — cancel without ASR");
-        let _ = cancel_recording_inner(&state);
-        crate::capsule::set_capsule_visible(&app, false, "idle");
+    // True bounce only: very short + nothing useful yet.
+    if held_ms < BOUNCE_MS && !state.audio.is_recording() {
+        tracing::info!(held_ms, "bounce stop — nothing to process");
         if let Ok(mut g) = RECORD_STARTED.lock() {
             *g = None;
         }
@@ -538,10 +546,15 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
     }
 
     if !state.audio.is_recording() {
+        tracing::warn!(held_ms, "stop but audio not recording — reset idle");
+        if let Ok(mut g) = RECORD_STARTED.lock() {
+            *g = None;
+        }
         PHASE.store(PHASE_IDLE, Ordering::SeqCst);
         return Ok(());
     }
 
+    tracing::info!(held_ms, "dictation stop → ASR");
     emit_dictation(
         &app,
         DictationUiEvent::Processing {
