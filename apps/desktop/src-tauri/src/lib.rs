@@ -1,10 +1,13 @@
+mod asr_models;
 mod capsule;
 mod commands;
 mod config;
 mod corrector_cmd;
+mod corrector_probe;
 mod corrector_svc;
 mod dictation;
 mod hotkey;
+mod hotkey_validate;
 mod inject_cmd;
 mod learning;
 mod mod_chord;
@@ -158,6 +161,17 @@ pub fn run() {
             onboard::reopen_onboarding,
             volume_mon::start_volume_monitoring_cmd,
             volume_mon::stop_volume_monitoring_cmd,
+            asr_models::check_asr_model_status,
+            asr_models::list_local_asr_models,
+            asr_models::use_existing_asr_model,
+            asr_models::start_asr_model_download,
+            asr_models::cancel_asr_model_download,
+            corrector_probe::probe_corrector,
+            corrector_probe::ollama_list_models,
+            corrector_probe::ollama_pull_model,
+            corrector_probe::cancel_ollama_pull,
+            corrector_probe::apply_corrector_suggestion,
+            hotkey_validate::validate_hotkey,
         ])
         .setup(|app| {
             // Keep Regular activation policy. Focus preservation: non-focusable

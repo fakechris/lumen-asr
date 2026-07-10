@@ -317,47 +317,42 @@ app setup
 
 ## 5. Lumen implementation plan (staged)
 
-### Stage A — Permission UX fix (unblock insert)
+### Stage A — Permission UX fix (unblock insert) ✅
 
-**Goal:** one running identity, clear Settings path, poll until trusted.
+- [x] `PermissionDto` path + trusted  
+- [x] No cold-start Settings open  
+- [x] Settings + wizard poll  
+- [x] Process path copy  
 
-- [ ] `PermissionDto` includes `process_path`, `process_hint`, `accessibility_trusted: bool`  
-- [ ] Remove cold-start silent AX prompt; only wizard/settings button opens Settings  
-- [ ] Settings + wizard poll 1s while step active  
-- [ ] README / Settings copy: enable **the binary you launched**  
-- [ ] Prefer launching **one** form during dev: document “use release .app for AX testing” OR always enable both  
+### Stage B — Wizard shell + steps 0–2 ✅
 
-**Success:** user enables correct row → UI shows 已开启 within 2s without restart (EventTap re-init may need restart — offer **重新注册热键** button).
+- [x] `OnboardingWizard.tsx` overlay  
+- [x] config `onboarding`  
+- [x] Welcome + permissions + volume monitoring  
 
-### Stage B — Wizard shell + steps 0–2
+### Stage C — ASR model step ✅
 
-- [ ] `OnboardingWizard.tsx` overlay  
-- [ ] config `onboarding` section  
-- [ ] Welcome + permissions + volume monitoring  
+- [x] `check_asr_model_status` / `list_local_asr_models` / `use_existing_asr_model`  
+- [x] SenseVoice download (curl + tar extract, sherpa int8 package)  
+- [x] path paste + validate  
 
-### Stage C — ASR model step
+### Stage D — Corrector step ✅
 
-- [ ] `check_asr_model_status` / `list_local_asr_models`  
-- [ ] download manager for SenseVoice (URL configurable; progress events)  
-- [ ] folder picker + validate layout  
+- [x] Ollama probe + list + pull  
+- [x] env OpenAI-compat detection  
+- [x] skip path  
 
-### Stage D — Corrector step
+### Stage E — Hotkey + E2E ✅
 
-- [ ] Ollama probe + list + pull  
-- [ ] env OpenAI-compat detection  
-- [ ] skip path  
-
-### Stage E — Hotkey + E2E
-
-- [ ] conflict hints  
-- [ ] practice textarea pipeline  
-- [ ] complete flag + badge if incomplete  
+- [x] `validate_hotkey` soft conflicts  
+- [x] HotkeyRecorder in wizard  
+- [x] practice + start/stop + hotkey dictation  
 
 ### Stage F — Polish
 
-- [ ] `backend-ready`  
-- [ ] status bar incomplete badge  
-- [ ] re-run wizard from Settings  
+- [x] re-run wizard from Settings / sidebar badge  
+- [ ] `backend-ready` event  
+- [ ] folder picker dialog (currently path paste)
 
 ---
 

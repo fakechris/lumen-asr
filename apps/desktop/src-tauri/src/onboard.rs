@@ -31,7 +31,7 @@ fn dto_from(cfg: &OnboardingConfig) -> OnboardingStateDto {
         version: cfg.version,
         step: cfg.step,
         show_wizard,
-        max_step_stage_b: 2, // 0 welcome, 1 permissions, 2 mic
+        max_step_stage_b: 6, // full wizard: 0…6
     }
 }
 
@@ -71,8 +71,7 @@ pub fn skip_onboarding(state: State<'_, AppState>) -> Result<OnboardingStateDto,
     Ok(dto_from(&guard.onboarding))
 }
 
-/// Mark Stage B portion done for now; full wizard (C–E) will extend this later.
-/// `complete_all=true` finishes onboarding entirely (user finished step 2 and continues).
+/// Finish onboarding (full wizard).
 #[tauri::command]
 pub fn complete_onboarding(
     state: State<'_, AppState>,
@@ -82,21 +81,13 @@ pub fn complete_onboarding(
         .config
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?;
-    let all = complete_all.unwrap_or(true);
-    if all {
-        guard.onboarding.completed = true;
-        guard.onboarding.skipped = false;
-        guard.onboarding.step = 6;
-        guard.onboarding.completed_at = Some(chrono::Utc::now().to_rfc3339());
-    } else {
-        // Finished Stage B only — advance step; keep wizard for later stages when shipped.
-        guard.onboarding.step = 3;
-        // Until C–E exist, treat Stage B finish as completed so user is not stuck.
-        guard.onboarding.completed = true;
-        guard.onboarding.completed_at = Some(chrono::Utc::now().to_rfc3339());
-    }
+    let _ = complete_all;
+    guard.onboarding.completed = true;
+    guard.onboarding.skipped = false;
+    guard.onboarding.step = 6;
+    guard.onboarding.completed_at = Some(chrono::Utc::now().to_rfc3339());
     guard.save()?;
-    tracing::info!(all, "onboarding completed");
+    tracing::info!("onboarding completed");
     Ok(dto_from(&guard.onboarding))
 }
 

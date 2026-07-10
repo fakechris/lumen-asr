@@ -32,6 +32,45 @@ export type OnboardingState = {
   maxStepStageB: number;
 };
 
+export type AsrModelCandidate = {
+  engine: string;
+  path: string;
+  label: string;
+  ready: boolean;
+  source: string;
+};
+
+export type AsrModelStatus = {
+  sensevoiceReady: boolean;
+  sensevoiceDir: string;
+  whisperReady: boolean;
+  whisperDir: string;
+  activeEngine: string;
+  candidates: AsrModelCandidate[];
+  downloadUrl: string;
+};
+
+export type CorrectorProbeResult = {
+  ollamaRunning: boolean;
+  ollamaUrl: string;
+  ollamaModels: string[];
+  hasQwen257b: boolean;
+  envOpenaiBase?: string | null;
+  envOpenaiKeySet: boolean;
+  envLumenModel?: string | null;
+  suggestedProvider: string;
+  suggestedBaseUrl: string;
+  suggestedModel: string;
+  message: string;
+};
+
+export type HotkeyValidation = {
+  ok: boolean;
+  shortcut: string;
+  warnings: string[];
+  errors: string[];
+};
+
 export const api = {
   health: () => invoke<Health>("app_health"),
 
@@ -78,6 +117,32 @@ export const api = {
   startVolumeMonitoring: (device?: string | null) =>
     invoke<void>("start_volume_monitoring_cmd", { device: device ?? null }),
   stopVolumeMonitoring: () => invoke<void>("stop_volume_monitoring_cmd"),
+
+  checkAsrModelStatus: () => invoke<AsrModelStatus>("check_asr_model_status"),
+  listLocalAsrModels: () => invoke<AsrModelCandidate[]>("list_local_asr_models"),
+  useExistingAsrModel: (path: string, engine?: string) =>
+    invoke<AsrModelStatus>("use_existing_asr_model", {
+      input: { path, engine },
+    }),
+  startAsrModelDownload: () => invoke<AsrModelStatus>("start_asr_model_download"),
+  cancelAsrModelDownload: () => invoke<void>("cancel_asr_model_download"),
+
+  probeCorrector: () => invoke<CorrectorProbeResult>("probe_corrector"),
+  ollamaListModels: () => invoke<string[]>("ollama_list_models"),
+  ollamaPullModel: (model?: string) =>
+    invoke<CorrectorProbeResult>("ollama_pull_model", {
+      input: { model: model ?? null },
+    }),
+  applyCorrectorSuggestion: (input: {
+    provider: string;
+    baseUrl: string;
+    model: string;
+    enabled?: boolean;
+    apiKey?: string;
+  }) => invoke<CorrectorStatus>("apply_corrector_suggestion", { input }),
+
+  validateHotkey: (shortcut: string) =>
+    invoke<HotkeyValidation>("validate_hotkey", { shortcut }),
 
   getInjectConfig: () =>
     invoke<{

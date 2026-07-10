@@ -6,7 +6,7 @@ use crate::AppState;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CorrectorStatus {
     pub enabled: bool,
