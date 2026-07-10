@@ -527,6 +527,19 @@ code {
   }
 }
 
+.history-layout {
+  align-items: stretch;
+}
+
+.history-hint {
+  font-size: 0.82rem;
+  margin: 0 0 10px;
+}
+
+.empty-history {
+  padding: 24px 8px;
+}
+
 .session-list {
   list-style: none;
   margin: 0;
@@ -534,7 +547,7 @@ code {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-height: 58vh;
+  max-height: 62vh;
   overflow: auto;
 }
 
@@ -544,13 +557,13 @@ code {
   border: 1px solid var(--border);
   background: color-mix(in srgb, var(--text) 3%, transparent);
   color: var(--text);
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 10px 12px;
   cursor: pointer;
   font: inherit;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
 
 .session-item:hover {
@@ -562,8 +575,96 @@ code {
   background: var(--accent-dim);
 }
 
+.session-item-warn {
+  border-color: color-mix(in srgb, var(--error, #ff453a) 35%, var(--border));
+}
+
+.session-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.session-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 .session-preview {
   font-size: 0.92rem;
+  line-height: 1.4;
+}
+
+.session-preview.empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.chip-app {
+  max-width: 7rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip-audio {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.history-detail-title {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.history-detail-sub {
+  margin-top: 4px;
+  font-size: 0.82rem;
+}
+
+.history-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 14px;
+}
+
+.history-main-text {
+  min-height: 120px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--text) 3.5%, transparent);
+  font-size: 1.05rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+
+.history-secondary {
+  margin-top: 14px;
+}
+
+.history-compare {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.history-compare-block .field-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.history-empty-detail {
+  padding: 48px 16px;
+  text-align: center;
 }
 
 .chip {

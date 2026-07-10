@@ -134,6 +134,8 @@ pub fn run() {
             dictation::stop_and_transcribe,
             dictation::cancel_recording,
             dictation::toggle_dictation_cmd,
+            dictation::get_session_audio,
+            dictation::retry_session_transcription,
             corrector_cmd::get_corrector_config,
             corrector_cmd::save_corrector_config,
             corrector_cmd::correct_text,

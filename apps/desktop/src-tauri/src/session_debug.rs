@@ -104,6 +104,62 @@ pub fn audio_stats(samples: &[f32]) -> (f32, f32) {
     (rms, peak)
 }
 
+/// Read a PCM16 mono WAV written by [`write_wav_f32_as_i16`] (or equivalent).
+pub fn read_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32), String> {
+    let bytes = fs::read(path).map_err(|e| format!("read audio: {e}"))?;
+    if bytes.len() < 44 {
+        return Err("audio file too short".into());
+    }
+    if &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("not a RIFF/WAVE file".into());
+    }
+    // Walk chunks after RIFF header (offset 12)
+    let mut i = 12usize;
+    let mut sample_rate = 16_000u32;
+    let mut data_off = None;
+    let mut data_len = 0usize;
+    let mut bits = 16u16;
+    let mut channels = 1u16;
+    while i + 8 <= bytes.len() {
+        let id = &bytes[i..i + 4];
+        let size = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap()) as usize;
+        let body = i + 8;
+        if id == b"fmt " && body + 16 <= bytes.len() {
+            channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().unwrap());
+            sample_rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().unwrap());
+            bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().unwrap());
+        } else if id == b"data" {
+            data_off = Some(body);
+            data_len = size.min(bytes.len().saturating_sub(body));
+            break;
+        }
+        i = body + size + (size % 2); // word align
+    }
+    let data_off = data_off.ok_or_else(|| "WAV missing data chunk".to_string())?;
+    if bits != 16 {
+        return Err(format!("unsupported WAV bits={bits} (need 16)"));
+    }
+    if channels == 0 {
+        return Err("invalid channel count".into());
+    }
+    let frame = 2 * channels as usize;
+    let n_frames = data_len / frame;
+    let mut samples = Vec::with_capacity(n_frames);
+    for f in 0..n_frames {
+        let mut acc = 0.0f32;
+        for c in 0..channels as usize {
+            let o = data_off + f * frame + c * 2;
+            if o + 2 > bytes.len() {
+                break;
+            }
+            let v = i16::from_le_bytes([bytes[o], bytes[o + 1]]);
+            acc += v as f32 / 32768.0;
+        }
+        samples.push(acc / channels as f32);
+    }
+    Ok((samples, sample_rate))
+}
+
 /// Minimal PCM16 mono WAV writer (no extra crate).
 fn write_wav_f32_as_i16(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), String> {
     let mut f = File::create(path).map_err(|e| e.to_string())?;

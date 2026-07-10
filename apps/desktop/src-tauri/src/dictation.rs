@@ -458,6 +458,180 @@ pub async fn stop_and_transcribe_inner(
     })
 }
 
+/// Load session WAV as raw bytes for frontend playback (Blob URL).
+#[tauri::command]
+pub fn get_session_audio(state: State<'_, AppState>, id: String) -> Result<Vec<u8>, String> {
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let rec = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
+        let store = guard.as_ref().ok_or_else(|| "database not available".to_string())?;
+        store
+            .get_session(uuid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "session not found".to_string())?
+    };
+    let path = rec
+        .audio_path
+        .as_ref()
+        .ok_or_else(|| "此会话没有保存音频".to_string())?;
+    let p = std::path::Path::new(path);
+    if !p.is_file() {
+        return Err(format!("音频文件不存在: {path}"));
+    }
+    std::fs::read(p).map_err(|e| format!("read audio: {e}"))
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryOutcome {
+    pub session: SessionRecord,
+    pub asr_text: String,
+    pub corrected_text: String,
+    pub asr_engine: String,
+    pub corrector_engine: String,
+    pub model_applied: bool,
+}
+
+/// Re-run ASR + corrector from saved session audio (no re-record, no auto-insert).
+#[tauri::command]
+pub async fn retry_session_transcription(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<RetryOutcome, String> {
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let mut rec = {
+        let guard = state
+            .store
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
+        let store = guard.as_ref().ok_or_else(|| "database not available".to_string())?;
+        store
+            .get_session(uuid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "session not found".to_string())?
+    };
+    let path = rec
+        .audio_path
+        .clone()
+        .ok_or_else(|| "此会话没有音频，无法重新转写".to_string())?;
+    let (samples, sample_rate) = session_debug::read_wav_mono_f32(std::path::Path::new(&path))?;
+    if samples.is_empty() {
+        return Err("音频为空".into());
+    }
+
+    // Resample to 16 kHz if needed
+    let samples_16k = if sample_rate == 16_000 {
+        samples
+    } else {
+        lumen_asr::resample_linear(&samples, sample_rate, 16_000)
+    };
+
+    let engine_kind = *state
+        .engine
+        .lock()
+        .map_err(|_| "engine lock poisoned".to_string())?;
+
+    tracing::info!(
+        %id,
+        engine = engine_kind.as_str(),
+        samples = samples_16k.len(),
+        "retry transcription start"
+    );
+
+    let result = match engine_kind {
+        EngineKind::SenseVoice => {
+            let eng = state
+                .sensevoice
+                .lock()
+                .map_err(|_| "asr lock poisoned".to_string())?
+                .clone();
+            eng.transcribe(AsrRequest {
+                samples: samples_16k.clone(),
+                sample_rate: 16_000,
+                hotwords: vec![],
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
+        EngineKind::Whisper => {
+            let eng = state
+                .whisper
+                .lock()
+                .map_err(|_| "asr lock poisoned".to_string())?
+                .clone();
+            eng.transcribe(AsrRequest {
+                samples: samples_16k.clone(),
+                sample_rate: 16_000,
+                hotwords: vec![],
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
+    };
+
+    let asr_text = result.text.trim().to_string();
+    let entries = {
+        let store_guard = state
+            .store
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
+        match store_guard.as_ref() {
+            Some(s) => s.list_dictionary().unwrap_or_default(),
+            None => vec![],
+        }
+    };
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?
+        .clone();
+    let corr = run_correct(&cfg, &asr_text, &entries).await;
+    let corrected_text = corr.text.trim().to_string();
+    let corrector_engine = if corr.model_applied {
+        engine_label(&cfg)
+    } else if !cfg.corrector.enabled || cfg.corrector.provider == "none" {
+        "none".into()
+    } else {
+        format!("{}:fallback", engine_label(&cfg))
+    };
+
+    rec.asr_raw = Some(asr_text.clone());
+    rec.corrected = Some(corrected_text.clone());
+    rec.pasted = Some(corrected_text.clone());
+    rec.asr_engine = Some(engine_kind.as_str().into());
+    rec.corrector_engine = Some(corrector_engine.clone());
+    rec.status = SessionStatus::Completed;
+
+    // Refresh sidecar text dumps if debug dir is the parent of audio_path.
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::write(parent.join("asr.txt"), &asr_text);
+        let _ = std::fs::write(parent.join("corrected.txt"), &corrected_text);
+    }
+
+    {
+        let store_guard = state
+            .store
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
+        if let Some(store) = store_guard.as_ref() {
+            store.save_session(&rec).map_err(|e| e.to_string())?;
+        }
+    }
+
+    tracing::info!(%id, %asr_text, %corrected_text, "retry transcription done");
+    Ok(RetryOutcome {
+        session: rec,
+        asr_text,
+        corrected_text,
+        asr_engine: engine_kind.as_str().into(),
+        corrector_engine,
+        model_applied: corr.model_applied,
+    })
+}
+
 #[tauri::command]
 pub fn cancel_recording(state: State<'_, AppState>) -> Result<(), String> {
     cancel_recording_inner(&state)

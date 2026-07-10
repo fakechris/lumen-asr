@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
 import { HotkeyRecorder } from "./HotkeyRecorder";
@@ -9,7 +9,6 @@ import type {
   AudioDevice,
   CorrectorStatus,
   DictionaryEntry,
-  EditEvent,
   Health,
   LearnCandidate,
   LearningConfig,
@@ -88,7 +87,6 @@ export default function App() {
 
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [edits, setEdits] = useState<EditEvent[]>([]);
 
   const [dict, setDict] = useState<DictionaryEntry[]>([]);
   const [termInput, setTermInput] = useState("");
@@ -238,17 +236,6 @@ export default function App() {
     }
   }, [tab, refreshSessions, refreshDict]);
 
-  useEffect(() => {
-    if (!selectedId) {
-      setEdits([]);
-      return;
-    }
-    api
-      .listEditEvents(selectedId)
-      .then(setEdits)
-      .catch((e) => setError(String(e)));
-  }, [selectedId]);
-
   const selected = sessions.find((s) => s.id === selectedId) ?? null;
 
   async function run(label: string, fn: () => Promise<void>) {
@@ -391,34 +378,21 @@ export default function App() {
               <HistoryPanel
                 sessions={sessions}
                 selected={selected}
-                edits={edits}
                 busy={busy}
                 onSelect={setSelectedId}
-                onSeed={() =>
-                  run("seed", async () => {
-                    const s = await api.seedDemoSession();
-                    await refreshSessions();
-                    setSelectedId(s.id);
-                    await refreshHealth();
-                  })
-                }
+                onRefresh={() => void refreshSessions()}
+                onBusy={setBusy}
+                onError={setError}
+                onUpdated={(s) => {
+                  setSessions((prev) => prev.map((x) => (x.id === s.id ? s : x)));
+                  setSelectedId(s.id);
+                }}
                 onDelete={(id) =>
                   run("delete session", async () => {
                     await api.deleteSession(id);
                     if (selectedId === id) setSelectedId(null);
                     await refreshSessions();
                     await refreshHealth();
-                  })
-                }
-                onRecordEdit={(sessionId, before, after) =>
-                  run("record edit", async () => {
-                    await api.recordEditEvent({
-                      sessionId,
-                      beforeText: before,
-                      afterText: after,
-                      source: "pre_insert_ui",
-                    });
-                    setEdits(await api.listEditEvents(sessionId));
                   })
                 }
               />
@@ -1634,143 +1608,281 @@ function Overview({
 function HistoryPanel({
   sessions,
   selected,
-  edits,
   busy,
   onSelect,
-  onSeed,
+  onRefresh,
+  onBusy,
+  onError,
+  onUpdated,
   onDelete,
-  onRecordEdit,
 }: {
   sessions: SessionRecord[];
   selected: SessionRecord | null;
-  edits: EditEvent[];
   busy: boolean;
   onSelect: (id: string | null) => void;
-  onSeed: () => void;
+  onRefresh: () => void;
+  onBusy: (b: boolean) => void;
+  onError: (e: string | null) => void;
+  onUpdated: (s: SessionRecord) => void;
   onDelete: (id: string) => void;
-  onRecordEdit: (sessionId: string, before: string, after: string) => void;
 }) {
-  const [editAfter, setEditAfter] = useState("");
+  const [playing, setPlaying] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
+  const [showAsr, setShowAsr] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const blobUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
-    setEditAfter(selected?.pasted || selected?.corrected || selected?.asr_raw || "");
-  }, [selected?.id, selected?.pasted, selected?.corrected, selected?.asr_raw]);
+    // Stop playback when switching rows.
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = null;
+    }
+    setPlaying(false);
+    setCopied(null);
+    setShowAsr(false);
+  }, [selected?.id]);
+
+  useEffect(() => {
+    return () => {
+      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+    };
+  }, []);
+
+  const mainText = (s: SessionRecord) =>
+    (s.corrected || s.pasted || s.asr_raw || "").trim();
+
+  async function copyText(label: string, text: string) {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(label);
+      window.setTimeout(() => setCopied(null), 1500);
+    } catch (e) {
+      onError(`复制失败: ${String(e)}`);
+    }
+  }
+
+  async function playAudio() {
+    if (!selected?.audio_path) {
+      onError("此会话没有保存音频");
+      return;
+    }
+    onError(null);
+    try {
+      if (playing && audioRef.current) {
+        audioRef.current.pause();
+        setPlaying(false);
+        return;
+      }
+      onBusy(true);
+      const bytes = await api.getSessionAudio(selected.id);
+      const u8 = new Uint8Array(bytes);
+      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+      const url = URL.createObjectURL(new Blob([u8], { type: "audio/wav" }));
+      blobUrlRef.current = url;
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.onended = () => setPlaying(false);
+      audio.onerror = () => {
+        setPlaying(false);
+        onError("音频播放失败");
+      };
+      await audio.play();
+      setPlaying(true);
+    } catch (e) {
+      onError(String(e));
+      setPlaying(false);
+    } finally {
+      onBusy(false);
+    }
+  }
+
+  async function retry() {
+    if (!selected) return;
+    onBusy(true);
+    onError(null);
+    try {
+      const out = await api.retrySessionTranscription(selected.id);
+      onUpdated(out.session);
+      onRefresh();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      onBusy(false);
+    }
+  }
 
   return (
-    <div className="split">
+    <div className="split history-layout">
       <section className="card list-pane">
         <div className="card-head">
           <h2>历史</h2>
-          <button type="button" className="btn small" disabled={busy} onClick={onSeed}>
-            + 示例
+          <button type="button" className="btn small ghost" disabled={busy} onClick={onRefresh}>
+            刷新
           </button>
         </div>
+        <p className="muted-text history-hint">
+          转写失败或不理想时，可试听原音频并重新转写。
+        </p>
         {sessions.length === 0 ? (
-          <p className="muted-text">空</p>
+          <p className="muted-text empty-history">暂无会话。用热键说一段话后会出现在这里。</p>
         ) : (
           <ul className="session-list">
-            {sessions.map((s) => (
-              <li key={s.id}>
-                <button
-                  type="button"
-                  className={`session-item ${selected?.id === s.id ? "active" : ""}`}
-                  onClick={() => onSelect(s.id)}
-                >
-                  <span className="list-time">{formatTime(s.created_at)}</span>
-                  <span className="session-preview">
-                    {previewText(s.pasted || s.corrected || s.asr_raw, 48)}
-                  </span>
-                  <span className="chip">{s.status}</span>
-                </button>
-              </li>
-            ))}
+            {sessions.map((s) => {
+              const text = mainText(s);
+              const empty = !text;
+              const weak = text.length <= 2 || text === "。" || text === ".";
+              return (
+                <li key={s.id}>
+                  <button
+                    type="button"
+                    className={`session-item ${selected?.id === s.id ? "active" : ""} ${
+                      weak || empty ? "session-item-warn" : ""
+                    }`}
+                    onClick={() => onSelect(s.id)}
+                  >
+                    <div className="session-item-top">
+                      <span className="list-time">{formatTime(s.created_at)}</span>
+                      <span className="session-item-meta">
+                        {s.focus?.app_name ? (
+                          <span className="chip chip-app">{s.focus.app_name}</span>
+                        ) : null}
+                        {s.audio_path ? (
+                          <span className="chip chip-audio" title="有音频">
+                            ♪
+                          </span>
+                        ) : null}
+                      </span>
+                    </div>
+                    <span className={`session-preview ${empty ? "empty" : ""}`}>
+                      {empty ? "（无文本）" : previewText(text, 72)}
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>
 
-      <section className="card detail-pane">
+      <section className="card detail-pane history-detail">
         {!selected ? (
-          <p className="muted-text">选择一条会话查看详情</p>
+          <div className="history-empty-detail">
+            <p className="muted-text">选择左侧一条会话</p>
+            <p className="muted-text">支持播放音频、一键复制、重新转写</p>
+          </div>
         ) : (
           <>
             <div className="card-head">
-              <h2>详情</h2>
+              <div>
+                <h2 className="history-detail-title">转写结果</h2>
+                <div className="history-detail-sub muted-text">
+                  {formatTime(selected.created_at)}
+                  {selected.focus?.app_name ? ` · ${selected.focus.app_name}` : ""}
+                  {selected.asr_engine ? ` · ${selected.asr_engine}` : ""}
+                  {selected.corrector_engine ? ` · ${selected.corrector_engine}` : ""}
+                </div>
+              </div>
+            </div>
+
+            <div className="history-toolbar">
               <button
                 type="button"
-                className="btn small danger"
+                className="btn"
+                disabled={busy || !selected.audio_path}
+                onClick={() => void playAudio()}
+                title={selected.audio_path ? "播放保存的录音" : "无音频"}
+              >
+                {playing ? "⏸ 停止" : "▶ 播放"}
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy || !mainText(selected)}
+                onClick={() => void copyText("main", mainText(selected))}
+              >
+                {copied === "main" ? "已复制" : "复制"}
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy || !selected.audio_path}
+                onClick={() => void retry()}
+                title="用已存音频重新跑 ASR + 修正"
+              >
+                {busy ? "转写中…" : "重新转写"}
+              </button>
+              <button
+                type="button"
+                className="btn ghost danger"
                 disabled={busy}
                 onClick={() => onDelete(selected.id)}
               >
                 删除
               </button>
             </div>
-            <dl className="meta">
-              <dt>时间</dt>
-              <dd>{formatTime(selected.created_at)}</dd>
-              <dt>App</dt>
-              <dd>{selected.focus?.app_name || "—"}</dd>
-              <dt>ASR</dt>
-              <dd>{selected.asr_engine || "—"}</dd>
-              <dt>插入</dt>
-              <dd>{selected.insert_strategy}</dd>
-            </dl>
-            <Field label="ASR 原文" value={selected.asr_raw} />
-            <Field label="修正后" value={selected.corrected} />
-            <Field label="最终粘贴" value={selected.pasted} />
 
-            <h3 className="subhead">模拟预览编辑</h3>
-            <p className="muted-text">
-              改字后保存为 edit_event（M6 会从系统焦点框自动捕获）。
-            </p>
-            <textarea
-              className="textarea"
-              rows={4}
-              value={editAfter}
-              onChange={(e) => setEditAfter(e.target.value)}
-            />
-            <div className="actions">
-              <button
-                type="button"
-                className="btn"
-                disabled={busy}
-                onClick={() => {
-                  const before =
-                    selected.corrected || selected.asr_raw || selected.pasted || "";
-                  onRecordEdit(selected.id, before, editAfter);
-                }}
-              >
-                记录编辑
-              </button>
+            <div className="history-main-text">
+              {mainText(selected) || (
+                <span className="muted-text">（空结果 — 可播放音频后重新转写）</span>
+              )}
             </div>
 
-            <h3 className="subhead">编辑事件 ({edits.length})</h3>
-            {edits.length === 0 ? (
-              <p className="muted-text">无</p>
-            ) : (
-              <ul className="list">
-                {edits.map((e) => (
-                  <li key={e.id} className="edit-item">
-                    <span className="chip">{e.source}</span>
-                    <div>
-                      <div className="diff-before">{e.before_text}</div>
-                      <div className="diff-after">{e.after_text}</div>
+            <div className="history-secondary">
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => setShowAsr((v) => !v)}
+              >
+                {showAsr ? "收起原文对比" : "查看 ASR 原文对比"}
+              </button>
+              {showAsr && (
+                <div className="history-compare">
+                  <div className="history-compare-block">
+                    <div className="field-label">
+                      ASR 原文
+                      <button
+                        type="button"
+                        className="btn small ghost"
+                        disabled={!selected.asr_raw}
+                        onClick={() => void copyText("asr", selected.asr_raw || "")}
+                      >
+                        {copied === "asr" ? "已复制" : "复制"}
+                      </button>
                     </div>
-                  </li>
-                ))}
-              </ul>
+                    <pre className="field-value">{selected.asr_raw || "—"}</pre>
+                  </div>
+                  <div className="history-compare-block">
+                    <div className="field-label">
+                      修正后
+                      <button
+                        type="button"
+                        className="btn small ghost"
+                        disabled={!selected.corrected}
+                        onClick={() => void copyText("corr", selected.corrected || "")}
+                      >
+                        {copied === "corr" ? "已复制" : "复制"}
+                      </button>
+                    </div>
+                    <pre className="field-value">{selected.corrected || "—"}</pre>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {!selected.audio_path && (
+              <p className="muted-text history-hint">
+                此条无音频文件，无法播放或重试（较旧的会话可能未保存）。
+              </p>
             )}
           </>
         )}
       </section>
-    </div>
-  );
-}
-
-function Field({ label, value }: { label: string; value?: string | null }) {
-  return (
-    <div className="field-block">
-      <div className="field-label">{label}</div>
-      <pre className="field-value">{value || "—"}</pre>
     </div>
   );
 }

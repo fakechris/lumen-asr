@@ -207,6 +207,19 @@ export const api = {
 
   deleteSession: (id: string) => invoke<boolean>("delete_session", { id }),
 
+  /** Raw WAV bytes for playback. */
+  getSessionAudio: (id: string) => invoke<number[]>("get_session_audio", { id }),
+
+  retrySessionTranscription: (id: string) =>
+    invoke<{
+      session: SessionRecord;
+      asrText: string;
+      correctedText: string;
+      asrEngine: string;
+      correctorEngine: string;
+      modelApplied: boolean;
+    }>("retry_session_transcription", { id }),
+
   seedDemoSession: () => invoke<SessionRecord>("seed_demo_session"),
 
   saveSession: (input: {
