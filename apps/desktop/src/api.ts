@@ -12,6 +12,26 @@ import type {
   TranscribeOutcome,
 } from "./types";
 
+export type PermissionStatus = {
+  microphone: string;
+  accessibility: string;
+  accessibilityTrusted: boolean;
+  canRecord: boolean;
+  canInject: boolean;
+  copyOnlyOk: boolean;
+  processHint: string;
+  processPath: string;
+};
+
+export type OnboardingState = {
+  completed: boolean;
+  skipped: boolean;
+  version: number;
+  step: number;
+  showWizard: boolean;
+  maxStepStageB: number;
+};
+
 export const api = {
   health: () => invoke<Health>("app_health"),
 
@@ -38,35 +58,26 @@ export const api = {
   correctText: (text: string) =>
     invoke<CorrectTextOutcome>("correct_text", { input: { text } }),
 
-  getPermissionStatus: () =>
-    invoke<{
-      microphone: string;
-      accessibility: string;
-      canRecord: boolean;
-      canInject: boolean;
-      copyOnlyOk: boolean;
-      processHint: string;
-    }>("get_permission_status"),
+  getPermissionStatus: () => invoke<PermissionStatus>("get_permission_status"),
+  pollPermissions: () => invoke<PermissionStatus>("poll_permissions"),
   openMicrophoneSettings: () => invoke<void>("open_microphone_settings"),
   openAccessibilitySettings: () => invoke<void>("open_accessibility_settings"),
   requestAccessibilityAccess: () =>
-    invoke<{
-      microphone: string;
-      accessibility: string;
-      canRecord: boolean;
-      canInject: boolean;
-      copyOnlyOk: boolean;
-      processHint: string;
-    }>("request_accessibility_access"),
+    invoke<PermissionStatus>("request_accessibility_access"),
   requestMicrophoneAccess: () =>
-    invoke<{
-      microphone: string;
-      accessibility: string;
-      canRecord: boolean;
-      canInject: boolean;
-      copyOnlyOk: boolean;
-      processHint: string;
-    }>("request_microphone_access"),
+    invoke<PermissionStatus>("request_microphone_access"),
+
+  getOnboardingState: () => invoke<OnboardingState>("get_onboarding_state"),
+  setOnboardingStep: (step: number) =>
+    invoke<OnboardingState>("set_onboarding_step", { input: { step } }),
+  skipOnboarding: () => invoke<OnboardingState>("skip_onboarding"),
+  completeOnboarding: (completeAll = true) =>
+    invoke<OnboardingState>("complete_onboarding", { completeAll }),
+  reopenOnboarding: () => invoke<OnboardingState>("reopen_onboarding"),
+
+  startVolumeMonitoring: (device?: string | null) =>
+    invoke<void>("start_volume_monitoring_cmd", { device: device ?? null }),
+  stopVolumeMonitoring: () => invoke<void>("stop_volume_monitoring_cmd"),
 
   getInjectConfig: () =>
     invoke<{

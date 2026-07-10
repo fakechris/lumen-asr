@@ -1,9 +1,7 @@
-//! Permission status + open System Settings (M4).
+//! Permission status + open System Settings.
 
 use lumen_platform::{PermissionStatus, Permissions};
-use lumen_platform_macos::{
-    ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,
-};
+use lumen_platform_macos::{is_accessibility_trusted, prompt_accessibility, MacPermissions};
 use serde::Serialize;
 use tauri::State;
 
@@ -14,11 +12,15 @@ use crate::AppState;
 pub struct PermissionDto {
     pub microphone: String,
     pub accessibility: String,
+    /// True when AXIsProcessTrusted — required for inject / event-tap.
+    pub accessibility_trusted: bool,
     pub can_record: bool,
     pub can_inject: bool,
     pub copy_only_ok: bool,
-    /// Process path / name to enable in System Settings (debug builds differ from .app).
+    /// Executable basename shown in System Settings (may differ for debug vs .app).
     pub process_hint: String,
+    /// Full path of the running binary — enable *this* entry in Accessibility.
+    pub process_path: String,
 }
 
 fn map_status(s: PermissionStatus) -> PermissionDto {
@@ -29,13 +31,17 @@ fn map_status(s: PermissionStatus) -> PermissionDto {
         PermissionState::Restricted => "restricted",
         PermissionState::NotDetermined => "not_determined",
     };
-    let ax = match s.accessibility {
-        PermissionState::Granted => "granted",
-        PermissionState::Denied => "denied",
-        PermissionState::Restricted => "restricted",
-        PermissionState::NotDetermined => "not_determined",
+    let trusted = is_accessibility_trusted();
+    let ax = if trusted {
+        "granted"
+    } else {
+        match s.accessibility {
+            PermissionState::Granted => "granted",
+            PermissionState::Denied => "needs_enable",
+            PermissionState::Restricted => "restricted",
+            PermissionState::NotDetermined => "needs_enable",
+        }
     };
-    // NotDetermined mic still allows start (system will prompt).
     let can_record = matches!(
         s.microphone,
         PermissionState::Granted | PermissionState::NotDetermined
@@ -43,10 +49,12 @@ fn map_status(s: PermissionStatus) -> PermissionDto {
     PermissionDto {
         microphone: mic.into(),
         accessibility: ax.into(),
+        accessibility_trusted: trusted,
         can_record,
-        can_inject: s.can_inject(),
+        can_inject: trusted,
         copy_only_ok: can_record,
         process_hint: process_hint(),
+        process_path: process_path(),
     }
 }
 
@@ -57,11 +65,23 @@ fn process_hint() -> String {
         .unwrap_or_else(|| "Lumen ASR".into())
 }
 
+fn process_path() -> String {
+    std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "(unknown)".into())
+}
+
 #[tauri::command]
 pub async fn get_permission_status() -> Result<PermissionDto, String> {
     let p = MacPermissions;
     let s = p.status().await.map_err(|e| e.to_string())?;
     Ok(map_status(s))
+}
+
+/// Lightweight poll for wizard / settings (same as get; named for intent).
+#[tauri::command]
+pub async fn poll_permissions() -> Result<PermissionDto, String> {
+    get_permission_status().await
 }
 
 #[tauri::command]
@@ -80,21 +100,29 @@ pub async fn open_accessibility_settings() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Show system AX prompt (if possible) and open System Settings → Accessibility.
+/// User-initiated: try once to appear in the Accessibility list, then open Settings.
+/// Does **not** grant permission — user must flip the switch for *this* process path.
 #[tauri::command]
 pub async fn request_accessibility_access() -> Result<PermissionDto, String> {
-    let trusted = ensure_accessibility_onboarding();
+    let before = is_accessibility_trusted();
+    if !before {
+        // May register the app in the list (often no dialog on modern macOS).
+        let _ = prompt_accessibility();
+    }
+    let _ = MacPermissions.open_accessibility_settings().await;
+    let after = is_accessibility_trusted();
     tracing::info!(
-        trusted,
+        before,
+        after,
         process = %process_hint(),
-        "accessibility onboarding"
+        path = %process_path(),
+        "accessibility request (open Settings; user must enable toggle)"
     );
     get_permission_status().await
 }
 
 #[tauri::command]
 pub async fn request_microphone_access(state: State<'_, AppState>) -> Result<PermissionDto, String> {
-    // Trigger TCC by briefly opening the input stream if not recording.
     if !state.audio.is_recording() {
         match state.audio.start() {
             Ok(()) => {
@@ -110,26 +138,18 @@ pub async fn request_microphone_access(state: State<'_, AppState>) -> Result<Per
     get_permission_status().await
 }
 
-/// Call once at app startup (after event loop is up).
+/// Startup: log only — do not open Settings or force system prompts.
 pub fn bootstrap_permissions() {
     let trusted = is_accessibility_trusted();
     tracing::info!(
         accessibility_trusted = trusted,
         process = %process_hint(),
-        "permission bootstrap"
+        path = %process_path(),
+        "permission bootstrap (no auto Settings open)"
     );
     if !trusted {
-        // System dialog + open Settings so the user can enable the toggle.
-        let after = prompt_accessibility();
         tracing::warn!(
-            after_prompt = after,
-            process = %process_hint(),
-            "Accessibility not granted — inject/hotkey event-tap need it. Enable in System Settings → Privacy & Security → Accessibility"
+            "Accessibility not granted for this process — inject/event-tap need it. Enable in System Settings → Privacy & Security → Accessibility"
         );
-        if !after {
-            tauri::async_runtime::spawn(async move {
-                let _ = MacPermissions.open_accessibility_settings().await;
-            });
-        }
     }
 }

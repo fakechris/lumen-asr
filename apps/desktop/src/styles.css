@@ -715,6 +715,202 @@ select.input:focus {
   margin-top: 0;
 }
 
+/* ── Onboarding wizard ─────────────────────────────────── */
+
+.onboard-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--bg, #1c1c1e) 72%, transparent);
+  backdrop-filter: blur(10px);
+}
+
+.onboard-card {
+  width: min(640px, 100%);
+  max-height: min(90vh, 820px);
+  overflow: auto;
+  border-radius: 16px;
+  padding: 28px 28px 22px;
+  background: var(--surface, #2c2c2e);
+  border: 1px solid color-mix(in srgb, var(--border, #48484a) 80%, transparent);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+}
+
+.onboard-progress {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+
+.onboard-dot {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  opacity: 0.45;
+}
+
+.onboard-dot.active,
+.onboard-dot.done {
+  opacity: 1;
+}
+
+.onboard-dot-n {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  font-size: 0.8rem;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--accent, #0a84ff) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent, #0a84ff) 45%, transparent);
+  color: var(--text, #f5f5f7);
+}
+
+.onboard-dot.active .onboard-dot-n {
+  background: var(--accent, #0a84ff);
+  border-color: var(--accent, #0a84ff);
+  color: #fff;
+}
+
+.onboard-dot.done .onboard-dot-n {
+  background: color-mix(in srgb, var(--ok, #30d158) 35%, transparent);
+  border-color: var(--ok, #30d158);
+}
+
+.onboard-dot-label {
+  font-size: 0.72rem;
+  color: var(--muted, #98989d);
+}
+
+.onboard-step h1 {
+  margin: 0 0 8px;
+  font-size: 1.45rem;
+  font-weight: 650;
+}
+
+.onboard-bullets {
+  margin: 14px 0 22px;
+  padding-left: 1.2rem;
+  line-height: 1.65;
+}
+
+.onboard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.onboard-error {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--error, #ff453a) 16%, transparent);
+  color: var(--text, #f5f5f7);
+  font-size: 0.9rem;
+}
+
+.onboard-perm-grid {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.onboard-perm-card {
+  border-radius: 12px;
+  padding: 14px;
+  border: 1px solid var(--border, #48484a);
+  background: color-mix(in srgb, var(--bg, #1c1c1e) 40%, transparent);
+}
+
+.onboard-perm-card.ok {
+  border-color: color-mix(in srgb, var(--ok, #30d158) 55%, transparent);
+}
+
+.onboard-perm-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.onboard-pill {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted, #98989d) 22%, transparent);
+}
+
+.onboard-perm-card.ok .onboard-pill {
+  background: color-mix(in srgb, var(--ok, #30d158) 28%, transparent);
+  color: var(--ok, #30d158);
+}
+
+.onboard-path-meta {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  gap: 4px 10px;
+  font-size: 0.82rem;
+  margin: 10px 0;
+}
+
+.onboard-path-meta dt {
+  color: var(--muted, #98989d);
+}
+
+.onboard-path code {
+  word-break: break-all;
+  font-size: 0.75rem;
+}
+
+.onboard-hint {
+  margin-top: 10px;
+  font-size: 0.82rem;
+}
+
+.onboard-meter-wrap {
+  margin: 8px 0 4px;
+}
+
+.onboard-meter-label {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.onboard-meter {
+  height: 14px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border, #48484a) 70%, transparent);
+  overflow: hidden;
+}
+
+.onboard-meter-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--accent, #0a84ff);
+  transition: width 60ms linear;
+}
+
+.onboard-meter-fill.ok {
+  background: var(--ok, #30d158);
+}
+
+.onboard-meter-nums {
+  margin-top: 6px;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── Capsule window ────────────────────────────────────── */
 
 html:has(.capsule-root),

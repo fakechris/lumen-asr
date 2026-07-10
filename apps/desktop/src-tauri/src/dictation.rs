@@ -119,7 +119,12 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 
 #[tauri::command]
 pub fn set_audio_device(state: State<'_, AppState>, name: Option<String>) -> Result<(), String> {
-    state.audio.set_device(name);
+    state.audio.set_device(name.clone());
+    // Persist preferred device for onboarding + next launch.
+    if let Ok(mut cfg) = state.config.lock() {
+        cfg.audio.device_name = name.filter(|s| !s.is_empty());
+        let _ = cfg.save();
+    }
     Ok(())
 }
 

@@ -2075,6 +2075,7 @@ name = "lumen-asr-desktop"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "cpal",
  "lumen-asr",
  "lumen-core",
  "lumen-corrector",
@@ -2084,6 +2085,7 @@ dependencies = [
  "lumen-platform-macos",
  "lumen-prompts",
  "lumen-store",
+ "parking_lot",
  "serde",
  "serde_json",
  "tauri",

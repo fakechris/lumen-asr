@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub inject: InjectConfig,
     pub hotkey: HotkeyConfig,
     pub learning: LearningConfig,
+    pub onboarding: OnboardingConfig,
+    pub audio: AudioConfig,
 }
 
 impl Default for AppConfig {
@@ -21,7 +23,46 @@ impl Default for AppConfig {
             inject: InjectConfig::default(),
             hotkey: HotkeyConfig::default(),
             learning: LearningConfig::default(),
+            onboarding: OnboardingConfig::default(),
+            audio: AudioConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OnboardingConfig {
+    pub completed: bool,
+    pub skipped: bool,
+    /// Bump to re-prompt critical setup after product changes.
+    pub version: u32,
+    /// Current wizard step (0 = welcome …).
+    pub step: u32,
+    pub completed_at: Option<String>,
+}
+
+impl Default for OnboardingConfig {
+    fn default() -> Self {
+        Self {
+            completed: false,
+            skipped: false,
+            version: 1,
+            step: 0,
+            completed_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// Empty = system default input.
+    pub device_name: Option<String>,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self { device_name: None }
     }
 }
 

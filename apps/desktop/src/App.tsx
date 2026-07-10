@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
 import { HotkeyRecorder } from "./HotkeyRecorder";
+import { OnboardingWizard } from "./OnboardingWizard";
 import { formatHotkeyLabel } from "./hotkeyFormat";
 import type {
   AsrStatus,
@@ -82,6 +83,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [hotkeyLabel, setHotkeyLabel] = useState("⌥Space");
   const [hotkeyEnabled, setHotkeyEnabledUi] = useState(true);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [onboardingIncomplete, setOnboardingIncomplete] = useState(false);
 
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -194,6 +197,18 @@ export default function App() {
   }, [refreshHealth, refreshSessions]);
 
   useEffect(() => {
+    void (async () => {
+      try {
+        const s = await api.getOnboardingState();
+        setShowOnboarding(s.showWizard);
+        setOnboardingIncomplete(!s.completed);
+      } catch {
+        /* ignore */
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
     void refreshHealth();
     void (async () => {
       try {
@@ -252,6 +267,15 @@ export default function App() {
 
   return (
     <div className="app-frame">
+      {showOnboarding && (
+        <OnboardingWizard
+          onDone={() => {
+            setShowOnboarding(false);
+            setOnboardingIncomplete(false);
+            void refreshHealth();
+          }}
+        />
+      )}
       {/* System titlebar (Visible) — native macOS drag / traffic lights */}
       <div className="app-body">
         <nav className="sidebar" aria-label="主导航">
@@ -270,11 +294,32 @@ export default function App() {
           ))}
           <div className="sidebar-spacer" />
           <div className="sidebar-meta">
+            {onboardingIncomplete && (
+              <>
+                <button
+                  type="button"
+                  className="linkish"
+                  onClick={() =>
+                    void (async () => {
+                      try {
+                        await api.reopenOnboarding();
+                        setShowOnboarding(true);
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    })()
+                  }
+                >
+                  完成首次设置
+                </button>
+                <br />
+              </>
+            )}
             {hotkeyEnabled ? (
               <>
                 热键 <span className="kbd">{hotkeyLabel}</span>
                 <br />
-                切换录音 / 停止
+                按住说话
               </>
             ) : (
               <>热键已关闭</>
@@ -988,13 +1033,7 @@ function SettingsPanel({
   const [apiKey, setApiKey] = useState("");
   const [timeoutSecs, setTimeoutSecs] = useState(60);
   const [probe, setProbe] = useState<string>("");
-  const [perm, setPerm] = useState<{
-    microphone: string;
-    accessibility: string;
-    canRecord: boolean;
-    canInject: boolean;
-    processHint?: string;
-  } | null>(null);
+  const [perm, setPerm] = useState<import("./api").PermissionStatus | null>(null);
   const [autoInsert, setAutoInsert] = useState(true);
   const [injectMode, setInjectMode] = useState("auto");
   const [preserveClip, setPreserveClip] = useState(true);
@@ -1102,19 +1141,26 @@ function SettingsPanel({
 
   async function refreshPerm() {
     try {
-      setPerm(await api.getPermissionStatus());
+      setPerm(await api.pollPermissions());
     } catch (e) {
       onError(String(e));
     }
   }
+
+  // Poll AX while settings tab is open so toggle flips update live.
+  useEffect(() => {
+    const id = window.setInterval(() => void refreshPerm(), 2000);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <>
       <section className="card settings-section">
         <h2>权限</h2>
         <p className="muted-text">
-          麦克风用于录音。辅助功能用于把文字插入其他 App，并启用全局热键监听。
-          macOS 不会在应用内直接授权，需在系统设置里手动打开开关。
+          麦克风：系统会弹窗授权。辅助功能：必须在系统设置里手动打开
+          <strong>当前正在运行</strong>的那个进程（开发版与正式 .app 是两条独立记录）。
         </p>
         {perm && (
           <dl className="meta">
@@ -1122,21 +1168,17 @@ function SettingsPanel({
             <dd>{perm.microphone}</dd>
             <dt>辅助功能</dt>
             <dd>
-              {perm.accessibility}
-              {perm.canInject ? "" : "（未授权时只能复制到剪贴板）"}
+              {perm.accessibilityTrusted ? "已开启" : "需要开启"}
+              {perm.accessibilityTrusted ? "" : "（未开启时只能复制到剪贴板）"}
             </dd>
-            {perm.processHint ? (
-              <>
-                <dt>列表中名称</dt>
-                <dd>
-                  <code>{perm.processHint}</code>
-                  <span className="muted-text">
-                    {" "}
-                    （开发构建可能是 lumen-asr-desktop，正式包是 Lumen ASR）
-                  </span>
-                </dd>
-              </>
-            ) : null}
+            <dt>列表中名称</dt>
+            <dd>
+              <code>{perm.processHint}</code>
+            </dd>
+            <dt>完整路径</dt>
+            <dd style={{ wordBreak: "break-all" }}>
+              <code>{perm.processPath}</code>
+            </dd>
           </dl>
         )}
         <div className="actions">
@@ -1185,18 +1227,32 @@ function SettingsPanel({
               })()
             }
           >
-            授权辅助功能
+            打开辅助功能设置
           </button>
           <button
             type="button"
             className="btn ghost"
             disabled={busy}
-            onClick={() => void api.openAccessibilitySettings()}
+            onClick={() => void refreshPerm()}
           >
-            打开辅助功能设置
-          </button>
-          <button type="button" className="btn ghost" disabled={busy} onClick={() => void refreshPerm()}>
             刷新状态
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={busy}
+            onClick={() =>
+              void (async () => {
+                try {
+                  await api.reopenOnboarding();
+                  window.location.reload();
+                } catch (e) {
+                  onError(String(e));
+                }
+              })()
+            }
+          >
+            重新运行首次设置
           </button>
         </div>
       </section>

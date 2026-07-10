@@ -8,8 +8,10 @@ mod hotkey;
 mod inject_cmd;
 mod learning;
 mod mod_chord;
+mod onboard;
 mod permissions_cmd;
 mod session_debug;
+mod volume_mon;
 
 use config::AppConfig;
 use lumen_asr::{
@@ -68,8 +70,16 @@ pub fn run() {
         provider = %app_config.corrector.provider,
         model = %app_config.corrector.model,
         hotkey = %app_config.hotkey.toggle,
+        onboarding_completed = app_config.onboarding.completed,
         "config loaded"
     );
+
+    let audio = AudioCapture::new();
+    if let Some(ref name) = app_config.audio.device_name {
+        if !name.is_empty() {
+            audio.set_device(Some(name.clone()));
+        }
+    }
 
     let store = match Store::open(default_db_path()) {
         Ok(s) => {
@@ -92,7 +102,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(AppState {
             store: Mutex::new(store),
-            audio: AudioCapture::new(),
+            audio,
             engine: Mutex::new(EngineKind::SenseVoice),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sv_dir)),
             whisper: Mutex::new(WhisperAsr::new(wh_dir)),
@@ -126,6 +136,7 @@ pub fn run() {
             corrector_cmd::correct_text,
             corrector_cmd::default_corrector_config,
             permissions_cmd::get_permission_status,
+            permissions_cmd::poll_permissions,
             permissions_cmd::open_microphone_settings,
             permissions_cmd::open_accessibility_settings,
             permissions_cmd::request_accessibility_access,
@@ -140,19 +151,23 @@ pub fn run() {
             learning::get_learning_config,
             learning::save_learning_config,
             learning::process_edit,
+            onboard::get_onboarding_state,
+            onboard::set_onboarding_step,
+            onboard::skip_onboarding,
+            onboard::complete_onboarding,
+            onboard::reopen_onboarding,
+            volume_mon::start_volume_monitoring_cmd,
+            volume_mon::stop_volume_monitoring_cmd,
         ])
         .setup(|app| {
-            // Keep Regular activation policy. Accessory was tried to avoid
-            // stealing focus but made the main window/Dock vanish (felt like a crash).
-            // Focus preservation is done by: non-focusable capsule + restore
-            // typing-target app before paste.
+            // Keep Regular activation policy. Focus preservation: non-focusable
+            // capsule + restore typing-target only when we stole frontmost.
 
             if let Err(e) = capsule::ensure_capsule(app.handle()) {
                 tracing::warn!(error = %e, "capsule window create failed");
             }
 
-            // Prompt Accessibility early — without it, inject only hits this process
-            // and CGEventTap hotkeys fall back / fail.
+            // Log AX status only — wizard/settings open System Settings on demand.
             permissions_cmd::bootstrap_permissions();
 
             if let Err(e) = hotkey::setup_hotkeys(app.handle()) {

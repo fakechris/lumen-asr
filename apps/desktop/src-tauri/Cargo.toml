@@ -29,6 +29,8 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 chrono = { workspace = true }
+cpal = { workspace = true }
+parking_lot = { workspace = true }
 
 [features]
 default = ["custom-protocol"]
