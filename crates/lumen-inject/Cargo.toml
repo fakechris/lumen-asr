@@ -1,0 +1,16 @@
+[package]
+name = "lumen-inject"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Text insertion orchestration (paste-first, AX, type)"
+
+[dependencies]
+async-trait = { workspace = true }
+lumen-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

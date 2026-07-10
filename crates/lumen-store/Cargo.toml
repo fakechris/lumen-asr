@@ -1,0 +1,21 @@
+[package]
+name = "lumen-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite persistence for sessions, edits, dictionary"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+lumen-core = { workspace = true }
+lumen-dictionary = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

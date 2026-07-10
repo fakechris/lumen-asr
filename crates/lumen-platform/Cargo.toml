@@ -1,0 +1,12 @@
+[package]
+name = "lumen-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform capability traits (permissions, hotkey, frontmost app)"
+
+[dependencies]
+async-trait = { workspace = true }
+lumen-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

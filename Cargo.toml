@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/lumen-core",
+  "crates/lumen-asr",
+  "crates/lumen-corrector",
+  "crates/lumen-dictionary",
+  "crates/lumen-store",
+  "crates/lumen-inject",
+  "crates/lumen-platform",
+  "crates/lumen-platform-macos",
+  "crates/lumen-prompts",
+  "apps/desktop/src-tauri",
+]
+default-members = [
+  "crates/lumen-core",
+  "crates/lumen-asr",
+  "crates/lumen-corrector",
+  "crates/lumen-dictionary",
+  "crates/lumen-store",
+  "crates/lumen-inject",
+  "crates/lumen-platform",
+  "crates/lumen-prompts",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+repository = "https://github.com/fakechris/lumen-asr"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+regex = "1"
+toml = "0.8"
+
+lumen-core = { path = "crates/lumen-core" }
+lumen-asr = { path = "crates/lumen-asr" }
+lumen-corrector = { path = "crates/lumen-corrector" }
+lumen-dictionary = { path = "crates/lumen-dictionary" }
+lumen-store = { path = "crates/lumen-store" }
+lumen-inject = { path = "crates/lumen-inject" }
+lumen-platform = { path = "crates/lumen-platform" }
+lumen-platform-macos = { path = "crates/lumen-platform-macos" }
+lumen-prompts = { path = "crates/lumen-prompts" }

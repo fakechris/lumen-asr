@@ -1,0 +1,15 @@
+[package]
+name = "lumen-dictionary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Personal dictionary and learn-from-edit candidates"
+
+[dependencies]
+chrono = { workspace = true }
+lumen-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]

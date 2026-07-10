@@ -1,0 +1,23 @@
+[package]
+name = "lumen-asr-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lumen ASR desktop shell (Tauri)"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+lumen-platform = { workspace = true }
+lumen-store = { workspace = true }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
