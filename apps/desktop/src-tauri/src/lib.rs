@@ -3,6 +3,8 @@ mod config;
 mod corrector_cmd;
 mod corrector_svc;
 mod dictation;
+mod inject_cmd;
+mod permissions_cmd;
 
 use config::AppConfig;
 use lumen_asr::{
@@ -40,7 +42,8 @@ pub fn run() {
         provider = %app_config.corrector.provider,
         model = %app_config.corrector.model,
         enabled = app_config.corrector.enabled,
-        "corrector config"
+        auto_insert = app_config.inject.auto_insert,
+        "config loaded"
     );
 
     let store = match Store::open(default_db_path()) {
@@ -95,11 +98,18 @@ pub fn run() {
             corrector_cmd::save_corrector_config,
             corrector_cmd::correct_text,
             corrector_cmd::default_corrector_config,
+            permissions_cmd::get_permission_status,
+            permissions_cmd::open_microphone_settings,
+            permissions_cmd::open_accessibility_settings,
+            permissions_cmd::request_microphone_access,
+            inject_cmd::get_inject_config,
+            inject_cmd::save_inject_config,
+            inject_cmd::insert_text,
         ])
         .setup(|app| {
             tracing::info!(
                 name = app.package_info().name,
-                "Lumen ASR desktop starting (M3)"
+                "Lumen ASR desktop starting (M4)"
             );
             Ok(())
         })

@@ -9,12 +9,14 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct AppConfig {
     pub corrector: CorrectorConfig,
+    pub inject: InjectConfig,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             corrector: CorrectorConfig::default(),
+            inject: InjectConfig::default(),
         }
     }
 }
@@ -42,6 +44,44 @@ impl Default for CorrectorConfig {
                 .unwrap_or_else(|_| "qwen2.5:7b".into()),
             api_key: std::env::var("LUMEN_CORRECTOR_API_KEY").unwrap_or_default(),
             timeout_secs: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InjectConfig {
+    /// auto | paste | type | copy_only
+    pub mode: String,
+    pub preserve_clipboard: bool,
+    /// After stop_and_transcribe, insert into frontmost app when accessibility allows.
+    pub auto_insert: bool,
+}
+
+impl Default for InjectConfig {
+    fn default() -> Self {
+        Self {
+            mode: "auto".into(),
+            preserve_clipboard: true,
+            auto_insert: true,
+        }
+    }
+}
+
+impl InjectConfig {
+    pub fn to_policy(&self) -> lumen_inject::InsertPolicy {
+        use lumen_inject::{InjectMode, InsertPolicy};
+        let mode = match self.mode.as_str() {
+            "paste" => InjectMode::Paste,
+            "type" => InjectMode::Type,
+            "copy_only" | "copy" => InjectMode::CopyOnly,
+            "ax" => InjectMode::Ax,
+            _ => InjectMode::Auto,
+        };
+        InsertPolicy {
+            mode,
+            preserve_clipboard: self.preserve_clipboard,
+            paste_first: true,
         }
     }
 }

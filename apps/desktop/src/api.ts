@@ -38,6 +38,41 @@ export const api = {
   correctText: (text: string) =>
     invoke<CorrectTextOutcome>("correct_text", { input: { text } }),
 
+  getPermissionStatus: () =>
+    invoke<{
+      microphone: string;
+      accessibility: string;
+      canRecord: boolean;
+      canInject: boolean;
+      copyOnlyOk: boolean;
+    }>("get_permission_status"),
+  openMicrophoneSettings: () => invoke<void>("open_microphone_settings"),
+  openAccessibilitySettings: () => invoke<void>("open_accessibility_settings"),
+  requestMicrophoneAccess: () =>
+    invoke<{
+      microphone: string;
+      accessibility: string;
+      canRecord: boolean;
+      canInject: boolean;
+      copyOnlyOk: boolean;
+    }>("request_microphone_access"),
+
+  getInjectConfig: () =>
+    invoke<{
+      mode: string;
+      preserveClipboard: boolean;
+      autoInsert: boolean;
+    }>("get_inject_config"),
+  saveInjectConfig: (input: {
+    mode?: string;
+    preserveClipboard?: boolean;
+    autoInsert?: boolean;
+  }) => invoke("save_inject_config", { input }),
+  insertText: (text: string) =>
+    invoke<{ strategy: string; restoredClipboard: boolean }>("insert_text", {
+      text,
+    }),
+
   listSessions: (limit = 50) =>
     invoke<SessionRecord[]>("list_sessions", { limit }),
 

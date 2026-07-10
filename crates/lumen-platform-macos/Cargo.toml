@@ -3,7 +3,7 @@ name = "lumen-platform-macos"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "macOS implementations: permissions stubs, inject backend stubs (M4 fills in)"
+description = "macOS: permissions, paste-first inject, AX/type fallbacks"
 
 [dependencies]
 async-trait = { workspace = true }
@@ -11,8 +11,8 @@ lumen-core = { workspace = true }
 lumen-inject = { workspace = true }
 lumen-platform = { workspace = true }
 tracing = { workspace = true }
+cpal = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Real AX / paste / CGEvent land in M4.
-# objc2 = "0.6"
-# objc2-app-kit = "0.3"
+core-foundation = "0.10"
+core-graphics = "0.24"

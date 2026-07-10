@@ -166,9 +166,25 @@ pub async fn stop_and_transcribe(
         format!("{}:fallback", engine_label(&cfg))
     };
 
+    // Optional auto-insert into frontmost app (paste-first).
+    let mut insert_strategy = InsertStrategy::None;
+    if cfg.inject.auto_insert && !corrected_text.is_empty() {
+        // Brief pause so user can leave our window focus if needed.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        match crate::inject_cmd::insert_with_config(&cfg.inject, &corrected_text).await {
+            Ok(out) => {
+                insert_strategy = out.strategy;
+                tracing::info!(?insert_strategy, "auto-insert done");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "auto-insert failed; text still available in UI");
+            }
+        }
+    }
+
     let mut rec = SessionRecord::new();
     rec.status = SessionStatus::Completed;
-    rec.insert_strategy = InsertStrategy::None;
+    rec.insert_strategy = insert_strategy;
     rec.asr_raw = Some(asr_text.clone());
     rec.corrected = Some(corrected_text.clone());
     rec.pasted = Some(corrected_text.clone());

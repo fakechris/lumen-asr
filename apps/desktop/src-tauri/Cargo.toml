@@ -22,6 +22,8 @@ lumen-dictionary = { workspace = true }
 lumen-asr = { workspace = true }
 lumen-corrector = { workspace = true }
 lumen-prompts = { workspace = true }
+lumen-inject = { workspace = true }
+lumen-platform-macos = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

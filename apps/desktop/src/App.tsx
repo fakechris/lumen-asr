@@ -445,6 +445,23 @@ function RecordPanel({
     }
   }
 
+  async function insertNow() {
+    if (!text.trim()) return;
+    onBusy(true);
+    onError(null);
+    try {
+      const out = await api.insertText(text);
+      setMeta(
+        (meta ? meta + " · " : "") +
+          `insert ${out.strategy}${out.restoredClipboard ? " (clipboard restored)" : ""}`
+      );
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      onBusy(false);
+    }
+  }
+
   async function cancel() {
     onBusy(true);
     try {
@@ -582,7 +599,18 @@ function RecordPanel({
           >
             重新 AI 修正
           </button>
+          <button
+            type="button"
+            className="btn"
+            disabled={busy || !text.trim()}
+            onClick={() => void insertNow()}
+          >
+            插入到当前应用
+          </button>
         </div>
+        <p className="muted-text" style={{ marginTop: 8, fontSize: "0.85rem" }}>
+          插入前请先点回目标 App 光标处。需要辅助功能权限；可在设置中开关「停止后自动插入」。
+        </p>
       </section>
     </>
   );
@@ -607,6 +635,15 @@ function SettingsPanel({
   const [apiKey, setApiKey] = useState("");
   const [timeoutSecs, setTimeoutSecs] = useState(60);
   const [probe, setProbe] = useState<string>("");
+  const [perm, setPerm] = useState<{
+    microphone: string;
+    accessibility: string;
+    canRecord: boolean;
+    canInject: boolean;
+  } | null>(null);
+  const [autoInsert, setAutoInsert] = useState(true);
+  const [injectMode, setInjectMode] = useState("auto");
+  const [preserveClip, setPreserveClip] = useState(true);
 
   useEffect(() => {
     void (async () => {
@@ -618,6 +655,12 @@ function SettingsPanel({
         setBaseUrl(c.baseUrl);
         setModel(c.model);
         setTimeoutSecs(c.timeoutSecs);
+        const p = await api.getPermissionStatus();
+        setPerm(p);
+        const inj = await api.getInjectConfig();
+        setAutoInsert(inj.autoInsert);
+        setInjectMode(inj.mode);
+        setPreserveClip(inj.preserveClipboard);
       } catch (e) {
         onError(String(e));
       }
@@ -666,8 +709,135 @@ function SettingsPanel({
     }
   }
 
+  async function saveInject() {
+    onBusy(true);
+    onError(null);
+    try {
+      await api.saveInjectConfig({
+        mode: injectMode,
+        preserveClipboard: preserveClip,
+        autoInsert,
+      });
+      onSaved();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      onBusy(false);
+    }
+  }
+
+  async function refreshPerm() {
+    try {
+      setPerm(await api.getPermissionStatus());
+    } catch (e) {
+      onError(String(e));
+    }
+  }
+
   return (
     <>
+      <section className="card">
+        <h2>权限</h2>
+        <p className="muted-text">
+          麦克风用于录音；辅助功能用于把文字粘贴进其他 App（⌘V 模拟）。
+        </p>
+        {perm && (
+          <dl className="meta">
+            <dt>麦克风</dt>
+            <dd>{perm.microphone}</dd>
+            <dt>辅助功能</dt>
+            <dd>{perm.accessibility}</dd>
+          </dl>
+        )}
+        <div className="actions">
+          <button
+            type="button"
+            className="btn"
+            disabled={busy}
+            onClick={() =>
+              void (async () => {
+                onBusy(true);
+                try {
+                  setPerm(await api.requestMicrophoneAccess());
+                } catch (e) {
+                  onError(String(e));
+                } finally {
+                  onBusy(false);
+                }
+              })()
+            }
+          >
+            请求麦克风
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={busy}
+            onClick={() => void api.openMicrophoneSettings()}
+          >
+            打开麦克风设置
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={busy}
+            onClick={() => void api.openAccessibilitySettings()}
+          >
+            打开辅助功能设置
+          </button>
+          <button type="button" className="btn ghost" disabled={busy} onClick={() => void refreshPerm()}>
+            刷新状态
+          </button>
+        </div>
+      </section>
+
+      <section className="card">
+        <h2>插入策略</h2>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={autoInsert}
+              disabled={busy}
+              onChange={(e) => setAutoInsert(e.target.checked)}
+            />{" "}
+            停止转写后自动插入
+          </label>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={preserveClip}
+              disabled={busy}
+              onChange={(e) => setPreserveClip(e.target.checked)}
+            />{" "}
+            保留并恢复原剪贴板
+          </label>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            模式
+          </label>
+          <select
+            className="input"
+            value={injectMode}
+            disabled={busy}
+            onChange={(e) => setInjectMode(e.target.value)}
+          >
+            <option value="auto">auto（paste → type）</option>
+            <option value="paste">paste only</option>
+            <option value="type">type unicode</option>
+            <option value="copy_only">copy only（仅剪贴板）</option>
+          </select>
+        </div>
+        <div className="actions">
+          <button type="button" className="btn" disabled={busy} onClick={() => void saveInject()}>
+            保存插入设置
+          </button>
+        </div>
+      </section>
+
       <section className="card">
         <h2>AI 修正（Corrector）</h2>
         <p className="muted-text">
@@ -871,7 +1041,7 @@ function Overview({
           <li className="done">M1 — Store / 词典 IPC + 本页 UI</li>
           <li className="done">M2 — SenseVoice (sherpa) + 麦克风</li>
           <li className="done">M3 — Ollama 修正</li>
-          <li>M4 — paste-first 注入 + 权限</li>
+          <li className="done">M4 — paste-first 注入 + 权限</li>
           <li>M5 — 热键 + 胶囊</li>
           <li>M6 — 粘贴后编辑捕获</li>
         </ol>

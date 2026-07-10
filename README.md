@@ -90,6 +90,14 @@ timeout_secs = 60
 
 On failure: rule preprocess + dictionary replacements only (session still completes).
 
+### Inject + permissions (M4)
+
+- **Paste-first**: write clipboard → simulate ⌘V (CGEvent) → restore clipboard (~450ms)
+- Requires **Accessibility** for insert; without it use copy-only / UI text
+- **Microphone** usage string in `Info.plist`; first record triggers system prompt
+- Settings: auto-insert, preserve clipboard, mode (`auto` / `paste` / `type` / `copy_only`)
+- IPC: `get_permission_status`, `insert_text`, `get/save_inject_config`
+
 Data directory (runtime):
 
 ```
