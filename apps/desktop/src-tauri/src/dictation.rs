@@ -317,35 +317,66 @@ pub async fn stop_and_transcribe_inner(
     let mut did_insert = false;
     let mut frontmost_before_insert = None;
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
-        frontmost_before_insert = restore_target_app_before_insert(app);
-        // Let focus settle after capsule hide; modifiers clear inside inject.
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-
-        if let Some(cur) = frontmost_app_name() {
-            if is_self_app_name(&cur) {
-                notes.push(format!("frontmost is self before insert: {cur}"));
-                tracing::warn!(%cur, "frontmost still Lumen — one restore attempt");
-                if let Some(ref t) = target {
-                    let _ = activate_target(t);
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let ax_ok = lumen_platform_macos::is_accessibility_trusted();
+        if !ax_ok {
+            // Without Accessibility, synthetic keys only hit *this* process — copy instead.
+            notes.push(
+                "accessibility denied — text copied to clipboard; enable Accessibility for insert"
+                    .into(),
+            );
+            tracing::error!(
+                "Accessibility not granted; cannot inject into other apps. Open System Settings → Privacy & Security → Accessibility and enable this process"
+            );
+            match crate::inject_cmd::copy_only(&corrected_text).await {
+                Ok(()) => {
+                    insert_strategy = InsertStrategy::CopyOnly;
+                    tracing::info!("copied result to clipboard (no AX)");
+                }
+                Err(e) => {
+                    notes.push(format!("clipboard copy failed: {e}"));
                 }
             }
-        }
-
-        match crate::inject_cmd::insert_with_config(&cfg.inject, &corrected_text).await {
-            Ok(out) => {
-                insert_strategy = out.strategy;
-                did_insert =
-                    !matches!(insert_strategy, InsertStrategy::None | InsertStrategy::CopyOnly);
-                tracing::info!(
-                    ?insert_strategy,
-                    frontmost = ?frontmost_app_name(),
-                    "auto-insert done (type→paste)"
+            if let Some(app) = app {
+                emit_dictation(
+                    app,
+                    DictationUiEvent::Error {
+                        message: "需要「辅助功能」权限才能插入到其他 App。请到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop），然后重试。文字已复制到剪贴板。".into(),
+                    },
                 );
             }
-            Err(e) => {
-                notes.push(format!("insert error: {e}"));
-                tracing::warn!(error = %e, "auto-insert failed");
+        } else {
+            frontmost_before_insert = restore_target_app_before_insert(app);
+            // Let focus settle after capsule hide; modifiers clear inside inject.
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+            if let Some(cur) = frontmost_app_name() {
+                if is_self_app_name(&cur) {
+                    notes.push(format!("frontmost is self before insert: {cur}"));
+                    tracing::warn!(%cur, "frontmost still Lumen — one restore attempt");
+                    if let Some(ref t) = target {
+                        let _ = activate_target(t);
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+            }
+
+            match crate::inject_cmd::insert_with_config(&cfg.inject, &corrected_text).await {
+                Ok(out) => {
+                    insert_strategy = out.strategy;
+                    did_insert = !matches!(
+                        insert_strategy,
+                        InsertStrategy::None | InsertStrategy::CopyOnly
+                    );
+                    tracing::info!(
+                        ?insert_strategy,
+                        frontmost = ?frontmost_app_name(),
+                        "auto-insert done"
+                    );
+                }
+                Err(e) => {
+                    notes.push(format!("insert error: {e}"));
+                    tracing::warn!(error = %e, "auto-insert failed");
+                }
             }
         }
     }

@@ -11,17 +11,17 @@ impl Permissions for MacPermissions {
     async fn status(&self) -> Result<PermissionStatus, PlatformError> {
         Ok(PermissionStatus {
             microphone: mic_status(),
-            accessibility: ax_status(),
+            accessibility: if is_accessibility_trusted() {
+                PermissionState::Granted
+            } else {
+                PermissionState::Denied
+            },
         })
     }
 
     async fn request_microphone(&self) -> Result<PermissionState, PlatformError> {
-        // Opening the default input stream triggers the system prompt when Info.plist
-        // has NSMicrophoneUsageDescription and status is NotDetermined.
         #[cfg(target_os = "macos")]
         {
-            // Probe: list devices / try short cpal open is done by caller.
-            // Here we only open System Settings if already denied.
             let st = mic_status();
             if st == PermissionState::Denied || st == PermissionState::Restricted {
                 let _ = self.open_microphone_settings().await;
@@ -35,50 +35,95 @@ impl Permissions for MacPermissions {
     }
 
     async fn open_accessibility_settings(&self) -> Result<(), PlatformError> {
-        // Prefer modern Settings URL, fall back to legacy pane.
+        open_accessibility_settings_urls()
+    }
+
+    async fn open_microphone_settings(&self) -> Result<(), PlatformError> {
+        // Try modern + legacy URLs.
         if open_url(
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone",
         )
         .is_err()
         {
             open_url(
-                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
             )?;
         }
         Ok(())
     }
-
-    async fn open_microphone_settings(&self) -> Result<(), PlatformError> {
-        open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
-    }
 }
 
-fn ax_status() -> PermissionState {
+/// True when macOS trusts this process for Accessibility (inject / event tap).
+pub fn is_accessibility_trusted() -> bool {
     #[cfg(target_os = "macos")]
     {
-        if ax_is_process_trusted() {
-            PermissionState::Granted
-        } else {
-            // Prompt once with options so the app appears in the list.
-            let _ = ax_is_process_trusted_with_prompt();
-            if ax_is_process_trusted() {
-                PermissionState::Granted
-            } else {
-                PermissionState::Denied
-            }
-        }
+        unsafe { AXIsProcessTrusted() }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        PermissionState::Denied
+        false
     }
+}
+
+/// Show the system Accessibility trust dialog (once per denial cycle) and return
+/// whether the process is trusted after the call.
+///
+/// macOS does **not** grant AX from an in-app toggle — the user must flip the
+/// switch in System Settings. This only ensures we appear in the list.
+pub fn prompt_accessibility() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if is_accessibility_trusted() {
+            return true;
+        }
+        let _ = ax_is_process_trusted_with_prompt();
+        is_accessibility_trusted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Prompt if needed, then open System Settings → Privacy → Accessibility.
+pub fn ensure_accessibility_onboarding() -> bool {
+    let trusted = prompt_accessibility();
+    if !trusted {
+        let _ = open_accessibility_settings_urls();
+    }
+    trusted
+}
+
+fn open_accessibility_settings_urls() -> Result<(), PlatformError> {
+    // macOS Ventura / Sequoia and older System Preferences.
+    let urls = [
+        "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+    ];
+    let mut last_err = None;
+    for url in urls {
+        match open_url(url) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    // Last resort: open System Settings app.
+    if std::process::Command::new("open")
+        .arg("-b")
+        .arg("com.apple.systempreferences")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    Err(last_err.unwrap_or_else(|| PlatformError::Message("open Accessibility settings failed".into())))
 }
 
 fn mic_status() -> PermissionState {
     #[cfg(target_os = "macos")]
     {
-        // Heuristic: if we can open the default input device config, treat as usable.
-        // Precise TCC status needs AVFoundation; cpal open will trigger the real prompt.
         match cpal_default_input_ok() {
             true => PermissionState::Granted,
             false => PermissionState::NotDetermined,
@@ -97,11 +142,6 @@ fn cpal_default_input_ok() -> bool {
     host.default_input_device()
         .and_then(|d| d.default_input_config().ok())
         .is_some()
-}
-
-#[cfg(target_os = "macos")]
-fn ax_is_process_trusted() -> bool {
-    unsafe { AXIsProcessTrusted() }
 }
 
 #[cfg(target_os = "macos")]

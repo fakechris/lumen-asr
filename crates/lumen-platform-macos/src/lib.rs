@@ -6,7 +6,9 @@ mod permissions;
 
 pub use hotkey_tap::{start_monitor, stop_monitor, HotkeyEdge, HotkeyMode, HotkeySpec};
 pub use inject::MacTextInjectorBackend;
-pub use permissions::MacPermissions;
+pub use permissions::{
+    ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,
+};
 
 use async_trait::async_trait;
 use lumen_core::FocusInfo;

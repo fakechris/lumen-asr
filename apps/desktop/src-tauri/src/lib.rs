@@ -128,6 +128,7 @@ pub fn run() {
             permissions_cmd::get_permission_status,
             permissions_cmd::open_microphone_settings,
             permissions_cmd::open_accessibility_settings,
+            permissions_cmd::request_accessibility_access,
             permissions_cmd::request_microphone_access,
             inject_cmd::get_inject_config,
             inject_cmd::save_inject_config,
@@ -149,8 +150,18 @@ pub fn run() {
             if let Err(e) = capsule::ensure_capsule(app.handle()) {
                 tracing::warn!(error = %e, "capsule window create failed");
             }
+
+            // Prompt Accessibility early — without it, inject only hits this process
+            // and CGEventTap hotkeys fall back / fail.
+            permissions_cmd::bootstrap_permissions();
+
             if let Err(e) = hotkey::setup_hotkeys(app.handle()) {
                 tracing::warn!(error = %e, "hotkey setup failed");
+            }
+            if !lumen_platform_macos::is_accessibility_trusted() {
+                tracing::warn!(
+                    "hotkey event-tap needs Accessibility; using fallback monitors until granted"
+                );
             }
 
             let debug_dir = session_debug::debug_root();
@@ -160,6 +171,7 @@ pub fn run() {
                 name = app.package_info().name,
                 debug = %debug_dir.display(),
                 log = %log_path.display(),
+                accessibility = lumen_platform_macos::is_accessibility_trusted(),
                 "Lumen ASR desktop starting (session debug enabled)"
             );
             Ok(())

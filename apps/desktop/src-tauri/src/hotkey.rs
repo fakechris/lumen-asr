@@ -183,7 +183,8 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "event-tap unavailable — falling back"
+                            accessibility = lumen_platform_macos::is_accessibility_trusted(),
+                            "event-tap unavailable — falling back (enable Accessibility if denied)"
                         );
                     }
                 }

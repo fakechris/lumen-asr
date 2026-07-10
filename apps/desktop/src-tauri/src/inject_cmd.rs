@@ -112,6 +112,20 @@ pub async fn insert_with_config(cfg: &InjectConfig, text: &str) -> Result<Insert
             restored_clipboard: false,
         });
     }
+    if !lumen_platform_macos::is_accessibility_trusted() {
+        return Err(
+            "Accessibility permission required to insert into other apps (System Settings → Privacy & Security → Accessibility)"
+                .into(),
+        );
+    }
     let injector = TextInjector::new(MacTextInjectorBackend, cfg.to_policy());
     injector.insert(text).await.map_err(|e| e.to_string())
+}
+
+pub async fn copy_only(text: &str) -> Result<(), String> {
+    use lumen_inject::TextInjectorBackend;
+    MacTextInjectorBackend
+        .copy_only(text)
+        .await
+        .map_err(|e| e.to_string())
 }

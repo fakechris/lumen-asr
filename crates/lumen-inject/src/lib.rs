@@ -105,12 +105,12 @@ impl<B: TextInjectorBackend> TextInjector<B> {
     }
 
     async fn try_auto(&self, text: &str) -> Result<InsertOutcome, InjectError> {
-        // Product default: type unicode at cursor first (no app activate),
-        // then clipboard paste, then AX. Field `paste_first` kept for config compat.
+        // paste_first=true (default): clipboard ⌘V first (most reliable for terminals).
+        // paste_first=false: type unicode first, then paste.
         let sequence: Vec<InsertStrategy> = if self.policy.paste_first {
             vec![
-                InsertStrategy::Type,
                 InsertStrategy::Paste,
+                InsertStrategy::Type,
                 InsertStrategy::Ax,
             ]
         } else {

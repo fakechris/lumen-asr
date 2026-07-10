@@ -45,9 +45,19 @@ export const api = {
       canRecord: boolean;
       canInject: boolean;
       copyOnlyOk: boolean;
+      processHint: string;
     }>("get_permission_status"),
   openMicrophoneSettings: () => invoke<void>("open_microphone_settings"),
   openAccessibilitySettings: () => invoke<void>("open_accessibility_settings"),
+  requestAccessibilityAccess: () =>
+    invoke<{
+      microphone: string;
+      accessibility: string;
+      canRecord: boolean;
+      canInject: boolean;
+      copyOnlyOk: boolean;
+      processHint: string;
+    }>("request_accessibility_access"),
   requestMicrophoneAccess: () =>
     invoke<{
       microphone: string;
@@ -55,6 +65,7 @@ export const api = {
       canRecord: boolean;
       canInject: boolean;
       copyOnlyOk: boolean;
+      processHint: string;
     }>("request_microphone_access"),
 
   getInjectConfig: () =>

@@ -993,6 +993,7 @@ function SettingsPanel({
     accessibility: string;
     canRecord: boolean;
     canInject: boolean;
+    processHint?: string;
   } | null>(null);
   const [autoInsert, setAutoInsert] = useState(true);
   const [injectMode, setInjectMode] = useState("auto");
@@ -1112,14 +1113,30 @@ function SettingsPanel({
       <section className="card settings-section">
         <h2>权限</h2>
         <p className="muted-text">
-          麦克风用于录音；辅助功能用于把文字粘贴进其他 App（⌘V 模拟）。建议先完成这两项再测热键。
+          麦克风用于录音。辅助功能用于把文字插入其他 App，并启用全局热键监听。
+          macOS 不会在应用内直接授权，需在系统设置里手动打开开关。
         </p>
         {perm && (
           <dl className="meta">
             <dt>麦克风</dt>
             <dd>{perm.microphone}</dd>
             <dt>辅助功能</dt>
-            <dd>{perm.accessibility}</dd>
+            <dd>
+              {perm.accessibility}
+              {perm.canInject ? "" : "（未授权时只能复制到剪贴板）"}
+            </dd>
+            {perm.processHint ? (
+              <>
+                <dt>列表中名称</dt>
+                <dd>
+                  <code>{perm.processHint}</code>
+                  <span className="muted-text">
+                    {" "}
+                    （开发构建可能是 lumen-asr-desktop，正式包是 Lumen ASR）
+                  </span>
+                </dd>
+              </>
+            ) : null}
           </dl>
         )}
         <div className="actions">
@@ -1149,6 +1166,26 @@ function SettingsPanel({
             onClick={() => void api.openMicrophoneSettings()}
           >
             打开麦克风设置
+          </button>
+          <button
+            type="button"
+            className="btn"
+            disabled={busy}
+            onClick={() =>
+              void (async () => {
+                onBusy(true);
+                try {
+                  setPerm(await api.requestAccessibilityAccess());
+                  onSaved();
+                } catch (e) {
+                  onError(String(e));
+                } finally {
+                  onBusy(false);
+                }
+              })()
+            }
+          >
+            授权辅助功能
           </button>
           <button
             type="button"
