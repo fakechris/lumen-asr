@@ -527,17 +527,20 @@ code {
   }
 }
 
+/* History: result log + recovery when quality is bad (not a clone of list+icon toolbars). */
+
 .history-layout {
   align-items: stretch;
 }
 
-.history-hint {
-  font-size: 0.82rem;
-  margin: 0 0 10px;
+.empty-history {
+  padding: 28px 12px 12px;
 }
 
-.empty-history {
-  padding: 24px 8px;
+.empty-history-title {
+  margin: 0 0 6px;
+  font-weight: 600;
+  font-size: 0.95rem;
 }
 
 .session-list {
@@ -546,16 +549,16 @@ code {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  max-height: 62vh;
+  gap: 4px;
+  max-height: 64vh;
   overflow: auto;
 }
 
 .session-item {
   width: 100%;
   text-align: left;
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--text) 3%, transparent);
+  border: 1px solid transparent;
+  background: transparent;
   color: var(--text);
   border-radius: 10px;
   padding: 10px 12px;
@@ -563,20 +566,20 @@ code {
   font: inherit;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .session-item:hover {
-  border-color: var(--border-strong);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
 }
 
 .session-item.active {
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
   background: var(--accent-dim);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
 }
 
-.session-item-warn {
-  border-color: color-mix(in srgb, var(--error, #ff453a) 35%, var(--border));
+.session-item-soft .session-preview {
+  color: var(--muted);
 }
 
 .session-item-top {
@@ -586,85 +589,117 @@ code {
   gap: 8px;
 }
 
-.session-item-meta {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
+.session-flag {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: color-mix(in srgb, var(--error) 85%, var(--muted));
 }
 
 .session-preview {
-  font-size: 0.92rem;
+  font-size: 0.93rem;
   line-height: 1.4;
 }
 
 .session-preview.empty {
   color: var(--muted);
-  font-style: italic;
 }
 
-.chip-app {
-  max-width: 7rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.session-context {
+  font-size: 0.75rem;
 }
 
-.chip-audio {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+.history-empty-detail {
+  padding: 56px 20px;
+  text-align: center;
 }
 
-.history-detail-title {
-  margin: 0;
-  font-size: 1.1rem;
-}
-
-.history-detail-sub {
-  margin-top: 4px;
-  font-size: 0.82rem;
-}
-
-.history-toolbar {
+.history-detail-head {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin: 12px 0 14px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
 }
 
-.history-main-text {
-  min-height: 120px;
-  padding: 14px 16px;
-  border-radius: 12px;
+.history-detail-when {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.history-detail-meta {
+  margin-top: 3px;
+  font-size: 0.8rem;
+}
+
+.history-result {
+  min-height: 7.5rem;
+  padding: 16px 18px;
+  border-radius: var(--radius);
   border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--text) 3.5%, transparent);
-  font-size: 1.05rem;
+  background: var(--card);
+  box-shadow: var(--shadow);
+  font-size: 1.06rem;
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
   user-select: text;
 }
 
-.history-secondary {
-  margin-top: 14px;
+.history-result-soft {
+  border-style: dashed;
+  background: color-mix(in srgb, var(--text) 2.5%, var(--card));
 }
 
-.history-compare {
-  display: grid;
-  gap: 10px;
-  margin-top: 10px;
+.history-recover {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--accent-dim);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
 }
 
-.history-compare-block .field-label {
+.history-recover-text {
+  margin: 0 0 10px;
+  font-size: 0.88rem;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.history-recover-actions {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
-.history-empty-detail {
-  padding: 48px 16px;
-  text-align: center;
+.history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.history-no-audio {
+  font-size: 0.82rem;
+}
+
+.history-retry-note {
+  margin: 10px 0 0;
+  font-size: 0.85rem;
+  color: var(--ok);
+}
+
+.history-pipeline {
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.history-pipeline-body {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
 }
 
 .chip {

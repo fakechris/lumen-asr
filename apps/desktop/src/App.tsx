@@ -1605,6 +1605,18 @@ function Overview({
   );
 }
 
+/** Quality of a session result — drives recovery UI, not decoration. */
+function sessionQuality(s: SessionRecord): "ok" | "weak" | "empty" {
+  const t = (s.corrected || s.pasted || s.asr_raw || "").trim();
+  if (!t) return "empty";
+  if (t.length <= 2 || t === "。" || t === "." || t === "…") return "weak";
+  return "ok";
+}
+
+function sessionMainText(s: SessionRecord): string {
+  return (s.corrected || s.pasted || s.asr_raw || "").trim();
+}
+
 function HistoryPanel({
   sessions,
   selected,
@@ -1627,13 +1639,13 @@ function HistoryPanel({
   onDelete: (id: string) => void;
 }) {
   const [playing, setPlaying] = useState(false);
-  const [copied, setCopied] = useState<string | null>(null);
-  const [showAsr, setShowAsr] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [showPipeline, setShowPipeline] = useState(false);
+  const [retryNote, setRetryNote] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
 
-  useEffect(() => {
-    // Stop playback when switching rows.
+  const stopAudio = useCallback(() => {
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
@@ -1643,25 +1655,25 @@ function HistoryPanel({
       blobUrlRef.current = null;
     }
     setPlaying(false);
-    setCopied(null);
-    setShowAsr(false);
-  }, [selected?.id]);
-
-  useEffect(() => {
-    return () => {
-      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
-    };
   }, []);
 
-  const mainText = (s: SessionRecord) =>
-    (s.corrected || s.pasted || s.asr_raw || "").trim();
+  useEffect(() => {
+    stopAudio();
+    setCopied(false);
+    setShowPipeline(false);
+    setRetryNote(null);
+  }, [selected?.id, stopAudio]);
 
-  async function copyText(label: string, text: string) {
+  useEffect(() => () => stopAudio(), [stopAudio]);
+
+  async function copyMain() {
+    if (!selected) return;
+    const text = sessionMainText(selected);
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
-      setCopied(label);
-      window.setTimeout(() => setCopied(null), 1500);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
     } catch (e) {
       onError(`复制失败: ${String(e)}`);
     }
@@ -1669,28 +1681,27 @@ function HistoryPanel({
 
   async function playAudio() {
     if (!selected?.audio_path) {
-      onError("此会话没有保存音频");
+      onError("这条记录没有保存录音，无法回听。");
       return;
     }
     onError(null);
     try {
-      if (playing && audioRef.current) {
-        audioRef.current.pause();
-        setPlaying(false);
+      if (playing) {
+        stopAudio();
         return;
       }
       onBusy(true);
       const bytes = await api.getSessionAudio(selected.id);
-      const u8 = new Uint8Array(bytes);
-      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
-      const url = URL.createObjectURL(new Blob([u8], { type: "audio/wav" }));
+      const url = URL.createObjectURL(
+        new Blob([new Uint8Array(bytes)], { type: "audio/wav" })
+      );
       blobUrlRef.current = url;
       const audio = new Audio(url);
       audioRef.current = audio;
       audio.onended = () => setPlaying(false);
       audio.onerror = () => {
         setPlaying(false);
-        onError("音频播放失败");
+        onError("录音播放失败");
       };
       await audio.play();
       setPlaying(true);
@@ -1706,16 +1717,31 @@ function HistoryPanel({
     if (!selected) return;
     onBusy(true);
     onError(null);
+    setRetryNote(null);
     try {
+      const before = sessionMainText(selected);
       const out = await api.retrySessionTranscription(selected.id);
       onUpdated(out.session);
       onRefresh();
+      const after = sessionMainText(out.session);
+      if (after && after !== before) {
+        setRetryNote("识别结果已更新");
+      } else if (!after) {
+        setRetryNote("仍然没有识别出文字，可先听录音确认环境音");
+      } else {
+        setRetryNote("结果与上次相同");
+      }
     } catch (e) {
       onError(String(e));
     } finally {
       onBusy(false);
     }
   }
+
+  const q = selected ? sessionQuality(selected) : null;
+  const needsRecovery = q === "empty" || q === "weak";
+  const hasAudio = Boolean(selected?.audio_path);
+  const text = selected ? sessionMainText(selected) : "";
 
   return (
     <div className="split history-layout">
@@ -1726,42 +1752,47 @@ function HistoryPanel({
             刷新
           </button>
         </div>
-        <p className="muted-text history-hint">
-          转写失败或不理想时，可试听原音频并重新转写。
-        </p>
         {sessions.length === 0 ? (
-          <p className="muted-text empty-history">暂无会话。用热键说一段话后会出现在这里。</p>
+          <div className="empty-history">
+            <p className="empty-history-title">还没有记录</p>
+            <p className="muted-text">
+              按住热键说一段话，结果会按时间出现在这里。识别不理想时可以回听录音再识别一次。
+            </p>
+          </div>
         ) : (
           <ul className="session-list">
             {sessions.map((s) => {
-              const text = mainText(s);
-              const empty = !text;
-              const weak = text.length <= 2 || text === "。" || text === ".";
+              const body = sessionMainText(s);
+              const quality = sessionQuality(s);
               return (
                 <li key={s.id}>
                   <button
                     type="button"
-                    className={`session-item ${selected?.id === s.id ? "active" : ""} ${
-                      weak || empty ? "session-item-warn" : ""
-                    }`}
+                    className={[
+                      "session-item",
+                      selected?.id === s.id ? "active" : "",
+                      quality !== "ok" ? "session-item-soft" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
                     onClick={() => onSelect(s.id)}
                   >
                     <div className="session-item-top">
                       <span className="list-time">{formatTime(s.created_at)}</span>
-                      <span className="session-item-meta">
-                        {s.focus?.app_name ? (
-                          <span className="chip chip-app">{s.focus.app_name}</span>
-                        ) : null}
-                        {s.audio_path ? (
-                          <span className="chip chip-audio" title="有音频">
-                            ♪
-                          </span>
-                        ) : null}
-                      </span>
+                      {quality !== "ok" && (
+                        <span className="session-flag">
+                          {quality === "empty" ? "无结果" : "偏短"}
+                        </span>
+                      )}
                     </div>
-                    <span className={`session-preview ${empty ? "empty" : ""}`}>
-                      {empty ? "（无文本）" : previewText(text, 72)}
+                    <span
+                      className={`session-preview ${quality === "empty" ? "empty" : ""}`}
+                    >
+                      {quality === "empty" ? "没有识别出文字" : previewText(body, 80)}
                     </span>
+                    {s.focus?.app_name ? (
+                      <span className="session-context muted-text">{s.focus.app_name}</span>
+                    ) : null}
                   </button>
                 </li>
               );
@@ -1773,112 +1804,141 @@ function HistoryPanel({
       <section className="card detail-pane history-detail">
         {!selected ? (
           <div className="history-empty-detail">
-            <p className="muted-text">选择左侧一条会话</p>
-            <p className="muted-text">支持播放音频、一键复制、重新转写</p>
+            <p className="empty-history-title">查看某次识别</p>
+            <p className="muted-text">从左侧选一条记录。核心是：核对文本、复制，必要时听录音再识别。</p>
           </div>
         ) : (
           <>
-            <div className="card-head">
+            <header className="history-detail-head">
               <div>
-                <h2 className="history-detail-title">转写结果</h2>
-                <div className="history-detail-sub muted-text">
-                  {formatTime(selected.created_at)}
-                  {selected.focus?.app_name ? ` · ${selected.focus.app_name}` : ""}
-                  {selected.asr_engine ? ` · ${selected.asr_engine}` : ""}
-                  {selected.corrector_engine ? ` · ${selected.corrector_engine}` : ""}
+                <div className="history-detail-when">{formatTime(selected.created_at)}</div>
+                <div className="history-detail-meta muted-text">
+                  {[
+                    selected.focus?.app_name,
+                    selected.asr_engine,
+                    selected.corrector_engine && selected.corrector_engine !== "none"
+                      ? `修正 ${selected.corrector_engine}`
+                      : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ") || "本地识别"}
                 </div>
               </div>
-            </div>
-
-            <div className="history-toolbar">
               <button
                 type="button"
-                className="btn"
-                disabled={busy || !selected.audio_path}
-                onClick={() => void playAudio()}
-                title={selected.audio_path ? "播放保存的录音" : "无音频"}
-              >
-                {playing ? "⏸ 停止" : "▶ 播放"}
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={busy || !mainText(selected)}
-                onClick={() => void copyText("main", mainText(selected))}
-              >
-                {copied === "main" ? "已复制" : "复制"}
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={busy || !selected.audio_path}
-                onClick={() => void retry()}
-                title="用已存音频重新跑 ASR + 修正"
-              >
-                {busy ? "转写中…" : "重新转写"}
-              </button>
-              <button
-                type="button"
-                className="btn ghost danger"
+                className="btn small ghost danger"
                 disabled={busy}
                 onClick={() => onDelete(selected.id)}
               >
                 删除
               </button>
-            </div>
+            </header>
 
-            <div className="history-main-text">
-              {mainText(selected) || (
-                <span className="muted-text">（空结果 — 可播放音频后重新转写）</span>
+            {/* Result first — text is the product */}
+            <div
+              className={`history-result ${needsRecovery ? "history-result-soft" : ""}`}
+              onDoubleClick={() => void copyMain()}
+              title="双击复制"
+            >
+              {text || (
+                <span className="muted-text">
+                  没有识别出文字。
+                  {hasAudio ? "可以先听录音，再点「再识别一次」。" : ""}
+                </span>
               )}
             </div>
 
-            <div className="history-secondary">
+            {/* Recovery path: emphasized only when quality is bad */}
+            {needsRecovery && hasAudio && (
+              <div className="history-recover" role="status">
+                <p className="history-recover-text">
+                  {q === "empty"
+                    ? "这次几乎没有可用文本。建议先听录音，确认说清楚了再识别一次。"
+                    : "结果偏短，可能是误触或环境噪声。听一下录音，再决定是否重新识别。"}
+                </p>
+                <div className="history-recover-actions">
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy}
+                    onClick={() => void playAudio()}
+                  >
+                    {playing ? "停止播放" : "听录音"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy}
+                    onClick={() => void retry()}
+                  >
+                    {busy ? "识别中…" : "再识别一次"}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {retryNote && <p className="history-retry-note">{retryNote}</p>}
+
+            {/* Always-available quiet tools */}
+            <div className="history-actions">
               <button
                 type="button"
-                className="linkish"
-                onClick={() => setShowAsr((v) => !v)}
+                className="btn"
+                disabled={busy || !text}
+                onClick={() => void copyMain()}
               >
-                {showAsr ? "收起原文对比" : "查看 ASR 原文对比"}
+                {copied ? "已复制" : "复制文本"}
               </button>
-              {showAsr && (
-                <div className="history-compare">
-                  <div className="history-compare-block">
-                    <div className="field-label">
-                      ASR 原文
-                      <button
-                        type="button"
-                        className="btn small ghost"
-                        disabled={!selected.asr_raw}
-                        onClick={() => void copyText("asr", selected.asr_raw || "")}
-                      >
-                        {copied === "asr" ? "已复制" : "复制"}
-                      </button>
-                    </div>
-                    <pre className="field-value">{selected.asr_raw || "—"}</pre>
-                  </div>
-                  <div className="history-compare-block">
-                    <div className="field-label">
-                      修正后
-                      <button
-                        type="button"
-                        className="btn small ghost"
-                        disabled={!selected.corrected}
-                        onClick={() => void copyText("corr", selected.corrected || "")}
-                      >
-                        {copied === "corr" ? "已复制" : "复制"}
-                      </button>
-                    </div>
-                    <pre className="field-value">{selected.corrected || "—"}</pre>
-                  </div>
-                </div>
+              {hasAudio && !needsRecovery && (
+                <>
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={busy}
+                    onClick={() => void playAudio()}
+                  >
+                    {playing ? "停止" : "听录音"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={busy}
+                    onClick={() => void retry()}
+                  >
+                    {busy ? "识别中…" : "再识别一次"}
+                  </button>
+                </>
+              )}
+              {!hasAudio && (
+                <span className="muted-text history-no-audio">未保存录音</span>
               )}
             </div>
 
-            {!selected.audio_path && (
-              <p className="muted-text history-hint">
-                此条无音频文件，无法播放或重试（较旧的会话可能未保存）。
-              </p>
+            {/* Pipeline detail is secondary — for power users */}
+            {(selected.asr_raw || selected.corrected) && (
+              <div className="history-pipeline">
+                <button
+                  type="button"
+                  className="linkish"
+                  onClick={() => setShowPipeline((v) => !v)}
+                >
+                  {showPipeline ? "收起识别过程" : "识别过程"}
+                </button>
+                {showPipeline && (
+                  <div className="history-pipeline-body">
+                    <div>
+                      <div className="field-label">模型输出</div>
+                      <pre className="field-value">{selected.asr_raw || "—"}</pre>
+                    </div>
+                    {selected.corrected && selected.corrected !== selected.asr_raw && (
+                      <div>
+                        <div className="field-label">修正后</div>
+                        <pre className="field-value">{selected.corrected}</pre>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
           </>
         )}
