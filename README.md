@@ -46,7 +46,7 @@ npm install
 npm run tauri dev
 ```
 
-### M1 IPC (desktop)
+### Desktop IPC (M1–M2)
 
 | Command | Purpose |
 |---------|---------|
@@ -54,7 +54,22 @@ npm run tauri dev
 | `save_session` / `seed_demo_session` | Write sessions |
 | `list_edit_events` / `record_edit_event` | Edit audit trail |
 | `suggest_from_edit` / `confirm_learn` | Edit → dictionary candidates |
-| `list_dictionary` / `add_dictionary_term` / `add_dictionary_replacement` / `delete_dictionary_entry` | Dictionary CRUD |
+| `list_dictionary` / `add_*` / `delete_dictionary_entry` | Dictionary CRUD |
+| `list_audio_devices` / `set_audio_device` | Mic selection |
+| `set_asr_engine` / `get_asr_status` | SenseVoice / Whisper |
+| `start_recording` / `stop_and_transcribe` / `cancel_recording` | Capture + local ASR |
+
+### Models
+
+Default SenseVoice dir resolution (first match wins):
+
+1. `LUMEN_SENSEVOICE_DIR`
+2. `~/Library/Application Support/LumenAsr/models/sensevoice`
+3. Common local sherpa packages under `~/.coli/models/...`
+
+Expected files: `model.int8.onnx` (or `model.onnx`) + `tokens.txt`.
+
+Whisper: `LUMEN_WHISPER_DIR` or `.../models/whisper` with encoder/decoder/tokens onnx.
 
 Data directory (runtime):
 

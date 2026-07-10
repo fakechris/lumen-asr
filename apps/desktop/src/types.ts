@@ -6,6 +6,31 @@ export type Health = {
   db_ok: boolean;
   session_count: number;
   dictionary_count: number;
+  sensevoice_ready: boolean;
+  whisper_ready: boolean;
+  recording: boolean;
+};
+
+export type AudioDevice = {
+  name: string;
+  is_default: boolean;
+};
+
+export type AsrStatus = {
+  recording: boolean;
+  engine: "sensevoice" | "whisper";
+  sensevoice: { kind: string; ready: boolean; model_dir: string };
+  whisper: { kind: string; ready: boolean; model_dir: string };
+  activeReady: boolean;
+};
+
+export type TranscribeOutcome = {
+  text: string;
+  engine: string;
+  sampleRate: number;
+  numSamples: number;
+  durationMs: number;
+  session: SessionRecord;
 };
 
 export type FocusInfo = {
@@ -57,4 +82,4 @@ export type LearnCandidate = {
   reason: string;
 };
 
-export type TabId = "overview" | "history" | "dictionary" | "learn";
+export type TabId = "record" | "overview" | "history" | "dictionary" | "learn";

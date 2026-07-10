@@ -1,14 +1,28 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AsrStatus,
+  AudioDevice,
   DictionaryEntry,
   EditEvent,
   Health,
   LearnCandidate,
   SessionRecord,
+  TranscribeOutcome,
 } from "./types";
 
 export const api = {
   health: () => invoke<Health>("app_health"),
+
+  listAudioDevices: () => invoke<AudioDevice[]>("list_audio_devices"),
+  setAudioDevice: (name: string | null) =>
+    invoke<void>("set_audio_device", { name }),
+  setAsrEngine: (engine: string) =>
+    invoke<string>("set_asr_engine", { engine }),
+  getAsrStatus: () => invoke<AsrStatus>("get_asr_status"),
+  startRecording: () => invoke<void>("start_recording"),
+  stopAndTranscribe: (save = true) =>
+    invoke<TranscribeOutcome>("stop_and_transcribe", { save }),
+  cancelRecording: () => invoke<void>("cancel_recording"),
 
   listSessions: (limit = 50) =>
     invoke<SessionRecord[]>("list_sessions", { limit }),

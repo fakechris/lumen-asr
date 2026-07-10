@@ -34,6 +34,9 @@ pub struct Health {
     pub db_ok: bool,
     pub session_count: u32,
     pub dictionary_count: u32,
+    pub sensevoice_ready: bool,
+    pub whisper_ready: bool,
+    pub recording: bool,
 }
 
 #[tauri::command]
@@ -50,6 +53,9 @@ pub fn app_health(state: State<'_, AppState>) -> Health {
         Err(_) => (false, 0, 0),
     };
 
+    let sv = lumen_asr::sensevoice_status();
+    let wh = lumen_asr::whisper_status();
+
     Health {
         app: "Lumen ASR".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -58,6 +64,9 @@ pub fn app_health(state: State<'_, AppState>) -> Health {
         db_ok,
         session_count,
         dictionary_count,
+        sensevoice_ready: sv.ready,
+        whisper_ready: wh.ready,
+        recording: state.audio.is_recording(),
     }
 }
 

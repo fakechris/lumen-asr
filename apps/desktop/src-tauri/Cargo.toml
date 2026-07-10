@@ -19,7 +19,9 @@ lumen-platform = { workspace = true }
 lumen-store = { workspace = true }
 lumen-core = { workspace = true }
 lumen-dictionary = { workspace = true }
+lumen-asr = { workspace = true }
 uuid = { workspace = true }
+tokio = { workspace = true }
 
 [features]
 default = ["custom-protocol"]

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
 import type {
+  AsrStatus,
+  AudioDevice,
   DictionaryEntry,
   EditEvent,
   Health,
@@ -24,7 +26,7 @@ function formatTime(iso: string): string {
 }
 
 export default function App() {
-  const [tab, setTab] = useState<TabId>("overview");
+  const [tab, setTab] = useState<TabId>("record");
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -121,6 +123,7 @@ export default function App() {
         <nav className="tabs">
           {(
             [
+              ["record", "录音"],
               ["overview", "概览"],
               ["history", "历史"],
               ["dictionary", "词典"],
@@ -149,6 +152,18 @@ export default function App() {
       )}
 
       <main>
+        {tab === "record" && (
+          <RecordPanel
+            busy={busy}
+            onError={setError}
+            onBusy={setBusy}
+            onSaved={async () => {
+              await refreshSessions();
+              await refreshHealth();
+            }}
+          />
+        )}
+
         {tab === "overview" && (
           <Overview
             health={health}
@@ -274,6 +289,248 @@ export default function App() {
   );
 }
 
+function RecordPanel({
+  busy,
+  onError,
+  onBusy,
+  onSaved,
+}: {
+  busy: boolean;
+  onError: (e: string | null) => void;
+  onBusy: (b: boolean) => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [devices, setDevices] = useState<AudioDevice[]>([]);
+  const [device, setDevice] = useState<string>("");
+  const [status, setStatus] = useState<AsrStatus | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [seconds, setSeconds] = useState(0);
+  const [text, setText] = useState("");
+  const [meta, setMeta] = useState<string>("");
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const s = await api.getAsrStatus();
+      setStatus(s);
+      setRecording(s.recording);
+    } catch (e) {
+      onError(String(e));
+    }
+  }, [onError]);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const list = await api.listAudioDevices();
+        setDevices(list);
+        const def = list.find((d) => d.is_default) ?? list[0];
+        if (def) {
+          setDevice(def.name);
+          await api.setAudioDevice(def.name);
+        }
+      } catch (e) {
+        onError(String(e));
+      }
+      await refreshStatus();
+    })();
+  }, [onError, refreshStatus]);
+
+  useEffect(() => {
+    if (!recording) {
+      setSeconds(0);
+      return;
+    }
+    const t = setInterval(() => setSeconds((s) => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [recording]);
+
+  async function onDeviceChange(name: string) {
+    setDevice(name);
+    try {
+      await api.setAudioDevice(name);
+    } catch (e) {
+      onError(String(e));
+    }
+  }
+
+  async function onEngineChange(engine: string) {
+    onBusy(true);
+    onError(null);
+    try {
+      await api.setAsrEngine(engine);
+      await refreshStatus();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      onBusy(false);
+    }
+  }
+
+  async function start() {
+    onBusy(true);
+    onError(null);
+    setText("");
+    setMeta("");
+    try {
+      await api.startRecording();
+      setRecording(true);
+      await refreshStatus();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      onBusy(false);
+    }
+  }
+
+  async function stop() {
+    onBusy(true);
+    onError(null);
+    try {
+      const out = await api.stopAndTranscribe(true);
+      setRecording(false);
+      setText(out.text);
+      setMeta(
+        `${out.engine} · ${(out.durationMs / 1000).toFixed(1)}s · ${out.numSamples} samples @ ${out.sampleRate} Hz`
+      );
+      await onSaved();
+      await refreshStatus();
+    } catch (e) {
+      setRecording(false);
+      onError(String(e));
+      try {
+        await api.cancelRecording();
+      } catch {
+        /* ignore */
+      }
+    } finally {
+      onBusy(false);
+    }
+  }
+
+  async function cancel() {
+    onBusy(true);
+    try {
+      await api.cancelRecording();
+      setRecording(false);
+      await refreshStatus();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      onBusy(false);
+    }
+  }
+
+  const engine = status?.engine ?? "sensevoice";
+  const ready = status?.activeReady ?? false;
+
+  return (
+    <>
+      <section className="card">
+        <h2>本地转写</h2>
+        <p className="muted-text">
+          默认 SenseVoice（sherpa-onnx）。模型就绪后点「开始录音」→「停止并转写」。
+        </p>
+        <div className="form-row" style={{ marginBottom: 12 }}>
+          <label className="muted-text" style={{ minWidth: 64 }}>
+            设备
+          </label>
+          <select
+            className="input"
+            value={device}
+            disabled={recording || busy}
+            onChange={(e) => void onDeviceChange(e.target.value)}
+          >
+            {devices.map((d) => (
+              <option key={d.name} value={d.name}>
+                {d.name}
+                {d.is_default ? " (默认)" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="form-row" style={{ marginBottom: 12 }}>
+          <label className="muted-text" style={{ minWidth: 64 }}>
+            引擎
+          </label>
+          <select
+            className="input"
+            value={engine}
+            disabled={recording || busy}
+            onChange={(e) => void onEngineChange(e.target.value)}
+          >
+            <option value="sensevoice">
+              SenseVoice {status?.sensevoice.ready ? "✓" : "（模型未就绪）"}
+            </option>
+            <option value="whisper">
+              Whisper {status?.whisper.ready ? "✓" : "（模型未就绪）"}
+            </option>
+          </select>
+        </div>
+        {status && (
+          <p className="muted-text" style={{ fontSize: "0.85rem" }}>
+            模型目录：
+            <code>
+              {engine === "whisper"
+                ? status.whisper.model_dir
+                : status.sensevoice.model_dir}
+            </code>
+          </p>
+        )}
+        <div className="actions">
+          {!recording ? (
+            <button
+              type="button"
+              className="btn"
+              disabled={busy || !ready}
+              onClick={() => void start()}
+            >
+              开始录音
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy}
+                onClick={() => void stop()}
+              >
+                停止并转写 ({seconds}s)
+              </button>
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={busy}
+                onClick={() => void cancel()}
+              >
+                取消
+              </button>
+            </>
+          )}
+        </div>
+        {!ready && (
+          <p className="muted-text" style={{ marginTop: 12 }}>
+            当前引擎模型未就绪。将 SenseVoice 的{" "}
+            <code>model.int8.onnx</code> + <code>tokens.txt</code> 放到上述目录，或设置环境变量{" "}
+            <code>LUMEN_SENSEVOICE_DIR</code> / <code>LUMEN_WHISPER_DIR</code>。
+          </p>
+        )}
+      </section>
+
+      <section className="card">
+        <h2>转写结果</h2>
+        {meta && <p className="muted-text">{meta}</p>}
+        <textarea
+          className="textarea"
+          rows={8}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder={recording ? "录音中…" : "转写文本将显示在这里"}
+        />
+      </section>
+    </>
+  );
+}
+
 function Overview({
   health,
   sessions,
@@ -307,11 +564,18 @@ function Overview({
             <dd>{health.session_count}</dd>
             <dt>词典条目</dt>
             <dd>{health.dictionary_count}</dd>
+            <dt>SenseVoice</dt>
+            <dd>{health.sensevoice_ready ? "就绪" : "未就绪"}</dd>
+            <dt>Whisper</dt>
+            <dd>{health.whisper_ready ? "就绪" : "未就绪"}</dd>
           </dl>
         ) : (
           <p className="muted-text">加载中…</p>
         )}
         <div className="actions">
+          <button type="button" className="btn" onClick={() => onGoto("record")}>
+            去录音
+          </button>
           <button type="button" className="btn" disabled={busy} onClick={onSeed}>
             写入示例会话
           </button>
@@ -345,7 +609,7 @@ function Overview({
         <ol>
           <li className="done">M0 — 架构骨架</li>
           <li className="done">M1 — Store / 词典 IPC + 本页 UI</li>
-          <li>M2 — SenseVoice (sherpa) + 麦克风</li>
+          <li className="done">M2 — SenseVoice (sherpa) + 麦克风</li>
           <li>M3 — Ollama 修正</li>
           <li>M4 — paste-first 注入 + 权限</li>
           <li>M5 — 热键 + 胶囊</li>
