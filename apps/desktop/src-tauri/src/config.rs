@@ -76,7 +76,7 @@ impl Default for InjectConfig {
 #[serde(default)]
 pub struct HotkeyConfig {
     pub enabled: bool,
-    /// Tauri/global-shortcut format, e.g. "CommandOrControl+Shift+Space"
+    /// Tauri/global-shortcut format, e.g. "Alt+Space" (set via click-to-record UI)
     pub toggle: String,
     /// Show floating capsule while recording / processing.
     pub show_capsule: bool,
@@ -86,8 +86,9 @@ impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // Cmd+Shift+Space is easy to reach; user can change in Settings.
-            toggle: "CommandOrControl+Shift+Space".into(),
+            // Option+Space — avoids Spotlight (⌘Space). User re-records in Settings.
+            // Bare Fn / right-⌘ push-to-talk needs lower-level hooks (later).
+            toggle: "Alt+Space".into(),
             show_capsule: true,
         }
     }

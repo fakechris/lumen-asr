@@ -100,14 +100,15 @@ On failure: rule preprocess + dictionary replacements only (session still comple
 
 ### Hotkey + capsule (M5)
 
-- Global toggle: default `CommandOrControl+Shift+Space` (start / stop+transcribe+insert)
+- Global toggle: default **`Alt+Space`** (⌥Space) — avoids Spotlight `⌘Space`
+- **Settings → 点击录制**: press a new chord (no typing `CommandOrControl+…`)
 - Floating capsule overlay while listening / processing
 - Config:
 
 ```toml
 [hotkey]
 enabled = true
-toggle = "CommandOrControl+Shift+Space"
+toggle = "Alt+Space"
 show_capsule = true
 ```
 

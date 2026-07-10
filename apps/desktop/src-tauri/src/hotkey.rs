@@ -112,6 +112,21 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
     Ok(())
 }
 
+/// Pause global shortcuts while the UI is capturing a new chord
+/// (competitor pattern: click-to-record must not fire dictation).
+#[tauri::command]
+pub fn pause_hotkeys(app: AppHandle) -> Result<(), String> {
+    let _ = app.global_shortcut().unregister_all();
+    tracing::info!("global hotkeys paused for capture");
+    Ok(())
+}
+
+/// Re-register from saved config after capture cancel / complete.
+#[tauri::command]
+pub fn resume_hotkeys(app: AppHandle) -> Result<(), String> {
+    reregister(&app)
+}
+
 /// Initial plugin setup helper — call after manage(AppState).
 pub fn setup_hotkeys(app: &AppHandle) -> Result<(), String> {
     reregister(app)

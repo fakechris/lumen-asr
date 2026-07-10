@@ -82,7 +82,13 @@ export const api = {
     enabled?: boolean;
     toggle?: string;
     showCapsule?: boolean;
-  }) => invoke("save_hotkey_config", { input }),
+  }) =>
+    invoke<{ enabled: boolean; toggle: string; showCapsule: boolean }>(
+      "save_hotkey_config",
+      { input }
+    ),
+  pauseHotkeys: () => invoke<void>("pause_hotkeys"),
+  resumeHotkeys: () => invoke<void>("resume_hotkeys"),
 
   getLearningConfig: () =>
     invoke<import("./types").LearningConfig>("get_learning_config"),

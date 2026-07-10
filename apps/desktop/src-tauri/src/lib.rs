@@ -111,6 +111,8 @@ pub fn run() {
             inject_cmd::insert_text,
             hotkey::get_hotkey_config,
             hotkey::save_hotkey_config,
+            hotkey::pause_hotkeys,
+            hotkey::resume_hotkeys,
             learning::get_learning_config,
             learning::save_learning_config,
             learning::process_edit,

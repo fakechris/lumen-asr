@@ -20,12 +20,10 @@
         "minHeight": 560,
         "resizable": true,
         "center": true,
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
-        "trafficLightPosition": { "x": 14, "y": 18 }
+        "decorations": true,
+        "titleBarStyle": "Visible"
       }
     ],
-    "macOSPrivateApi": true,
     "security": {
       "csp": null
     }

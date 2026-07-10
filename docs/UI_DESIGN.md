@@ -1,102 +1,110 @@
 # Lumen ASR — Desktop UI Design (macOS-first)
 
-> Product shell for the MVP loop. Settings + global hotkey are first-class, not afterthoughts.
+> Shell IA and interaction patterns aligned with Wispr Flow / Typeless / 闪电说.
 
-## 1. Product surfaces
+## 1. Framework (what we use)
 
-| Surface | Role | Backend status |
-|---------|------|----------------|
-| **Main window** | Dictation playground, history, dictionary, learn, settings | M1–M6 wired |
-| **Floating capsule** | Non-activating overlay while listening / processing | M5 done |
-| **Global hotkey** | Toggle record → ASR → correct → paste | M5 done (`CommandOrControl+Shift+Space`) |
-| **Settings** | Permissions, hotkey, inject, corrector, learning | M3–M6 done |
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Shell | **Tauri 2** (Rust + WebView) | Same class as 闪电说 / OpenLess — not Electron for binary size |
+| UI | React | Settings + history density; not “fake web page” chrome |
+| Global hotkey | `tauri-plugin-global-shortcut` | Chord register; capture UI pauses registration while recording |
+| Window chrome | **System titlebar (Visible)** | Native drag, traffic lights, double-click maximize, Mission Control — Overlay + custom drag is fragile |
 
-## 2. Information architecture
+**Non-goal for MVP:** pure SwiftUI rewrite. Competitors with Electron/Tauri still feel native when they keep OS chrome and use click-to-record shortcuts.
+
+## 2. Competitor patterns we copy
+
+| Product | Default hotkey | Set hotkey UX | Window |
+|---------|----------------|---------------|--------|
+| **Typeless** | `Fn` (push-to-talk); extra chords in Settings | Click / add shortcut — press keys | OS + Electron chrome, fully draggable |
+| **闪电说** | `Fn` / right ⌘ free mode | Config + pause/resume global hooks while UI edits | Tauri multi-window, native-feeling shell |
+| **Wispr Flow** | Often right-modifier / Fn class | Click field → press new chord | Native Mac window affordances |
+
+### Anti-patterns we remove
+
+1. **Hand-typed shortcut strings** (`CommandOrControl+Shift+Space`) — unfriendly and error-prone  
+2. **Custom Overlay titlebar without `data-tauri-drag-region` + `allow-start-dragging`** — window cannot move  
+3. **Default ⌘Space / easy Spotlight conflicts** — never ship Spotlight/IME defaults
+
+## 3. Window policy (locked)
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  ░░ titlebar (overlay / drag)              Lumen ASR    │
-├──────────┬──────────────────────────────────────────────┤
-│ 录音     │  Content pane (title + primary actions)      │
-│ 历史     │                                              │
-│ 词典     │  Cards / forms / lists                       │
-│ 学习     │                                              │
-│ 设置     │                                              │
-├──────────┴──────────────────────────────────────────────┤
-│  status: DB · model · hotkey hint · permission chips    │
-└─────────────────────────────────────────────────────────┘
+titleBarStyle: Visible   (system decorations)
+hiddenTitle: false
+no custom full-window drag region required
 ```
 
-### Nav (sidebar)
+Result: drag anywhere on the system titlebar; sidebar does not steal drag; looks like System Settings / Notes.
 
-| Item | Default content |
-|------|-----------------|
-| **录音** | Device, engine, start/stop, transcript edit, insert, inline learn candidates |
-| **历史** | Session list + detail + edit events |
-| **词典** | Terms / replacements CRUD |
-| **学习** | Before/after → candidates → confirm |
-| **设置** | Permissions → Hotkey → Insert → Corrector → Learning |
+## 4. Hotkey policy (locked)
 
-### Capsule (separate window)
+### Default (new installs)
 
-- Phases: idle (hidden) · listening · processing · error flash
-- Stop button while listening
-- Drag-friendly; no activation of main app when possible
+`Alt+Space` → display **⌥Space**
 
-## 3. Native chrome (macOS)
+Why:
 
-| Choice | Why |
-|--------|-----|
-| Sidebar + content | Matches System Settings / Notes density |
-| Overlay titlebar + drag region | Feels like a real Mac app, not a browser tab strip |
-| SF / system font stack | Zero custom display fonts |
-| Light default + `prefers-color-scheme: dark` | Respect system appearance |
-| Accent ≈ system blue `#007aff` | Familiar primary actions |
-| Status bar with live hotkey string | User always sees how to dictate without opening Settings |
+- Avoids Spotlight (`⌘Space`)
+- Avoids common IME / input source chords when possible
+- Easy one-hand reach on Mac keyboards
+- Works with global-shortcut (true bare `Fn` needs lower-level hooks; later)
 
-## 4. Settings layout (priority order)
+Users with an existing `config.toml` keep their saved chord until they re-record.
 
-1. **Permissions** — mic + accessibility (hard gates for record / inject)
-2. **Hotkey** — enable, chord string, capsule toggle (save re-registers immediately)
-3. **Insert** — auto-insert, clipboard restore, mode
-4. **Corrector** — Ollama / OpenAI-compatible, probe button
-5. **Learning** — auto-promote N, post-paste capture
+### Capture UX (must match competitors)
 
-Each section saves independently (fail-soft; no giant single form).
+```
+┌─────────────────────────────────────────────┐
+│  录音热键                                    │
+│  ┌──────────────────────┐  ┌─────────────┐ │
+│  │  ⌥Space              │  │ 点击录制    │ │
+│  └──────────────────────┘  └─────────────┘ │
+│  录制中: 请按下新组合键… Esc 取消           │
+│  常用: [⌥Space] [⌃⇧Space] [⌘⇧D]            │
+└─────────────────────────────────────────────┘
+```
 
-## 5. Hotkey UX rules
+1. Click **点击录制** (or the kbd chip itself)  
+2. Backend **pauses** global shortcuts (so the old chord is not fired)  
+3. User presses modifiers + key  
+4. UI shows pretty label; write config; **re-register**  
+5. **Esc** cancels → resume previous registration  
 
-- Default: `CommandOrControl+Shift+Space` (display as **⌘⇧Space**)
-- Save → persist TOML → `unregister_all` + re-register
-- Listening state always reflected in capsule + main status
-- If registration fails, show banner with the OS error (do not silently drop)
+Never require typing `CommandOrControl+…`.
+
+## 5. Information architecture
+
+```
+┌──────────────────────────────────────────────────┐
+│  ● ● ●   Lumen ASR          (system titlebar)    │
+├──────────┬───────────────────────────────────────┤
+│ 录音     │  Content                              │
+│ 历史     │                                       │
+│ 词典     │                                       │
+│ 学习     │                                       │
+│ 设置     │                                       │
+│ 概览     │                                       │
+├──────────┴───────────────────────────────────────┤
+│  status · model · current hotkey (pretty)        │
+└──────────────────────────────────────────────────┘
+```
+
+### Settings order
+
+1. Permissions  
+2. **Hotkey** (recorder)  
+3. Insert  
+4. Corrector  
+5. Learning  
 
 ## 6. Visual tokens
 
-| Token | Light | Dark |
-|-------|-------|------|
-| bg | `#f2f2f7` | `#1c1c1e` |
-| sidebar | `#eaeaef` | `#2c2c2e` |
-| card | `#ffffff` | `#2c2c2e` |
-| text | `#1d1d1f` | `#f5f5f7` |
-| muted | `#6e6e73` | `#98989d` |
-| accent | `#007aff` | `#0a84ff` |
-| danger | `#ff3b30` | `#ff453a` |
-| ok | `#34c759` | `#30d158` |
-| radius | 10–12px cards, 6px controls | same |
+System light/dark, SF / `-apple-system`, accent ≈ `#007aff` / `#0a84ff`. See `styles.css`.
 
-## 7. Out of scope for this shell pass
+## 7. Later (not blocking this pass)
 
-- Full SwiftUI rewrite (Tauri WebView is the product shell for MVP)
-- Menu bar extra / LaunchAgent
-- Onboarding wizard carousel (permissions live in Settings for now)
-- Windows chrome (keep layout portable; styles already dual-theme)
-
-## 8. Build / test checklist
-
-- [ ] App launches; sidebar navigation works
-- [ ] Settings → Permissions open System Settings
-- [ ] Settings → Hotkey save re-binds chord
-- [ ] Hotkey toggles capsule + dictation when models ready
-- [ ] Record tab start/stop and insert path still work
-- [ ] Dark/light follows system
+- Bare `Fn` / right-⌘ push-to-talk via CGEventTap (闪电说-class)  
+- Hold vs toggle modes  
+- Menu bar extra  
+- Transparent titlebar + vibrancy without breaking drag  

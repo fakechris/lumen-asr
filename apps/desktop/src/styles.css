@@ -67,40 +67,13 @@ body {
 }
 
 /* ── App frame ─────────────────────────────────────────── */
+/* System titlebar (Visible) provides native macOS drag. */
 
 .app-frame {
   display: flex;
   flex-direction: column;
   height: 100%;
   min-height: 0;
-}
-
-.titlebar {
-  height: var(--titlebar-h);
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0 80px;
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  color: var(--text);
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--sidebar) 92%, transparent),
-    var(--sidebar)
-  );
-  border-bottom: 1px solid var(--border);
-  user-select: none;
-  -webkit-app-region: drag;
-}
-
-.titlebar-sub {
-  margin-left: 8px;
-  font-weight: 400;
-  color: var(--muted);
-  font-size: 12px;
 }
 
 .app-body {
@@ -239,7 +212,8 @@ body {
   font-weight: 600;
 }
 
-.statusbar .kbd {
+.statusbar .kbd,
+.kbd {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   padding: 1px 6px;
@@ -247,6 +221,89 @@ body {
   border: 1px solid var(--border-strong);
   background: var(--card);
   color: var(--text);
+  display: inline-block;
+}
+
+/* Hotkey recorder (click-to-capture) */
+.hotkey-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.hotkey-chip {
+  min-width: 160px;
+  min-height: 40px;
+  padding: 8px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  text-align: center;
+}
+
+.hotkey-chip:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.hotkey-chip.recording {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.hotkey-hint {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.hotkey-hint.recording {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.preset-chip {
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.preset-chip:hover:not(:disabled) {
+  background: var(--sidebar-hover);
+}
+
+.preset-chip.active {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.preset-chip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .dot {

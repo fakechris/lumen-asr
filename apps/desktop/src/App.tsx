@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
+import { HotkeyRecorder } from "./HotkeyRecorder";
+import { formatHotkeyLabel } from "./hotkeyFormat";
 import type {
   AsrStatus,
   AudioDevice,
@@ -26,20 +28,6 @@ function formatTime(iso: string): string {
   } catch {
     return iso;
   }
-}
-
-/** Pretty-print Tauri shortcut strings for the status bar. */
-function formatHotkeyLabel(raw: string): string {
-  return raw
-    .replace(/CommandOrControl/gi, "⌘")
-    .replace(/Command/gi, "⌘")
-    .replace(/Control/gi, "⌃")
-    .replace(/Ctrl/gi, "⌃")
-    .replace(/Option|Alt/gi, "⌥")
-    .replace(/Shift/gi, "⇧")
-    .replace(/Super|Meta/gi, "⌘")
-    .replace(/Space/gi, "Space")
-    .replace(/\+/g, "");
 }
 
 const NAV: { id: TabId; label: string; icon: string; title: string; blurb: string }[] = [
@@ -92,7 +80,7 @@ export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [hotkeyLabel, setHotkeyLabel] = useState("⌘⇧Space");
+  const [hotkeyLabel, setHotkeyLabel] = useState("⌥Space");
   const [hotkeyEnabled, setHotkeyEnabledUi] = useState(true);
 
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
@@ -264,11 +252,7 @@ export default function App() {
 
   return (
     <div className="app-frame">
-      <div className="titlebar">
-        Lumen ASR
-        <span className="titlebar-sub">Local-first dictation</span>
-      </div>
-
+      {/* System titlebar (Visible) — native macOS drag / traffic lights */}
       <div className="app-body">
         <nav className="sidebar" aria-label="主导航">
           {NAV.map((item) => (
@@ -288,7 +272,7 @@ export default function App() {
           <div className="sidebar-meta">
             {hotkeyEnabled ? (
               <>
-                热键 <code>{hotkeyLabel}</code>
+                热键 <span className="kbd">{hotkeyLabel}</span>
                 <br />
                 切换录音 / 停止
               </>
@@ -1014,7 +998,7 @@ function SettingsPanel({
   const [injectMode, setInjectMode] = useState("auto");
   const [preserveClip, setPreserveClip] = useState(true);
   const [hotkeyEnabled, setHotkeyEnabled] = useState(true);
-  const [hotkeyToggle, setHotkeyToggle] = useState("CommandOrControl+Shift+Space");
+  const [hotkeyToggle, setHotkeyToggle] = useState("Alt+Space");
   const [showCapsule, setShowCapsule] = useState(true);
   const [learning, setLearning] = useState<LearningConfig | null>(null);
   const [autoPromote, setAutoPromote] = useState(false);
@@ -1124,165 +1108,6 @@ function SettingsPanel({
   return (
     <>
       <section className="card settings-section">
-        <h2>编辑学习</h2>
-        <p className="muted-text">
-          转写结果改字、或粘贴后在目标 App 再改，可生成词典候选。默认需手动确认。
-        </p>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text">
-            <input
-              type="checkbox"
-              checked={autoPromote}
-              disabled={busy}
-              onChange={(e) => setAutoPromote(e.target.checked)}
-            />{" "}
-            自动晋升（同一替换累计达到阈值）
-          </label>
-        </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
-            阈值 N
-          </label>
-          <input
-            className="input"
-            type="number"
-            min={2}
-            value={promoteN}
-            disabled={busy}
-            onChange={(e) => setPromoteN(Number(e.target.value) || 3)}
-          />
-        </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text">
-            <input
-              type="checkbox"
-              checked={postPaste}
-              disabled={busy}
-              onChange={(e) => setPostPaste(e.target.checked)}
-            />{" "}
-            粘贴后监听目标输入框改动（需辅助功能）
-          </label>
-        </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
-            监听秒数
-          </label>
-          <input
-            className="input"
-            type="number"
-            min={5}
-            max={120}
-            value={postPasteSecs}
-            disabled={busy}
-            onChange={(e) => setPostPasteSecs(Number(e.target.value) || 20)}
-          />
-        </div>
-        {learning && (
-          <p className="muted-text" style={{ fontSize: "0.85rem" }}>
-            当前：autoPromote={String(learning.autoPromote)} N=
-            {learning.autoPromoteThreshold} postPaste=
-            {String(learning.postPasteCapture)}
-          </p>
-        )}
-        <div className="actions">
-          <button
-            type="button"
-            className="btn"
-            disabled={busy}
-            onClick={() =>
-              void (async () => {
-                onBusy(true);
-                try {
-                  const ln = await api.saveLearningConfig({
-                    autoPromote,
-                    autoPromoteThreshold: promoteN,
-                    postPasteCapture: postPaste,
-                    postPasteSeconds: postPasteSecs,
-                  });
-                  setLearning(ln);
-                  onSaved();
-                } catch (e) {
-                  onError(String(e));
-                } finally {
-                  onBusy(false);
-                }
-              })()
-            }
-          >
-            保存学习设置
-          </button>
-        </div>
-      </section>
-
-      <section className="card settings-section">
-        <h2>全局热键</h2>
-        <p className="muted-text">
-          默认 <span className="kbd">⌘⇧Space</span> 切换录音/停止转写。保存后立即重新注册。若被其他软件占用请改 chord 或放行。
-        </p>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text">
-            <input
-              type="checkbox"
-              checked={hotkeyEnabled}
-              disabled={busy}
-              onChange={(e) => setHotkeyEnabled(e.target.checked)}
-            />{" "}
-            启用热键
-          </label>
-        </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text">
-            <input
-              type="checkbox"
-              checked={showCapsule}
-              disabled={busy}
-              onChange={(e) => setShowCapsule(e.target.checked)}
-            />{" "}
-            显示浮动胶囊
-          </label>
-        </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
-            热键
-          </label>
-          <input
-            className="input"
-            value={hotkeyToggle}
-            disabled={busy}
-            onChange={(e) => setHotkeyToggle(e.target.value)}
-            placeholder="CommandOrControl+Shift+Space"
-          />
-        </div>
-        <div className="actions">
-          <button
-            type="button"
-            className="btn"
-            disabled={busy}
-            onClick={() =>
-              void (async () => {
-                onBusy(true);
-                onError(null);
-                try {
-                  await api.saveHotkeyConfig({
-                    enabled: hotkeyEnabled,
-                    toggle: hotkeyToggle,
-                    showCapsule,
-                  });
-                  onSaved();
-                } catch (e) {
-                  onError(String(e));
-                } finally {
-                  onBusy(false);
-                }
-              })()
-            }
-          >
-            保存热键
-          </button>
-        </div>
-      </section>
-
-      <section className="card settings-section">
         <h2>权限</h2>
         <p className="muted-text">
           麦克风用于录音；辅助功能用于把文字粘贴进其他 App（⌘V 模拟）。建议先完成这两项再测热键。
@@ -1336,6 +1161,21 @@ function SettingsPanel({
           </button>
         </div>
       </section>
+
+      <HotkeyRecorder
+        enabled={hotkeyEnabled}
+        toggle={hotkeyToggle}
+        showCapsule={showCapsule}
+        busy={busy}
+        onBusy={onBusy}
+        onError={onError}
+        onChange={(next) => {
+          setHotkeyEnabled(next.enabled);
+          setHotkeyToggle(next.toggle);
+          setShowCapsule(next.showCapsule);
+        }}
+        onSaved={onSaved}
+      />
 
       <section className="card settings-section">
         <h2>插入策略</h2>
@@ -1485,6 +1325,98 @@ function SettingsPanel({
         </div>
         {probe && <pre className="field-value" style={{ marginTop: 12 }}>{probe}</pre>}
       </section>
+
+      <section className="card settings-section">
+        <h2>编辑学习</h2>
+        <p className="muted-text">
+          转写结果改字、或粘贴后在目标 App 再改，可生成词典候选。默认需手动确认。
+        </p>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={autoPromote}
+              disabled={busy}
+              onChange={(e) => setAutoPromote(e.target.checked)}
+            />{" "}
+            自动晋升（同一替换累计达到阈值）
+          </label>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            阈值 N
+          </label>
+          <input
+            className="input"
+            type="number"
+            min={2}
+            value={promoteN}
+            disabled={busy}
+            onChange={(e) => setPromoteN(Number(e.target.value) || 3)}
+          />
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={postPaste}
+              disabled={busy}
+              onChange={(e) => setPostPaste(e.target.checked)}
+            />{" "}
+            粘贴后监听目标输入框改动（需辅助功能）
+          </label>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            监听秒数
+          </label>
+          <input
+            className="input"
+            type="number"
+            min={5}
+            max={120}
+            value={postPasteSecs}
+            disabled={busy}
+            onChange={(e) => setPostPasteSecs(Number(e.target.value) || 20)}
+          />
+        </div>
+        {learning && (
+          <p className="muted-text" style={{ fontSize: "0.85rem" }}>
+            当前：autoPromote={String(learning.autoPromote)} N=
+            {learning.autoPromoteThreshold} postPaste=
+            {String(learning.postPasteCapture)}
+          </p>
+        )}
+        <div className="actions">
+          <button
+            type="button"
+            className="btn"
+            disabled={busy}
+            onClick={() =>
+              void (async () => {
+                onBusy(true);
+                try {
+                  const ln = await api.saveLearningConfig({
+                    autoPromote,
+                    autoPromoteThreshold: promoteN,
+                    postPasteCapture: postPaste,
+                    postPasteSeconds: postPasteSecs,
+                  });
+                  setLearning(ln);
+                  onSaved();
+                } catch (e) {
+                  onError(String(e));
+                } finally {
+                  onBusy(false);
+                }
+              })()
+            }
+          >
+            保存学习设置
+          </button>
+        </div>
+      </section>
+
       <section className="card muted">
         <h2>说明</h2>
         <ul style={{ margin: 0, paddingLeft: "1.2rem", lineHeight: 1.7 }}>
@@ -1496,6 +1428,9 @@ function SettingsPanel({
           <li>
             配置文件：
             <code>~/Library/Application Support/LumenAsr/config.toml</code>
+          </li>
+          <li>
+            热键：设置里「点击录制」后直接按键；默认 ⌥Space，避开 Spotlight
           </li>
         </ul>
       </section>
@@ -1592,7 +1527,7 @@ function Overview({
           <li className="done">M6 — 编辑学习 / 粘贴后捕获</li>
         </ol>
         <p className="muted-text">
-          词典条目数：{dictCount} · 热键默认 ⌘⇧Space 切换录音
+          词典条目数：{dictCount} · 热键默认 ⌥Space（设置里可点按录制）
         </p>
       </section>
     </>
