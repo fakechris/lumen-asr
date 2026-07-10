@@ -73,6 +73,17 @@ export const api = {
       text,
     }),
 
+  toggleDictation: () => invoke<void>("toggle_dictation_cmd"),
+  getHotkeyConfig: () =>
+    invoke<{ enabled: boolean; toggle: string; showCapsule: boolean }>(
+      "get_hotkey_config"
+    ),
+  saveHotkeyConfig: (input: {
+    enabled?: boolean;
+    toggle?: string;
+    showCapsule?: boolean;
+  }) => invoke("save_hotkey_config", { input }),
+
   listSessions: (limit = 50) =>
     invoke<SessionRecord[]>("list_sessions", { limit }),
 

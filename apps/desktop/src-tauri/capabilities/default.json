@@ -2,9 +2,21 @@
   "$schema": "https://schema.tauri.app/config/2",
   "identifier": "default",
   "description": "Default capabilities for Lumen ASR",
-  "windows": ["main"],
+  "windows": ["main", "capsule"],
   "permissions": [
     "core:default",
-    "shell:allow-open"
+    "shell:allow-open",
+    "core:event:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-set-position",
+    "core:window:allow-outer-position",
+    "core:window:allow-outer-size",
+    "core:window:allow-current-monitor",
+    "global-shortcut:allow-is-registered",
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister",
+    "global-shortcut:allow-unregister-all"
   ]
 }

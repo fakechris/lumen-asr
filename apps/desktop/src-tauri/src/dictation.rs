@@ -1,4 +1,4 @@
-//! Recording + local ASR + model corrector IPC (M2–M3).
+//! Recording + local ASR + model corrector IPC (M2–M5).
 
 use crate::corrector_svc::{engine_label, run_correct};
 use crate::AppState;
@@ -8,9 +8,9 @@ use lumen_asr::{
 };
 use lumen_core::{FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Emitter, Manager, State};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AsrStatus {
     pub recording: bool,
@@ -40,34 +40,42 @@ pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<Engi
 
 #[tauri::command]
 pub fn get_asr_status(state: State<'_, AppState>) -> Result<AsrStatus, String> {
-    let engine = *state
+    Ok(asr_status_from(&state))
+}
+
+pub fn asr_status_from(state: &AppState) -> AsrStatus {
+    let engine = state
         .engine
         .lock()
-        .map_err(|_| "engine lock poisoned".to_string())?;
+        .map(|g| *g)
+        .unwrap_or(EngineKind::SenseVoice);
     let sv = sensevoice_status();
     let wh = whisper_status();
     let active_ready = match engine {
         EngineKind::SenseVoice => sv.ready,
         EngineKind::Whisper => wh.ready,
     };
-    Ok(AsrStatus {
+    AsrStatus {
         recording: state.audio.is_recording(),
         engine,
         sensevoice: sv,
         whisper: wh,
         active_ready,
-    })
+    }
 }
 
 #[tauri::command]
 pub fn start_recording(state: State<'_, AppState>) -> Result<(), String> {
+    start_recording_inner(&state)
+}
+
+pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     state.audio.start().map_err(|e| e.to_string())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscribeOutcome {
-    /// Final text after corrector (or ASR if corrector off/failed soft).
     pub text: String,
     pub asr_text: String,
     pub corrected_text: String,
@@ -84,6 +92,13 @@ pub struct TranscribeOutcome {
 pub async fn stop_and_transcribe(
     state: State<'_, AppState>,
     save: Option<bool>,
+) -> Result<TranscribeOutcome, String> {
+    stop_and_transcribe_inner(&state, save.unwrap_or(true)).await
+}
+
+pub async fn stop_and_transcribe_inner(
+    state: &AppState,
+    save: bool,
 ) -> Result<TranscribeOutcome, String> {
     let capture = state.audio.stop().map_err(|e| e.to_string())?;
     let num_samples = capture.samples.len();
@@ -104,7 +119,6 @@ pub async fn stop_and_transcribe(
         .lock()
         .map_err(|_| "engine lock poisoned".to_string())?;
 
-    // Clone engines (Arc) so MutexGuard is not held across .await
     let result = match engine_kind {
         EngineKind::SenseVoice => {
             let eng = state
@@ -138,7 +152,6 @@ pub async fn stop_and_transcribe(
 
     let asr_text = result.text.trim().to_string();
 
-    // Dictionary for corrector injection
     let entries = {
         let store_guard = state
             .store
@@ -166,10 +179,8 @@ pub async fn stop_and_transcribe(
         format!("{}:fallback", engine_label(&cfg))
     };
 
-    // Optional auto-insert into frontmost app (paste-first).
     let mut insert_strategy = InsertStrategy::None;
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
-        // Brief pause so user can leave our window focus if needed.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         match crate::inject_cmd::insert_with_config(&cfg.inject, &corrected_text).await {
             Ok(out) => {
@@ -196,7 +207,7 @@ pub async fn stop_and_transcribe(
         window_title: None,
     };
 
-    if save.unwrap_or(true) {
+    if save {
         let store_guard = state
             .store
             .lock()
@@ -222,8 +233,80 @@ pub async fn stop_and_transcribe(
 
 #[tauri::command]
 pub fn cancel_recording(state: State<'_, AppState>) -> Result<(), String> {
+    cancel_recording_inner(&state)
+}
+
+pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
     if state.audio.is_recording() {
         let _ = state.audio.stop();
     }
     Ok(())
+}
+
+/// Capsule / hotkey lifecycle events for the UI.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "phase")]
+pub enum DictationUiEvent {
+    Idle,
+    Listening { message: String },
+    Processing { message: String },
+    Done { outcome: TranscribeOutcome },
+    Error { message: String },
+    Cancelled,
+}
+
+pub fn emit_dictation(app: &AppHandle, event: DictationUiEvent) {
+    let _ = app.emit("dictation", &event);
+}
+
+pub async fn toggle_dictation(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let show_capsule = state
+        .config
+        .lock()
+        .map(|c| c.hotkey.show_capsule)
+        .unwrap_or(true);
+
+    if state.audio.is_recording() {
+        emit_dictation(
+            &app,
+            DictationUiEvent::Processing {
+                message: "转写与修正中…".into(),
+            },
+        );
+        crate::capsule::set_capsule_visible(&app, show_capsule, "processing");
+        match stop_and_transcribe_inner(&state, true).await {
+            Ok(outcome) => {
+                crate::capsule::set_capsule_visible(&app, false, "idle");
+                emit_dictation(&app, DictationUiEvent::Done { outcome });
+                emit_dictation(&app, DictationUiEvent::Idle);
+            }
+            Err(e) => {
+                crate::capsule::set_capsule_visible(&app, false, "idle");
+                emit_dictation(
+                    &app,
+                    DictationUiEvent::Error {
+                        message: e.clone(),
+                    },
+                );
+                emit_dictation(&app, DictationUiEvent::Idle);
+                return Err(e);
+            }
+        }
+    } else {
+        start_recording_inner(&state)?;
+        crate::capsule::set_capsule_visible(&app, show_capsule, "listening");
+        emit_dictation(
+            &app,
+            DictationUiEvent::Listening {
+                message: "正在录音…".into(),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toggle_dictation_cmd(app: AppHandle) -> Result<(), String> {
+    toggle_dictation(app).await
 }

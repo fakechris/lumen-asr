@@ -1,8 +1,10 @@
+mod capsule;
 mod commands;
 mod config;
 mod corrector_cmd;
 mod corrector_svc;
 mod dictation;
+mod hotkey;
 mod inject_cmd;
 mod permissions_cmd;
 
@@ -41,8 +43,7 @@ pub fn run() {
     tracing::info!(
         provider = %app_config.corrector.provider,
         model = %app_config.corrector.model,
-        enabled = app_config.corrector.enabled,
-        auto_insert = app_config.inject.auto_insert,
+        hotkey = %app_config.hotkey.toggle,
         "config loaded"
     );
 
@@ -64,6 +65,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(AppState {
             store: Mutex::new(store),
             audio: AudioCapture::new(),
@@ -94,6 +96,7 @@ pub fn run() {
             dictation::start_recording,
             dictation::stop_and_transcribe,
             dictation::cancel_recording,
+            dictation::toggle_dictation_cmd,
             corrector_cmd::get_corrector_config,
             corrector_cmd::save_corrector_config,
             corrector_cmd::correct_text,
@@ -105,11 +108,19 @@ pub fn run() {
             inject_cmd::get_inject_config,
             inject_cmd::save_inject_config,
             inject_cmd::insert_text,
+            hotkey::get_hotkey_config,
+            hotkey::save_hotkey_config,
         ])
         .setup(|app| {
+            if let Err(e) = capsule::ensure_capsule(app.handle()) {
+                tracing::warn!(error = %e, "capsule window create failed");
+            }
+            if let Err(e) = hotkey::setup_hotkeys(app.handle()) {
+                tracing::warn!(error = %e, "hotkey setup failed");
+            }
             tracing::info!(
                 name = app.package_info().name,
-                "Lumen ASR desktop starting (M4)"
+                "Lumen ASR desktop starting (M5)"
             );
             Ok(())
         })

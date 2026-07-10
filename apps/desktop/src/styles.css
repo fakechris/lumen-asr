@@ -453,3 +453,86 @@ code {
   color: #9decc0;
   font-size: 0.9rem;
 }
+
+/* Floating capsule window */
+html:has(.capsule-root),
+body:has(.capsule-root) {
+  background: transparent !important;
+  overflow: hidden;
+}
+
+.capsule-root {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  background: rgba(26, 29, 36, 0.92);
+  border: 1px solid rgba(110, 168, 254, 0.35);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  -webkit-app-region: drag;
+  user-select: none;
+  font-size: 0.92rem;
+  color: var(--text);
+}
+
+.capsule-root.phase-listening {
+  border-color: rgba(255, 90, 90, 0.55);
+}
+
+.capsule-root.phase-processing {
+  border-color: rgba(255, 200, 80, 0.5);
+}
+
+.capsule-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #6ea8fe;
+  flex-shrink: 0;
+}
+
+.phase-listening .capsule-dot {
+  background: #ff5a5a;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.phase-processing .capsule-dot {
+  background: #ffc850;
+  animation: pulse 0.7s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.85);
+  }
+}
+
+.capsule-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.capsule-btn {
+  -webkit-app-region: no-drag;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.capsule-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}

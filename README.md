@@ -98,6 +98,19 @@ On failure: rule preprocess + dictionary replacements only (session still comple
 - Settings: auto-insert, preserve clipboard, mode (`auto` / `paste` / `type` / `copy_only`)
 - IPC: `get_permission_status`, `insert_text`, `get/save_inject_config`
 
+### Hotkey + capsule (M5)
+
+- Global toggle: default `CommandOrControl+Shift+Space` (start / stop+transcribe+insert)
+- Floating capsule overlay while listening / processing
+- Config:
+
+```toml
+[hotkey]
+enabled = true
+toggle = "CommandOrControl+Shift+Space"
+show_capsule = true
+```
+
 Data directory (runtime):
 
 ```

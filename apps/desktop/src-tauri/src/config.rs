@@ -10,6 +10,7 @@ use std::path::PathBuf;
 pub struct AppConfig {
     pub corrector: CorrectorConfig,
     pub inject: InjectConfig,
+    pub hotkey: HotkeyConfig,
 }
 
 impl Default for AppConfig {
@@ -17,6 +18,7 @@ impl Default for AppConfig {
         Self {
             corrector: CorrectorConfig::default(),
             inject: InjectConfig::default(),
+            hotkey: HotkeyConfig::default(),
         }
     }
 }
@@ -64,6 +66,27 @@ impl Default for InjectConfig {
             mode: "auto".into(),
             preserve_clipboard: true,
             auto_insert: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HotkeyConfig {
+    pub enabled: bool,
+    /// Tauri/global-shortcut format, e.g. "CommandOrControl+Shift+Space"
+    pub toggle: String,
+    /// Show floating capsule while recording / processing.
+    pub show_capsule: bool,
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Cmd+Shift+Space is easy to reach; user can change in Settings.
+            toggle: "CommandOrControl+Shift+Space".into(),
+            show_capsule: true,
         }
     }
 }

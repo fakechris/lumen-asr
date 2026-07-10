@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
 import type {
   AsrStatus,
@@ -68,6 +69,42 @@ export default function App() {
       setError(String(e));
     }
   }, []);
+
+  // Global hotkey / capsule events
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    listen<{
+      phase: string;
+      message?: string;
+      outcome?: {
+        text: string;
+        asrText?: string;
+        asrEngine?: string;
+        correctorEngine?: string;
+      };
+    }>("dictation", (e) => {
+      const p = e.payload;
+      if (p.phase === "listening") {
+        setBusy(true);
+        setError(null);
+      } else if (p.phase === "processing") {
+        setBusy(true);
+      } else if (p.phase === "done" && p.outcome) {
+        setBusy(false);
+        void refreshHealth();
+        void refreshSessions();
+        setTab("record");
+      } else if (p.phase === "error") {
+        setBusy(false);
+        setError(p.message || "dictation error");
+      } else if (p.phase === "idle") {
+        setBusy(false);
+      }
+    }).then((fn) => {
+      un = fn;
+    });
+    return () => un?.();
+  }, [refreshHealth, refreshSessions]);
 
   useEffect(() => {
     void refreshHealth();
@@ -483,7 +520,7 @@ function RecordPanel({
       <section className="card">
         <h2>本地转写</h2>
         <p className="muted-text">
-          默认 SenseVoice（sherpa-onnx）。模型就绪后点「开始录音」→「停止并转写」。
+          默认 SenseVoice。也可用全局热键（默认 ⌘⇧Space）切换录音/停止。模型就绪后即可用。
         </p>
         <div className="form-row" style={{ marginBottom: 12 }}>
           <label className="muted-text" style={{ minWidth: 64 }}>
@@ -644,6 +681,9 @@ function SettingsPanel({
   const [autoInsert, setAutoInsert] = useState(true);
   const [injectMode, setInjectMode] = useState("auto");
   const [preserveClip, setPreserveClip] = useState(true);
+  const [hotkeyEnabled, setHotkeyEnabled] = useState(true);
+  const [hotkeyToggle, setHotkeyToggle] = useState("CommandOrControl+Shift+Space");
+  const [showCapsule, setShowCapsule] = useState(true);
 
   useEffect(() => {
     void (async () => {
@@ -661,6 +701,10 @@ function SettingsPanel({
         setAutoInsert(inj.autoInsert);
         setInjectMode(inj.mode);
         setPreserveClip(inj.preserveClipboard);
+        const hk = await api.getHotkeyConfig();
+        setHotkeyEnabled(hk.enabled);
+        setHotkeyToggle(hk.toggle);
+        setShowCapsule(hk.showCapsule);
       } catch (e) {
         onError(String(e));
       }
@@ -736,6 +780,74 @@ function SettingsPanel({
 
   return (
     <>
+      <section className="card">
+        <h2>全局热键</h2>
+        <p className="muted-text">
+          默认 <code>⌘⇧Space</code> 切换录音/停止转写。需在系统设置中允许本应用接收全局快捷键（如有拦截软件请放行）。
+        </p>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={hotkeyEnabled}
+              disabled={busy}
+              onChange={(e) => setHotkeyEnabled(e.target.checked)}
+            />{" "}
+            启用热键
+          </label>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={showCapsule}
+              disabled={busy}
+              onChange={(e) => setShowCapsule(e.target.checked)}
+            />{" "}
+            显示浮动胶囊
+          </label>
+        </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            热键
+          </label>
+          <input
+            className="input"
+            value={hotkeyToggle}
+            disabled={busy}
+            onChange={(e) => setHotkeyToggle(e.target.value)}
+            placeholder="CommandOrControl+Shift+Space"
+          />
+        </div>
+        <div className="actions">
+          <button
+            type="button"
+            className="btn"
+            disabled={busy}
+            onClick={() =>
+              void (async () => {
+                onBusy(true);
+                onError(null);
+                try {
+                  await api.saveHotkeyConfig({
+                    enabled: hotkeyEnabled,
+                    toggle: hotkeyToggle,
+                    showCapsule,
+                  });
+                  onSaved();
+                } catch (e) {
+                  onError(String(e));
+                } finally {
+                  onBusy(false);
+                }
+              })()
+            }
+          >
+            保存热键
+          </button>
+        </div>
+      </section>
+
       <section className="card">
         <h2>权限</h2>
         <p className="muted-text">
@@ -1042,10 +1154,12 @@ function Overview({
           <li className="done">M2 — SenseVoice (sherpa) + 麦克风</li>
           <li className="done">M3 — Ollama 修正</li>
           <li className="done">M4 — paste-first 注入 + 权限</li>
-          <li>M5 — 热键 + 胶囊</li>
+          <li className="done">M5 — 热键 + 胶囊</li>
           <li>M6 — 粘贴后编辑捕获</li>
         </ol>
-        <p className="muted-text">词典条目数：{dictCount}</p>
+        <p className="muted-text">
+          词典条目数：{dictCount} · 热键默认 ⌘⇧Space 切换录音
+        </p>
       </section>
     </>
   );
