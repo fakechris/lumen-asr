@@ -361,13 +361,16 @@ Migration: existing configs get those defaults; no behavior surprise.
 
 ---
 
-## 11. Open decisions (need product pick before coding)
+## 11. Locked product decisions
 
-1. **Default cleanup**: `light` (recommended) vs `medium`.  
-2. **Translate**: always run light cleanup first, or raw→translate only? (Recommend light first.)  
-3. **Secondary hotkey**: separate chord list vs long-press on same key (unified short/long)?  
-   - Recommend **separate chords** first (clearer; EventTap already chord-based).  
-4. **Strong** level: ship in P0 or fold into medium+polish.concise?
+| # | Decision | Choice |
+|---|----------|--------|
+| 1 | Default cleanup | **`medium`** |
+| 2 | Translate pipeline | **Light cleanup first, then translate** to `target_language` |
+| 3 | Secondary hotkeys | **Independent chords** (not short/long on the same key) |
+| 4 | Ship / git | **Push every completed stage** to `origin` |
+
+**Strong** level: include in P0 as optional fourth segment (default remains medium).
 
 ---
 
