@@ -1,53 +1,86 @@
 //! Recording + local ASR + model corrector IPC (M2–M5).
 
 use crate::corrector_svc::{engine_label, run_correct};
+use crate::session_debug::{self, SessionDebugMeta};
 use crate::AppState;
 use lumen_asr::{
     prepare_for_asr, sensevoice_status, whisper_status, AsrEngine, AsrRequest, AudioDeviceInfo,
     EngineKind, EngineStatus,
 };
 use lumen_core::{FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
-use lumen_platform_macos::{activate_app_by_name, frontmost_app_name, is_self_app_name};
+use lumen_platform_macos::{
+    activate_target, frontmost_app_name, frontmost_target, is_self_app_name, is_self_target,
+    FrontmostTarget,
+};
 use serde::Serialize;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// Frontmost app captured when hotkey dictation starts — restored before paste
-/// so Lumen never steals the typing target.
-static TARGET_APP: Mutex<Option<String>> = Mutex::new(None);
+/// Frontmost app captured when hotkey dictation starts — restored before paste.
+static TARGET: Mutex<Option<FrontmostTarget>> = Mutex::new(None);
 
 fn remember_target_app() {
-    if let Some(name) = frontmost_app_name() {
-        if !is_self_app_name(&name) {
-            tracing::info!(%name, "dictation target app remembered");
-            if let Ok(mut g) = TARGET_APP.lock() {
-                *g = Some(name);
+    let t = frontmost_target();
+    match &t {
+        Some(t) if !is_self_target(t) => {
+            tracing::info!(
+                name = ?t.name,
+                bundle = ?t.bundle_id,
+                "dictation target remembered"
+            );
+            if let Ok(mut g) = TARGET.lock() {
+                *g = Some(t.clone());
             }
-            return;
         }
-    }
-    if let Ok(mut g) = TARGET_APP.lock() {
-        *g = None;
+        other => {
+            tracing::warn!(?other, "could not remember non-self frontmost target");
+            // Keep previous good target if we briefly saw ourselves.
+            if let Ok(mut g) = TARGET.lock() {
+                if g.is_none() {
+                    *g = t.filter(|x| !is_self_target(x));
+                }
+            }
+        }
     }
 }
 
-fn restore_target_app_before_insert() {
-    let target = TARGET_APP.lock().ok().and_then(|g| g.clone());
-    let current = frontmost_app_name();
-    // If something (capsule/main) stole focus, put the typing app back.
-    let need_restore = match (&target, &current) {
-        (Some(t), Some(c)) => is_self_app_name(c) || c != t,
-        (Some(_), None) => true,
-        _ => current.as_ref().map(|c| is_self_app_name(c)).unwrap_or(false),
-    };
-    if need_restore {
-        if let Some(name) = target {
-            tracing::info!(%name, "restoring focus to target app before insert");
-            let _ = activate_app_by_name(&name);
-            // Give the target a beat to become key window.
-            std::thread::sleep(std::time::Duration::from_millis(120));
+/// Put typing target frontmost and hide our overlays before ⌘V.
+fn restore_target_app_before_insert(app: Option<&AppHandle>) -> Option<String> {
+    // Hide capsule first so it cannot remain key window.
+    if let Some(app) = app {
+        crate::capsule::set_capsule_visible(app, false, "idle");
+        crate::capsule::ensure_main_stays_background(app);
+        // Accessory: do not fight the target for activation.
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    }
+
+    let target = TARGET.lock().ok().and_then(|g| g.clone());
+    let mut notes_front: Option<String> = None;
+
+    if let Some(ref t) = target {
+        if !is_self_target(t) {
+            tracing::info!(name = ?t.name, bundle = ?t.bundle_id, "activating typing target");
+            let ok = activate_target(t);
+            tracing::info!(ok, "activate_target result");
+            // Wait for key window — iTerm/Electron need a beat.
+            std::thread::sleep(std::time::Duration::from_millis(220));
         }
     }
+
+    // Verify
+    if let Some(cur) = frontmost_app_name() {
+        notes_front = Some(cur.clone());
+        if is_self_app_name(&cur) {
+            tracing::warn!(%cur, "frontmost is still Lumen before paste — retry activate");
+            if let Some(ref t) = target {
+                let _ = activate_target(t);
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                notes_front = frontmost_app_name();
+            }
+        }
+    }
+    notes_front
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -137,7 +170,7 @@ pub async fn stop_and_transcribe(
     state: State<'_, AppState>,
     save: Option<bool>,
 ) -> Result<TranscribeOutcome, String> {
-    let outcome = stop_and_transcribe_inner(&state, save.unwrap_or(true)).await?;
+    let outcome = stop_and_transcribe_inner(&state, save.unwrap_or(true), Some(&app)).await?;
     if outcome.watch_post_paste {
         crate::learning::spawn_post_paste_watch(
             app,
@@ -152,6 +185,7 @@ pub async fn stop_and_transcribe(
 pub async fn stop_and_transcribe_inner(
     state: &AppState,
     save: bool,
+    app: Option<&AppHandle>,
 ) -> Result<TranscribeOutcome, String> {
     let capture = state.audio.stop().map_err(|e| e.to_string())?;
     let num_samples = capture.samples.len();
@@ -161,16 +195,33 @@ pub async fn stop_and_transcribe_inner(
     } else {
         0
     };
+    let (rms_cap, peak_cap) = session_debug::audio_stats(&capture.samples);
+    tracing::info!(
+        num_samples,
+        sample_rate,
+        duration_ms,
+        rms = rms_cap,
+        peak = peak_cap,
+        "audio capture stopped"
+    );
 
     if capture.samples.is_empty() {
-        return Err("no audio captured".into());
+        return Err("no audio captured (0 samples) — hold longer or check mic".into());
     }
 
     let samples_16k = prepare_for_asr(&capture);
+    let (rms, peak) = session_debug::audio_stats(&samples_16k);
+    if peak < 0.005 {
+        tracing::warn!(peak, rms, "audio nearly silent — ASR likely empty");
+    }
+
     let engine_kind = *state
         .engine
         .lock()
         .map_err(|_| "engine lock poisoned".to_string())?;
+
+    // Clone samples for debug dump (after ASR we still have this).
+    let samples_for_debug = samples_16k.clone();
 
     let result = match engine_kind {
         EngineKind::SenseVoice => {
@@ -204,6 +255,7 @@ pub async fn stop_and_transcribe_inner(
     };
 
     let asr_text = result.text.trim().to_string();
+    tracing::info!(%asr_text, engine = engine_kind.as_str(), "ASR result");
 
     let entries = {
         let store_guard = state
@@ -231,23 +283,51 @@ pub async fn stop_and_transcribe_inner(
     } else {
         format!("{}:fallback", engine_label(&cfg))
     };
+    tracing::info!(%corrected_text, %corrector_engine, "corrector result");
 
-    let target_name = TARGET_APP.lock().ok().and_then(|g| g.clone());
+    let target = TARGET.lock().ok().and_then(|g| g.clone());
+    let mut notes: Vec<String> = Vec::new();
+    if peak < 0.005 {
+        notes.push("near-silent audio".into());
+    }
+    if asr_text.is_empty() || asr_text == "." {
+        notes.push("empty/dot ASR".into());
+    }
 
     let mut insert_strategy = InsertStrategy::None;
     let mut did_insert = false;
+    let mut frontmost_before_insert = None;
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
-        // Critical: paste into the *typing target*, not Lumen if we stole focus.
-        restore_target_app_before_insert();
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        frontmost_before_insert = restore_target_app_before_insert(app);
+        // Block on async runtime — short sleeps already done in restore.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Re-check we are not pasting into ourselves.
+        if let Some(cur) = frontmost_app_name() {
+            if is_self_app_name(&cur) {
+                notes.push(format!("still frontmost self before paste: {cur}"));
+                tracing::error!(%cur, "refusing to paste into Lumen — retry activate");
+                if let Some(ref t) = target {
+                    let _ = activate_target(t);
+                    tokio::time::sleep(std::time::Duration::from_millis(280)).await;
+                }
+            }
+        }
+
         match crate::inject_cmd::insert_with_config(&cfg.inject, &corrected_text).await {
             Ok(out) => {
                 insert_strategy = out.strategy;
-                did_insert = !matches!(insert_strategy, InsertStrategy::None | InsertStrategy::CopyOnly);
-                tracing::info!(?insert_strategy, "auto-insert done");
+                did_insert =
+                    !matches!(insert_strategy, InsertStrategy::None | InsertStrategy::CopyOnly);
+                tracing::info!(
+                    ?insert_strategy,
+                    frontmost = ?frontmost_app_name(),
+                    "auto-insert done"
+                );
             }
             Err(e) => {
-                tracing::warn!(error = %e, "auto-insert failed; text still available in UI");
+                notes.push(format!("insert error: {e}"));
+                tracing::warn!(error = %e, "auto-insert failed");
             }
         }
     }
@@ -261,10 +341,42 @@ pub async fn stop_and_transcribe_inner(
     rec.asr_engine = Some(engine_kind.as_str().into());
     rec.corrector_engine = Some(corrector_engine.clone());
     rec.focus = FocusInfo {
-        app_name: target_name.or_else(|| Some("unknown".into())),
-        bundle_id: None,
+        app_name: target.as_ref().and_then(|t| t.name.clone()),
+        bundle_id: target.as_ref().and_then(|t| t.bundle_id.clone()),
         window_title: None,
     };
+
+    // Always write debug dump (audio + texts) for analysis.
+    let debug_dir = session_debug::new_session_dir(&rec.id.to_string());
+    let meta = SessionDebugMeta {
+        session_id: rec.id.to_string(),
+        created_at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        target_app: target.as_ref().and_then(|t| t.name.clone()),
+        target_bundle_id: target.as_ref().and_then(|t| t.bundle_id.clone()),
+        frontmost_before_insert,
+        sample_rate_capture: sample_rate,
+        num_samples_capture: num_samples,
+        sample_rate_asr: 16_000,
+        num_samples_asr: samples_for_debug.len(),
+        duration_ms,
+        rms,
+        peak,
+        asr_engine: engine_kind.as_str().into(),
+        corrector_engine: corrector_engine.clone(),
+        asr_text: asr_text.clone(),
+        corrected_text: corrected_text.clone(),
+        insert_strategy: format!("{insert_strategy:?}"),
+        insert_ok: did_insert,
+        notes,
+    };
+    if let Err(e) = session_debug::write_session_debug(&debug_dir, &meta, &samples_for_debug) {
+        tracing::warn!(error = %e, "failed to write session debug");
+    } else {
+        rec.audio_path = Some(debug_dir.join("audio_16k.wav").display().to_string());
+    }
 
     if save {
         let store_guard = state
@@ -274,12 +386,6 @@ pub async fn stop_and_transcribe_inner(
         if let Some(store) = store_guard.as_ref() {
             store.save_session(&rec).map_err(|e| e.to_string())?;
         }
-    }
-
-    // M6: optional post-paste watch for user corrections in the target app.
-    if did_insert && cfg.learning.post_paste_capture {
-        // Need AppHandle — not available here. Caller with AppHandle should spawn.
-        // Stored flag on outcome for UI/hotkey path.
     }
 
     Ok(TranscribeOutcome {
@@ -332,9 +438,10 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
     if state.audio.is_recording() {
         return Ok(());
     }
-    // Capture typing target *before* any of our windows show.
+    // Capture typing target *before* any of our windows show / activate.
     remember_target_app();
-    // Never bring the main settings window forward during hotkey use.
+    // Accessory: windows must not steal key focus from iTerm/etc.
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     crate::capsule::ensure_main_stays_background(&app);
 
     let show_capsule = state
@@ -344,6 +451,7 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
         .unwrap_or(true);
 
     start_recording_inner(&state)?;
+    // Capsule is optional visual only — never focusable.
     crate::capsule::set_capsule_visible(&app, show_capsule, "listening");
     emit_dictation(
         &app,
@@ -372,8 +480,12 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
             message: "转写与修正中…".into(),
         },
     );
-    crate::capsule::set_capsule_visible(&app, show_capsule, "processing");
-    match stop_and_transcribe_inner(&state, true).await {
+    // Prefer hiding overlays during process so paste target stays frontmost.
+    crate::capsule::set_capsule_visible(&app, false, "processing");
+    let _ = show_capsule;
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+    match stop_and_transcribe_inner(&state, true, Some(&app)).await {
         Ok(outcome) => {
             if outcome.watch_post_paste {
                 crate::learning::spawn_post_paste_watch(
@@ -384,7 +496,6 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
                 );
             }
             crate::capsule::set_capsule_visible(&app, false, "idle");
-            // Done is for history UI only — do not focus main window.
             emit_dictation(&app, DictationUiEvent::Done { outcome });
             emit_dictation(&app, DictationUiEvent::Idle);
             crate::capsule::ensure_main_stays_background(&app);

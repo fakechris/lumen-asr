@@ -9,6 +9,7 @@ mod inject_cmd;
 mod learning;
 mod mod_chord;
 mod permissions_cmd;
+mod session_debug;
 
 use config::AppConfig;
 use lumen_asr::{
@@ -18,6 +19,7 @@ use lumen_asr::{
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
 use std::sync::Mutex;
+use tauri::Manager;
 
 pub struct AppState {
     pub store: Mutex<Option<Store>>,
@@ -30,16 +32,37 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "lumen_asr_desktop=info,lumen=info,warn".into()),
-        )
-        .init();
-
     let data_dir = default_data_dir();
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::fs::create_dir_all(data_dir.join("models"));
+    let _ = std::fs::create_dir_all(data_dir.join("debug"));
+    let _ = std::fs::create_dir_all(data_dir.join("logs"));
+
+    // File + stderr logging so we can debug "ASR died" / paste target issues.
+    let log_path = data_dir.join("logs/lumen.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path);
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "lumen_asr_desktop=info,lumen=info,warn".into());
+    match file {
+        Ok(f) => {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            let writer = std::io::stderr.and(f);
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(writer)
+                .init();
+            tracing::info!(path = %log_path.display(), "file logging enabled");
+        }
+        Err(e) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .init();
+            tracing::warn!(error = %e, "file logging unavailable");
+        }
+    }
 
     let app_config = AppConfig::load();
     tracing::info!(
@@ -119,15 +142,38 @@ pub fn run() {
             learning::process_edit,
         ])
         .setup(|app| {
+            // Accessory by default so hotkey + capsule do not steal key focus
+            // from the app the user is typing into (iTerm, browser, etc.).
+            if let Err(e) = app
+                .handle()
+                .set_activation_policy(tauri::ActivationPolicy::Accessory)
+            {
+                tracing::warn!(error = %e, "set_activation_policy Accessory failed");
+            }
+
+            // When user opens the main settings window, allow normal activation.
+            if let Some(main) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
+                main.on_window_event(move |ev| {
+                    if let tauri::WindowEvent::Focused(true) = ev {
+                        let _ = handle.set_activation_policy(tauri::ActivationPolicy::Regular);
+                    }
+                });
+            }
+
             if let Err(e) = capsule::ensure_capsule(app.handle()) {
                 tracing::warn!(error = %e, "capsule window create failed");
             }
             if let Err(e) = hotkey::setup_hotkeys(app.handle()) {
                 tracing::warn!(error = %e, "hotkey setup failed");
             }
+
+            let debug_dir = session_debug::debug_root();
+            let _ = std::fs::create_dir_all(&debug_dir);
             tracing::info!(
                 name = app.package_info().name,
-                "Lumen ASR desktop starting (M6)"
+                debug = %debug_dir.display(),
+                "Lumen ASR desktop starting (session debug enabled)"
             );
             Ok(())
         })

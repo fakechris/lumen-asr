@@ -95,7 +95,10 @@ impl AudioCapture {
                             let _ = reply.send(res);
                         }
                         AudioCmd::Stop { reply } => {
+                            // Drop stream first (waits for callback), then take buffer.
                             stream_slot = None;
+                            // macOS CoreAudio can glitch if we re-open immediately.
+                            thread::sleep(std::time::Duration::from_millis(40));
                             rec_flag.store(false, Ordering::SeqCst);
                             let sample_rate = rate_flag.load(Ordering::SeqCst);
                             let samples = std::mem::take(&mut *samples_for_thread.lock());

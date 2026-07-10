@@ -138,7 +138,14 @@ Data directory (runtime):
   config.toml
   lumen.sqlite
   models/
-  recordings/   # optional
+  logs/lumen.log          # runtime log (append)
+  debug/                  # per-session dumps for analysis
+    LATEST.txt            # path to newest dump
+    <ts>-<id>/
+      audio_16k.wav       # raw ASR audio (16 kHz mono)
+      asr.txt             # model output
+      corrected.txt       # after corrector
+      meta.json           # target app, RMS, insert status, notes
 ```
 
 ## License

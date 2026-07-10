@@ -97,6 +97,9 @@ impl Default for HotkeyConfig {
     }
 }
 
+// Note: session audio/ASR dumps land in:
+//   ~/Library/Application Support/LumenAsr/debug/
+
 impl HotkeyConfig {
     pub fn is_hold_mode(&self) -> bool {
         !matches!(self.mode.to_ascii_lowercase().as_str(), "toggle" | "click")
