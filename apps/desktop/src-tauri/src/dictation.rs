@@ -25,9 +25,15 @@ static TARGET: Mutex<Option<FrontmostTarget>> = Mutex::new(None);
 
 /// Intent bound to the current dictation session (default / translate / raw).
 static SESSION_INTENT: Mutex<IntentSpec> = Mutex::new(IntentSpec::Default);
+/// UI-facing copy of session intent; kept until capsule goes idle so processing
+/// phase still knows “翻译” after take_session_intent() for the corrector.
+static UI_SESSION_INTENT: Mutex<IntentSpec> = Mutex::new(IntentSpec::Default);
 
 pub fn set_session_intent(intent: IntentSpec) {
     if let Ok(mut g) = SESSION_INTENT.lock() {
+        *g = intent.clone();
+    }
+    if let Ok(mut g) = UI_SESSION_INTENT.lock() {
         *g = intent;
     }
 }
@@ -37,6 +43,19 @@ fn take_session_intent() -> IntentSpec {
         .lock()
         .map(|mut g| std::mem::take(&mut *g))
         .unwrap_or(IntentSpec::Default)
+}
+
+fn peek_ui_intent() -> IntentSpec {
+    UI_SESSION_INTENT
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or(IntentSpec::Default)
+}
+
+fn clear_ui_intent() {
+    if let Ok(mut g) = UI_SESSION_INTENT.lock() {
+        *g = IntentSpec::Default;
+    }
 }
 
 /// Serial dictation lifecycle — prevents overlapping start/stop thrash (felt like crash).
@@ -817,9 +836,10 @@ fn intent_ui_label(intent: &IntentSpec) -> (String, Option<String>, String) {
             Some(target_language.clone()),
             format!("翻译→{target_language}"),
         ),
-        IntentSpec::Raw => ("raw".into(), None, "原文".into()),
+        IntentSpec::Raw => ("raw".into(), None, "仅原文".into()),
+        // Never call normal path “录音” during processing — user confuses with translate.
         IntentSpec::Default | IntentSpec::PolishOverride => {
-            ("default".into(), None, "录音".into())
+            ("default".into(), None, "整理".into())
         }
     }
 }
@@ -955,18 +975,18 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    // Peek intent for UI (don't take — stop_and_transcribe still needs it).
-    let intent_peek = SESSION_INTENT
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or(IntentSpec::Default);
+    // UI intent survives take_session_intent inside stop_and_transcribe_inner.
+    let intent_peek = peek_ui_intent();
     let (intent_kind, target_lang, intent_label) = intent_ui_label(&intent_peek);
     tracing::info!(held_ms, %intent_kind, "dictation stop → ASR");
     let processing_msg = if intent_kind == "translate" {
-        format!("转写并翻译→{}…", target_lang.as_deref().unwrap_or("en"))
+        format!("正在翻译 → {}…", target_lang.as_deref().unwrap_or("en"))
+    } else if intent_kind == "raw" {
+        "转写中（不整理）…".into()
     } else {
-        format!("转写与修正中…（{intent_label}）")
+        "转写与整理中…".into()
     };
+    let _ = intent_label;
     emit_dictation(
         &app,
         DictationUiEvent::Processing {
@@ -983,6 +1003,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
         *g = None;
     }
 
+    clear_ui_intent();
     match result {
         Ok(outcome) => {
             if outcome.watch_post_paste {

@@ -1,10 +1,12 @@
 //! Floating capsule overlay — the visible popup while dictating.
 //!
 //! Must **not** steal keyboard focus from the app the user is typing into.
+//! Window chrome must be fully transparent (no white/light frame around the pill).
 
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const CAPSULE_LABEL: &str = "capsule";
+#[allow(dead_code)]
 pub const MAIN_LABEL: &str = "main";
 
 /// Create the always-on-top capsule window (initially hidden).
@@ -13,13 +15,14 @@ pub fn ensure_capsule(app: &AppHandle) -> tauri::Result<()> {
         return Ok(());
     }
 
-    let win = WebviewWindowBuilder::new(
+    // Transparent NSWindow + transparent webview so only the pill CSS is visible.
+    let mut builder = WebviewWindowBuilder::new(
         app,
         CAPSULE_LABEL,
         WebviewUrl::App("index.html?window=capsule".into()),
     )
-    .title("Lumen")
-    .inner_size(280.0, 64.0)
+    .title("Lumen Capsule")
+    .inner_size(340.0, 56.0)
     .resizable(false)
     .maximizable(false)
     .minimizable(false)
@@ -29,11 +32,24 @@ pub fn ensure_capsule(app: &AppHandle) -> tauri::Result<()> {
     .visible(false)
     .focused(false)
     .focusable(false)
-    .build()?;
+    .shadow(false);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.transparent(true);
+        // Fully clear window + webview background (avoids white “card” around the pill).
+        builder = builder.background_color(tauri::window::Color(0, 0, 0, 0));
+    }
+
+    let win = builder.build()?;
 
     position_top_center(&win);
     let _ = win.set_focusable(false);
-    tracing::info!("capsule window created");
+    #[cfg(target_os = "macos")]
+    {
+        let _ = win.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
+    }
+    tracing::info!("capsule window created (transparent)");
     Ok(())
 }
 
@@ -41,7 +57,7 @@ fn position_top_center(win: &tauri::WebviewWindow) {
     if let Some(monitor) = win.current_monitor().ok().flatten() {
         let size = monitor.size();
         let scale = monitor.scale_factor();
-        let w = 280.0 * scale;
+        let w = 340.0 * scale;
         let x = (size.width as f64 - w) / 2.0 / scale;
         let y = 56.0;
         let _ = win.set_position(tauri::LogicalPosition::new(x, y));

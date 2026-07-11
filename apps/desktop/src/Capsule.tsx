@@ -42,8 +42,9 @@ export default function Capsule() {
       } else if (p.phase === "processing") {
         setPhase("processing");
         setMessage(p.message || "处理中");
-        setIntent(p.intent || intent);
-        setTargetLang(p.targetLanguage ?? targetLang);
+        // Prefer payload intent; keep previous if missing so translate stays visible.
+        if (p.intent) setIntent(p.intent);
+        if (p.targetLanguage != null) setTargetLang(p.targetLanguage);
       } else if (p.phase === "error") {
         setPhase("error");
         setMessage(p.message);
@@ -64,7 +65,6 @@ export default function Capsule() {
     return () => {
       un?.();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -83,24 +83,56 @@ export default function Capsule() {
   }
 
   const isTranslate = intent === "translate";
-  const label =
-    phase === "listening"
-      ? isTranslate
-        ? `翻译→${targetLang || "en"} ${seconds}s`
-        : intent === "raw"
-          ? `原文 ${seconds}s`
-          : `录音 ${seconds}s`
-      : phase === "processing"
-        ? message
-        : message;
+  const isRaw = intent === "raw";
+  const lang = targetLang || "en";
+
+  // Strong visual copy — never use the same “录音” string for translate.
+  let label: string;
+  let badge: string;
+  if (phase === "listening") {
+    if (isTranslate) {
+      badge = "译";
+      label = `翻译 → ${lang} · ${seconds}s`;
+    } else if (isRaw) {
+      badge = "原";
+      label = `仅原文 · ${seconds}s`;
+    } else {
+      badge = "录";
+      label = `录音 · ${seconds}s`;
+    }
+  } else if (phase === "processing") {
+    if (isTranslate) {
+      badge = "译";
+      label = message.includes("翻译") ? message : `正在翻译 → ${lang}…`;
+    } else if (isRaw) {
+      badge = "原";
+      label = "转写中（不整理）…";
+    } else {
+      badge = "整";
+      label = message.includes("修正") ? message : "转写与整理中…";
+    }
+  } else if (phase === "error") {
+    badge = "!";
+    label = message;
+  } else {
+    badge = "·";
+    label = message;
+  }
 
   return (
     <div
-      className={`capsule-root phase-${phase}${isTranslate ? " intent-translate" : ""}${
-        intent === "raw" ? " intent-raw" : ""
-      }`}
+      className={[
+        "capsule-root",
+        `phase-${phase}`,
+        isTranslate ? "intent-translate" : "",
+        isRaw ? "intent-raw" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
     >
-      <span className="capsule-dot" />
+      <span className="capsule-badge" aria-hidden>
+        {badge}
+      </span>
       <span className="capsule-text">{label}</span>
       {phase === "listening" && (
         <button type="button" className="capsule-btn" onClick={() => void stop()}>
