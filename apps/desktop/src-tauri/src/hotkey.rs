@@ -1,6 +1,6 @@
 //! Global hotkey registration — primary + independent intent chords.
 
-use crate::config::{HotkeyConfig, HotkeyIntentConfig};
+use crate::config::{ensure_default_intents, HotkeyConfig, HotkeyIntentConfig};
 use crate::dictation;
 use crate::mod_chord::{self, ModChord};
 use crate::AppState;
@@ -64,16 +64,21 @@ fn intent_dto(i: &HotkeyIntentConfig) -> HotkeyIntentDto {
 
 #[tauri::command]
 pub fn get_hotkey_config(state: State<'_, AppState>) -> Result<HotkeyDto, String> {
-    let cfg = state
+    let mut guard = state
         .config
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?;
+    let before = guard.hotkey.intents.len();
+    ensure_default_intents(&mut guard.hotkey);
+    if guard.hotkey.intents.len() != before {
+        let _ = guard.save();
+    }
     Ok(HotkeyDto {
-        enabled: cfg.hotkey.enabled,
-        toggle: cfg.hotkey.toggle.clone(),
-        show_capsule: cfg.hotkey.show_capsule,
-        mode: cfg.hotkey.mode.clone(),
-        intents: cfg.hotkey.intents.iter().map(intent_dto).collect(),
+        enabled: guard.hotkey.enabled,
+        toggle: guard.hotkey.toggle.clone(),
+        show_capsule: guard.hotkey.show_capsule,
+        mode: guard.hotkey.mode.clone(),
+        intents: guard.hotkey.intents.iter().map(intent_dto).collect(),
     })
 }
 

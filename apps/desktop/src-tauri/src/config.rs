@@ -235,7 +235,8 @@ impl Default for HotkeyIntentConfig {
             mode: "hold".into(),
             intent: "translate".into(),
             target_language: "en".into(),
-            enabled: false,
+            // Ship enabled: secondary translate chord is a core product path.
+            enabled: true,
         }
     }
 }
@@ -247,11 +248,15 @@ impl Default for HotkeyConfig {
             toggle: "Alt+Space".into(),
             show_capsule: true,
             mode: "hold".into(),
-            intents: vec![HotkeyIntentConfig {
-                enabled: false,
-                ..HotkeyIntentConfig::default()
-            }],
+            intents: vec![HotkeyIntentConfig::default()],
         }
+    }
+}
+
+/// Ensure at least a translate intent exists (old configs may have empty list).
+pub fn ensure_default_intents(cfg: &mut HotkeyConfig) {
+    if cfg.intents.is_empty() {
+        cfg.intents.push(HotkeyIntentConfig::default());
     }
 }
 
@@ -336,8 +341,11 @@ impl AppConfig {
             return cfg;
         }
         match fs::read_to_string(path) {
-            Ok(s) => match toml::from_str(&s) {
-                Ok(c) => c,
+            Ok(s) => match toml::from_str::<Self>(&s) {
+                Ok(mut c) => {
+                    ensure_default_intents(&mut c.hotkey);
+                    c
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "config parse failed, using defaults");
                     Self::default()

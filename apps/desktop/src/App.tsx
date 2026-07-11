@@ -5,6 +5,7 @@ import { HotkeyRecorder } from "./HotkeyRecorder";
 import { OnboardingWizard } from "./OnboardingWizard";
 import { formatHotkeyLabel } from "./hotkeyFormat";
 import { Icon, type IconName } from "./Icons";
+import { ChordCaptureChip } from "./ChordCaptureChip";
 import type {
   AsrStatus,
   AudioDevice,
@@ -1337,65 +1338,147 @@ function SettingsPanel({
       <section className="card settings-section">
         <h2>意图快捷键</h2>
         <p className="muted-text">
-          与主热键独立。例如按住「翻译」键说话 → 先轻度整理再译成目标语言。
+          与主热键<strong>独立</strong>。例如按住「翻译」键说话 → 先按当前整理设置处理，再译成目标语言。
+          默认 <span className="kbd">⌥⇧T</span>；须点「保存」后全局生效。
         </p>
-        {intents.map((it, idx) => (
-          <div key={it.id + idx} className="intent-row">
-            <label className="muted-text">
-              <input
-                type="checkbox"
-                checked={it.enabled}
-                disabled={busy}
-                onChange={(e) => {
-                  const next = [...intents];
-                  next[idx] = { ...it, enabled: e.target.checked };
-                  setIntents(next);
-                }}
-              />{" "}
-              启用
-            </label>
-            <input
-              className="input"
-              style={{ maxWidth: 140 }}
-              value={it.chord}
-              disabled={busy}
-              onChange={(e) => {
-                const next = [...intents];
-                next[idx] = { ...it, chord: e.target.value };
-                setIntents(next);
-              }}
-              placeholder="Alt+Shift+T"
-            />
-            <select
-              className="input"
-              style={{ maxWidth: 120 }}
-              value={it.intent}
-              disabled={busy}
-              onChange={(e) => {
-                const next = [...intents];
-                next[idx] = { ...it, intent: e.target.value };
-                setIntents(next);
-              }}
-            >
-              <option value="translate">翻译</option>
-              <option value="raw">仅原文</option>
-              <option value="default">默认整理</option>
-            </select>
-            {it.intent === "translate" && (
-              <input
+        {(intents.length === 0
+          ? [
+              {
+                id: "translate",
+                chord: "Alt+Shift+T",
+                mode: "hold",
+                intent: "translate",
+                targetLanguage: "en",
+                enabled: true,
+              },
+            ]
+          : intents
+        ).map((it, idx) => (
+          <div key={it.id + idx} className="intent-card">
+            <div className="intent-card-top">
+              <label className="muted-text intent-enable">
+                <input
+                  type="checkbox"
+                  checked={it.enabled}
+                  disabled={busy}
+                  onChange={(e) => {
+                    const next = [...(intents.length ? intents : [it])];
+                    next[idx] = { ...next[idx], enabled: e.target.checked };
+                    setIntents(next);
+                  }}
+                />{" "}
+                启用
+              </label>
+              <select
                 className="input"
-                style={{ maxWidth: 80 }}
-                value={it.targetLanguage}
+                style={{ maxWidth: 140 }}
+                value={it.intent}
                 disabled={busy}
                 onChange={(e) => {
-                  const next = [...intents];
-                  next[idx] = { ...it, targetLanguage: e.target.value };
+                  const next = [...(intents.length ? intents : [it])];
+                  next[idx] = { ...next[idx], intent: e.target.value };
                   setIntents(next);
                 }}
-                placeholder="en"
-                title="目标语言"
+              >
+                <option value="translate">翻译</option>
+                <option value="raw">仅原文（不整理）</option>
+                <option value="default">默认整理</option>
+              </select>
+            </div>
+            <div className="intent-card-row">
+              <span className="muted-text intent-label">快捷键</span>
+              <ChordCaptureChip
+                value={it.chord}
+                disabled={busy}
+                busy={busy}
+                onBusy={onBusy}
+                onError={onError}
+                onChange={(chord) => {
+                  const next = [...(intents.length ? intents : [it])];
+                  next[idx] = { ...next[idx], chord };
+                  setIntents(next);
+                }}
               />
+              <select
+                className="input"
+                style={{ maxWidth: 100 }}
+                value={it.mode === "toggle" ? "toggle" : "hold"}
+                disabled={busy}
+                onChange={(e) => {
+                  const next = [...(intents.length ? intents : [it])];
+                  next[idx] = { ...next[idx], mode: e.target.value };
+                  setIntents(next);
+                }}
+              >
+                <option value="hold">按住</option>
+                <option value="toggle">切换</option>
+              </select>
+            </div>
+            {it.intent === "translate" && (
+              <div className="intent-card-row">
+                <span className="muted-text intent-label">译成</span>
+                <select
+                  className="input"
+                  style={{ maxWidth: 160 }}
+                  value={
+                    ["en", "zh", "ja", "ko", "fr", "de", "es"].includes(
+                      (it.targetLanguage || "en").toLowerCase()
+                    )
+                      ? (it.targetLanguage || "en").toLowerCase()
+                      : "custom"
+                  }
+                  disabled={busy}
+                  onChange={(e) => {
+                    const next = [...(intents.length ? intents : [it])];
+                    const v = e.target.value;
+                    next[idx] = {
+                      ...next[idx],
+                      targetLanguage:
+                        v === "custom"
+                          ? ["en", "zh", "ja", "ko", "fr", "de", "es"].includes(
+                              (it.targetLanguage || "").toLowerCase()
+                            )
+                            ? "pt"
+                            : it.targetLanguage || "pt"
+                          : v,
+                    };
+                    setIntents(next);
+                  }}
+                >
+                  <option value="en">英语 (en)</option>
+                  <option value="zh">中文 (zh)</option>
+                  <option value="ja">日语 (ja)</option>
+                  <option value="ko">韩语 (ko)</option>
+                  <option value="fr">法语 (fr)</option>
+                  <option value="de">德语 (de)</option>
+                  <option value="es">西班牙语 (es)</option>
+                  <option value="custom">其他…</option>
+                </select>
+                {!["en", "zh", "ja", "ko", "fr", "de", "es"].includes(
+                  (it.targetLanguage || "").toLowerCase()
+                ) && (
+                  <input
+                    className="input"
+                    style={{ maxWidth: 100 }}
+                    value={it.targetLanguage}
+                    disabled={busy}
+                    onChange={(e) => {
+                      const next = [...(intents.length ? intents : [it])];
+                      next[idx] = { ...next[idx], targetLanguage: e.target.value || "en" };
+                      setIntents(next);
+                    }}
+                    placeholder="e.g. pt"
+                    title="目标语言代码或名称"
+                  />
+                )}
+              </div>
             )}
+            <p className="muted-text intent-hint">
+              {it.intent === "translate" &&
+                `按住 ${it.chord || "…"} 说话 → 轻度/当前整理 → 译为 ${it.targetLanguage || "en"}`}
+              {it.intent === "raw" && "本轮跳过 AI 整理，只插入 ASR 原文。"}
+              {it.intent === "default" && "与主热键相同的整理流程，只是另一组按键。"}
+            </p>
           </div>
         ))}
         <div className="actions" style={{ marginTop: 10 }}>
@@ -1407,14 +1490,27 @@ function SettingsPanel({
               void (async () => {
                 onBusy(true);
                 try {
+                  const list =
+                    intents.length > 0
+                      ? intents
+                      : [
+                          {
+                            id: "translate",
+                            chord: "Alt+Shift+T",
+                            mode: "hold",
+                            intent: "translate",
+                            targetLanguage: "en",
+                            enabled: true,
+                          },
+                        ];
                   const h = await api.saveHotkeyConfig({
                     enabled: hotkeyEnabled,
                     toggle: hotkeyToggle,
                     showCapsule,
                     mode: hotkeyMode,
-                    intents,
+                    intents: list,
                   });
-                  setIntents(h.intents || []);
+                  setIntents(h.intents || list);
                   onSaved();
                 } catch (e) {
                   onError(String(e));
@@ -1432,12 +1528,12 @@ function SettingsPanel({
             disabled={busy}
             onClick={() =>
               setIntents((prev) => [
-                ...prev,
+                ...(prev.length ? prev : []),
                 {
-                  id: `intent_${prev.length + 1}`,
-                  chord: "Alt+Shift+T",
+                  id: `intent_${Date.now()}`,
+                  chord: "Alt+Shift+R",
                   mode: "hold",
-                  intent: "translate",
+                  intent: "raw",
                   targetLanguage: "en",
                   enabled: true,
                 },
@@ -1499,8 +1595,33 @@ function SettingsPanel({
       <section className="card settings-section">
         <h2>AI 修正（Corrector）</h2>
         <p className="muted-text">
-          识别原文始终保留。整理强度控制默认改写多少；模型失败时回退规则预处理。
+          识别原文始终保留。下面每一项都会写进发给模型的
+          <strong>系统提示词分层</strong>
+          （红线固定 + 整理强度 + 语气/标点 + 额外规则 + 自定义）。改完请点「保存」；下次热键松手转写时生效。模型失败时回退规则预处理。
         </p>
+        <details className="settings-help">
+          <summary>这些设置在模型侧具体改什么？</summary>
+          <ul className="muted-text settings-help-list">
+            <li>
+              <strong>整理强度</strong>：无=不调模型；轻=纠错/去口头禅；中=默认理顺；强=更短更书面。并影响 temperature。
+            </li>
+            <li>
+              <strong>语气 / 大小写 / 标点</strong>：追加到 prompt 的「语气与书写」段，不改红线（禁止回答问题等）。
+            </li>
+            <li>
+              <strong>额外整理</strong>：concise/clarity 等勾选项变成独立规则条。
+            </li>
+            <li>
+              <strong>自定义说明</strong>：叠加在红线之上；若要求「回答问题」会被 prompt 声明忽略。
+            </li>
+            <li>
+              <strong>Provider / Model</strong>：走 Ollama 或 OpenAI 兼容 API；与整理文案无关，只决定谁执行。
+            </li>
+            <li>
+              <strong>意图快捷键·翻译</strong>：同一套整理设置 + 额外「本轮译成目标语言」指令（若整理=无，翻译时仍至少轻度纠错）。
+            </li>
+          </ul>
+        </details>
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text">
             <input

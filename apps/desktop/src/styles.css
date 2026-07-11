@@ -971,6 +971,72 @@ code {
   margin-bottom: 8px;
 }
 
+.intent-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card-soft);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.intent-card-top,
+.intent-card-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.intent-enable {
+  min-width: 64px;
+}
+
+.intent-label {
+  min-width: 48px;
+  font-size: 12.5px;
+}
+
+.intent-hint {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.intent-chord-chip {
+  min-width: 120px !important;
+  min-height: 34px !important;
+  font-size: 13px !important;
+  padding: 6px 12px !important;
+}
+
+.settings-help {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--card-soft);
+  font-size: 12.5px;
+}
+
+.settings-help summary {
+  cursor: pointer;
+  font-weight: 550;
+  color: var(--text);
+}
+
+.settings-help-list {
+  margin: 10px 0 0;
+  padding-left: 1.15rem;
+  line-height: 1.55;
+}
+
+.settings-help-list li {
+  margin-bottom: 6px;
+}
+
 .chip {
   display: inline-block;
   font-size: 0.72rem;
