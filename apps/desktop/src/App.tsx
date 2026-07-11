@@ -4,6 +4,7 @@ import { api } from "./api";
 import { HotkeyRecorder } from "./HotkeyRecorder";
 import { OnboardingWizard } from "./OnboardingWizard";
 import { formatHotkeyLabel } from "./hotkeyFormat";
+import { Icon, type IconName } from "./Icons";
 import type {
   AsrStatus,
   AudioDevice,
@@ -30,46 +31,46 @@ function formatTime(iso: string): string {
   }
 }
 
-const NAV: { id: TabId; label: string; icon: string; title: string; blurb: string }[] = [
+const NAV: { id: TabId; label: string; icon: IconName; title: string; blurb: string }[] = [
   {
     id: "record",
     label: "录音",
-    icon: "🎙",
+    icon: "mic",
     title: "录音",
     blurb: "本地转写 · 热键或按钮开始",
   },
   {
     id: "history",
     label: "历史",
-    icon: "🕐",
+    icon: "history",
     title: "历史",
-    blurb: "会话记录与编辑事件",
+    blurb: "核对文本 · 复制 · 必要时重识别",
   },
   {
     id: "dictionary",
     label: "词典",
-    icon: "📖",
+    icon: "dictionary",
     title: "词典",
     blurb: "术语与替换规则",
   },
   {
     id: "learn",
     label: "学习",
-    icon: "✨",
+    icon: "learn",
     title: "编辑学习",
     blurb: "从改写生成词典候选",
   },
   {
     id: "settings",
     label: "设置",
-    icon: "⚙",
+    icon: "settings",
     title: "设置",
     blurb: "权限 · 热键 · 插入 · 修正 · 学习",
   },
   {
     id: "overview",
     label: "概览",
-    icon: "⌂",
+    icon: "overview",
     title: "概览",
     blurb: "状态与快捷入口",
   },
@@ -266,6 +267,13 @@ export default function App() {
       {/* System titlebar (Visible) — native macOS drag / traffic lights */}
       <div className="app-body">
         <nav className="sidebar" aria-label="主导航">
+          <div className="sidebar-brand">
+            <div className="sidebar-brand-mark" aria-hidden />
+            <div className="sidebar-brand-text">
+              <span className="sidebar-brand-name">Lumen</span>
+              <span className="sidebar-brand-sub">ASR</span>
+            </div>
+          </div>
           {NAV.map((item) => (
             <button
               key={item.id}
@@ -274,7 +282,7 @@ export default function App() {
               onClick={() => setTab(item.id)}
             >
               <span className="nav-icon" aria-hidden>
-                {item.icon}
+                <Icon name={item.icon} size={18} />
               </span>
               <span>{item.label}</span>
             </button>
@@ -2068,8 +2076,15 @@ function HistoryPanel({
       <section className="card list-pane">
         <div className="card-head">
           <h2>历史</h2>
-          <button type="button" className="btn small ghost" disabled={busy} onClick={onRefresh}>
-            刷新
+          <button
+            type="button"
+            className="icon-btn"
+            disabled={busy}
+            onClick={onRefresh}
+            title="刷新"
+            aria-label="刷新"
+          >
+            <Icon name="refresh" size={16} />
           </button>
         </div>
         {sessions.length === 0 ? (
@@ -2144,14 +2159,77 @@ function HistoryPanel({
                     .join(" · ") || "本地识别"}
                 </div>
               </div>
-              <button
-                type="button"
-                className="btn small ghost danger"
-                disabled={busy}
-                onClick={() => onDelete(selected.id)}
-              >
-                删除
-              </button>
+              <div className="history-toolbar">
+                <button
+                  type="button"
+                  className={`icon-btn ${copied ? "copied" : ""}`}
+                  disabled={busy || !text}
+                  onClick={() => void copyMain()}
+                  title={copied ? "已复制" : "复制文本（双击正文亦可）"}
+                  aria-label={copied ? "已复制" : "复制文本"}
+                >
+                  <Icon name={copied ? "copy-check" : "copy"} size={16} />
+                </button>
+                {selected.asr_raw &&
+                  selected.asr_raw.trim() &&
+                  selected.asr_raw.trim() !== text && (
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      disabled={busy}
+                      onClick={() =>
+                        void (async () => {
+                          try {
+                            await navigator.clipboard.writeText(selected.asr_raw!.trim());
+                            setCopied(true);
+                            setRetryNote("已复制识别原文（未整理）");
+                            window.setTimeout(() => setCopied(false), 1600);
+                          } catch (e) {
+                            onError(String(e));
+                          }
+                        })()
+                      }
+                      title="复制识别原文（未整理）"
+                      aria-label="复制原文"
+                    >
+                      <Icon name="clipboard" size={16} />
+                    </button>
+                  )}
+                {hasAudio && (
+                  <button
+                    type="button"
+                    className={`icon-btn ${playing ? "active" : ""}`}
+                    disabled={busy}
+                    onClick={() => void playAudio()}
+                    title={playing ? "停止播放" : "听录音"}
+                    aria-label={playing ? "停止播放" : "听录音"}
+                  >
+                    <Icon name={playing ? "stop" : "play"} size={16} />
+                  </button>
+                )}
+                {hasAudio && (
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    disabled={busy}
+                    onClick={() => void retry()}
+                    title={busy ? "识别中…" : "再识别一次"}
+                    aria-label="再识别一次"
+                  >
+                    <Icon name="refresh" size={16} />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="icon-btn danger"
+                  disabled={busy}
+                  onClick={() => onDelete(selected.id)}
+                  title="删除"
+                  aria-label="删除"
+                >
+                  <Icon name="delete" size={16} />
+                </button>
+              </div>
             </header>
 
             {/* Result first — text is the product */}
@@ -2179,18 +2257,20 @@ function HistoryPanel({
                 <div className="history-recover-actions">
                   <button
                     type="button"
-                    className="btn"
+                    className="icon-btn-label primary"
                     disabled={busy}
                     onClick={() => void playAudio()}
                   >
+                    <Icon name={playing ? "stop" : "play"} size={15} />
                     {playing ? "停止播放" : "听录音"}
                   </button>
                   <button
                     type="button"
-                    className="btn"
+                    className="icon-btn-label primary"
                     disabled={busy}
                     onClick={() => void retry()}
                   >
+                    <Icon name="refresh" size={15} />
                     {busy ? "识别中…" : "再识别一次"}
                   </button>
                 </div>
@@ -2199,64 +2279,9 @@ function HistoryPanel({
 
             {retryNote && <p className="history-retry-note">{retryNote}</p>}
 
-            {/* Always-available quiet tools */}
-            <div className="history-actions">
-              <button
-                type="button"
-                className="btn"
-                disabled={busy || !text}
-                onClick={() => void copyMain()}
-              >
-                {copied ? "已复制" : "复制文本"}
-              </button>
-              {selected.asr_raw &&
-                selected.asr_raw.trim() &&
-                selected.asr_raw.trim() !== text && (
-                  <button
-                    type="button"
-                    className="btn ghost"
-                    disabled={busy}
-                    onClick={() =>
-                      void (async () => {
-                        try {
-                          await navigator.clipboard.writeText(selected.asr_raw!.trim());
-                          setCopied(true);
-                          setRetryNote("已复制识别原文（未整理）");
-                          window.setTimeout(() => setCopied(false), 1600);
-                        } catch (e) {
-                          onError(String(e));
-                        }
-                      })()
-                    }
-                    title="复制 ASR 原文，相当于还原 AI 整理前的文本"
-                  >
-                    复制原文
-                  </button>
-                )}
-              {hasAudio && !needsRecovery && (
-                <>
-                  <button
-                    type="button"
-                    className="btn ghost"
-                    disabled={busy}
-                    onClick={() => void playAudio()}
-                  >
-                    {playing ? "停止" : "听录音"}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn ghost"
-                    disabled={busy}
-                    onClick={() => void retry()}
-                  >
-                    {busy ? "识别中…" : "再识别一次"}
-                  </button>
-                </>
-              )}
-              {!hasAudio && (
-                <span className="muted-text history-no-audio">未保存录音</span>
-              )}
-            </div>
+            {!hasAudio && (
+              <p className="muted-text history-no-audio">未保存录音 · 无法回听或重识别</p>
+            )}
 
             {/* Pipeline detail is secondary — for power users */}
             {(selected.asr_raw || selected.corrected) && (

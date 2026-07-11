@@ -8,6 +8,7 @@ import {
 } from "./api";
 import { HotkeyRecorder } from "./HotkeyRecorder";
 import { formatHotkeyLabel } from "./hotkeyFormat";
+import { Icon } from "./Icons";
 import type { AudioDevice } from "./types";
 
 type Props = {
@@ -344,10 +345,25 @@ export function OnboardingWizard({ onDone }: Props) {
             <p className="muted-text">
               在本地把语音转成文字，并插入到你正在输入的应用光标处。随时可点右上角关闭，稍后从侧栏继续。
             </p>
-            <ul className="onboard-bullets">
-              <li>本地转写（SenseVoice）</li>
-              <li>按住热键说话，松手插入</li>
-              <li>可选 AI 修正（Ollama / OpenAI 兼容）</li>
+            <ul className="onboard-feature-list">
+              <li>
+                <span className="onboard-feature-icon accent">
+                  <Icon name="mic" size={14} />
+                </span>
+                本地转写（SenseVoice）
+              </li>
+              <li>
+                <span className="onboard-feature-icon accent">
+                  <Icon name="hotkey" size={14} />
+                </span>
+                按住热键说话，松手插入
+              </li>
+              <li>
+                <span className="onboard-feature-icon warm">
+                  <Icon name="sparkle-ai" size={14} />
+                </span>
+                可选 AI 修正（Ollama / OpenAI 兼容）
+              </li>
             </ul>
             <div className="onboard-actions">
               <button type="button" className="btn" disabled={busy} onClick={() => void goStep(1)}>

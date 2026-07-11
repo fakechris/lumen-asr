@@ -94,7 +94,20 @@ Never require typing `CommandOrControl+…`.
 
 ## 6. Visual tokens
 
-System light/dark, SF / `-apple-system`, accent ≈ `#007aff` / `#0a84ff`. See `styles.css`.
+From **Lumen 设计系统** (icon + product UX packs):
+
+| Token | Light | Dark |
+|-------|-------|------|
+| Accent (system blue) | `#007AFF` | `#0A84FF` |
+| Lumen warm (highlight) | `#FF9F0A` → `#FFC24B` | same |
+| Success | `#34C759` | `#30D158` |
+| Error / rec | `#FF3B30` | `#FF453A` |
+| BG / sidebar / card | `#F2F2F7` / `#E8E8ED` / `#fff` | `#1C1C1E` / `#2C2C2E` |
+| Radius | 11px cards, 8px controls | |
+| Icons | 24×24 SF-linear, stroke 1.7, `currentColor` — `src/Icons.tsx` + `assets/icons/` | |
+| App icon | Warm-core sonic waves on blue squircle — `src-tauri/icons/` | |
+
+See `styles.css` for full CSS variables (`--lumen-warm*`, `--shadow-lift`, …).
 
 ## 7. Text insert
 

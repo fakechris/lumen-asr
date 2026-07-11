@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3B86FF"></stop>
+      <stop offset="0.5" stop-color="#0E4ECB"></stop>
+      <stop offset="1" stop-color="#082C82"></stop>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.30"></stop>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0"></stop>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFD27A" stop-opacity="0.95"></stop>
+      <stop offset="0.4" stop-color="#FFB020" stop-opacity="0.6"></stop>
+      <stop offset="1" stop-color="#FFB020" stop-opacity="0"></stop>
+    </radialGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="229" fill="url(#bg)"></rect>
+  <rect width="1024" height="1024" rx="229" fill="url(#sheen)"></rect>
+  <circle cx="512" cy="444" r="330" fill="url(#glow)"></circle>
+  <g fill="none" stroke="#EAF3FF" stroke-linecap="round">
+    <path d="M631.6 320.4 A172 172 0 0 1 631.6 567.6" stroke-width="48" opacity="0.95"></path>
+    <path d="M676 274.4 A236 236 0 0 1 676 613.6" stroke-width="38" opacity="0.68"></path>
+    <path d="M720.6 228.2 A300 300 0 0 1 720.6 659.8" stroke-width="28" opacity="0.42"></path>
+    <path d="M392.4 320.4 A172 172 0 0 0 392.4 567.6" stroke-width="48" opacity="0.95"></path>
+    <path d="M348 274.4 A236 236 0 0 0 348 613.6" stroke-width="38" opacity="0.68"></path>
+    <path d="M303.4 228.2 A300 300 0 0 0 303.4 659.8" stroke-width="28" opacity="0.42"></path>
+  </g>
+  <circle cx="512" cy="444" r="68" fill="#FFFDF5"></circle>
+  <circle cx="512" cy="444" r="68" fill="#FFB020" opacity="0.30"></circle>
+</svg>
