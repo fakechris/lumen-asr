@@ -307,8 +307,9 @@ export function OnboardingWizard({ onDone }: Props) {
           <section className="onboard-step">
             <h1>核心权限</h1>
             <p className="muted-text">
-              麦克风会弹系统对话框。辅助功能需在系统设置里手动打开
-              <strong>当前进程</strong>（开发版与正式包是两条记录）。
+              麦克风会弹系统对话框。辅助功能<strong>不会弹窗</strong>，必须在系统设置里打开
+              <strong>当前这份进程</strong>。列表里若出现两个 Lumen，是不同签名/路径（开发版 vs
+              .app，或多次 adhoc 编译），只开对应当前路径的那一项；开完后建议完全退出再开一次。
             </p>
             <div className="onboard-perm-grid">
               <div className={`onboard-perm-card ${micOk ? "ok" : ""}`}>
@@ -351,7 +352,11 @@ export function OnboardingWizard({ onDone }: Props) {
                 </div>
                 {perm && (
                   <dl className="onboard-path-meta">
-                    <dt>名称</dt>
+                    <dt>系统列表名称</dt>
+                    <dd>
+                      <code>{perm.settingsListName || perm.processHint}</code>
+                    </dd>
+                    <dt>可执行文件</dt>
                     <dd>
                       <code>{perm.processHint}</code>
                     </dd>
@@ -359,6 +364,15 @@ export function OnboardingWizard({ onDone }: Props) {
                     <dd className="onboard-path">
                       <code>{perm.processPath}</code>
                     </dd>
+                    {perm.codesignKind ? (
+                      <>
+                        <dt>签名</dt>
+                        <dd>
+                          <code>{perm.codesignKind}</code>
+                          {perm.codesignAdhoc ? " · 重新编译后常需重开开关" : ""}
+                        </dd>
+                      </>
+                    ) : null}
                   </dl>
                 )}
                 <div className="actions">

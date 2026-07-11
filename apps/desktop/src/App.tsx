@@ -1163,27 +1163,75 @@ function SettingsPanel({
       <section className="card settings-section">
         <h2>权限</h2>
         <p className="muted-text">
-          麦克风：系统会弹窗授权。辅助功能：必须在系统设置里手动打开
-          <strong>当前正在运行</strong>的那个进程（开发版与正式 .app 是两条独立记录）。
+          麦克风：系统弹窗授权。辅助功能：系统<strong>不会</strong>弹授权窗，必须在「系统设置 →
+          隐私与安全性 → 辅助功能」里打开<strong>当前进程</strong>的开关。检测用的是系统 API
+          <code>AXIsProcessTrusted</code>，不是猜的。
         </p>
         {perm && (
-          <dl className="meta">
-            <dt>麦克风</dt>
-            <dd>{perm.microphone}</dd>
-            <dt>辅助功能</dt>
-            <dd>
-              {perm.accessibilityTrusted ? "已开启" : "需要开启"}
-              {perm.accessibilityTrusted ? "" : "（未开启时只能复制到剪贴板）"}
-            </dd>
-            <dt>列表中名称</dt>
-            <dd>
-              <code>{perm.processHint}</code>
-            </dd>
-            <dt>完整路径</dt>
-            <dd style={{ wordBreak: "break-all" }}>
-              <code>{perm.processPath}</code>
-            </dd>
-          </dl>
+          <>
+            <dl className="meta">
+              <dt>麦克风</dt>
+              <dd>{perm.microphone}</dd>
+              <dt>辅助功能</dt>
+              <dd>
+                {perm.accessibilityTrusted ? "已开启" : "需要开启"}
+                {perm.accessibilityTrusted ? "" : "（未开启时只能复制到剪贴板）"}
+              </dd>
+              <dt>系统列表中的名称</dt>
+              <dd>
+                <code>{perm.settingsListName || perm.processHint}</code>
+                {perm.processHint && perm.settingsListName !== perm.processHint ? (
+                  <span className="muted-text"> （可执行文件名 {perm.processHint}）</span>
+                ) : null}
+              </dd>
+              <dt>完整路径</dt>
+              <dd style={{ wordBreak: "break-all" }}>
+                <code>{perm.processPath}</code>
+              </dd>
+              <dt>代码签名</dt>
+              <dd>
+                <code>{perm.codesignKind || "unknown"}</code>
+                {perm.codesignIdentifier ? (
+                  <>
+                    {" · "}
+                    <code style={{ wordBreak: "break-all" }}>{perm.codesignIdentifier}</code>
+                  </>
+                ) : null}
+              </dd>
+            </dl>
+            {!perm.accessibilityTrusted && (
+              <div className="ax-recovery" style={{ marginTop: 12 }}>
+                <p className="muted-text" style={{ marginBottom: 8 }}>
+                  <strong>为什么开关开了仍显示「需要开启」？</strong>
+                  多半不是检测坏了，而是开错了身份：macOS
+                  按<strong>代码签名指纹</strong>记权限，不是按产品名。列表里出现两个
+                  「Lumen ASR」很常见——分别对应开发版二进制和正式 .app，或两次不同的 adhoc
+                  编译。打开其中任意一个旧条目，对<strong>当前这份</strong>进程无效。
+                </p>
+                <ol className="muted-text" style={{ margin: "0 0 8px 1.2em", lineHeight: 1.55 }}>
+                  <li>完全退出 Lumen（菜单退出或 Activity Monitor 结束，不要只关窗口）。</li>
+                  <li>
+                    系统设置 → 辅助功能 → 用「−」删掉所有 Lumen / lumen-asr-desktop 相关项。
+                  </li>
+                  <li>
+                    重新打开<strong>本程序</strong>，点下方「打开辅助功能设置」，只打开
+                    <strong>新出现</strong>、且对应路径与上面一致的那一项（名称通常是「
+                    {perm.settingsListName || "Lumen ASR"}」）。
+                  </li>
+                  <li>
+                    再<strong>完全退出并重开</strong>一次，再点「刷新状态」。很多机器开关后不即时生效。
+                  </li>
+                </ol>
+                {perm.codesignAdhoc && (
+                  <p className="muted-text" style={{ marginBottom: 0 }}>
+                    当前是 <strong>adhoc 未正式签名</strong> 构建：每次重新{" "}
+                    <code>tauri build</code> 指纹会变，辅助功能往往要按上面步骤重做一遍。正式发版应用
+                    Developer ID 签名后，同一 Team 身份会稳定得多。
+                  </p>
+                )}
+              </div>
+            )}
+          </>
         )}
         <div className="actions">
           <button

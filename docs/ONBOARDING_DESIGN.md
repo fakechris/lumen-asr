@@ -16,7 +16,9 @@ macOS TCC keys trust by **code signature identity**, not by product name.
 
 Different paths ⇒ different CDHashes ⇒ **two separate toggles**. Enabling the `.app` does nothing for `tauri dev`, and vice versa.
 
-**Rule for onboarding:** always show the **currently running** executable basename + full path, and which entry to enable. After rebuild (adhoc signature changes), macOS may require toggle **off → on** again.
+**Rule for onboarding:** always show the **currently running** executable basename + full path, **settings list name** (usually “Lumen ASR” for `.app`), codesign kind, and which entry to enable. After rebuild (adhoc signature changes), macOS may require: remove stale rows → re-add current → **fully quit & relaunch**.
+
+**Detection is not a guess:** UI uses `AXIsProcessTrusted()`. If the user enabled two “Lumen ASR” rows but status stays off, they almost always enabled **stale identities** (old CDHash), not the process that is running now. Adhoc `tauri build` without Developer ID makes this the default developer pain.
 
 ### 0.2 Why there is no system “request” dialog
 

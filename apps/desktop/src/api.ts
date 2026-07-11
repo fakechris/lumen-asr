@@ -21,6 +21,12 @@ export type PermissionStatus = {
   copyOnlyOk: boolean;
   processHint: string;
   processPath: string;
+  /** Name likely shown in System Settings → Accessibility (e.g. Lumen ASR). */
+  settingsListName: string;
+  bundleId: string;
+  codesignKind: string;
+  codesignIdentifier: string;
+  codesignAdhoc: boolean;
 };
 
 export type OnboardingState = {
