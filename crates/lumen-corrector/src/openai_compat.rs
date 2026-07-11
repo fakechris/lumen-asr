@@ -6,10 +6,20 @@ use lumen_core::CorrectorEngineId;
 use lumen_prompts::{
     build_system_prompt, corrector_user_message, format_dictionary_block, CleanupLevel,
 };
+use once_cell::sync::Lazy;
+use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
+
+/// Align with 闪电说 `src/ai/common.rs` strip pattern (+ unclosed Qwen think blocks).
+static THINKING_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?s)<think>.*?</think>|<thought>.*?</thought>|<thinking>.*?</thinking>|</?think_[a-zA-Z0-9_]+>|💭.*?\n|<think>.*",
+    )
+    .expect("thinking regex")
+});
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatConfig {
@@ -85,25 +95,18 @@ impl Corrector for OpenAiCompatCorrector {
         let base = self.config.base_url.trim_end_matches('/');
         let url = format!("{base}/chat/completions");
 
+        // Competitor defaults: temperature ~0.3, max_tokens for short dictation outputs.
         let mut body = json!({
             "model": self.config.model,
-            "temperature": temperature,
+            "temperature": temperature.clamp(0.01, 1.0),
+            "max_tokens": 1024,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user }
             ]
         });
 
-        // Qwen3.x on Ollama enables "thinking" by default — can be 20×+ slower.
-        // OpenAI-compat layer on Ollama ≥0.5.7 accepts `think: false`.
-        if is_local_ollama(&self.config) {
-            body["think"] = json!(false);
-            // Keep context modest for dictation-length inputs.
-            body["options"] = json!({
-                "num_ctx": 4096,
-                "num_predict": 1024,
-            });
-        }
+        inject_no_thinking_params(&self.config, &mut body);
 
         let mut builder = self.client.post(&url).json(&body);
         if !self.config.api_key.is_empty() {
@@ -131,6 +134,7 @@ impl Corrector for OpenAiCompatCorrector {
             .first()
             .and_then(|c| c.message.content.clone())
             .map(|s| strip_fences(&s))
+            .map(|s| strip_thinking_tags(&s))
             .filter(|s| !s.is_empty())
             .ok_or(CorrectorError::EmptyOutput)?;
 
@@ -153,11 +157,81 @@ fn is_local_ollama(cfg: &OpenAiCompatConfig) -> bool {
         || u.contains("0.0.0.0:11434")
 }
 
+/// Request-side: turn off thinking for Ollama / Qwen3 / DeepSeek-R1 style APIs.
+fn inject_no_thinking_params(cfg: &OpenAiCompatConfig, body: &mut serde_json::Value) {
+    let url = cfg.base_url.to_ascii_lowercase();
+    let model = cfg.model.to_ascii_lowercase();
+
+    if is_local_ollama(cfg) {
+        body["think"] = json!(false);
+        body["options"] = json!({
+            "num_ctx": 4096,
+            "num_predict": 1024,
+        });
+        return;
+    }
+
+    // DashScope / Qwen3 compatible mode (闪电说: enable_thinking + think).
+    if url.contains("dashscope") || model.contains("qwen3") || model.starts_with("qwen") {
+        body["enable_thinking"] = json!(false);
+        body["think"] = json!(false);
+    }
+
+    // DeepSeek reasoner / thinking models.
+    if model.contains("reasoner") || model.contains("r1") || model.contains("thinking") {
+        body["thinking"] = json!({ "type": "disabled" });
+    }
+
+    // Gemini OpenAI-compat: some builds honor thinkingBudget 0.
+    if url.contains("generativelanguage") || model.contains("gemini") {
+        body["extra_body"] = json!({
+            "google": {
+                "thinking_config": { "thinking_budget": 0 }
+            }
+        });
+    }
+}
+
+/// Response-side strip (闪电说 common.rs). Always run for dictation safety.
+pub fn strip_thinking_tags(text: &str) -> String {
+    let cleaned = THINKING_RE.replace_all(text, "");
+    // Fallback: if still starts with residual open tag without close.
+    let cleaned = cleaned.trim();
+    if let Some(idx) = cleaned.rfind("</think>") {
+        return cleaned[idx + "</think>".len()..].trim().to_string();
+    }
+    cleaned.to_string()
+}
+
 fn dict_block_opt(d: &DictionaryContext) -> Option<String> {
     if d.terms.is_empty() && d.replacements.is_empty() {
         None
     } else {
         Some(format_dictionary_block(&d.terms, &d.replacements))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_qwen_think_block() {
+        let raw = r#"<think>
+The user said something.
+I should only output clean text.
+</think>
+
+Hello world."#;
+        let out = strip_thinking_tags(raw);
+        assert_eq!(out, "Hello world.");
+        assert!(!out.contains("think"));
+    }
+
+    #[test]
+    fn strips_thinking_xml() {
+        let raw = "<thinking>plan</thinking>final";
+        assert_eq!(strip_thinking_tags(raw), "final");
     }
 }
 

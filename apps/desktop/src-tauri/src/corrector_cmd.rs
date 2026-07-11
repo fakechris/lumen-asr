@@ -103,15 +103,13 @@ pub fn save_asr_service_config(
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?;
     if let Some(v) = input.provider {
-        // Apply preset defaults when switching provider and fields empty.
+        // Apply preset defaults when switching provider.
         if let Some(p) = crate::provider_presets::asr_preset_by_id(&v) {
-            if guard.asr.base_url.is_empty() || guard.asr.provider != v {
-                if !p.base_url.is_empty() {
-                    guard.asr.base_url = p.base_url;
-                }
-                if !p.default_model.is_empty() {
-                    guard.asr.model = p.default_model;
-                }
+            if !p.base_url.is_empty() {
+                guard.asr.base_url = p.base_url;
+            }
+            if !p.default_model.is_empty() {
+                guard.asr.model = p.default_model;
             }
         }
         guard.asr.provider = v;

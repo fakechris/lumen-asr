@@ -124,10 +124,15 @@ fn restore_target_app_before_insert(app: Option<&AppHandle>) -> Option<String> {
 #[serde(rename_all = "camelCase")]
 pub struct AsrStatus {
     pub recording: bool,
+    /// Local runtime engine (sensevoice | whisper) when provider is local.
     pub engine: EngineKind,
+    /// Settings ASR provider id (local_sensevoice | openai_audio | …) — source of truth for pipeline.
+    pub provider: String,
     pub sensevoice: EngineStatus,
     pub whisper: EngineStatus,
     pub active_ready: bool,
+    /// Short label for UI (e.g. "OpenAI Audio · whisper-1").
+    pub provider_label: String,
 }
 
 #[tauri::command]
@@ -148,8 +153,52 @@ pub fn set_audio_device(state: State<'_, AppState>, name: Option<String>) -> Res
 
 #[tauri::command]
 pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<EngineKind, String> {
-    let kind = EngineKind::parse(&engine).ok_or_else(|| format!("unknown engine: {engine}"))?;
+    // Accept either local engine names or full provider ids from Settings.
+    let e = engine.trim().to_ascii_lowercase();
+    let (kind, provider_id) = match e.as_str() {
+        "sensevoice" | "local_sensevoice" => (EngineKind::SenseVoice, "local_sensevoice"),
+        "whisper" | "local_whisper" => (EngineKind::Whisper, "local_whisper"),
+        "openai_audio" | "custom" => (EngineKind::SenseVoice, if e == "custom" { "custom" } else { "openai_audio" }),
+        other if other.starts_with("local_") => {
+            return Err(format!("unknown local engine: {engine}"));
+        }
+        other => {
+            // Cloud / config_only providers: store in asr config; local engine unchanged.
+            if let Ok(mut cfg) = state.config.lock() {
+                if let Some(p) = crate::provider_presets::asr_preset_by_id(other) {
+                    cfg.asr.provider = p.id;
+                    if !p.base_url.is_empty() {
+                        cfg.asr.base_url = p.base_url;
+                    }
+                    if !p.default_model.is_empty() {
+                        cfg.asr.model = p.default_model;
+                    }
+                    let _ = cfg.save();
+                } else {
+                    cfg.asr.provider = other.to_string();
+                    let _ = cfg.save();
+                }
+            }
+            return Ok(state
+                .engine
+                .lock()
+                .map(|g| *g)
+                .unwrap_or(EngineKind::SenseVoice));
+        }
+    };
     *state.engine.lock().map_err(|_| "engine lock poisoned".to_string())? = kind;
+    if let Ok(mut cfg) = state.config.lock() {
+        cfg.asr.provider = provider_id.into();
+        if provider_id == "openai_audio" {
+            if cfg.asr.base_url.is_empty() {
+                cfg.asr.base_url = "https://api.openai.com/v1".into();
+            }
+            if cfg.asr.model.is_empty() {
+                cfg.asr.model = "whisper-1".into();
+            }
+        }
+        let _ = cfg.save();
+    }
     Ok(kind)
 }
 
@@ -164,18 +213,45 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         .lock()
         .map(|g| *g)
         .unwrap_or(EngineKind::SenseVoice);
+    let asr_cfg = state
+        .config
+        .lock()
+        .map(|c| c.asr.clone())
+        .unwrap_or_default();
+    let provider = if asr_cfg.provider.is_empty() {
+        match engine {
+            EngineKind::SenseVoice => "local_sensevoice".into(),
+            EngineKind::Whisper => "local_whisper".into(),
+        }
+    } else {
+        asr_cfg.provider.clone()
+    };
     let sv = sensevoice_status();
     let wh = whisper_status();
-    let active_ready = match engine {
-        EngineKind::SenseVoice => sv.ready,
-        EngineKind::Whisper => wh.ready,
+    let active_ready = match provider.as_str() {
+        "local_sensevoice" | "sensevoice" => sv.ready,
+        "local_whisper" | "whisper" => wh.ready,
+        "openai_audio" | "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
+        // config_only: selectable but not runnable yet
+        _ => false,
     };
+    let provider_label = crate::provider_presets::asr_preset_by_id(&provider)
+        .map(|p| {
+            if asr_cfg.model.is_empty() {
+                p.label
+            } else {
+                format!("{} · {}", p.label, asr_cfg.model)
+            }
+        })
+        .unwrap_or_else(|| provider.clone());
     AsrStatus {
         recording: state.audio.is_recording(),
         engine,
+        provider,
         sensevoice: sv,
         whisper: wh,
         active_ready,
+        provider_label,
     }
 }
 

@@ -664,11 +664,13 @@ function RecordPanel({
     }
   }
 
-  async function onEngineChange(engine: string) {
+  async function onEngineChange(providerId: string) {
     onBusy(true);
     onError(null);
     try {
-      await api.setAsrEngine(engine);
+      // Single source of truth: Settings ASR config + local EngineKind for local models.
+      await api.saveAsrServiceConfig({ provider: providerId });
+      await api.setAsrEngine(providerId);
       await refreshStatus();
     } catch (e) {
       onError(String(e));
@@ -799,17 +801,22 @@ function RecordPanel({
     }
   }
 
-  const engine = status?.engine ?? "sensevoice";
+  // Synced with 设置 → 语音识别 (config.asr.provider).
+  const provider =
+    status?.provider ||
+    (status?.engine === "whisper" ? "local_whisper" : "local_sensevoice");
   const ready = status?.activeReady ?? false;
+  const isLocal = provider.startsWith("local") || provider === "sensevoice" || provider === "whisper";
 
   return (
     <>
       <section className="card">
-        <h2>本地转写</h2>
+        <h2>录音转写</h2>
         <p className="muted-text">
-          默认 SenseVoice。全局热键{" "}
-          <span className="kbd">{hotkeyLabel}</span> 可在任意 App
-          切换录音/停止。模型就绪后即可用。
+          引擎与「设置 → 语音识别」为同一配置。全局热键{" "}
+          <span className="kbd">{hotkeyLabel}</span>{" "}
+          在任意 App 按住说话。当前：
+          <strong> {status?.providerLabel || provider}</strong>
         </p>
         <div className="form-row" style={{ marginBottom: 12 }}>
           <label className="muted-text" style={{ minWidth: 64 }}>
@@ -831,30 +838,51 @@ function RecordPanel({
         </div>
         <div className="form-row" style={{ marginBottom: 12 }}>
           <label className="muted-text" style={{ minWidth: 64 }}>
-            引擎
+            ASR
           </label>
           <select
             className="input"
-            value={engine}
+            value={provider}
             disabled={recording || busy}
             onChange={(e) => void onEngineChange(e.target.value)}
           >
-            <option value="sensevoice">
-              SenseVoice {status?.sensevoice.ready ? "✓" : "（模型未就绪）"}
+            <option value="local_sensevoice">
+              本地 SenseVoice {status?.sensevoice.ready ? "✓" : "（模型未就绪）"}
             </option>
-            <option value="whisper">
-              Whisper {status?.whisper.ready ? "✓" : "（模型未就绪）"}
+            <option value="local_whisper">
+              本地 Whisper {status?.whisper.ready ? "✓" : "（模型未就绪）"}
+            </option>
+            <option value="openai_audio">OpenAI Audio / Whisper（在线）</option>
+            <option value="aliyun_qwen" disabled>
+              阿里 Qwen ASR（预设，流式待接）
+            </option>
+            <option value="volcengine" disabled>
+              火山 ASR（预设，待接）
+            </option>
+            <option value="soniox" disabled>
+              Soniox（预设，待接）
+            </option>
+            <option value="stepfun" disabled>
+              阶跃 ASR（预设，待接）
+            </option>
+            <option value="mimo" disabled>
+              小米 MiMo ASR（预设，待接）
             </option>
           </select>
         </div>
-        {status && (
+        {status && isLocal && (
           <p className="muted-text" style={{ fontSize: "0.85rem" }}>
-            模型目录：
+            本地模型目录：
             <code>
-              {engine === "whisper"
+              {provider.includes("whisper")
                 ? status.whisper.model_dir
                 : status.sensevoice.model_dir}
             </code>
+          </p>
+        )}
+        {provider === "openai_audio" && !ready && (
+          <p className="muted-text" style={{ fontSize: "0.85rem" }}>
+            请到「设置 → 语音识别」填写 OpenAI API Key 并保存，再回到此处录音。
           </p>
         )}
         <div className="actions">
@@ -888,11 +916,11 @@ function RecordPanel({
             </>
           )}
         </div>
-        {!ready && (
+        {!ready && isLocal && (
           <p className="muted-text" style={{ marginTop: 12 }}>
-            当前引擎模型未就绪。将 SenseVoice 的{" "}
-            <code>model.int8.onnx</code> + <code>tokens.txt</code> 放到上述目录，或设置环境变量{" "}
-            <code>LUMEN_SENSEVOICE_DIR</code> / <code>LUMEN_WHISPER_DIR</code>。
+            当前本地引擎未就绪。将 SenseVoice 的{" "}
+            <code>model.int8.onnx</code> + <code>tokens.txt</code> 放到模型目录，或到「设置 →
+            语音识别」切换其它 ASR。
           </p>
         )}
       </section>
@@ -1497,6 +1525,12 @@ function SettingsPanel({
                   setAsrLanguage(s.language);
                   setAsrHasKey(s.hasApiKey);
                   setAsrApiKey("");
+                  // Keep Record tab engine dropdown in sync (local EngineKind + provider).
+                  try {
+                    await api.setAsrEngine(s.provider);
+                  } catch {
+                    /* cloud-only providers keep local engine kind */
+                  }
                   onSaved();
                 } catch (e) {
                   onError(String(e));

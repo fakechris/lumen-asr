@@ -118,7 +118,9 @@ pub async fn correct_or_fallback_with(
         .await
     {
         Ok(mut r) => {
-            r.text = r.text.trim().to_string();
+            // Always strip thinking blocks (Ollama/Qwen/Kimi/etc.) — dictation must
+            // never paste chain-of-thought into the user's cursor.
+            r.text = crate::openai_compat::strip_thinking_tags(r.text.trim());
             if r.text.is_empty() {
                 CorrectResult {
                     text: pre,
