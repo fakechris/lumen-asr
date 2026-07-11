@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub learning: LearningConfig,
     pub onboarding: OnboardingConfig,
     pub audio: AudioConfig,
+    /// Speech recognition backend (local or cloud).
+    pub asr: AsrServiceConfig,
 }
 
 impl Default for AppConfig {
@@ -27,6 +29,34 @@ impl Default for AppConfig {
             learning: LearningConfig::default(),
             onboarding: OnboardingConfig::default(),
             audio: AudioConfig::default(),
+            asr: AsrServiceConfig::default(),
+        }
+    }
+}
+
+/// ASR provider selection (local SenseVoice vs cloud transcription).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AsrServiceConfig {
+    /// local_sensevoice | local_whisper | openai_audio | …
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    /// Optional BCP-47 / ISO language hint for cloud ASR.
+    pub language: String,
+    pub timeout_secs: u64,
+}
+
+impl Default for AsrServiceConfig {
+    fn default() -> Self {
+        Self {
+            provider: "local_sensevoice".into(),
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+            language: String::new(),
+            timeout_secs: 120,
         }
     }
 }

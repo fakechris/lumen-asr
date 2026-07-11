@@ -3,9 +3,10 @@
 use crate::corrector_svc::{engine_label, run_correct_with_intent};
 use crate::session_debug::{self, SessionDebugMeta};
 use crate::AppState;
+use crate::config::AsrServiceConfig;
 use lumen_asr::{
-    prepare_for_asr, sensevoice_status, whisper_status, AsrEngine, AsrRequest, AudioDeviceInfo,
-    EngineKind, EngineStatus,
+    prepare_for_asr, sensevoice_status, whisper_status, AsrEngine, AsrRequest, AsrResult,
+    AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig,
 };
 use lumen_core::{FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use lumen_platform_macos::{
@@ -264,39 +265,22 @@ pub async fn stop_and_transcribe_inner(
     // Clone samples for debug dump (after ASR we still have this).
     let samples_for_debug = samples_16k.clone();
 
-    let result = match engine_kind {
-        EngineKind::SenseVoice => {
-            let eng = state
-                .sensevoice
-                .lock()
-                .map_err(|_| "asr lock poisoned".to_string())?
-                .clone();
-            eng.transcribe(AsrRequest {
-                samples: samples_16k,
-                sample_rate: 16_000,
-                hotwords: vec![],
-            })
-            .await
-            .map_err(|e| e.to_string())?
-        }
-        EngineKind::Whisper => {
-            let eng = state
-                .whisper
-                .lock()
-                .map_err(|_| "asr lock poisoned".to_string())?
-                .clone();
-            eng.transcribe(AsrRequest {
-                samples: samples_16k,
-                sample_rate: 16_000,
-                hotwords: vec![],
-            })
-            .await
-            .map_err(|e| e.to_string())?
-        }
-    };
+    let asr_cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?
+        .asr
+        .clone();
+
+    let result = run_asr(state, engine_kind, &asr_cfg, samples_16k).await?;
 
     let asr_text = result.text.trim().to_string();
-    tracing::info!(%asr_text, engine = engine_kind.as_str(), "ASR result");
+    let asr_engine_str = if asr_cfg.provider.starts_with("local") {
+        engine_kind.as_str().to_string()
+    } else {
+        asr_cfg.provider.clone()
+    };
+    tracing::info!(%asr_text, engine = %asr_engine_str, "ASR result");
 
     let entries = {
         let store_guard = state
@@ -574,36 +558,12 @@ pub async fn retry_session_transcription(
         "retry transcription start"
     );
 
-    let result = match engine_kind {
-        EngineKind::SenseVoice => {
-            let eng = state
-                .sensevoice
-                .lock()
-                .map_err(|_| "asr lock poisoned".to_string())?
-                .clone();
-            eng.transcribe(AsrRequest {
-                samples: samples_16k.clone(),
-                sample_rate: 16_000,
-                hotwords: vec![],
-            })
-            .await
-            .map_err(|e| e.to_string())?
-        }
-        EngineKind::Whisper => {
-            let eng = state
-                .whisper
-                .lock()
-                .map_err(|_| "asr lock poisoned".to_string())?
-                .clone();
-            eng.transcribe(AsrRequest {
-                samples: samples_16k.clone(),
-                sample_rate: 16_000,
-                hotwords: vec![],
-            })
-            .await
-            .map_err(|e| e.to_string())?
-        }
-    };
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?
+        .clone();
+    let result = run_asr(&*state, engine_kind, &cfg.asr, samples_16k.clone()).await?;
 
     let asr_text = result.text.trim().to_string();
     let entries = {
@@ -616,11 +576,6 @@ pub async fn retry_session_transcription(
             None => vec![],
         }
     };
-    let cfg = state
-        .config
-        .lock()
-        .map_err(|_| "config lock poisoned".to_string())?
-        .clone();
     let corr = run_correct_with_intent(&cfg, &asr_text, &entries, IntentSpec::Default).await;
     let corrected_text = corr.text.trim().to_string();
     let corrector_engine = if corr.model_applied {
@@ -675,6 +630,86 @@ pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
         let _ = state.audio.stop();
     }
     Ok(())
+}
+
+async fn run_asr(
+    state: &AppState,
+    engine_kind: EngineKind,
+    asr_cfg: &AsrServiceConfig,
+    samples_16k: Vec<f32>,
+) -> Result<AsrResult, String> {
+    let provider = asr_cfg.provider.as_str();
+
+    if matches!(
+        provider,
+        "aliyun_qwen" | "volcengine" | "soniox" | "stepfun" | "mimo"
+    ) {
+        return Err(format!(
+            "ASR「{provider}」已收录预设（对齐闪电说 endpoint），完整流式客户端下一阶段接入。请改用本地 SenseVoice 或 OpenAI Audio。"
+        ));
+    }
+
+    if matches!(provider, "openai_audio" | "custom") {
+        let base = if asr_cfg.base_url.trim().is_empty() {
+            "https://api.openai.com/v1".into()
+        } else {
+            asr_cfg.base_url.clone()
+        };
+        let model = if asr_cfg.model.trim().is_empty() {
+            "whisper-1".into()
+        } else {
+            asr_cfg.model.clone()
+        };
+        let eng = OpenAiAudioAsr::new(OpenAiAudioConfig {
+            base_url: base,
+            api_key: asr_cfg.api_key.clone(),
+            model,
+            timeout: std::time::Duration::from_secs(asr_cfg.timeout_secs.max(30)),
+            language: if asr_cfg.language.trim().is_empty() {
+                None
+            } else {
+                Some(asr_cfg.language.clone())
+            },
+        })
+        .map_err(|e| e.to_string())?;
+        return eng
+            .transcribe(AsrRequest {
+                samples: samples_16k,
+                sample_rate: 16_000,
+                hotwords: vec![],
+            })
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    if provider == "local_whisper" || matches!(engine_kind, EngineKind::Whisper) {
+        let eng = state
+            .whisper
+            .lock()
+            .map_err(|_| "asr lock poisoned".to_string())?
+            .clone();
+        return eng
+            .transcribe(AsrRequest {
+                samples: samples_16k,
+                sample_rate: 16_000,
+                hotwords: vec![],
+            })
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    let eng = state
+        .sensevoice
+        .lock()
+        .map_err(|_| "asr lock poisoned".to_string())?
+        .clone();
+    eng.transcribe(AsrRequest {
+        samples: samples_16k,
+        sample_rate: 16_000,
+        hotwords: vec![],
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Capsule / hotkey lifecycle events for the UI.

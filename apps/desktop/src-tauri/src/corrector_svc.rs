@@ -28,23 +28,31 @@ pub fn build_corrector(cfg: &CorrectorConfig) -> Result<Box<dyn Corrector + Send
 
     let engine_id = match cfg.provider.as_str() {
         "ollama" => CorrectorEngineId::Ollama,
-        "openai_compatible" | "openai" => CorrectorEngineId::OpenAiCompatible,
-        other => {
-            return Err(format!("unknown corrector provider: {other}"));
-        }
+        "none" => return Ok(Box::new(NullCorrector)),
+        // All cloud / compatible presets share OpenAI chat completions shape.
+        _ => CorrectorEngineId::OpenAiCompatible,
     };
 
     let base_url = if cfg.base_url.trim().is_empty() {
         match engine_id {
             CorrectorEngineId::Ollama => "http://127.0.0.1:11434/v1".into(),
-            _ => return Err("base_url required for openai_compatible".into()),
+            _ => {
+                // Fill from preset defaults when user only picked provider id.
+                crate::provider_presets::llm_preset_by_id(&cfg.provider)
+                    .map(|p| p.base_url)
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| "base_url required for online corrector".to_string())?
+            }
         }
     } else {
         cfg.base_url.clone()
     };
 
     let model = if cfg.model.trim().is_empty() {
-        "qwen2.5:7b".into()
+        crate::provider_presets::llm_preset_by_id(&cfg.provider)
+            .map(|p| p.default_model)
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "qwen3.5:9b".into())
     } else {
         cfg.model.clone()
     };

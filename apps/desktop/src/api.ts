@@ -116,6 +116,58 @@ export const api = {
     customEnabled?: boolean;
     customInstruction?: string;
   }) => invoke<CorrectorStatus>("save_corrector_config", { input }),
+  listLlmPresets: () =>
+    invoke<
+      {
+        id: string;
+        label: string;
+        kind: string;
+        baseUrl: string;
+        defaultModel: string;
+        models: string[];
+        needsApiKey: boolean;
+        notes: string;
+      }[]
+    >("list_llm_presets"),
+  listAsrPresets: () =>
+    invoke<
+      {
+        id: string;
+        label: string;
+        kind: string;
+        baseUrl: string;
+        defaultModel: string;
+        models: string[];
+        needsApiKey: boolean;
+        status: string;
+        notes: string;
+      }[]
+    >("list_asr_presets"),
+  getAsrServiceConfig: () =>
+    invoke<{
+      provider: string;
+      baseUrl: string;
+      model: string;
+      hasApiKey: boolean;
+      language: string;
+      timeoutSecs: number;
+    }>("get_asr_service_config"),
+  saveAsrServiceConfig: (input: {
+    provider?: string;
+    baseUrl?: string;
+    model?: string;
+    apiKey?: string;
+    language?: string;
+    timeoutSecs?: number;
+  }) =>
+    invoke<{
+      provider: string;
+      baseUrl: string;
+      model: string;
+      hasApiKey: boolean;
+      language: string;
+      timeoutSecs: number;
+    }>("save_asr_service_config", { input }),
   correctText: (text: string) =>
     invoke<CorrectTextOutcome>("correct_text", { input: { text } }),
 

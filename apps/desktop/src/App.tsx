@@ -1012,9 +1012,40 @@ function SettingsPanel({
   const [enabled, setEnabled] = useState(true);
   const [provider, setProvider] = useState("ollama");
   const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:11434/v1");
-  const [model, setModel] = useState("qwen2.5:7b");
+  const [model, setModel] = useState("qwen3.5:9b");
   const [apiKey, setApiKey] = useState("");
   const [timeoutSecs, setTimeoutSecs] = useState(60);
+  const [llmPresets, setLlmPresets] = useState<
+    {
+      id: string;
+      label: string;
+      kind: string;
+      baseUrl: string;
+      defaultModel: string;
+      models: string[];
+      needsApiKey: boolean;
+      notes: string;
+    }[]
+  >([]);
+  const [asrPresets, setAsrPresets] = useState<
+    {
+      id: string;
+      label: string;
+      kind: string;
+      baseUrl: string;
+      defaultModel: string;
+      models: string[];
+      needsApiKey: boolean;
+      status: string;
+      notes: string;
+    }[]
+  >([]);
+  const [asrProvider, setAsrProvider] = useState("local_sensevoice");
+  const [asrBaseUrl, setAsrBaseUrl] = useState("");
+  const [asrModel, setAsrModel] = useState("");
+  const [asrApiKey, setAsrApiKey] = useState("");
+  const [asrLanguage, setAsrLanguage] = useState("");
+  const [asrHasKey, setAsrHasKey] = useState(false);
   const [cleanup, setCleanup] = useState("medium");
   const [style, setStyle] = useState("neutral");
   const [casing, setCasing] = useState("sentence");
@@ -1042,8 +1073,20 @@ function SettingsPanel({
   useEffect(() => {
     void (async () => {
       try {
-        const c = await api.getCorrectorConfig();
+        const [c, presets, asrP, asrC] = await Promise.all([
+          api.getCorrectorConfig(),
+          api.listLlmPresets(),
+          api.listAsrPresets(),
+          api.getAsrServiceConfig(),
+        ]);
         setCfg(c);
+        setLlmPresets(presets);
+        setAsrPresets(asrP);
+        setAsrProvider(asrC.provider);
+        setAsrBaseUrl(asrC.baseUrl);
+        setAsrModel(asrC.model);
+        setAsrLanguage(asrC.language || "");
+        setAsrHasKey(asrC.hasApiKey);
         setEnabled(c.enabled);
         setProvider(c.provider);
         setBaseUrl(c.baseUrl);
@@ -1336,6 +1379,137 @@ function SettingsPanel({
         }}
         onSaved={onSaved}
       />
+
+      <section className="card settings-section">
+        <h2>语音识别（ASR）</h2>
+        <p className="muted-text">
+          默认本地 SenseVoice。在线预设对齐闪电说：OpenAI Whisper 已可直接用；阿里/火山/Soniox/阶跃/MiMo
+          已收录 endpoint，流式客户端分阶段接入。
+        </p>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text" style={{ minWidth: 72 }}>
+            Provider
+          </label>
+          <select
+            className="input"
+            value={asrProvider}
+            disabled={busy}
+            onChange={(e) => {
+              const id = e.target.value;
+              setAsrProvider(id);
+              const p = asrPresets.find((x) => x.id === id);
+              if (p) {
+                if (p.baseUrl) setAsrBaseUrl(p.baseUrl);
+                if (p.defaultModel) setAsrModel(p.defaultModel);
+              }
+            }}
+          >
+            {asrPresets.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+                {p.status === "config_only" ? "（预设）" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+        {asrPresets.find((p) => p.id === asrProvider)?.notes && (
+          <p className="muted-text" style={{ fontSize: "0.82rem", marginTop: 0 }}>
+            {asrPresets.find((p) => p.id === asrProvider)?.notes}
+          </p>
+        )}
+        {!asrProvider.startsWith("local") && (
+          <>
+            <div className="form-row" style={{ marginBottom: 10 }}>
+              <label className="muted-text" style={{ minWidth: 72 }}>
+                Base URL
+              </label>
+              <input
+                className="input"
+                value={asrBaseUrl}
+                disabled={busy}
+                onChange={(e) => setAsrBaseUrl(e.target.value)}
+              />
+            </div>
+            <div className="form-row" style={{ marginBottom: 10 }}>
+              <label className="muted-text" style={{ minWidth: 72 }}>
+                Model
+              </label>
+              <input
+                className="input"
+                value={asrModel}
+                disabled={busy}
+                onChange={(e) => setAsrModel(e.target.value)}
+                list="asr-model-list"
+              />
+              <datalist id="asr-model-list">
+                {(asrPresets.find((p) => p.id === asrProvider)?.models || []).map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
+            </div>
+            <div className="form-row" style={{ marginBottom: 10 }}>
+              <label className="muted-text" style={{ minWidth: 72 }}>
+                API Key
+              </label>
+              <input
+                className="input"
+                type="password"
+                value={asrApiKey}
+                disabled={busy}
+                onChange={(e) => setAsrApiKey(e.target.value)}
+                placeholder={asrHasKey ? "已保存（留空不改）" : "必填"}
+              />
+            </div>
+            <div className="form-row" style={{ marginBottom: 10 }}>
+              <label className="muted-text" style={{ minWidth: 72 }}>
+                语言
+              </label>
+              <input
+                className="input"
+                value={asrLanguage}
+                disabled={busy}
+                onChange={(e) => setAsrLanguage(e.target.value)}
+                placeholder="可选 zh / en"
+              />
+            </div>
+          </>
+        )}
+        <div className="actions">
+          <button
+            type="button"
+            className="btn"
+            disabled={busy}
+            onClick={() =>
+              void (async () => {
+                onBusy(true);
+                try {
+                  const input: Parameters<typeof api.saveAsrServiceConfig>[0] = {
+                    provider: asrProvider,
+                    baseUrl: asrBaseUrl,
+                    model: asrModel,
+                    language: asrLanguage,
+                  };
+                  if (asrApiKey.trim()) input.apiKey = asrApiKey.trim();
+                  const s = await api.saveAsrServiceConfig(input);
+                  setAsrProvider(s.provider);
+                  setAsrBaseUrl(s.baseUrl);
+                  setAsrModel(s.model);
+                  setAsrLanguage(s.language);
+                  setAsrHasKey(s.hasApiKey);
+                  setAsrApiKey("");
+                  onSaved();
+                } catch (e) {
+                  onError(String(e));
+                } finally {
+                  onBusy(false);
+                }
+              })()
+            }
+          >
+            保存 ASR 设置
+          </button>
+        </div>
+      </section>
 
       <section className="card settings-section">
         <h2>翻译快捷键</h2>
@@ -1752,13 +1926,35 @@ function SettingsPanel({
             className="input"
             value={provider}
             disabled={busy}
-            onChange={(e) => setProvider(e.target.value)}
+            onChange={(e) => {
+              const id = e.target.value;
+              setProvider(id);
+              const p = llmPresets.find((x) => x.id === id);
+              if (p) {
+                if (p.baseUrl) setBaseUrl(p.baseUrl);
+                if (p.defaultModel) setModel(p.defaultModel);
+              }
+            }}
           >
-            <option value="ollama">Ollama</option>
-            <option value="openai_compatible">OpenAI-compatible</option>
-            <option value="none">none（仅规则）</option>
+            {(llmPresets.length
+              ? llmPresets
+              : [
+                  { id: "ollama", label: "Ollama（本地）" },
+                  { id: "openai_compatible", label: "OpenAI 兼容" },
+                  { id: "none", label: "关闭" },
+                ]
+            ).map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+              </option>
+            ))}
           </select>
         </div>
+        {llmPresets.find((p) => p.id === provider)?.notes && (
+          <p className="muted-text" style={{ fontSize: "0.82rem", marginTop: 0 }}>
+            {llmPresets.find((p) => p.id === provider)?.notes}
+          </p>
+        )}
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text" style={{ minWidth: 72 }}>
             Base URL
@@ -1780,8 +1976,14 @@ function SettingsPanel({
             value={model}
             disabled={busy}
             onChange={(e) => setModel(e.target.value)}
-            placeholder="qwen2.5:7b"
+            placeholder="qwen3.5:9b"
+            list="llm-model-list"
           />
+          <datalist id="llm-model-list">
+            {(llmPresets.find((p) => p.id === provider)?.models || []).map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
         </div>
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text" style={{ minWidth: 72 }}>

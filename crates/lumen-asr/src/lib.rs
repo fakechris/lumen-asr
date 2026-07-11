@@ -4,11 +4,13 @@
 //! Alternative: Whisper (same `AsrEngine` port).
 
 mod audio;
+mod cloud_openai;
 mod paths;
 mod sensevoice;
 mod whisper;
 
 pub use audio::{resample_linear, AudioCapture, AudioDeviceInfo, AudioError, CaptureResult};
+pub use cloud_openai::{OpenAiAudioAsr, OpenAiAudioConfig};
 pub use paths::{
     default_sensevoice_dir, default_whisper_dir, sensevoice_ready, whisper_ready,
 };

@@ -46,6 +46,103 @@ pub struct CorrectorConfigInput {
 }
 
 #[tauri::command]
+pub fn list_llm_presets() -> Vec<crate::provider_presets::LlmProviderPreset> {
+    crate::provider_presets::llm_presets()
+}
+
+#[tauri::command]
+pub fn list_asr_presets() -> Vec<crate::provider_presets::AsrProviderPreset> {
+    crate::provider_presets::asr_presets()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsrServiceStatus {
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub has_api_key: bool,
+    pub language: String,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsrServiceInput {
+    pub provider: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub language: Option<String>,
+    pub timeout_secs: Option<u64>,
+}
+
+#[tauri::command]
+pub fn get_asr_service_config(state: State<'_, AppState>) -> Result<AsrServiceStatus, String> {
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    Ok(AsrServiceStatus {
+        provider: cfg.asr.provider.clone(),
+        base_url: cfg.asr.base_url.clone(),
+        model: cfg.asr.model.clone(),
+        has_api_key: !cfg.asr.api_key.is_empty(),
+        language: cfg.asr.language.clone(),
+        timeout_secs: cfg.asr.timeout_secs,
+    })
+}
+
+#[tauri::command]
+pub fn save_asr_service_config(
+    state: State<'_, AppState>,
+    input: AsrServiceInput,
+) -> Result<AsrServiceStatus, String> {
+    let mut guard = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    if let Some(v) = input.provider {
+        // Apply preset defaults when switching provider and fields empty.
+        if let Some(p) = crate::provider_presets::asr_preset_by_id(&v) {
+            if guard.asr.base_url.is_empty() || guard.asr.provider != v {
+                if !p.base_url.is_empty() {
+                    guard.asr.base_url = p.base_url;
+                }
+                if !p.default_model.is_empty() {
+                    guard.asr.model = p.default_model;
+                }
+            }
+        }
+        guard.asr.provider = v;
+    }
+    if let Some(v) = input.base_url {
+        guard.asr.base_url = v;
+    }
+    if let Some(v) = input.model {
+        guard.asr.model = v;
+    }
+    if let Some(v) = input.api_key {
+        guard.asr.api_key = v;
+    }
+    if let Some(v) = input.language {
+        guard.asr.language = v;
+    }
+    if let Some(v) = input.timeout_secs {
+        guard.asr.timeout_secs = v.max(15);
+    }
+    guard.save()?;
+    Ok(AsrServiceStatus {
+        provider: guard.asr.provider.clone(),
+        base_url: guard.asr.base_url.clone(),
+        model: guard.asr.model.clone(),
+        has_api_key: !guard.asr.api_key.is_empty(),
+        language: guard.asr.language.clone(),
+        timeout_secs: guard.asr.timeout_secs,
+    })
+}
+
+#[tauri::command]
 pub fn get_corrector_config(state: State<'_, AppState>) -> Result<CorrectorStatus, String> {
     let cfg = state
         .config
@@ -69,7 +166,25 @@ pub fn save_corrector_config(
         guard.corrector.enabled = v;
     }
     if let Some(v) = input.provider {
-        guard.corrector.provider = v;
+        if let Some(p) = crate::provider_presets::llm_preset_by_id(&v) {
+            // Switching provider fills endpoint + default model (user can still edit).
+            if !p.base_url.is_empty() {
+                guard.corrector.base_url = p.base_url;
+            }
+            if !p.default_model.is_empty() {
+                guard.corrector.model = p.default_model;
+            }
+            // Keep preset id; build_corrector maps ollama/none specially, rest → OpenAI-compat.
+            guard.corrector.provider = if p.kind == "none" {
+                "none".into()
+            } else if p.kind == "ollama" {
+                "ollama".into()
+            } else {
+                v
+            };
+        } else {
+            guard.corrector.provider = v;
+        }
     }
     if let Some(v) = input.base_url {
         guard.corrector.base_url = v;

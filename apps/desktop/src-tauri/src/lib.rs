@@ -13,6 +13,7 @@ mod learning;
 mod mod_chord;
 mod onboard;
 mod permissions_cmd;
+mod provider_presets;
 mod session_debug;
 mod volume_mon;
 
@@ -140,6 +141,10 @@ pub fn run() {
             corrector_cmd::save_corrector_config,
             corrector_cmd::correct_text,
             corrector_cmd::default_corrector_config,
+            corrector_cmd::list_llm_presets,
+            corrector_cmd::list_asr_presets,
+            corrector_cmd::get_asr_service_config,
+            corrector_cmd::save_asr_service_config,
             permissions_cmd::get_permission_status,
             permissions_cmd::poll_permissions,
             permissions_cmd::open_microphone_settings,

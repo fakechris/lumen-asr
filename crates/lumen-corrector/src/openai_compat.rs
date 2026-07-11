@@ -82,12 +82,10 @@ impl Corrector for OpenAiCompatCorrector {
             0.3
         };
 
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = format!("{base}/chat/completions");
 
-        let body = json!({
+        let mut body = json!({
             "model": self.config.model,
             "temperature": temperature,
             "messages": [
@@ -95,6 +93,17 @@ impl Corrector for OpenAiCompatCorrector {
                 { "role": "user", "content": user }
             ]
         });
+
+        // Qwen3.x on Ollama enables "thinking" by default — can be 20×+ slower.
+        // OpenAI-compat layer on Ollama ≥0.5.7 accepts `think: false`.
+        if is_local_ollama(&self.config) {
+            body["think"] = json!(false);
+            // Keep context modest for dictation-length inputs.
+            body["options"] = json!({
+                "num_ctx": 4096,
+                "num_predict": 1024,
+            });
+        }
 
         let mut builder = self.client.post(&url).json(&body);
         if !self.config.api_key.is_empty() {
@@ -131,6 +140,17 @@ impl Corrector for OpenAiCompatCorrector {
             model_applied: true,
         })
     }
+}
+
+/// Local Ollama (any model): disable thinking chain for speed.
+fn is_local_ollama(cfg: &OpenAiCompatConfig) -> bool {
+    if matches!(cfg.engine_id, CorrectorEngineId::Ollama) {
+        return true;
+    }
+    let u = cfg.base_url.to_ascii_lowercase();
+    u.contains("127.0.0.1:11434")
+        || u.contains("localhost:11434")
+        || u.contains("0.0.0.0:11434")
 }
 
 fn dict_block_opt(d: &DictionaryContext) -> Option<String> {
