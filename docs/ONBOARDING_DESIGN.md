@@ -63,7 +63,7 @@ After first-run wizard completes, the user has:
 
 Persist: `onboarding.completed = true` in config. Incomplete wizard re-opens next launch (skippable with “稍后再说”, but status bar keeps a badge).
 
-**Dismiss anytime:** every step has close (×) + 「稍后再说」; Esc and click on scrim also call `skip_onboarding`. Overlay is **dark scrim + backdrop blur** with a **solid `--card` modal** (not dark glass on dark text — that was inverted/unreadable in light mode).
+**Dismiss anytime (explicit only):** every step has close (×) + 「稍后再说」; Esc also calls `skip_onboarding`. **Clicking the dimmed scrim does not dismiss** — prevents accidental exit mid-flow. Overlay is **dark scrim + backdrop blur** with a **solid `--card` modal**.
 
 ---
 

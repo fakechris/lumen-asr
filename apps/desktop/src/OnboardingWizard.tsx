@@ -293,15 +293,9 @@ export function OnboardingWizard({ onDone }: Props) {
       role="dialog"
       aria-modal="true"
       aria-label="首次设置"
-      onMouseDown={(e) => {
-        // Click scrim (not the card) → dismiss, same as 稍后再说.
-        if (e.target === e.currentTarget) void skipAll();
-      }}
     >
-      <div
-        className="onboard-card onboard-card-wide"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
+      {/* Overlay is non-dismissive: only × / 稍后再说 / Esc close the wizard. */}
+      <div className="onboard-card onboard-card-wide">
         <div className="onboard-topbar">
           <span className="onboard-topbar-title">首次设置 · {step + 1}/{STEPS.length}</span>
           <div className="onboard-topbar-actions">
