@@ -1411,8 +1411,7 @@ function SettingsPanel({
       <section className="card settings-section">
         <h2>语音识别（ASR）</h2>
         <p className="muted-text">
-          默认本地 SenseVoice。在线预设对齐闪电说：OpenAI Whisper 已可直接用；阿里/火山/Soniox/阶跃/MiMo
-          已收录 endpoint，流式客户端分阶段接入。
+          默认本地 SenseVoice。也可选用 OpenAI 兼容的云端识别；部分厂商入口已预置，完整流式接入会分阶段开放。
         </p>
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text" style={{ minWidth: 72 }}>

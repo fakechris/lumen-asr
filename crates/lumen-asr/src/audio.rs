@@ -2,15 +2,23 @@
 //!
 //! `cpal::Stream` is `!Send` on macOS, so the live stream lives on a dedicated
 //! audio thread. AppState only holds Send/Sync control handles.
+//!
+//! **Important (macOS):** CoreAudio input callbacks can keep firing briefly (or
+//! longer) after `cpal::Stream` is dropped. If every session shares one sample
+//! buffer, those "zombie" callbacks stack on the next recording and the audio
+//! sounds time-stretched by ~N× (N = number of live streams). We isolate each
+//! session with its own buffer + an epoch so stale callbacks cannot pollute
+//! the active capture.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, StreamConfig};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -72,16 +80,21 @@ impl AudioCapture {
 
         let (tx, rx) = mpsc::channel::<AudioCmd>();
         let rec_flag = Arc::clone(&recording);
+        // Shared only as a pointer slot; each Start installs a fresh buffer.
+        let samples_slot: Arc<Mutex<Option<Arc<Mutex<Vec<f32>>>>>> =
+            Arc::new(Mutex::new(None));
         let sample_rate = Arc::new(AtomicU32::new(0));
-        let samples_buf = Arc::new(Mutex::new(Vec::new()));
+        let epoch = Arc::new(AtomicU64::new(0));
         let rate_flag = Arc::clone(&sample_rate);
-        let samples_for_thread = Arc::clone(&samples_buf);
+        let samples_for_thread = Arc::clone(&samples_slot);
+        let epoch_for_thread = Arc::clone(&epoch);
 
         thread::Builder::new()
             .name("lumen-audio".into())
             .spawn(move || {
                 // Stream must live on this thread.
                 let mut stream_slot: Option<cpal::Stream> = None;
+                let mut started_at: Option<Instant> = None;
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         AudioCmd::Start { device, reply } => {
@@ -89,20 +102,65 @@ impl AudioCapture {
                                 device,
                                 &rec_flag,
                                 &rate_flag,
+                                &epoch_for_thread,
                                 &samples_for_thread,
                                 &mut stream_slot,
                             );
+                            if res.is_ok() {
+                                started_at = Some(Instant::now());
+                            } else {
+                                started_at = None;
+                            }
                             let _ = reply.send(res);
                         }
                         AudioCmd::Stop { reply } => {
-                            // Drop stream first (waits for callback), then take buffer.
-                            stream_slot = None;
-                            // macOS CoreAudio can glitch if we re-open immediately.
-                            thread::sleep(std::time::Duration::from_millis(40));
+                            // Invalidate callbacks first so any zombie stream
+                            // still draining from a prior Drop cannot append.
+                            epoch_for_thread.fetch_add(1, Ordering::SeqCst);
+                            shutdown_stream(&mut stream_slot);
+                            // macOS CoreAudio can glitch if we re-open immediately;
+                            // also gives in-flight callbacks a moment to exit.
+                            thread::sleep(std::time::Duration::from_millis(60));
                             rec_flag.store(false, Ordering::SeqCst);
                             let sample_rate = rate_flag.load(Ordering::SeqCst);
-                            let samples = std::mem::take(&mut *samples_for_thread.lock());
-                            tracing::info!(n = samples.len(), sample_rate, "recording stopped");
+                            let samples = samples_for_thread
+                                .lock()
+                                .take()
+                                .map(|buf| std::mem::take(&mut *buf.lock()))
+                                .unwrap_or_default();
+                            let wall_ms = started_at
+                                .take()
+                                .map(|t| t.elapsed().as_millis() as u64)
+                                .unwrap_or(0);
+                            let audio_ms = if sample_rate > 0 {
+                                (samples.len() as u64 * 1000) / sample_rate as u64
+                            } else {
+                                0
+                            };
+                            let ratio = if wall_ms > 50 {
+                                audio_ms as f64 / wall_ms as f64
+                            } else {
+                                0.0
+                            };
+                            if ratio > 1.25 {
+                                tracing::warn!(
+                                    n = samples.len(),
+                                    sample_rate,
+                                    wall_ms,
+                                    audio_ms,
+                                    ratio,
+                                    "recording stopped with stretched sample count (zombie stream?)"
+                                );
+                            } else {
+                                tracing::info!(
+                                    n = samples.len(),
+                                    sample_rate,
+                                    wall_ms,
+                                    audio_ms,
+                                    ratio,
+                                    "recording stopped"
+                                );
+                            }
                             let _ = reply.send(Ok(CaptureResult {
                                 samples,
                                 sample_rate,
@@ -176,46 +234,96 @@ impl AudioCapture {
     }
 }
 
+fn shutdown_stream(stream_slot: &mut Option<cpal::Stream>) {
+    if let Some(stream) = stream_slot.take() {
+        // Prefer an explicit pause so CoreAudio stops invoking the callback
+        // before the Stream (and its callback Arc) is released.
+        if let Err(e) = stream.pause() {
+            tracing::warn!(error = %e, "audio stream pause failed");
+        }
+        drop(stream);
+    }
+}
+
 fn start_on_thread(
     preferred: Option<String>,
     recording: &AtomicBool,
     sample_rate_atom: &AtomicU32,
-    samples: &Arc<Mutex<Vec<f32>>>,
+    epoch: &Arc<AtomicU64>,
+    samples_slot: &Arc<Mutex<Option<Arc<Mutex<Vec<f32>>>>>>,
     stream_slot: &mut Option<cpal::Stream>,
 ) -> Result<(), AudioError> {
     if recording.swap(true, Ordering::SeqCst) {
         return Err(AudioError::AlreadyRecording);
     }
 
-    let device = resolve_device(preferred)?;
-    let config = device
-        .default_input_config()
-        .map_err(|e| {
+    // Defensive: never leave a previous stream alive across sessions.
+    epoch.fetch_add(1, Ordering::SeqCst);
+    shutdown_stream(stream_slot);
+    *samples_slot.lock() = None;
+
+    let device = match resolve_device(preferred) {
+        Ok(d) => d,
+        Err(e) => {
             recording.store(false, Ordering::SeqCst);
-            AudioError::Device(e.to_string())
-        })?;
+            return Err(e);
+        }
+    };
+    let config = match device.default_input_config() {
+        Ok(c) => c,
+        Err(e) => {
+            recording.store(false, Ordering::SeqCst);
+            return Err(AudioError::Device(e.to_string()));
+        }
+    };
 
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
     sample_rate_atom.store(sample_rate, Ordering::SeqCst);
-    samples.lock().clear();
 
-    let samples_cb = Arc::clone(samples);
+    // Fresh buffer + epoch for this session only.
+    let session_epoch = epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    let samples_buf = Arc::new(Mutex::new(Vec::with_capacity(
+        sample_rate as usize * 30, // ~30s headroom
+    )));
+    *samples_slot.lock() = Some(Arc::clone(&samples_buf));
+
+    let samples_cb = Arc::clone(&samples_buf);
+    let epoch_cb = Arc::clone(epoch);
     let stream_config: StreamConfig = config.clone().into();
     let err_fn = |e| tracing::error!(error = %e, "audio stream error");
 
     let stream = match config.sample_format() {
-        SampleFormat::F32 => {
-            build_stream::<f32>(&device, &stream_config, channels, samples_cb, err_fn)
-        }
-        SampleFormat::I16 => {
-            build_stream::<i16>(&device, &stream_config, channels, samples_cb, err_fn)
-        }
-        SampleFormat::U16 => {
-            build_stream::<u16>(&device, &stream_config, channels, samples_cb, err_fn)
-        }
+        SampleFormat::F32 => build_stream::<f32>(
+            &device,
+            &stream_config,
+            channels,
+            samples_cb,
+            epoch_cb,
+            session_epoch,
+            err_fn,
+        ),
+        SampleFormat::I16 => build_stream::<i16>(
+            &device,
+            &stream_config,
+            channels,
+            samples_cb,
+            epoch_cb,
+            session_epoch,
+            err_fn,
+        ),
+        SampleFormat::U16 => build_stream::<u16>(
+            &device,
+            &stream_config,
+            channels,
+            samples_cb,
+            epoch_cb,
+            session_epoch,
+            err_fn,
+        ),
         other => {
             recording.store(false, Ordering::SeqCst);
+            *samples_slot.lock() = None;
             return Err(AudioError::Stream(format!(
                 "unsupported sample format: {other:?}"
             )));
@@ -226,17 +334,19 @@ fn start_on_thread(
         Ok(s) => s,
         Err(e) => {
             recording.store(false, Ordering::SeqCst);
+            *samples_slot.lock() = None;
             return Err(e);
         }
     };
 
     if let Err(e) = stream.play() {
         recording.store(false, Ordering::SeqCst);
+        *samples_slot.lock() = None;
         return Err(AudioError::Stream(e.to_string()));
     }
 
     *stream_slot = Some(stream);
-    tracing::info!(sample_rate, channels, "recording started");
+    tracing::info!(sample_rate, channels, session_epoch, "recording started");
     Ok(())
 }
 
@@ -261,6 +371,8 @@ fn build_stream<T>(
     config: &StreamConfig,
     channels: usize,
     samples: Arc<Mutex<Vec<f32>>>,
+    epoch: Arc<AtomicU64>,
+    session_epoch: u64,
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, AudioError>
 where
@@ -271,6 +383,10 @@ where
         .build_input_stream(
             config,
             move |data: &[T], _| {
+                // Stale stream from a previous session — ignore completely.
+                if epoch.load(Ordering::SeqCst) != session_epoch {
+                    return;
+                }
                 let mut buf = samples.lock();
                 if channels <= 1 {
                     for &s in data {

@@ -740,7 +740,7 @@ async fn run_asr(
         "aliyun_qwen" | "volcengine" | "soniox" | "stepfun" | "mimo"
     ) {
         return Err(format!(
-            "ASR「{provider}」已收录预设（对齐闪电说 endpoint），完整流式客户端下一阶段接入。请改用本地 SenseVoice 或 OpenAI Audio。"
+            "ASR「{provider}」仅预置了 endpoint，完整流式客户端尚未接入。请改用本地 SenseVoice 或 OpenAI Audio。"
         ));
     }
 

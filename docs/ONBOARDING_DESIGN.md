@@ -1,7 +1,7 @@
 # First-run Onboarding Design
 
 > Product design for Lumen ASR first-launch wizard.  
-> **Does not ship competitor names or reverse-engineering notes in UI copy.**
+> **UI copy stays product-facing only — no internal implementation notes.**
 
 ## 0. Why permissions feel broken today
 

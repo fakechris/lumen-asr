@@ -374,4 +374,4 @@ Migration: existing configs get those defaults; no behavior surprise.
 
 ---
 
-*When implementing, do not paste competitor UI copy; use Lumen wording (整理强度 / 语气 / 意图快捷键 / 还原原文).*
+*When implementing, use Lumen product wording (整理强度 / 语气 / 意图快捷键 / 还原原文).*

@@ -1,7 +1,7 @@
-//! Built-in provider catalogs mirrored from 闪电说 reverse-engineering (endpoints + default models).
+//! Built-in LLM / ASR provider catalogs (endpoints + default models).
 //!
 //! LLM presets use OpenAI-compatible chat completions unless noted.
-//! Cloud ASR presets capture competitor defaults; only `openai_audio` + local are fully wired today.
+//! Cloud ASR: `openai_audio` + local engines are fully wired; other entries may be config-only.
 
 use serde::Serialize;
 
@@ -72,7 +72,7 @@ pub fn llm_presets() -> Vec<LlmProviderPreset> {
                 "claude-3-5-haiku-latest".into(),
             ],
             needs_api_key: true,
-            notes: "闪电说内置 Claude；完整 Messages API 后续增强，当前按兼容层填写".into(),
+            notes: "Anthropic Messages API 可后续增强；当前可按兼容层填写".into(),
         },
         LlmProviderPreset {
             id: "gemini".into(),
@@ -134,10 +134,17 @@ pub fn llm_presets() -> Vec<LlmProviderPreset> {
             label: "MiniMax".into(),
             kind: "openai_compatible".into(),
             base_url: "https://api.minimaxi.com/v1".into(),
+            // Dictation: M3 + thinking disabled ≈ 3× faster end-to-end than M2.7-highspeed
+            // (M2.x cannot turn off CoT; "highspeed" still burns hundreds of think tokens).
             default_model: "MiniMax-M3".into(),
-            models: vec!["MiniMax-M3".into(), "MiniMax-M2.5".into()],
+            models: vec![
+                "MiniMax-M3".into(),
+                "MiniMax-M2.7".into(),
+                "MiniMax-M2.7-highspeed".into(),
+                "MiniMax-M2.5".into(),
+            ],
             needs_api_key: true,
-            notes: String::new(),
+            notes: "听写请用 MiniMax-M3（请求侧自动 thinking=OFF）。M2.x/highspeed 无法关思考，纠错会慢且浪费 token。".into(),
         },
         LlmProviderPreset {
             id: "volcengine".into(),
@@ -287,7 +294,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec![],
             needs_api_key: true,
             status: "config_only".into(),
-            notes: "闪电说：DashScope realtime WS；流式接入待接".into(),
+            notes: "DashScope realtime WebSocket；流式客户端待接".into(),
         },
         AsrProviderPreset {
             id: "volcengine".into(),
@@ -298,7 +305,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec![],
             needs_api_key: true,
             status: "config_only".into(),
-            notes: "闪电说 VolcengineAsrConfig：app_id + access_token".into(),
+            notes: "需要 app_id + access_token；流式客户端待接".into(),
         },
         AsrProviderPreset {
             id: "soniox".into(),
@@ -309,7 +316,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec!["stt-rt-v4".into()],
             needs_api_key: true,
             status: "config_only".into(),
-            notes: "闪电说实时 WS".into(),
+            notes: "实时 WebSocket；流式客户端待接".into(),
         },
         AsrProviderPreset {
             id: "stepfun".into(),

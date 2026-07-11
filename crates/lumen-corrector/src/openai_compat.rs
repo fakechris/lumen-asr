@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 
-/// Align with 闪电说 `src/ai/common.rs` strip pattern (+ unclosed Qwen think blocks).
+/// Strip common model thinking wrappers (+ unclosed Qwen-style think blocks).
 static THINKING_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?s)<think>.*?</think>|<thought>.*?</thought>|<thinking>.*?</thinking>|</?think_[a-zA-Z0-9_]+>|💭.*?\n|<think>.*",
@@ -157,7 +157,15 @@ fn is_local_ollama(cfg: &OpenAiCompatConfig) -> bool {
         || u.contains("0.0.0.0:11434")
 }
 
-/// Request-side: turn off thinking for Ollama / Qwen3 / DeepSeek-R1 style APIs.
+/// Request-side: turn off thinking for providers that support it.
+///
+/// Dictation / short translate should not pay CoT cost:
+/// - Ollama: `think: false`
+/// - Qwen/DashScope: `enable_thinking` + `think`
+/// - DeepSeek reasoner: `thinking: {type:disabled}`
+/// - Gemini: thinkingBudget 0 / thinkingConfig
+/// - MiniMax-M3 (OpenAI path): `thinking: {type:disabled}` — works (dictation default)
+/// - MiniMax-M2.x / `*-highspeed`: cannot fully disable CoT; prefer M3 for cleanup
 fn inject_no_thinking_params(cfg: &OpenAiCompatConfig, body: &mut serde_json::Value) {
     let url = cfg.base_url.to_ascii_lowercase();
     let model = cfg.model.to_ascii_lowercase();
@@ -171,7 +179,7 @@ fn inject_no_thinking_params(cfg: &OpenAiCompatConfig, body: &mut serde_json::Va
         return;
     }
 
-    // DashScope / Qwen3 compatible mode (闪电说: enable_thinking + think).
+    // DashScope / Qwen3 compatible mode.
     if url.contains("dashscope") || model.contains("qwen3") || model.starts_with("qwen") {
         body["enable_thinking"] = json!(false);
         body["think"] = json!(false);
@@ -182,6 +190,17 @@ fn inject_no_thinking_params(cfg: &OpenAiCompatConfig, body: &mut serde_json::Va
         body["thinking"] = json!({ "type": "disabled" });
     }
 
+    // MiniMax (OpenAI-compatible Chat Completions).
+    // M3: on this path omit ⇒ thinking ON — must send disabled explicitly.
+    // M2.x: official docs say thinking cannot be fully disabled (param ignored);
+    // we still send disabled for forward-compat + strip residual tags.
+    let is_minimax = url.contains("minimax") || model.contains("minimax");
+    if is_minimax {
+        body["thinking"] = json!({ "type": "disabled" });
+        // Prefer split fields so answer stays in `content` when gateway supports it.
+        body["reasoning_split"] = json!(true);
+    }
+
     // Gemini OpenAI-compat: some builds honor thinkingBudget 0.
     if url.contains("generativelanguage") || model.contains("gemini") {
         body["extra_body"] = json!({
@@ -190,9 +209,14 @@ fn inject_no_thinking_params(cfg: &OpenAiCompatConfig, body: &mut serde_json::Va
             }
         });
     }
+
+    // OpenRouter-style reasoning disable.
+    if url.contains("openrouter") {
+        body["reasoning"] = json!({ "effort": "none", "exclude": true });
+    }
 }
 
-/// Response-side strip (闪电说 common.rs). Always run for dictation safety.
+/// Response-side strip of thinking tags. Always run for dictation safety.
 pub fn strip_thinking_tags(text: &str) -> String {
     let cleaned = THINKING_RE.replace_all(text, "");
     // Fallback: if still starts with residual open tag without close.
