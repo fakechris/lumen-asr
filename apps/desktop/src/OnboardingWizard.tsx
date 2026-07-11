@@ -48,6 +48,7 @@ export function OnboardingWizard({ onDone }: Props) {
   const [practice, setPractice] = useState("");
   const [e2ePhase, setE2ePhase] = useState("idle");
   const [e2eOk, setE2eOk] = useState(false);
+  const dismissing = useRef(false);
 
   const refreshPerm = useCallback(async () => {
     try {
@@ -232,12 +233,20 @@ export function OnboardingWizard({ onDone }: Props) {
   }
 
   async function skipAll() {
+    // Always allow mid-wizard exit (even during long downloads / probes).
+    if (dismissing.current) return;
+    dismissing.current = true;
     setBusy(true);
     try {
-      await api.stopVolumeMonitoring();
+      try {
+        await api.stopVolumeMonitoring();
+      } catch {
+        /* ignore if not monitoring */
+      }
       await api.skipOnboarding();
       onDone();
     } catch (e) {
+      dismissing.current = false;
       setError(String(e));
     } finally {
       setBusy(false);
@@ -257,6 +266,20 @@ export function OnboardingWizard({ onDone }: Props) {
     }
   }
 
+  // Escape / anytime dismiss — standard wizard exit, not only step 0.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        void skipAll();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy]);
+
   const micOk = perm?.canRecord ?? false;
   const axOk = perm?.accessibilityTrusted ?? false;
   const canLeavePerms = micOk;
@@ -264,8 +287,42 @@ export function OnboardingWizard({ onDone }: Props) {
   const asrReady = asr?.sensevoiceReady ?? false;
 
   return (
-    <div className="onboard-overlay" role="dialog" aria-modal="true" aria-label="首次设置">
-      <div className="onboard-card onboard-card-wide">
+    <div
+      className="onboard-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="首次设置"
+      onMouseDown={(e) => {
+        // Click scrim (not the card) → dismiss, same as 稍后再说.
+        if (e.target === e.currentTarget) void skipAll();
+      }}
+    >
+      <div
+        className="onboard-card onboard-card-wide"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="onboard-topbar">
+          <span className="onboard-topbar-title">首次设置 · {step + 1}/{STEPS.length}</span>
+          <div className="onboard-topbar-actions">
+            <button
+              type="button"
+              className="onboard-skip-btn"
+              onClick={() => void skipAll()}
+            >
+              稍后再说
+            </button>
+            <button
+              type="button"
+              className="onboard-close-btn"
+              aria-label="关闭设置"
+              title="关闭（Esc，可稍后在侧栏继续）"
+              onClick={() => void skipAll()}
+            >
+              ×
+            </button>
+          </div>
+        </div>
+
         <div className="onboard-progress">
           {STEPS.map((label, i) => (
             <div
@@ -285,7 +342,7 @@ export function OnboardingWizard({ onDone }: Props) {
           <section className="onboard-step">
             <h1>欢迎使用 Lumen ASR</h1>
             <p className="muted-text">
-              在本地把语音转成文字，并插入到你正在输入的应用光标处。
+              在本地把语音转成文字，并插入到你正在输入的应用光标处。随时可点右上角关闭，稍后从侧栏继续。
             </p>
             <ul className="onboard-bullets">
               <li>本地转写（SenseVoice）</li>
