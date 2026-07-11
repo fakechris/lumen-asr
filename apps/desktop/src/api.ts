@@ -190,6 +190,8 @@ export const api = {
       showCapsule: boolean;
       mode: string;
       intents: HotkeyIntent[];
+      eventTapActive: boolean;
+      registerNote: string;
     }>("get_hotkey_config"),
   saveHotkeyConfig: (input: {
     enabled?: boolean;
@@ -204,6 +206,8 @@ export const api = {
       showCapsule: boolean;
       mode: string;
       intents: HotkeyIntent[];
+      eventTapActive: boolean;
+      registerNote: string;
     }>("save_hotkey_config", { input }),
   pauseHotkeys: () => invoke<void>("pause_hotkeys"),
   resumeHotkeys: () => invoke<void>("resume_hotkeys"),

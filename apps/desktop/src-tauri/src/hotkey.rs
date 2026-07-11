@@ -28,6 +28,10 @@ pub struct HotkeyDto {
     pub show_capsule: bool,
     pub mode: String,
     pub intents: Vec<HotkeyIntentDto>,
+    /// True when EventTap multi-binding is active (best path).
+    pub event_tap_active: bool,
+    /// Human hint when intents cannot fully register.
+    pub register_note: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +66,26 @@ fn intent_dto(i: &HotkeyIntentConfig) -> HotkeyIntentDto {
     }
 }
 
+static EVENT_TAP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REGISTER_NOTE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn set_register_status(tap: bool, note: impl Into<String>) {
+    EVENT_TAP_ACTIVE.store(tap, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut g) = REGISTER_NOTE.lock() {
+        *g = note.into();
+    }
+}
+
+fn register_status() -> (bool, String) {
+    (
+        EVENT_TAP_ACTIVE.load(std::sync::atomic::Ordering::SeqCst),
+        REGISTER_NOTE
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default(),
+    )
+}
+
 #[tauri::command]
 pub fn get_hotkey_config(state: State<'_, AppState>) -> Result<HotkeyDto, String> {
     let mut guard = state
@@ -73,12 +97,15 @@ pub fn get_hotkey_config(state: State<'_, AppState>) -> Result<HotkeyDto, String
     if guard.hotkey.intents.len() != before {
         let _ = guard.save();
     }
+    let (tap, note) = register_status();
     Ok(HotkeyDto {
         enabled: guard.hotkey.enabled,
         toggle: guard.hotkey.toggle.clone(),
         show_capsule: guard.hotkey.show_capsule,
         mode: guard.hotkey.mode.clone(),
         intents: guard.hotkey.intents.iter().map(intent_dto).collect(),
+        event_tap_active: tap,
+        register_note: note,
     })
 }
 
@@ -123,6 +150,8 @@ pub fn save_hotkey_config(
                 })
                 .collect();
         }
+        // Never rewrite user chords on save — only fill empty defaults.
+        ensure_default_intents(&mut guard.hotkey);
         guard.save()?;
     }
     reregister(&app)?;
@@ -132,10 +161,11 @@ pub fn save_hotkey_config(
 pub fn reregister(app: &AppHandle) -> Result<(), String> {
     let cfg = {
         let state = app.state::<AppState>();
-        let guard = state
+        let mut guard = state
             .config
             .lock()
             .map_err(|_| "config lock poisoned".to_string())?;
+        ensure_default_intents(&mut guard.hotkey);
         guard.hotkey.clone()
     };
     reregister_with(app, &cfg)
@@ -195,9 +225,11 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
     let _ = app.global_shortcut().unregister_all();
     mod_chord::stop_watcher();
     lumen_platform_macos::stop_monitor();
+    set_register_status(false, String::new());
 
     if !cfg.enabled || cfg.toggle.trim().is_empty() {
         tracing::info!("global hotkey disabled");
+        set_register_status(false, "热键已关闭".to_string());
         return Ok(());
     }
 
@@ -206,9 +238,7 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
 
     #[cfg(target_os = "macos")]
     {
-        use lumen_platform_macos::{
-            HotkeyBinding, HotkeyEdge, HotkeyMode, HotkeySpec,
-        };
+        use lumen_platform_macos::{HotkeyBinding, HotkeyEdge, HotkeyMode, HotkeySpec};
 
         let mode = if hold {
             HotkeyMode::Hold
@@ -227,7 +257,6 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
             }
         }
 
-        // Intent chords share the primary hold/toggle mode (one mental model).
         for intent in &cfg.intents {
             if !intent.enabled || intent.chord.trim().is_empty() {
                 continue;
@@ -266,10 +295,15 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
                 }
             }) {
                 Ok(()) => {
+                    let n = cfg.intents.iter().filter(|i| i.enabled).count();
                     tracing::info!(
                         primary = %toggle,
-                        intents = cfg.intents.iter().filter(|i| i.enabled).count(),
+                        intents = n,
                         "event-tap multi hotkeys registered"
+                    );
+                    set_register_status(
+                        true,
+                        format!("EventTap 已注册主热键 + {n} 个意图键"),
                     );
                     return Ok(());
                 }
@@ -280,41 +314,117 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
         }
     }
 
-    // Fallback: primary only (legacy paths)
+    // ── Fallback: pure-mod multi-watcher + global_shortcut for key chords ──
+    register_fallback(app, cfg, hold, toggle)
+}
+
+fn register_fallback(
+    app: &AppHandle,
+    cfg: &HotkeyConfig,
+    hold: bool,
+    toggle: &str,
+) -> Result<(), String> {
+    let mut mod_bindings: Vec<(String, ModChord)> = Vec::new();
+    let mut notes = Vec::new();
+
     if let Some(chord) = ModChord::parse_modifier_only(toggle) {
-        let app_press = app.clone();
-        let app_release = app.clone();
-        if hold {
-            mod_chord::start_watcher(
-                chord,
-                move || spawn_start(app_press.clone(), IntentSpec::Default),
-                move || spawn_stop(app_release.clone()),
-            );
-        } else {
-            mod_chord::start_watcher(
-                chord,
-                move || spawn_toggle(app_press.clone()),
-                move || {},
-            );
-        }
-        tracing::info!(hotkey = %toggle, hold, "modifier-only hotkey registered (fallback)");
-        return Ok(());
+        mod_bindings.push(("default".into(), chord));
     }
 
-    let shortcut: Shortcut = toggle
-        .parse()
-        .map_err(|e| format!("invalid hotkey '{toggle}': {e}"))?;
+    for intent in &cfg.intents {
+        if !intent.enabled || intent.chord.trim().is_empty() {
+            continue;
+        }
+        if let Some(chord) = ModChord::parse_modifier_only(intent.chord.trim()) {
+            mod_bindings.push((intent.id.clone(), chord));
+        }
+    }
 
-    let handle = app.clone();
-    let hold_mode = hold;
-    app.global_shortcut()
-        .on_shortcut(shortcut, move |_app, _shortcut, event| {
+    if !mod_bindings.is_empty() {
+        let app_c = app.clone();
+        let cfg_c = cfg.clone();
+        let hold_mode = hold;
+        mod_chord::start_multi_watcher(mod_bindings.clone(), move |id, press| {
+            let intent = resolve_intent(&cfg_c, &id);
+            if hold_mode {
+                if press {
+                    spawn_start(app_c.clone(), intent);
+                } else {
+                    spawn_stop(app_c.clone());
+                }
+            } else if press {
+                dictation::set_session_intent(intent);
+                spawn_toggle(app_c.clone());
+            }
+        });
+        notes.push(format!(
+            "修饰键监听: {}",
+            mod_bindings
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        tracing::info!(
+            n = mod_bindings.len(),
+            "modifier-only multi hotkeys registered (fallback)"
+        );
+    }
+
+    // Key chords (e.g. Alt+Shift+T) via global_shortcut when EventTap is down.
+    let mut key_chord_count = 0usize;
+    if ModChord::parse_modifier_only(toggle).is_none() {
+        if let Ok(shortcut) = toggle.parse::<Shortcut>() {
+            let handle = app.clone();
+            let hold_mode = hold;
+            app.global_shortcut()
+                .on_shortcut(shortcut, move |_app, _shortcut, event| {
+                    let handle = handle.clone();
+                    match event.state {
+                        ShortcutState::Pressed => {
+                            if hold_mode {
+                                spawn_start(handle, IntentSpec::Default);
+                            } else {
+                                spawn_toggle(handle);
+                            }
+                        }
+                        ShortcutState::Released => {
+                            if hold_mode {
+                                spawn_stop(handle);
+                            }
+                        }
+                    }
+                })
+                .map_err(|e| format!("register primary hotkey failed: {e}"))?;
+            key_chord_count += 1;
+        }
+    }
+
+    for intent in &cfg.intents {
+        if !intent.enabled || intent.chord.trim().is_empty() {
+            continue;
+        }
+        if ModChord::parse_modifier_only(intent.chord.trim()).is_some() {
+            continue; // already in multi mod watcher
+        }
+        let chord = intent.chord.trim();
+        let Ok(shortcut) = chord.parse::<Shortcut>() else {
+            notes.push(format!("无法解析意图键 {}", chord));
+            continue;
+        };
+        let handle = app.clone();
+        let intent_spec = intent.to_intent_spec();
+        let hold_mode = hold;
+        let id = intent.id.clone();
+        match app.global_shortcut().on_shortcut(shortcut, move |_app, _s, event| {
             let handle = handle.clone();
+            let intent_spec = intent_spec.clone();
             match event.state {
                 ShortcutState::Pressed => {
                     if hold_mode {
-                        spawn_start(handle, IntentSpec::Default);
+                        spawn_start(handle, intent_spec);
                     } else {
+                        dictation::set_session_intent(intent_spec);
                         spawn_toggle(handle);
                     }
                 }
@@ -324,10 +434,31 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
                     }
                 }
             }
-        })
-        .map_err(|e| format!("register hotkey failed: {e}"))?;
+        }) {
+            Ok(()) => {
+                key_chord_count += 1;
+                tracing::info!(%id, chord, "intent global_shortcut registered (fallback)");
+            }
+            Err(e) => {
+                tracing::warn!(%id, error = %e, "intent global_shortcut failed");
+                notes.push(format!("意图键 {id} 注册失败: {e}"));
+            }
+        }
+    }
 
-    tracing::info!(hotkey = %toggle, hold, "global hotkey registered (fallback)");
+    if mod_bindings.is_empty() && key_chord_count == 0 {
+        return Err("no hotkeys could be registered".into());
+    }
+
+    let note = if notes.is_empty() {
+        format!("回退注册成功（修饰键组 + {key_chord_count} 个含字母键）")
+    } else {
+        format!(
+            "回退注册（EventTap 需辅助功能）。{}",
+            notes.join("；")
+        )
+    };
+    set_register_status(false, note);
     Ok(())
 }
 

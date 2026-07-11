@@ -1565,6 +1565,22 @@ body:has(.capsule-root) {
   border-color: rgba(255, 159, 10, 0.55);
 }
 
+/* Translate intent — warm lumen glow so it's not confused with normal record */
+.capsule-root.intent-translate {
+  border-color: rgba(255, 178, 32, 0.75);
+  box-shadow:
+    0 0 0 0.5px rgba(255, 178, 32, 0.35),
+    0 8px 28px rgba(0, 0, 0, 0.38);
+}
+
+.capsule-root.intent-translate .capsule-dot {
+  background: #ffb020;
+}
+
+.capsule-root.intent-raw {
+  border-color: rgba(152, 152, 157, 0.65);
+}
+
 .capsule-dot {
   width: 10px;
   height: 10px;

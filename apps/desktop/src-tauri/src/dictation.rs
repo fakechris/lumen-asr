@@ -316,7 +316,8 @@ pub async fn stop_and_transcribe_inner(
         .clone();
 
     let intent = take_session_intent();
-    let corr = run_correct_with_intent(&cfg, &asr_text, &entries, intent).await;
+    tracing::info!(?intent, "running corrector with session intent");
+    let corr = run_correct_with_intent(&cfg, &asr_text, &entries, intent.clone()).await;
     let corrected_text = corr.text.trim().to_string();
     let corrector_engine = if corr.model_applied {
         engine_label(&cfg)
@@ -325,7 +326,15 @@ pub async fn stop_and_transcribe_inner(
     } else {
         format!("{}:fallback", engine_label(&cfg))
     };
-    tracing::info!(%corrected_text, %corrector_engine, "corrector result");
+    if !corr.model_applied {
+        if matches!(intent, IntentSpec::Translate { .. }) {
+            tracing::warn!(
+                %corrector_engine,
+                "translate intent but model not applied — output stays ASR language"
+            );
+        }
+    }
+    tracing::info!(%corrected_text, %corrector_engine, model_applied = corr.model_applied, "corrector result");
 
     let target = TARGET.lock().ok().and_then(|g| g.clone());
     let mut notes: Vec<String> = Vec::new();
@@ -334,6 +343,12 @@ pub async fn stop_and_transcribe_inner(
     }
     if asr_text.is_empty() || asr_text == "." {
         notes.push("empty/dot ASR".into());
+    }
+    if matches!(intent, IntentSpec::Translate { .. }) && !corr.model_applied {
+        notes.push(format!(
+            "翻译未执行：模型未响应（{}）。请在「AI 修正」里确认 Ollama 模型名可用（当前机器常见 qwen3.5:9b）",
+            corrector_engine
+        ));
     }
 
     let mut insert_strategy = InsertStrategy::None;
@@ -667,11 +682,35 @@ pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
 #[serde(rename_all = "camelCase", tag = "phase")]
 pub enum DictationUiEvent {
     Idle,
-    Listening { message: String },
-    Processing { message: String },
+    Listening {
+        message: String,
+        /// default | translate | raw — for capsule styling
+        intent: String,
+        /// e.g. "en" when translating
+        target_language: Option<String>,
+    },
+    Processing {
+        message: String,
+        intent: String,
+        target_language: Option<String>,
+    },
     Done { outcome: TranscribeOutcome },
     Error { message: String },
     Cancelled,
+}
+
+fn intent_ui_label(intent: &IntentSpec) -> (String, Option<String>, String) {
+    match intent {
+        IntentSpec::Translate { target_language } => (
+            "translate".into(),
+            Some(target_language.clone()),
+            format!("翻译→{target_language}"),
+        ),
+        IntentSpec::Raw => ("raw".into(), None, "原文".into()),
+        IntentSpec::Default | IntentSpec::PolishOverride => {
+            ("default".into(), None, "录音".into())
+        }
+    }
 }
 
 pub fn emit_dictation(app: &AppHandle, event: DictationUiEvent) {
@@ -704,7 +743,8 @@ pub async fn dictation_start_with_intent(
         return Ok(());
     }
 
-    set_session_intent(intent);
+    set_session_intent(intent.clone());
+    let (intent_kind, target_lang, intent_label) = intent_ui_label(&intent);
 
     // Stamp immediately so a racing stop does not see held_ms=0.
     if let Ok(mut g) = RECORD_STARTED.lock() {
@@ -730,7 +770,7 @@ pub async fn dictation_start_with_intent(
     // Then start mic; never show UI before we know the target.
     match start_recording_inner(&state) {
         Ok(()) => {
-            tracing::info!("dictation recording live");
+            tracing::info!(%intent_kind, ?target_lang, "dictation recording live");
             // Force-show capsule on hotkey start so user always sees feedback.
             crate::capsule::set_capsule_visible(&app, true, "listening");
             if !show_capsule {
@@ -739,7 +779,9 @@ pub async fn dictation_start_with_intent(
             emit_dictation(
                 &app,
                 DictationUiEvent::Listening {
-                    message: "按住说话…".into(),
+                    message: format!("按住·{intent_label}"),
+                    intent: intent_kind,
+                    target_language: target_lang,
                 },
             );
             Ok(())
@@ -802,11 +844,24 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    tracing::info!(held_ms, "dictation stop → ASR");
+    // Peek intent for UI (don't take — stop_and_transcribe still needs it).
+    let intent_peek = SESSION_INTENT
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or(IntentSpec::Default);
+    let (intent_kind, target_lang, intent_label) = intent_ui_label(&intent_peek);
+    tracing::info!(held_ms, %intent_kind, "dictation stop → ASR");
+    let processing_msg = if intent_kind == "translate" {
+        format!("转写并翻译→{}…", target_lang.as_deref().unwrap_or("en"))
+    } else {
+        format!("转写与修正中…（{intent_label}）")
+    };
     emit_dictation(
         &app,
         DictationUiEvent::Processing {
-            message: "转写与修正中…".into(),
+            message: processing_msg,
+            intent: intent_kind,
+            target_language: target_lang,
         },
     );
     // Keep capsule visible during processing so user sees work in progress.

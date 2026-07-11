@@ -1,10 +1,6 @@
-//! Modifier-only global chords (e.g. Alt+Shift) via HID flag polling.
+//! Modifier-only global chords (e.g. Alt+Shift, Control+Alt) via HID flag polling.
 //!
-//! Design for reliable push-to-talk:
-//! - **Active** when all *required* modifiers are down (extra mods OK)
-//! - Short debounce on press, **longer sticky debounce on release** so brief
-//!   flag flicker while holding does not stop recording
-//! - Does not enforce min-hold itself (dictation layer owns that lightly)
+//! Supports multiple chords at once (primary + translate) with **most-specific wins**.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -58,8 +54,7 @@ impl ModChord {
         }
     }
 
-    /// True when every required modifier is down. Extra modifiers are allowed
-    /// (critical — exact match breaks when Caps/Fn/IME sets other bits).
+    /// Required mods down; extras OK (single-chord path).
     pub fn is_active(self, flags: u64) -> bool {
         let alt = flags & FLAG_ALTERNATE != 0;
         let shift = flags & FLAG_SHIFT != 0;
@@ -70,6 +65,15 @@ impl ModChord {
             && (!self.control || control)
             && (!self.meta || meta)
     }
+
+    /// Exact modifier set — use when several pure-mod chords are registered.
+    pub fn is_exact(self, flags: u64) -> bool {
+        let alt = flags & FLAG_ALTERNATE != 0;
+        let shift = flags & FLAG_SHIFT != 0;
+        let control = flags & FLAG_CONTROL != 0;
+        let meta = flags & FLAG_COMMAND != 0;
+        self.alt == alt && self.shift == shift && self.control == control && self.meta == meta
+    }
 }
 
 const FLAG_SHIFT: u64 = 0x0002_0000;
@@ -78,8 +82,6 @@ const FLAG_ALTERNATE: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
 const HID_SYSTEM_STATE: u32 = 1;
 
-/// ~16ms poll. Press after 2 stable samples (~32ms). Release after 12 (~190ms)
-/// of required-mods-not-all-down — sticky so hold does not false-release.
 const POLL_MS: u64 = 16;
 const DEBOUNCE_ON: u8 = 2;
 const DEBOUNCE_OFF: u8 = 12;
@@ -114,12 +116,36 @@ pub fn stop_watcher() {
     }
 }
 
+/// Single chord (legacy API).
 pub fn start_watcher<F, G>(chord: ModChord, on_press: F, on_release: G)
 where
     F: Fn() + Send + 'static,
     G: Fn() + Send + 'static,
 {
+    start_multi_watcher(
+        vec![("default".into(), chord)],
+        move |id, press| {
+            if id == "default" {
+                if press {
+                    on_press();
+                } else {
+                    on_release();
+                }
+            }
+        },
+    );
+}
+
+/// Multiple pure-mod chords. `on_edge(id, is_press)`.
+/// Most-specific exact match wins (more modifiers = higher priority).
+pub fn start_multi_watcher<F>(chords: Vec<(String, ModChord)>, on_edge: F)
+where
+    F: Fn(String, bool) + Send + 'static,
+{
     stop_watcher();
+    if chords.is_empty() {
+        return;
+    }
     let stop = Arc::new(AtomicBool::new(false));
     {
         let mut guard = WATCHER.lock().unwrap_or_else(|e| e.into_inner());
@@ -131,39 +157,85 @@ where
     thread::Builder::new()
         .name("lumen-mod-chord".into())
         .spawn(move || {
-            let mut latched = false;
+            let mut active_id: Option<String> = None;
             let mut on_count: u8 = 0;
             let mut off_count: u8 = 0;
+            let mut pending_id: Option<String> = None;
             let boot = Instant::now();
 
-            tracing::info!(?chord, "mod-chord watcher running");
+            tracing::info!(n = chords.len(), "mod-chord multi watcher running");
 
             while !stop.load(Ordering::SeqCst) {
-                // Brief ignore only after (re)register so setup keys don't fire.
                 if boot.elapsed() < Duration::from_millis(150) {
                     thread::sleep(Duration::from_millis(POLL_MS));
                     continue;
                 }
 
-                let active = chord.is_active(read_mod_flags());
-                if active {
-                    on_count = on_count.saturating_add(1);
-                    off_count = 0;
-                } else {
-                    off_count = off_count.saturating_add(1);
-                    on_count = 0;
+                let flags = read_mod_flags();
+                // Prefer exact match with most modifiers.
+                let mut best: Option<(String, u8)> = None;
+                for (id, chord) in &chords {
+                    if chord.is_exact(flags) {
+                        let score = chord.count();
+                        if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+                            best = Some((id.clone(), score));
+                        }
+                    }
+                }
+                // Soft match only if nothing exact (single-chord UX: extras OK).
+                if best.is_none() && chords.len() == 1 {
+                    let (id, chord) = &chords[0];
+                    if chord.is_active(flags) {
+                        best = Some((id.clone(), chord.count()));
+                    }
                 }
 
-                if !latched && on_count >= DEBOUNCE_ON {
-                    latched = true;
-                    on_count = 0;
-                    tracing::info!(?chord, "mod-chord PRESS");
-                    on_press();
-                } else if latched && off_count >= DEBOUNCE_OFF {
-                    latched = false;
-                    off_count = 0;
-                    tracing::info!(?chord, "mod-chord RELEASE");
-                    on_release();
+                let matched = best.map(|(id, _)| id);
+
+                match (&active_id, &matched) {
+                    (None, Some(id)) => {
+                        if pending_id.as_ref() == Some(id) {
+                            on_count = on_count.saturating_add(1);
+                        } else {
+                            pending_id = Some(id.clone());
+                            on_count = 1;
+                        }
+                        off_count = 0;
+                        if on_count >= DEBOUNCE_ON {
+                            active_id = Some(id.clone());
+                            pending_id = None;
+                            on_count = 0;
+                            tracing::info!(%id, "mod-chord PRESS");
+                            on_edge(id.clone(), true);
+                        }
+                    }
+                    (Some(cur), Some(id)) if cur == id => {
+                        off_count = 0;
+                        on_count = 0;
+                        pending_id = None;
+                    }
+                    (Some(cur), other) => {
+                        // Released or switched to another chord.
+                        let switch = other.as_ref().map(|id| id != cur).unwrap_or(false);
+                        if other.is_none() || switch {
+                            off_count = off_count.saturating_add(1);
+                            on_count = 0;
+                            if off_count >= DEBOUNCE_OFF {
+                                let id = cur.clone();
+                                active_id = None;
+                                off_count = 0;
+                                pending_id = None;
+                                tracing::info!(%id, "mod-chord RELEASE");
+                                on_edge(id, false);
+                                // If switched, next loop will press new id.
+                            }
+                        }
+                    }
+                    (None, None) => {
+                        on_count = 0;
+                        off_count = 0;
+                        pending_id = None;
+                    }
                 }
 
                 thread::sleep(Duration::from_millis(POLL_MS));
@@ -186,13 +258,18 @@ mod tests {
     #[test]
     fn active_allows_extra_mods() {
         let c = ModChord::parse_modifier_only("Alt+Shift").unwrap();
-        // Alt+Shift only
         let flags = FLAG_ALTERNATE | FLAG_SHIFT;
         assert!(c.is_active(flags));
-        // Alt+Shift+Cmd still active (extras OK)
         assert!(c.is_active(flags | FLAG_COMMAND));
-        // Only Alt — not active
         assert!(!c.is_active(FLAG_ALTERNATE));
+    }
+
+    #[test]
+    fn exact_rejects_extra_mods() {
+        let c = ModChord::parse_modifier_only("Control+Alt").unwrap();
+        let flags = FLAG_CONTROL | FLAG_ALTERNATE;
+        assert!(c.is_exact(flags));
+        assert!(!c.is_exact(flags | FLAG_SHIFT));
     }
 
     #[test]

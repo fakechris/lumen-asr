@@ -171,7 +171,7 @@ impl Default for CorrectorConfig {
             provider: "ollama".into(),
             base_url: "http://127.0.0.1:11434/v1".into(),
             model: std::env::var("LUMEN_CORRECTOR_MODEL")
-                .unwrap_or_else(|_| "qwen2.5:7b".into()),
+                .unwrap_or_else(|_| "qwen3.5:9b".into()),
             api_key: std::env::var("LUMEN_CORRECTOR_API_KEY").unwrap_or_default(),
             timeout_secs: 60,
         }
@@ -273,34 +273,10 @@ pub fn ensure_default_intents(cfg: &mut HotkeyConfig) {
         if i.chord.trim().is_empty() {
             i.chord = "Alt+Shift+T".into();
         }
-        if i.intent.eq_ignore_ascii_case("translate") {
-            if i.target_language.trim().is_empty() {
-                i.target_language = "en".into();
-            }
-            // Pure modifier chords (e.g. Control+Alt) fight the primary key and
-            // feel like "no reaction". Prefer a letter key: Alt+Shift+T.
-            let has_non_mod = i.chord.split('+').any(|p| {
-                let u = p.trim().to_ascii_lowercase();
-                !u.is_empty()
-                    && !matches!(
-                        u.as_str(),
-                        "alt"
-                            | "option"
-                            | "shift"
-                            | "control"
-                            | "ctrl"
-                            | "command"
-                            | "cmd"
-                            | "meta"
-                            | "super"
-                            | "commandorcontrol"
-                            | "cmdorctrl"
-                    )
-            });
-            if !has_non_mod {
-                i.chord = "Alt+Shift+T".into();
-            }
+        if i.intent.eq_ignore_ascii_case("translate") && i.target_language.trim().is_empty() {
+            i.target_language = "en".into();
         }
+        // Never rewrite a user-chosen chord (including pure modifiers like Control+Alt).
     }
     if !cfg
         .intents

@@ -1032,6 +1032,7 @@ function SettingsPanel({
   const [showCapsule, setShowCapsule] = useState(true);
   const [hotkeyMode, setHotkeyMode] = useState("hold");
   const [intents, setIntents] = useState<import("./api").HotkeyIntent[]>([]);
+  const [hotkeyRegisterNote, setHotkeyRegisterNote] = useState("");
   const [learning, setLearning] = useState<LearningConfig | null>(null);
   const [autoPromote, setAutoPromote] = useState(false);
   const [promoteN, setPromoteN] = useState(3);
@@ -1067,6 +1068,7 @@ function SettingsPanel({
         setShowCapsule(hk.showCapsule);
         setHotkeyMode(hk.mode || "hold");
         setIntents(hk.intents || []);
+        setHotkeyRegisterNote(hk.registerNote || "");
         const ln = await api.getLearningConfig();
         setLearning(ln);
         setAutoPromote(ln.autoPromote);
@@ -1384,6 +1386,7 @@ function SettingsPanel({
                 intents: list,
               });
               setIntents(h.intents || list);
+              setHotkeyRegisterNote(h.registerNote || "");
               onSaved();
             } catch (e) {
               onError(String(e));
@@ -1402,7 +1405,7 @@ function SettingsPanel({
                   onChange={(e) =>
                     void saveTranslate({
                       enabled: e.target.checked,
-                      chord: tr.chord || "Alt+Shift+T",
+                      chord: tr.chord || "Control+Alt",
                       targetLanguage: tr.targetLanguage || "en",
                     })
                   }
@@ -1413,7 +1416,7 @@ function SettingsPanel({
               <div className="intent-card-row">
                 <span className="muted-text intent-label">快捷键</span>
                 <ChordCaptureChip
-                  value={tr.chord || "Alt+Shift+T"}
+                  value={tr.chord || "Control+Alt"}
                   disabled={busy || !tr.enabled}
                   busy={busy}
                   onBusy={onBusy}
@@ -1437,11 +1440,16 @@ function SettingsPanel({
                       targetLanguage: tr.targetLanguage || "en",
                     })
                   }
-                  title="恢复推荐快捷键"
+                  title="推荐：与纯修饰键主热键不易冲突"
                 >
-                  默认 ⌥⇧T
+                  推荐 ⌥⇧T
                 </button>
               </div>
+              {hotkeyRegisterNote && (
+                <p className="muted-text intent-hint" style={{ fontSize: "0.8rem" }}>
+                  注册状态：{hotkeyRegisterNote}
+                </p>
+              )}
 
               <div className="intent-card-row">
                 <span className="muted-text intent-label">译成</span>
