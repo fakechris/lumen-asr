@@ -253,10 +253,67 @@ impl Default for HotkeyConfig {
     }
 }
 
-/// Ensure at least a translate intent exists (old configs may have empty list).
+/// Ensure a usable translate intent exists; align mode with primary hotkey.
 pub fn ensure_default_intents(cfg: &mut HotkeyConfig) {
+    let primary_mode = if cfg.is_hold_mode() {
+        "hold"
+    } else {
+        "toggle"
+    };
     if cfg.intents.is_empty() {
-        cfg.intents.push(HotkeyIntentConfig::default());
+        cfg.intents.push(HotkeyIntentConfig {
+            mode: primary_mode.into(),
+            ..HotkeyIntentConfig::default()
+        });
+        return;
+    }
+    for i in &mut cfg.intents {
+        // One global hold/toggle setting — per-intent mode confused users.
+        i.mode = primary_mode.into();
+        if i.chord.trim().is_empty() {
+            i.chord = "Alt+Shift+T".into();
+        }
+        if i.intent.eq_ignore_ascii_case("translate") {
+            if i.target_language.trim().is_empty() {
+                i.target_language = "en".into();
+            }
+            // Pure modifier chords (e.g. Control+Alt) fight the primary key and
+            // feel like "no reaction". Prefer a letter key: Alt+Shift+T.
+            let has_non_mod = i.chord.split('+').any(|p| {
+                let u = p.trim().to_ascii_lowercase();
+                !u.is_empty()
+                    && !matches!(
+                        u.as_str(),
+                        "alt"
+                            | "option"
+                            | "shift"
+                            | "control"
+                            | "ctrl"
+                            | "command"
+                            | "cmd"
+                            | "meta"
+                            | "super"
+                            | "commandorcontrol"
+                            | "cmdorctrl"
+                    )
+            });
+            if !has_non_mod {
+                i.chord = "Alt+Shift+T".into();
+            }
+        }
+    }
+    if !cfg
+        .intents
+        .iter()
+        .any(|i| i.intent.eq_ignore_ascii_case("translate"))
+    {
+        cfg.intents.insert(
+            0,
+            HotkeyIntentConfig {
+                mode: primary_mode.into(),
+                ..HotkeyIntentConfig::default()
+            },
+        );
     }
 }
 

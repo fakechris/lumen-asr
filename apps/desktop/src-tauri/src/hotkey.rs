@@ -227,16 +227,12 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
             }
         }
 
+        // Intent chords share the primary hold/toggle mode (one mental model).
         for intent in &cfg.intents {
             if !intent.enabled || intent.chord.trim().is_empty() {
                 continue;
             }
-            let imode = if intent.mode.eq_ignore_ascii_case("toggle") {
-                HotkeyMode::Toggle
-            } else {
-                HotkeyMode::Hold
-            };
-            match HotkeySpec::parse(intent.chord.trim(), imode) {
+            match HotkeySpec::parse(intent.chord.trim(), mode) {
                 Ok(spec) => bindings.push(HotkeyBinding {
                     id: intent.id.clone(),
                     spec,
@@ -253,19 +249,9 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
             let hold_primary = hold;
             match lumen_platform_macos::start_multi_monitor(bindings, move |edge, id| {
                 let intent = resolve_intent(&cfg_c, &id);
-                let is_hold = if id == "default" {
-                    hold_primary
-                } else {
-                    cfg_c
-                        .intents
-                        .iter()
-                        .find(|i| i.id == id)
-                        .map(|i| !i.mode.eq_ignore_ascii_case("toggle"))
-                        .unwrap_or(true)
-                };
                 match edge {
                     HotkeyEdge::Press => {
-                        if is_hold {
+                        if hold_primary {
                             spawn_start(app_c.clone(), intent);
                         } else {
                             dictation::set_session_intent(intent);
@@ -273,7 +259,7 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
                         }
                     }
                     HotkeyEdge::Release => {
-                        if is_hold {
+                        if hold_primary {
                             spawn_stop(app_c.clone());
                         }
                     }

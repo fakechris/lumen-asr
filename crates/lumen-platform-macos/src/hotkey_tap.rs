@@ -85,12 +85,23 @@ impl HotkeySpec {
         let shift = flags & FLAG_SHIFT != 0;
         let control = flags & FLAG_CONTROL != 0;
         let meta = flags & FLAG_COMMAND != 0;
-        (!self.alt || alt)
-            && (!self.shift || shift)
-            && (!self.control || control)
-            && (!self.meta || meta)
+        // Exact modifier set: required on, others off.
+        // Prevents Alt+Shift primary from also matching Alt+Control+Shift, etc.
+        self.alt == alt
+            && self.shift == shift
+            && self.control == control
+            && self.meta == meta
     }
 
+    /// Higher = more specific. Prefer key+mods over pure modifier chords.
+    fn specificity(&self) -> u32 {
+        let mods = (self.alt as u32)
+            + (self.shift as u32)
+            + (self.control as u32)
+            + (self.meta as u32);
+        let key = if self.keycode.is_some() { 100 } else { 0 };
+        key + mods
+    }
 }
 
 fn key_name_to_keycode(name: &str) -> Option<i64> {
@@ -284,6 +295,8 @@ fn run_tap_loop_multi<F>(
             let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
 
             let mut map = latches_c.borrow_mut();
+            // Track per-binding key held, then pick the single most-specific match.
+            // e.g. primary Alt+Shift must lose to translate Alt+Shift+T while T is held.
             for b in bindings_c.iter() {
                 let latch = map.get_mut(&b.id).unwrap();
                 match etype {
@@ -299,29 +312,37 @@ fn run_tap_loop_multi<F>(
                     }
                     _ => {}
                 }
+            }
 
-                let key_arg = if b.spec.keycode.is_some() {
-                    if latch.key_held {
-                        b.spec.keycode
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                // For key chords, is_active checks keycode match via key_held path:
-                let want = if let Some(need) = b.spec.keycode {
-                    b.spec.mods_active(flags) && latch.key_held && Some(need) == b.spec.keycode
+            // If any key-chord binding currently matches, prefer it over pure modifier chords
+            // (so Alt+Shift+T wins over Alt+Shift while T is held).
+            let mut best_id: Option<String> = None;
+            let mut best_score: i32 = -1;
+            for b in bindings_c.iter() {
+                let latch = map.get(&b.id).unwrap();
+                let want = if b.spec.keycode.is_some() {
+                    b.spec.mods_active(flags) && latch.key_held
                 } else {
                     b.spec.mods_active(flags)
                 };
-                let _ = key_arg;
+                if want {
+                    let score = b.spec.specificity() as i32;
+                    if score > best_score {
+                        best_score = score;
+                        best_id = Some(b.id.clone());
+                    }
+                }
+            }
+
+            for b in bindings_c.iter() {
+                let latch = map.get_mut(&b.id).unwrap();
+                let want = best_id.as_ref().map(|id| id == &b.id).unwrap_or(false);
 
                 if want {
                     latch.release_after = None;
                     if !latch.active {
                         latch.active = true;
-                        tracing::info!(id = %b.id, "hotkey press");
+                        tracing::info!(id = %b.id, score = best_score, "hotkey press");
                         on_edge_c(HotkeyEdge::Press, b.id.clone());
                     }
                 } else if latch.active {
@@ -410,5 +431,12 @@ mod tests {
     fn parse_alt_space() {
         let s = HotkeySpec::parse("Alt+Space", HotkeyMode::Hold).unwrap();
         assert!(s.alt && s.keycode == Some(0x31));
+    }
+
+    #[test]
+    fn key_chord_more_specific_than_mods_only() {
+        let mods = HotkeySpec::parse("Alt+Shift", HotkeyMode::Hold).unwrap();
+        let key = HotkeySpec::parse("Alt+Shift+T", HotkeyMode::Hold).unwrap();
+        assert!(key.specificity() > mods.specificity());
     }
 }
