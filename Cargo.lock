@@ -2102,6 +2102,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "lumen-asr",
+ "lumen-core",
+ "lumen-corrector",
+ "lumen-prompts",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.2",
+ "uuid",
+]
+
+[[package]]
 name = "lumen-core"
 version = "0.1.0"
 dependencies = [

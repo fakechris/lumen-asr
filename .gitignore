@@ -25,6 +25,7 @@ apps/desktop/src-tauri/gen/schemas
 
 # Models & local data (never commit)
 models/
+/benchmarks/
 *.onnx
 *.bin
 *.gguf
