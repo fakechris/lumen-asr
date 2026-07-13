@@ -1,5 +1,6 @@
 [package]
 name = "lumen-asr-desktop"
+default-run = "lumen-asr-desktop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
