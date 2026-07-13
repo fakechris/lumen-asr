@@ -48,14 +48,108 @@ pub fn migrate(conn: &Connection) -> Result<()> {
           confirmed INTEGER NOT NULL DEFAULT 0,
           updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS context_snapshots (
+          capture_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          revision INTEGER NOT NULL,
+          schema_version INTEGER NOT NULL,
+          profile TEXT NOT NULL,
+          target_generation INTEGER NOT NULL,
+          started_at TEXT NOT NULL,
+          frozen_at TEXT NOT NULL,
+          completed_at TEXT,
+          manifest_path TEXT NOT NULL,
+          source_presence_bitmap INTEGER NOT NULL,
+          source_status_json TEXT NOT NULL,
+          sanitized_hash TEXT NOT NULL,
+          encryption TEXT NOT NULL DEFAULT 'none',
+          status TEXT NOT NULL,
+          PRIMARY KEY(capture_id, revision)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_snapshots_session
+          ON context_snapshots(session_id, revision);
         "#,
     )?;
 
     // Record base migration if empty.
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))?;
     if count == 0 {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (1)", [])?;
     }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)",
+        [],
+    )?;
+    let has_encryption = {
+        let mut statement = conn.prepare("PRAGMA table_info(context_snapshots)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "encryption")
+    };
+    if !has_encryption {
+        conn.execute(
+            "ALTER TABLE context_snapshots ADD COLUMN encryption TEXT NOT NULL DEFAULT 'none'",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)",
+        [],
+    )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_two_context_table_is_upgraded_with_encryption_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE context_snapshots (
+                  capture_id TEXT NOT NULL,
+                  session_id TEXT NOT NULL,
+                  revision INTEGER NOT NULL,
+                  schema_version INTEGER NOT NULL,
+                  profile TEXT NOT NULL,
+                  target_generation INTEGER NOT NULL,
+                  started_at TEXT NOT NULL,
+                  frozen_at TEXT NOT NULL,
+                  completed_at TEXT,
+                  manifest_path TEXT NOT NULL,
+                  source_presence_bitmap INTEGER NOT NULL,
+                  source_status_json TEXT NOT NULL,
+                  sanitized_hash TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  PRIMARY KEY(capture_id, revision)
+                );
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let mut statement = connection
+            .prepare("PRAGMA table_info(context_snapshots)")
+            .unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "encryption"));
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 3);
+    }
 }

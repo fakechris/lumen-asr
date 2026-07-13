@@ -3,7 +3,7 @@
 use lumen_platform::default_config_path;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub audio: AudioConfig,
     /// Speech recognition backend (local or cloud).
     pub asr: AsrServiceConfig,
+    /// Local context capture is shadow-only in this phase.
+    pub context: ContextCaptureConfig,
 }
 
 impl Default for AppConfig {
@@ -30,7 +32,54 @@ impl Default for AppConfig {
             onboarding: OnboardingConfig::default(),
             audio: AudioConfig::default(),
             asr: AsrServiceConfig::default(),
+            context: ContextCaptureConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextCaptureConfig {
+    pub enabled: bool,
+    pub profile: String,
+    pub freeze_deadline_ms: u64,
+    pub late_deadline_ms: u64,
+    pub retention_hours: u64,
+    pub capture_all_displays: bool,
+    pub screenshot_max_edge: u32,
+    pub ocr_helper_path: String,
+    pub browser_enabled: bool,
+    pub browser_extension_origins: Vec<String>,
+    /// Optional Safari app-group container. Socket, token, and relay config stay
+    /// inside this directory when configured.
+    pub browser_bridge_dir: Option<PathBuf>,
+    pub browser_timeout_ms: u64,
+}
+
+impl Default for ContextCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            profile: "full_local".to_owned(),
+            freeze_deadline_ms: 250,
+            late_deadline_ms: 5_000,
+            retention_hours: 24 * 7,
+            capture_all_displays: true,
+            screenshot_max_edge: 2_560,
+            ocr_helper_path: String::new(),
+            browser_enabled: false,
+            browser_extension_origins: Vec::new(),
+            browser_bridge_dir: None,
+            browser_timeout_ms: 500,
+        }
+    }
+}
+
+impl ContextCaptureConfig {
+    pub fn browser_bridge_root(&self, data_dir: &Path) -> PathBuf {
+        self.browser_bridge_dir
+            .clone()
+            .unwrap_or_else(|| data_dir.join("context-browser"))
     }
 }
 
@@ -200,8 +249,7 @@ impl Default for CorrectorConfig {
             enabled: true,
             provider: "ollama".into(),
             base_url: "http://127.0.0.1:11434/v1".into(),
-            model: std::env::var("LUMEN_CORRECTOR_MODEL")
-                .unwrap_or_else(|_| "qwen3.5:9b".into()),
+            model: std::env::var("LUMEN_CORRECTOR_MODEL").unwrap_or_else(|_| "qwen3.5:9b".into()),
             api_key: std::env::var("LUMEN_CORRECTOR_API_KEY").unwrap_or_default(),
             timeout_secs: 60,
         }
@@ -285,11 +333,7 @@ impl Default for HotkeyConfig {
 
 /// Ensure a usable translate intent exists; align mode with primary hotkey.
 pub fn ensure_default_intents(cfg: &mut HotkeyConfig) {
-    let primary_mode = if cfg.is_hold_mode() {
-        "hold"
-    } else {
-        "toggle"
-    };
+    let primary_mode = if cfg.is_hold_mode() { "hold" } else { "toggle" };
     if cfg.intents.is_empty() {
         cfg.intents.push(HotkeyIntentConfig {
             mode: primary_mode.into(),
@@ -443,6 +487,7 @@ mod tests {
     fn roundtrip_toml() {
         let mut cfg = AppConfig::default();
         cfg.corrector.model = "test-model".into();
+        cfg.context.browser_bridge_dir = Some(PathBuf::from("/tmp/lumen-context-group"));
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -451,6 +496,21 @@ mod tests {
         cfg.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path);
         assert_eq!(loaded.corrector.model, "test-model");
+        assert_eq!(
+            loaded.context.browser_bridge_dir,
+            Some(PathBuf::from("/tmp/lumen-context-group"))
+        );
+        assert_eq!(
+            loaded
+                .context
+                .browser_bridge_root(Path::new("/tmp/lumen-data")),
+            PathBuf::from("/tmp/lumen-context-group")
+        );
+        let defaults = ContextCaptureConfig::default();
+        assert_eq!(
+            defaults.browser_bridge_root(Path::new("/tmp/lumen-data")),
+            PathBuf::from("/tmp/lumen-data/context-browser")
+        );
         let _ = fs::remove_file(path);
     }
 }

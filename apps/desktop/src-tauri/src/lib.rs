@@ -2,6 +2,7 @@ mod asr_models;
 mod capsule;
 mod commands;
 mod config;
+mod context_capture;
 mod corrector_cmd;
 mod corrector_probe;
 mod corrector_svc;
@@ -24,7 +25,7 @@ use lumen_asr::{
 };
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub struct AppState {
     pub store: Mutex<Option<Store>>,
@@ -33,6 +34,7 @@ pub struct AppState {
     pub sensevoice: Mutex<SenseVoiceSherpaAsr>,
     pub whisper: Mutex<WhisperAsr>,
     pub config: Mutex<AppConfig>,
+    pub context: context_capture::ContextCaptureState,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -62,9 +64,7 @@ pub fn run() {
             tracing::info!(path = %log_path.display(), "file logging enabled");
         }
         Err(e) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
             tracing::warn!(error = %e, "file logging unavailable");
         }
     }
@@ -79,6 +79,44 @@ pub fn run() {
     );
 
     let audio = AudioCapture::new();
+    let browser_provider: Option<Arc<dyn lumen_context::BrowserSnapshotProvider>> = if app_config
+        .context
+        .browser_enabled
+        && !app_config.context.browser_extension_origins.is_empty()
+    {
+        let bridge_root = app_config.context.browser_bridge_root(&data_dir);
+        let bridge = lumen_context::NativeBrowserBridgeConfig::new(
+            "lumen-asr",
+            bridge_root.join("bridge.sock"),
+            bridge_root.join("bridge.token"),
+            app_config.context.browser_extension_origins.clone(),
+        );
+        let host_config = data_dir.join("context-browser/host.json");
+        let safari_host_config = bridge_root.join("browser-host.json");
+        let provider = bridge
+            .write_host_config(&host_config)
+            .and_then(|_| bridge.write_host_config(&safari_host_config))
+            .and_then(|_| {
+                tauri::async_runtime::block_on(lumen_context::NativeBrowserProvider::bind(bridge))
+            });
+        match provider {
+            Ok(provider) => Some(Arc::new(provider)),
+            Err(error) => {
+                tracing::warn!(error = %error, "browser context bridge initialization failed");
+                None
+            }
+        }
+    } else {
+        if app_config.context.browser_enabled {
+            tracing::warn!("browser context enabled without an extension origin allowlist");
+        }
+        None
+    };
+    let context = context_capture::ContextCaptureState::new_with_browser(
+        &app_config.context,
+        &data_dir,
+        browser_provider,
+    );
     if let Some(ref name) = app_config.audio.device_name {
         if !name.is_empty() {
             audio.set_device(Some(name.clone()));
@@ -95,6 +133,10 @@ pub fn run() {
             None
         }
     };
+    let store = Mutex::new(store);
+    if let Err(error) = context.enforce_retention(&store) {
+        tracing::warn!(error = %error, "context retention enforcement failed");
+    }
 
     let sv_dir = default_sensevoice_dir();
     let wh_dir = default_whisper_dir();
@@ -105,12 +147,13 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(AppState {
-            store: Mutex::new(store),
+            store,
             audio,
             engine: Mutex::new(EngineKind::SenseVoice),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sv_dir)),
             whisper: Mutex::new(WhisperAsr::new(wh_dir)),
             config: Mutex::new(app_config),
+            context,
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_health,
@@ -179,6 +222,7 @@ pub fn run() {
             corrector_probe::cancel_ollama_pull,
             corrector_probe::apply_corrector_suggestion,
             hotkey_validate::validate_hotkey,
+            context_capture::clear_context_data,
         ])
         .setup(|app| {
             // Keep Regular activation policy. Focus preservation: non-focusable
