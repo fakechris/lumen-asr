@@ -3,6 +3,7 @@ mod capsule;
 mod commands;
 mod config;
 mod context_capture;
+mod context_inference;
 mod corrector_cmd;
 mod corrector_probe;
 mod corrector_svc;

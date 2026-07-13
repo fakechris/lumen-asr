@@ -1,4 +1,4 @@
-//! Shadow-only context capture lifecycle and local persistence.
+//! Context capture lifecycle and local persistence.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use lumen_context::{
     ArtifactPayload, BrowserSnapshotProvider, CaptureId, CaptureProfile, CaptureRequest,
-    CaptureSession, CaptureTrigger, ContextCollector, ContextConfig, ContextSealer,
-    ContextSnapshot, PrivacyPolicy, SourceKind, SourceSelection, SourceState, TargetHint,
-    TriggerKind,
+    CaptureSession, CaptureTrigger, ContextCollector, ContextConfig, ContextManifest,
+    ContextSealer, ContextSnapshot, PrivacyPolicy, SourceKind, SourceSelection, SourceState,
+    TargetHint, TriggerKind,
 };
 use lumen_store::{ContextSnapshotRecord, Store};
 use uuid::Uuid;
@@ -236,6 +236,13 @@ fn resolve_ocr_helper_path(configured: &str) -> Option<PathBuf> {
 }
 
 impl ActiveContextCapture {
+    /// Freeze the latest in-memory revision without waiting for unfinished
+    /// sources. Callers use the manifest only; binary artifacts stay local.
+    pub async fn latest_manifest(&self) -> Option<ContextManifest> {
+        let session = self.session.as_ref()?;
+        Some(session.snapshot(Instant::now()).await.manifest)
+    }
+
     pub async fn persist_partial(&self, store: &Mutex<Option<Store>>) -> Result<bool, String> {
         self.persist(store, self.freeze_deadline).await
     }
@@ -548,7 +555,11 @@ mod tests {
     #[tokio::test]
     async fn disabled_capture_still_allocates_session_without_writing_context() {
         let directory = tempfile::tempdir().unwrap();
-        let state = ContextCaptureState::new(&ContextCaptureConfig::default(), directory.path());
+        let config = ContextCaptureConfig {
+            enabled: false,
+            ..ContextCaptureConfig::default()
+        };
+        let state = ContextCaptureState::new(&config, directory.path());
         let session_id = state.begin(None);
         let active = state.take_active().unwrap();
         assert_eq!(active.session_id, session_id);
@@ -564,6 +575,28 @@ mod tests {
             .list_context_snapshots(session_id)
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_capture_exposes_latest_manifest_for_downstream_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = ContextCaptureConfig {
+            enabled: true,
+            profile: "metadata".to_owned(),
+            ..ContextCaptureConfig::default()
+        };
+        let state = ContextCaptureState::new_with_components(
+            &config,
+            directory.path(),
+            None,
+            Some(Arc::new(ContextSealer::from_key([21_u8; 32]))),
+        );
+        let session_id = state.begin(None);
+        let active = state.take_active().unwrap();
+
+        let manifest = active.latest_manifest().await.unwrap();
+        assert_eq!(manifest.consumer_session_id, session_id);
+        assert_eq!(manifest.capture_id, active.capture_id);
     }
 
     #[tokio::test]
@@ -602,6 +635,7 @@ mod tests {
     fn retention_removes_expired_rows_and_capture_directories() {
         let directory = tempfile::tempdir().unwrap();
         let config = ContextCaptureConfig {
+            enabled: false,
             retention_hours: 1,
             ..ContextCaptureConfig::default()
         };

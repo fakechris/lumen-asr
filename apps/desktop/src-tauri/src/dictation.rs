@@ -1,7 +1,9 @@
 //! Recording + local ASR + model corrector IPC (M2–M5).
 
 use crate::config::AsrServiceConfig;
-use crate::corrector_svc::{engine_label, run_correct_with_intent};
+use crate::corrector_svc::{
+    engine_label, run_correct_with_intent, run_correct_with_intent_and_context,
+};
 use crate::session_debug::{self, SessionDebugMeta};
 use crate::AppState;
 use lumen_asr::{
@@ -445,8 +447,39 @@ pub async fn stop_and_transcribe_inner(
         .clone();
 
     let intent = take_session_intent();
-    tracing::info!(?intent, "running corrector with session intent");
-    let corr = run_correct_with_intent(&cfg, &asr_text, &entries, intent.clone()).await;
+    let window_context = if cfg.context.send_to_corrector {
+        match active_context.as_ref() {
+            Some(active) => active
+                .latest_manifest()
+                .await
+                .and_then(|manifest| {
+                    crate::context_inference::flatten_for_corrector(
+                        &manifest,
+                        crate::context_inference::CORRECTOR_CONTEXT_MAX_CHARS,
+                    )
+                }),
+            None => None,
+        }
+    } else {
+        None
+    };
+    tracing::info!(
+        ?intent,
+        context_enabled = cfg.context.send_to_corrector,
+        context_chars = window_context
+            .as_ref()
+            .map(|value| value.chars().count())
+            .unwrap_or(0),
+        "running corrector with session intent"
+    );
+    let corr = run_correct_with_intent_and_context(
+        &cfg,
+        &asr_text,
+        &entries,
+        intent.clone(),
+        window_context,
+    )
+    .await;
     let corrected_text = corr.text.trim().to_string();
     let corrector_engine = if corr.model_applied {
         engine_label(&cfg)

@@ -103,6 +103,7 @@ export const api = {
   getCorrectorConfig: () => invoke<CorrectorStatus>("get_corrector_config"),
   saveCorrectorConfig: (input: {
     enabled?: boolean;
+    sendContext?: boolean;
     provider?: string;
     baseUrl?: string;
     model?: string;

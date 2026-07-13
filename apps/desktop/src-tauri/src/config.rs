@@ -17,7 +17,7 @@ pub struct AppConfig {
     pub audio: AudioConfig,
     /// Speech recognition backend (local or cloud).
     pub asr: AsrServiceConfig,
-    /// Local context capture is shadow-only in this phase.
+    /// Local context capture plus an independently gated corrector projection.
     pub context: ContextCaptureConfig,
 }
 
@@ -41,6 +41,9 @@ impl Default for AppConfig {
 #[serde(default)]
 pub struct ContextCaptureConfig {
     pub enabled: bool,
+    /// Send a bounded, text-only projection of the latest capture to the LLM corrector.
+    /// Capture and local persistence remain independent of this opt-in switch.
+    pub send_to_corrector: bool,
     pub profile: String,
     pub freeze_deadline_ms: u64,
     pub late_deadline_ms: u64,
@@ -59,7 +62,8 @@ pub struct ContextCaptureConfig {
 impl Default for ContextCaptureConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
+            send_to_corrector: false,
             profile: "full_local".to_owned(),
             freeze_deadline_ms: 250,
             late_deadline_ms: 5_000,
@@ -507,6 +511,8 @@ mod tests {
             PathBuf::from("/tmp/lumen-context-group")
         );
         let defaults = ContextCaptureConfig::default();
+        assert!(defaults.enabled);
+        assert!(!defaults.send_to_corrector);
         assert_eq!(
             defaults.browser_bridge_root(Path::new("/tmp/lumen-data")),
             PathBuf::from("/tmp/lumen-data/context-browser")

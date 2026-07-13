@@ -1038,6 +1038,7 @@ function SettingsPanel({
 }) {
   const [cfg, setCfg] = useState<CorrectorStatus | null>(null);
   const [enabled, setEnabled] = useState(true);
+  const [sendContext, setSendContext] = useState(false);
   const [provider, setProvider] = useState("ollama");
   const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:11434/v1");
   const [model, setModel] = useState("qwen3.5:9b");
@@ -1116,6 +1117,7 @@ function SettingsPanel({
         setAsrLanguage(asrC.language || "");
         setAsrHasKey(asrC.hasApiKey);
         setEnabled(c.enabled);
+        setSendContext(!!c.sendContext);
         setProvider(c.provider);
         setBaseUrl(c.baseUrl);
         setModel(c.model);
@@ -1158,6 +1160,7 @@ function SettingsPanel({
     try {
       const input: Parameters<typeof api.saveCorrectorConfig>[0] = {
         enabled,
+        sendContext,
         provider,
         baseUrl,
         model,
@@ -1175,6 +1178,7 @@ function SettingsPanel({
       }
       const c = await api.saveCorrectorConfig(input);
       setCfg(c);
+      setSendContext(!!c.sendContext);
       setCleanup(c.cleanup || cleanup);
       setStyle(c.style || style);
       setCasing(c.casing || casing);
@@ -1824,6 +1828,21 @@ function SettingsPanel({
             启用模型修正
           </label>
         </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={sendContext}
+              disabled={busy}
+              onChange={(e) => setSendContext(e.target.checked)}
+            />{" "}
+            使用当前窗口上下文辅助修正（实验性）
+          </label>
+        </div>
+        <p className="muted-text" style={{ marginTop: -4, fontSize: "0.82rem" }}>
+          默认关闭。打开后只发送最多约 2,000 字符的精简文本；不会发送截图、AX/DOM tree、坐标、OCR box
+          或来源信息。关闭此项不会停止本地上下文采集。
+        </p>
         <div className="cleanup-level-block">
           <div className="field-label">自动整理强度</div>
           <div className="cleanup-seg" role="group" aria-label="整理强度">

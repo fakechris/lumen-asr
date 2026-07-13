@@ -92,6 +92,21 @@ Publish shared changes in Navi before testing the ASR integration, then update A
 commit and regenerate `Cargo.lock`. This keeps normal ASR builds reproducible and avoids a local
 path override silently rewriting the lockfile. Never pin ASR to a movable branch.
 
+### Optional context-assisted correction
+
+Local context capture and model forwarding are separate controls. Encrypted local capture is on by
+default and continues whether or not context is sent to the corrector. The forwarding switch is
+**off by default** and can be changed under **Settings → AI Corrector → Use current-window
+context** (`[context].send_to_corrector` in `config.toml`). Existing installations that previously
+saved `[context].enabled = false` keep that explicit setting until it is changed.
+
+When enabled, the corrector receives a text-only projection capped at 2,000 Unicode characters:
+selection, cursor prefix/suffix, nearby field text, app/window/page labels, domain, and deduplicated
+visible text. Full URLs, query strings, screenshots, accessibility/DOM trees, coordinates, OCR
+boxes, hashes, diagnostics, and source provenance stay local. Secure editor fields and captures
+whose privacy policy disallows raw text are never projected. If context is empty or unavailable,
+dictation falls back to the existing ASR + dictionary correction request.
+
 ### Install & run (from source)
 
 ```bash
@@ -288,6 +303,19 @@ cargo test --manifest-path ../lumen-navi/Cargo.toml -p lumen-context --locked
 
 共享库修改必须先在 Navi 发布，再由 ASR 更新到新的完整 commit 并重新生成 `Cargo.lock`。
 这样可以避免本地 path override 悄悄改写 lockfile；不要让 ASR 依赖可移动分支。
+
+### 可选的上下文辅助修正
+
+本地上下文采集与“发送给模型”是两个独立开关。本地加密采集默认开启，无论是否发送给
+corrector 都会继续进行；发送开关**默认关闭**，可在 **设置 → AI 修正 → 使用当前窗口
+上下文辅助修正**中手工打开，对应 `config.toml` 的 `[context].send_to_corrector`。旧安装
+若已经保存了 `[context].enabled = false`，会继续尊重该显式设置，直到手工修改。
+
+打开后，corrector 只会收到最多 2,000 个 Unicode 字符的纯文本投影：选区、光标前后文、
+输入框附近文字、应用/窗口/页面名称、域名及去重后的可见文字。完整 URL 与 query、截图、
+AX/DOM tree、坐标、OCR box、hash、诊断信息和来源 provenance 都保留在本地，不进入模型。
+secure 输入框或隐私策略禁止原文的 capture 不会生成投影；上下文为空或不可用时，听写会
+自动退回原有的“ASR 文本 + 用户词典”修正请求。
 
 ### 安装与启动（源码）
 
