@@ -55,6 +55,43 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 - **Accessibility** — to paste into other apps (without it, Lumen copies to the clipboard)  
 - Optional: [Ollama](https://ollama.com) or any OpenAI-compatible API key for AI cleanup  
 
+### Shared context build dependency
+
+Lumen ASR uses the shared `lumen-context` crate maintained in the
+[Lumen Navi repository](https://github.com/fakechris/lumen-navi). This is a source/build dependency,
+not an application runtime dependency:
+
+- `Cargo.toml` and `Cargo.lock` pin one exact Navi Git commit.
+- A normal ASR build does not require a Navi checkout, process, daemon, database, or installation.
+- The first build needs network access to fetch the pinned Git commit; later builds can use Cargo's
+  local cache.
+- ASR owns its own context configuration, encrypted storage, browser bridge credentials, and
+  Safari App Group.
+
+Fetch and verify all pinned Rust dependencies before building:
+
+```bash
+cargo fetch --locked
+cargo build -p lumen-asr-desktop --locked
+```
+
+For an offline build, populate the cache once with `cargo fetch --locked`, then run:
+
+```bash
+CARGO_NET_OFFLINE=true cargo build -p lumen-asr-desktop --locked --release
+./dev-install.sh --skip-build --open
+```
+
+Develop and test unpublished shared-library changes inside the Navi workspace:
+
+```bash
+cargo test --manifest-path ../lumen-navi/Cargo.toml -p lumen-context --locked
+```
+
+Publish shared changes in Navi before testing the ASR integration, then update ASR to the new full
+commit and regenerate `Cargo.lock`. This keeps normal ASR builds reproducible and avoids a local
+path override silently rewriting the lockfile. Never pin ASR to a movable branch.
+
 ### Install & run (from source)
 
 ```bash
@@ -218,6 +255,39 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 - **麦克风**：录音  
 - **辅助功能**：向其他 App 粘贴（未授权时仅复制到剪贴板）  
 - 可选：Ollama 或任意 OpenAI 兼容 API，用于 AI 整理  
+
+### 共享上下文库与构建依赖
+
+Lumen ASR 使用由 [Lumen Navi 仓库](https://github.com/fakechris/lumen-navi)维护的共享
+`lumen-context` crate。这只是源码/编译期依赖，不是两个应用之间的运行时依赖：
+
+- `Cargo.toml` 与 `Cargo.lock` 固定到 Navi 的一个完整 Git commit；
+- 正常构建 ASR 不需要本机存在 Navi checkout，也不需要运行 Navi app、daemon 或数据库；
+- 第一次构建需要联网获取固定的 Git commit，之后可以使用 Cargo 本地缓存离线构建；
+- ASR 使用独立的上下文配置、加密存储、浏览器凭据和 Safari App Group。
+
+首次构建前建议先获取并校验锁定依赖：
+
+```bash
+cargo fetch --locked
+cargo build -p lumen-asr-desktop --locked
+```
+
+依赖已进入缓存后，可以离线构建并安装：
+
+```bash
+CARGO_NET_OFFLINE=true cargo build -p lumen-asr-desktop --locked --release
+./dev-install.sh --skip-build --open
+```
+
+尚未发布的共享库修改应直接在 Navi workspace 内开发和测试：
+
+```bash
+cargo test --manifest-path ../lumen-navi/Cargo.toml -p lumen-context --locked
+```
+
+共享库修改必须先在 Navi 发布，再由 ASR 更新到新的完整 commit 并重新生成 `Cargo.lock`。
+这样可以避免本地 path override 悄悄改写 lockfile；不要让 ASR 依赖可移动分支。
 
 ### 安装与启动（源码）
 
