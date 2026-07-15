@@ -36,10 +36,6 @@ pub struct DictionaryContext {
 pub struct CorrectRequest {
     pub text: String,
     pub dictionary: DictionaryContext,
-    /// Bounded, text-only current-window context. Capture internals never cross
-    /// this provider-facing seam.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window_context: Option<String>,
     /// Full system prompt (empty → backend default light-ish base).
     #[serde(default)]
     pub system_prompt: String,
@@ -103,26 +99,6 @@ pub async fn correct_or_fallback_with(
     system_prompt: String,
     temperature: f32,
 ) -> CorrectResult {
-    correct_or_fallback_with_context(
-        corrector,
-        text,
-        dictionary,
-        system_prompt,
-        temperature,
-        None,
-    )
-    .await
-}
-
-/// Preprocess then invoke the model with optional current-window context.
-pub async fn correct_or_fallback_with_context(
-    corrector: &dyn Corrector,
-    text: &str,
-    dictionary: DictionaryContext,
-    system_prompt: String,
-    temperature: f32,
-    window_context: Option<String>,
-) -> CorrectResult {
     let pre = preprocess(text);
     let pre = apply_replacements(&pre, &dictionary.replacements);
 
@@ -136,7 +112,6 @@ pub async fn correct_or_fallback_with_context(
         .correct(CorrectRequest {
             text: pre.clone(),
             dictionary,
-            window_context,
             system_prompt,
             temperature,
         })
@@ -199,27 +174,6 @@ impl Corrector for NullCorrector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-
-    struct CapturingCorrector {
-        request: Arc<Mutex<Option<CorrectRequest>>>,
-    }
-
-    #[async_trait]
-    impl Corrector for CapturingCorrector {
-        fn id(&self) -> CorrectorEngineId {
-            CorrectorEngineId::OpenAiCompatible
-        }
-
-        async fn correct(&self, req: CorrectRequest) -> Result<CorrectResult, CorrectorError> {
-            *self.request.lock().unwrap() = Some(req.clone());
-            Ok(CorrectResult {
-                text: req.text,
-                engine: self.id(),
-                model_applied: true,
-            })
-        }
-    }
 
     #[tokio::test]
     async fn fallback_on_null_is_preprocessed() {
@@ -237,54 +191,5 @@ mod tests {
     fn replacements_apply() {
         let s = apply_replacements("用脱肯鉴权", &[("脱肯".into(), "Token".into())]);
         assert_eq!(s, "用Token鉴权");
-    }
-
-    #[tokio::test]
-    async fn optional_window_context_crosses_the_corrector_request_seam() {
-        let captured = Arc::new(Mutex::new(None));
-        let corrector = CapturingCorrector {
-            request: Arc::clone(&captured),
-        };
-
-        correct_or_fallback_with_context(
-            &corrector,
-            "麦克 vision OCR",
-            DictionaryContext::default(),
-            "system".into(),
-            0.3,
-            Some("窗口：Docs\n可见文字：macOS Vision".into()),
-        )
-        .await;
-
-        let request = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(
-            request.window_context.as_deref(),
-            Some("窗口：Docs\n可见文字：macOS Vision")
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_corrector_call_keeps_window_context_absent() {
-        let captured = Arc::new(Mutex::new(None));
-        let corrector = CapturingCorrector {
-            request: Arc::clone(&captured),
-        };
-
-        correct_or_fallback_with(
-            &corrector,
-            "原始文本",
-            DictionaryContext::default(),
-            "system".into(),
-            0.3,
-        )
-        .await;
-
-        assert!(captured
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .window_context
-            .is_none());
     }
 }
