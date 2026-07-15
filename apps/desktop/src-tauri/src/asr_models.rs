@@ -5,7 +5,6 @@ use lumen_asr::{
     default_sensevoice_dir, default_whisper_dir, sensevoice_ready, whisper_ready, EngineKind,
     SenseVoiceSherpaAsr, WhisperAsr,
 };
-use lumen_platform::default_data_dir;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -95,12 +94,25 @@ fn scan_candidates() -> Vec<AsrModelCandidate> {
         });
     };
 
-    let app_sv = default_data_dir().join("models/sensevoice");
-    push("sensevoice", app_sv, "app");
+    // Shared Lumen cluster (download target for all Lumen apps)
+    use lumen_asr::app_models_dir;
+    let shared_sv = app_models_dir().join("sensevoice");
+    push("sensevoice", shared_sv, "lumen-shared");
     if let Ok(p) = std::env::var("LUMEN_SENSEVOICE_DIR") {
         push("sensevoice", PathBuf::from(p), "env");
     }
     let h = home();
+    // Legacy per-app + coli (selectable; no re-download required)
+    push(
+        "sensevoice",
+        h.join("Library/Application Support/LumenAsr/models/sensevoice"),
+        "legacy-lumen-asr",
+    );
+    push(
+        "sensevoice",
+        h.join("Library/Application Support/LumenNavi/models/sensevoice"),
+        "legacy-lumen-navi",
+    );
     for name in [
         "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
         "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
@@ -112,11 +124,21 @@ fn scan_candidates() -> Vec<AsrModelCandidate> {
         );
     }
 
-    let app_wh = default_data_dir().join("models/whisper");
-    push("whisper", app_wh, "app");
+    let shared_wh = app_models_dir().join("whisper");
+    push("whisper", shared_wh, "lumen-shared");
     if let Ok(p) = std::env::var("LUMEN_WHISPER_DIR") {
         push("whisper", PathBuf::from(p), "env");
     }
+    push(
+        "whisper",
+        h.join("Library/Application Support/LumenAsr/models/whisper"),
+        "legacy-lumen-asr",
+    );
+    push(
+        "whisper",
+        h.join("Library/Application Support/LumenNavi/models/whisper"),
+        "legacy-lumen-navi",
+    );
     for name in [
         "sherpa-onnx-whisper-tiny.en",
         "sherpa-onnx-whisper-base.en",
@@ -296,7 +318,8 @@ fn emit_progress(app: &AppHandle, phase: &str, message: &str, bytes: u64, total:
 }
 
 fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
-    let dest_root = default_data_dir().join("models");
+    // Shared cluster root — same path navi uses so apps do not re-download.
+    let dest_root = lumen_asr::app_models_dir();
     std::fs::create_dir_all(&dest_root).map_err(|e| e.to_string())?;
     let archive_path = dest_root.join(SENSEVOICE_ARCHIVE_NAME);
     let extract_tmp = dest_root.join("sensevoice-extract-tmp");

@@ -2,18 +2,23 @@
 
 use std::path::{Path, PathBuf};
 
-/// Prefer product data dir, then env, then common local caches (dev machines).
+/// Prefer env → shared cluster → ready legacy → shared install target.
 pub fn default_sensevoice_dir() -> PathBuf {
     if let Ok(p) = std::env::var("LUMEN_SENSEVOICE_DIR") {
-        return PathBuf::from(p);
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
     }
-    let app = crate::app_models_dir().join("sensevoice");
-    if sensevoice_ready(&app) {
-        return app;
+    let shared = crate::app_models_dir().join("sensevoice");
+    if sensevoice_ready(&shared) {
+        return shared;
     }
-    // Known sherpa-layout caches
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let candidates = [
+        // Legacy per-app installs (still usable without re-download)
+        format!("{home}/Library/Application Support/LumenAsr/models/sensevoice"),
+        format!("{home}/Library/Application Support/LumenNavi/models/sensevoice"),
         format!("{home}/.coli/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"),
         format!("{home}/.coli/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"),
     ];
@@ -23,19 +28,24 @@ pub fn default_sensevoice_dir() -> PathBuf {
             return p;
         }
     }
-    app
+    shared
 }
 
 pub fn default_whisper_dir() -> PathBuf {
     if let Ok(p) = std::env::var("LUMEN_WHISPER_DIR") {
-        return PathBuf::from(p);
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
     }
-    let app = crate::app_models_dir().join("whisper");
-    if whisper_ready(&app) {
-        return app;
+    let shared = crate::app_models_dir().join("whisper");
+    if whisper_ready(&shared) {
+        return shared;
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let candidates = [
+        format!("{home}/Library/Application Support/LumenAsr/models/whisper"),
+        format!("{home}/Library/Application Support/LumenNavi/models/whisper"),
         format!("{home}/.coli/models/sherpa-onnx-whisper-tiny.en"),
         format!("{home}/.coli/models/sherpa-onnx-whisper-base.en"),
     ];
@@ -45,7 +55,7 @@ pub fn default_whisper_dir() -> PathBuf {
             return p;
         }
     }
-    app
+    shared
 }
 
 pub fn sensevoice_ready(dir: &Path) -> bool {

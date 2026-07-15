@@ -87,16 +87,28 @@ impl AsrEngine for StubAsr {
     }
 }
 
-/// Product Application Support models root.
+/// Shared Lumen cluster models root (navi / asr / future apps).
+///
+/// Override with `LUMEN_MODELS_DIR`. Default macOS:
+/// `~/Library/Application Support/Lumen/models`.
+///
+/// Legacy per-app dirs (`LumenAsr/models`, …) are still discovered when ready;
+/// **new downloads** land here so products do not re-fetch the same package.
 pub fn app_models_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("LUMEN_MODELS_DIR") {
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     #[cfg(target_os = "macos")]
     {
-        PathBuf::from(home).join("Library/Application Support/LumenAsr/models")
+        PathBuf::from(home).join("Library/Application Support/Lumen/models")
     }
     #[cfg(not(target_os = "macos"))]
     {
-        PathBuf::from(home).join(".lumen-asr/models")
+        PathBuf::from(home).join(".lumen/models")
     }
 }
 
