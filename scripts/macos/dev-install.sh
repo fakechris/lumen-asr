@@ -7,7 +7,7 @@
 #   ./scripts/macos/dev-install.sh           # build + install + sign
 #   ./scripts/macos/dev-install.sh --open    # also launch
 #   ./scripts/macos/dev-install.sh --skip-build  # only reinstall/sign current binary
-#   LUMEN_CODESIGN_IDENTITY="Apple Development: you@x.com (…)" ./scripts/macos/dev-install.sh
+#   LUMEN_CODESIGN_IDENTITY="Apple Development: <Apple-ID> (<certificate-id>)" ./scripts/macos/dev-install.sh
 #
 # After first install, grant Accessibility / Microphone once for this app.
 # Re-running this script keeps the same signing identity → TCC usually sticks.

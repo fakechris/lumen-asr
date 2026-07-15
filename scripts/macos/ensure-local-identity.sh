@@ -161,9 +161,9 @@ Finish once in Keychain Access:
 Then:
   ./scripts/macos/dev-install.sh --open
 
-Alternative (free Apple ID, Personal Team ${PERSONAL_TEAM:-69P8KHFNAT}):
+Alternative (free Apple ID; select your own Personal Team in Xcode):
   Xcode → Settings → Accounts → Manage Certificates → + → Apple Development
-  export LUMEN_CODESIGN_IDENTITY="Apple Development: you@example.com (XXXXXXXX)"
+  export LUMEN_CODESIGN_IDENTITY="Apple Development: <Apple-ID> (<certificate-id>)"
   ./scripts/macos/dev-install.sh --open
 EOF
 exit 2

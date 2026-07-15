@@ -3,8 +3,6 @@ name: Public repository boundary
 on:
   pull_request:
   push:
-    branches:
-      - main
 
 permissions:
   contents: read
@@ -12,12 +10,16 @@ permissions:
 jobs:
   boundary:
     name: Reject internal or generated artifacts
+    if: ${{ github.event_name != 'push' || github.event.deleted == false }}
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+
+      - name: Test public repository boundary rules
+        run: scripts/ci/test-public-repo-boundary.sh
 
       - name: Check public repository boundary
         run: scripts/ci/check-public-repo-boundary.sh
@@ -28,3 +30,18 @@ jobs:
           scripts/ci/check-pr-scope.sh
           "${{ github.event.pull_request.base.sha }}"
           "${{ github.event.pull_request.head.sha }}"
+
+      - name: Check every commit pushed
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.before }}"
+          if [[ "$base" =~ ^0+$ ]]; then
+            git fetch origin "${{ github.event.repository.default_branch }}"
+            base="$(git merge-base FETCH_HEAD "${{ github.sha }}")"
+          fi
+          scripts/ci/check-pr-scope.sh \
+            "$base" \
+            "${{ github.sha }}" \
+            --history-only

@@ -60,7 +60,7 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 Prebuilt ad-hoc signed DMGs for Apple Silicon and Intel are published on
 [GitHub Releases](https://github.com/fakechris/lumen-asr/releases). macOS requires a one-time manual
 approval under **System Settings → Privacy & Security**. See
-[docs/MACOS_GITHUB_RELEASE.md](./docs/MACOS_GITHUB_RELEASE.md) for verification and installation.
+[docs/release/macos/GITHUB_RELEASE.md](./docs/release/macos/GITHUB_RELEASE.md) for verification and installation.
 
 To build locally instead:
 
@@ -80,7 +80,7 @@ npm install
 npm run tauri dev
 ```
 
-> **Signing tip:** after every release build, reinstall with `./dev-install.sh` so the `.app` signature stays valid. Prefer a trusted local Code Signing certificate or free Apple Development identity so Mic / Accessibility grants survive rebuilds. Details: [docs/MACOS_LOCAL_SIGNING.md](./docs/MACOS_LOCAL_SIGNING.md).
+> **Signing tip:** after every release build, reinstall with `./dev-install.sh` so the `.app` signature stays valid. Prefer a trusted local Code Signing certificate or free Apple Development identity so Mic / Accessibility grants survive rebuilds. Details: [docs/release/macos/LOCAL_SIGNING.md](./docs/release/macos/LOCAL_SIGNING.md).
 
 ### First-time setup (step by step)
 
@@ -231,7 +231,7 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 Apple Silicon 和 Intel 的 ad-hoc 签名 DMG 会发布在
 [GitHub Releases](https://github.com/fakechris/lumen-asr/releases)。首次启动需要前往
 **系统设置 → 隐私与安全性**手工放行。校验与安装方法见
-[docs/MACOS_GITHUB_RELEASE.md](./docs/MACOS_GITHUB_RELEASE.md)。
+[docs/release/macos/GITHUB_RELEASE.md](./docs/release/macos/GITHUB_RELEASE.md)。
 
 如需从源码构建：
 
@@ -251,7 +251,7 @@ npm install
 npm run tauri dev
 ```
 
-> **签名提示：** 每次 release 编译后请用 `./dev-install.sh` 重新安装，否则 `.app` 签名会失效。建议使用受信任的本地代码签名证书或免费 Apple Development 证书，以便麦克风/辅助功能授权在重装后尽量保留。详见 [docs/MACOS_LOCAL_SIGNING.md](./docs/MACOS_LOCAL_SIGNING.md)。
+> **签名提示：** 每次 release 编译后请用 `./dev-install.sh` 重新安装，否则 `.app` 签名会失效。建议使用受信任的本地代码签名证书或免费 Apple Development 证书，以便麦克风/辅助功能授权在重装后尽量保留。详见 [docs/release/macos/LOCAL_SIGNING.md](./docs/release/macos/LOCAL_SIGNING.md)。
 
 ### 第一次使用（分步）
 

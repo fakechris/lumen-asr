@@ -7,7 +7,6 @@
 node_modules/
 /apps/desktop/dist/
 *.tsbuildinfo
-.DS_Store
 *.local
 .env
 .env.*
@@ -16,52 +15,83 @@ node_modules/
 apps/desktop/src-tauri/target
 apps/desktop/src-tauri/gen/schemas
 
-# IDE
+# IDE and OS
 .idea/
 .vscode/
 *.swp
+.DS_Store
+Thumbs.db
 
-# Local visual brainstorming sessions
-.superpowers/
-
-# Local agent and browser state (never publish)
+# Local agent, browser, and visual brainstorming state (never publish)
 /.codex/
 /.mcp.json
 /.playwright-mcp/
+/.superpowers/
 /blind-review-*
 
-# Internal research, competitive analysis, and evolution plans (never publish)
+# Local research workspace (never publish)
+# Canonical location: .research/docs/<topic>/
 /.research/
+# Also reserve the visible spelling so research/docs cannot be tracked by mistake.
+/research/
+# Working notes are not a second public-documentation tree.
+/notes/
+
+# Research does not belong in the public documentation tree.
 /docs/research/
-/docs/superpowers/
+/docs/**/research/
 /docs/internal/
 /docs/private/
 /docs/**/internal/
 /docs/**/private/
-/docs/evolution/
-/docs/competitive/
-/docs/competitor/
-/docs/design/
-/docs/plans/
-/docs/planning/
-/docs/strategy/
-/docs/vendor/
-/docs/market/
-/docs/**/*[Rr][Ee][Ss][Ee][Aa][Rr][Cc][Hh]*
-/docs/**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Ii][Vv][Ee]*
-/docs/**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Oo][Rr]*
-/docs/**/*[Ee][Vv][Oo][Ll][Uu][Tt][Ii][Oo][Nn]*
-/docs/**/*[Dd][Ee][Ss][Ii][Gg][Nn]*
-/docs/**/*[Pp][Ll][Aa][Nn]*
-/docs/**/*[Mm][Ii][Ll][Ee][Ss][Tt][Oo][Nn][Ee]*
+
+# High-confidence private research names are ignored in every directory.
+/**/*[Rr][Ee][Ss][Ee][Aa][Rr][Cc][Hh]*
+/**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Ii][Vv][Ee]*
+/**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Oo][Rr]*
+/**/*[Vv][Ee][Nn][Dd][Oo][Rr]*[Ee][Vv][Aa][Ll][Uu][Aa][Tt][Ii][Oo][Nn]*
+/**/*[Cc][Aa][Pp][Aa][Bb][Ii][Ll][Ii][Tt][Yy]*[Ss][Ee][Ll][Ee][Cc][Tt][Ii][Oo][Nn]*
+/**/*[Pp][Rr][Oo][Vv][Ii][Dd][Ee][Rr]*[Cc][Oo][Mm][Pp][Aa][Rr][Ii][Ss][Oo][Nn]*
+/**/*[Pp][Rr][Oo][Vv][Ii][Dd][Ee][Rr]*[Ee][Vv][Aa][Ll][Uu][Aa][Tt][Ii][Oo][Nn]*
+/**/*[Cc][Oo][Nn][Tt][Ee][Xx][Tt]*[Pp][Ii][Pp][Ee][Ll][Ii][Nn][Ee]*
+/**/*[Bb][Ee][Nn][Cc][Hh][Mm][Aa][Rr][Kk]*
+/**/*竞品*
+/**/*调研*
+/**/*研究*
+/**/*评测*
+
+# Internal planning/evolution documents. Keep source modules such as
+# retry_strategy.rs trackable; the checker applies document-aware rules.
+/docs/**/*[Ii][Mm][Pp][Ll][Ee][Mm][Ee][Nn][Tt][Aa][Tt][Ii][Oo][Nn]*[Pp][Ll][Aa][Nn]*
 /docs/**/*[Rr][Oo][Aa][Dd][Mm][Aa][Pp]*
+/docs/**/*[Mm][Ii][Ll][Ee][Ss][Tt][Oo][Nn][Ee]*
+/docs/**/*[Ee][Vv][Oo][Ll][Uu][Tt][Ii][Oo][Nn]*
 /docs/**/*[Ss][Tt][Rr][Aa][Tt][Ee][Gg][Yy]*
-/docs/**/*[Vv][Ee][Nn][Dd][Oo][Rr]*
-/docs/**/*[Mm][Aa][Rr][Kk][Ee][Tt]*
-/docs/**/*竞品*
-/docs/**/*调研*
-/docs/**/*研究*
-/docs/**/*进化*
+/docs/**/[Pp][Ll][Aa][Nn][Nn][Ii][Nn][Gg]/
+/docs/**/[Pp][Ll][Aa][Nn][Ss]/
+/notes/**/*[Ii][Mm][Pp][Ll][Ee][Mm][Ee][Nn][Tt][Aa][Tt][Ii][Oo][Nn]*[Pp][Ll][Aa][Nn]*
+/notes/**/*[Rr][Oo][Aa][Dd][Mm][Aa][Pp]*
+/notes/**/*[Mm][Ii][Ll][Ee][Ss][Tt][Oo][Nn][Ee]*
+/notes/**/*[Ee][Vv][Oo][Ll][Uu][Tt][Ii][Oo][Nn]*
+/notes/**/*[Ss][Tt][Rr][Aa][Tt][Ee][Gg][Yy]*
+/notes/**/[Pp][Ll][Aa][Nn][Nn][Ii][Nn][Gg]/
+/notes/**/[Pp][Ll][Aa][Nn][Ss]/
+/planning/
+/plans/
+
+# Context-capture/inference pipeline is not part of this public repository.
+/apps/desktop/src-tauri/src/context_capture.rs
+/apps/desktop/src-tauri/src/context_inference.rs
+/apps/desktop/src-tauri/src/bin/lumen-asr-context-*
+/**/context_capture.*
+/**/context_inference.*
+
+# Benchmark harnesses, private datasets, and generated reports (never publish)
+/crates/lumen-bench/
+/benchmarks/
+/benchmark-results/
+/**/benches/
+/**/*benchmark*/
 
 # Credentials and private key material (never publish)
 *.pem
@@ -75,36 +105,8 @@ id_ed25519.*
 *credentials*.json
 *secrets*.json
 
-# Internal document filenames in any directory
-**/*[Rr][Ee][Ss][Ee][Aa][Rr][Cc][Hh]*.md
-**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Oo][Rr]*.md
-**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Ii][Vv][Ee]*.md
-**/*[Ee][Vv][Oo][Ll][Uu][Tt][Ii][Oo][Nn]*.md
-**/*[Ii][Mm][Pp][Ll][Ee][Mm][Ee][Nn][Tt][Aa][Tt][Ii][Oo][Nn]-[Pp][Ll][Aa][Nn]*.md
-**/*[Vv][Ee][Nn][Dd][Oo][Rr]-[Ee][Vv][Aa][Ll][Uu][Aa][Tt][Ii][Oo][Nn]*.md
-**/*[Mm][Aa][Rr][Kk][Ee][Tt]-[Ll][Aa][Nn][Dd][Ss][Cc][Aa][Pp][Ee]*.md
-**/*[Rr][Ee][Ss][Ee][Aa][Rr][Cc][Hh]*.*
-**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Oo][Rr]*.*
-**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Ii][Vv][Ee]*.*
-**/*[Ee][Vv][Oo][Ll][Uu][Tt][Ii][Oo][Nn]*.*
-**/*[Ii][Mm][Pp][Ll][Ee][Mm][Ee][Nn][Tt][Aa][Tt][Ii][Oo][Nn]-[Pp][Ll][Aa][Nn]*.*
-**/*[Vv][Ee][Nn][Dd][Oo][Rr]-[Ee][Vv][Aa][Ll][Uu][Aa][Tt][Ii][Oo][Nn]*.*
-**/*[Mm][Aa][Rr][Kk][Ee][Tt]-[Ll][Aa][Nn][Dd][Ss][Cc][Aa][Pp][Ee]*.*
-**/*[Rr][Oo][Aa][Dd][Mm][Aa][Pp]*.*
-**/*[Mm][Ii][Ll][Ee][Ss][Tt][Oo][Nn][Ee]*.*
-**/*[Ss][Tt][Rr][Aa][Tt][Ee][Gg][Yy]*.*
-**/*[Dd][Ee][Ss][Ii][Gg][Nn]*.*
-**/[Pp][Ll][Aa][Nn][Nn][Ii][Nn][Gg]/**
-**/[Pp][Ll][Aa][Nn][Ss]/**
-**/[Ss][Tt][Rr][Aa][Tt][Ee][Gg][Yy]/**
-
-# Models & local data (never commit)
+# Models and local data (never publish)
 models/
-/benchmarks/
 *.onnx
 *.bin
 *.gguf
-
-# OS
-.DS_Store
-Thumbs.db

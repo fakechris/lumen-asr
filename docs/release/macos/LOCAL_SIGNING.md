@@ -2,7 +2,7 @@
 
 > This document covers the daily development loop on one machine. Public test builds use
 > **ad-hoc signing + DMG + GitHub Release** instead; see
-> [MACOS_GITHUB_RELEASE.md](./MACOS_GITHUB_RELEASE.md). A stable local identity preserves TCC
+> [GITHUB_RELEASE.md](./GITHUB_RELEASE.md). A stable local identity preserves TCC
 > permissions during development, while an ad-hoc identity is intentionally used for portable CI
 > builds that require no certificate.
 
@@ -19,13 +19,6 @@ Two separate issues get mixed together:
 | **Self-signed “Code Signing” cert** | one-time Keychain trust | local only | **Stable** (same cert requirement) |
 | **Apple Development** (free Personal Team) | free Apple ID + yearly refresh | local | Stable while cert valid |
 | **Developer ID + notarize** | **\$99/yr program** + Team ID | distribute outside Store | Stable |
-
-### Your machine (snapshot)
-
-- Free Personal Team: Apple ID linked in Xcode → Team ID **`69P8KHFNAT`** (Chris Song Personal Team)
-- Old `Apple Development: chris__song@hotmail.com (UB3UKXAMG7)` → **expired 2024-04-16** (`CSSMERR_TP_CERT_EXPIRED`)
-- Valid codesign identities were otherwise company/iPhone certs — **do not** use those for Lumen
-- Until a trusted local or Apple Development cert exists, scripts fall back to ad-hoc
 
 **You do not need a paid Team ID** for local testing. Free Personal Team ID is enough for Development certs; self-signed needs no Team ID at all.
 
@@ -70,8 +63,8 @@ Create identity only:
 
 No \$99 program required. Once a year:
 
-1. Xcode → **Settings → Accounts** → add `chris__song@hotmail.com`
-2. Select **Personal Team** (`69P8KHFNAT`) → **Manage Certificates…** → **+** → **Apple Development**
+1. Xcode → **Settings → Accounts** → add your Apple ID
+2. Select your **Personal Team** → **Manage Certificates…** → **+** → **Apple Development**
 3. Confirm:
 
    ```bash
@@ -81,7 +74,7 @@ No \$99 program required. Once a year:
 4. Use it:
 
    ```bash
-   export LUMEN_CODESIGN_IDENTITY="Apple Development: chris__song@hotmail.com (XXXXXXXX)"
+   export LUMEN_CODESIGN_IDENTITY="Apple Development: <Apple-ID> (<certificate-id>)"
    ./scripts/macos/dev-install.sh --open
    ```
 

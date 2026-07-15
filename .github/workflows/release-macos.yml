@@ -139,7 +139,7 @@ jobs:
               --draft \
               --title "Lumen ASR $GITHUB_REF_NAME" \
               --generate-notes \
-              --notes "$(cat docs/MACOS_RELEASE_NOTES.md)"
+              --notes "$(cat docs/release/macos/RELEASE_NOTES.md)"
           fi
 
           # A rebuilt DMG is not byte-for-byte reproducible. Replace the complete draft

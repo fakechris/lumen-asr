@@ -10,7 +10,7 @@ ad-hoc 签名 → 分架构 DMG → SHA-256 校验 → GitHub Release
 
 ## Pipeline 做了什么
 
-推送形如 `vMAJOR.MINOR.PATCH` 的 tag 后，[release-macos.yml](../.github/workflows/release-macos.yml) 会：
+推送形如 `vMAJOR.MINOR.PATCH` 的 tag 后，[release-macos.yml](../../../.github/workflows/release-macos.yml) 会：
 
 1. 从 tag 解析版本，并把它注入 Tauri App bundle；
 2. 在 Apple Silicon runner 上构建 `aarch64-apple-darwin`；

@@ -63,5 +63,5 @@ if [[ "$IDENTITY" != "-" ]]; then
   echo "Requirement: $REQ"
   echo "OK: signed with stable identity (TCC should survive rebuilds)."
 else
-  echo "OK: ad-hoc signed. Prefer stable identity for daily work — see docs/MACOS_LOCAL_SIGNING.md"
+  echo "OK: ad-hoc signed. Prefer stable identity for daily work — see docs/release/macos/LOCAL_SIGNING.md"
 fi
