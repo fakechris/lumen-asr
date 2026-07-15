@@ -25,25 +25,6 @@ pub struct EditEventRecord {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextSnapshotRecord {
-    pub capture_id: Uuid,
-    pub session_id: Uuid,
-    pub revision: u64,
-    pub schema_version: u32,
-    pub profile: String,
-    pub target_generation: u64,
-    pub started_at: DateTime<Utc>,
-    pub frozen_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub manifest_path: String,
-    pub source_presence_bitmap: u64,
-    pub source_status_json: String,
-    pub sanitized_hash: String,
-    pub encryption: String,
-    pub status: String,
-}
-
 pub struct Store {
     conn: Connection,
     path: PathBuf,
@@ -55,8 +36,7 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn =
-            Connection::open(&path).with_context(|| format!("open db {}", path.display()))?;
+        let conn = Connection::open(&path).with_context(|| format!("open db {}", path.display()))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
         schema::migrate(&conn)?;
         Ok(Self { conn, path })
@@ -100,103 +80,6 @@ impl Store {
             ],
         )?;
         Ok(())
-    }
-
-    pub fn save_context_snapshot(&self, rec: &ContextSnapshotRecord) -> Result<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO context_snapshots (
-              capture_id, session_id, revision, schema_version, profile,
-              target_generation, started_at, frozen_at, completed_at,
-              manifest_path, source_presence_bitmap, source_status_json,
-              sanitized_hash, encryption, status
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
-            "#,
-            params![
-                rec.capture_id.to_string(),
-                rec.session_id.to_string(),
-                rec.revision as i64,
-                rec.schema_version as i64,
-                rec.profile,
-                rec.target_generation as i64,
-                rec.started_at.to_rfc3339(),
-                rec.frozen_at.to_rfc3339(),
-                rec.completed_at.map(|value| value.to_rfc3339()),
-                rec.manifest_path,
-                rec.source_presence_bitmap as i64,
-                rec.source_status_json,
-                rec.sanitized_hash,
-                rec.encryption,
-                rec.status,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_context_snapshots(&self, session_id: Uuid) -> Result<Vec<ContextSnapshotRecord>> {
-        let mut statement = self.conn.prepare(
-            r#"
-            SELECT capture_id, session_id, revision, schema_version, profile,
-                   target_generation, started_at, frozen_at, completed_at,
-                   manifest_path, source_presence_bitmap, source_status_json,
-                   sanitized_hash, encryption, status
-            FROM context_snapshots
-            WHERE session_id=?1
-            ORDER BY revision ASC
-            "#,
-        )?;
-        let rows = statement.query_map(params![session_id.to_string()], |row| {
-            Ok(ContextSnapshotRecord {
-                capture_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
-                session_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
-                revision: row.get::<_, i64>(2)? as u64,
-                schema_version: row.get::<_, i64>(3)? as u32,
-                profile: row.get(4)?,
-                target_generation: row.get::<_, i64>(5)? as u64,
-                started_at: parse_dt(&row.get::<_, String>(6)?),
-                frozen_at: parse_dt(&row.get::<_, String>(7)?),
-                completed_at: row
-                    .get::<_, Option<String>>(8)?
-                    .map(|value| parse_dt(&value)),
-                manifest_path: row.get(9)?,
-                source_presence_bitmap: row.get::<_, i64>(10)? as u64,
-                source_status_json: row.get(11)?,
-                sanitized_hash: row.get(12)?,
-                encryption: row.get(13)?,
-                status: row.get(14)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
-    pub fn prune_context_captures_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<Uuid>> {
-        let mut statement = self.conn.prepare(
-            r#"
-            SELECT capture_id
-            FROM context_snapshots
-            GROUP BY capture_id
-            HAVING MAX(frozen_at) < ?1
-            "#,
-        )?;
-        let capture_ids = statement
-            .query_map(params![cutoff.to_rfc3339()], |row| {
-                Ok(Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default())
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        for capture_id in &capture_ids {
-            self.conn.execute(
-                "DELETE FROM context_snapshots WHERE capture_id=?1",
-                params![capture_id.to_string()],
-            )?;
-        }
-        Ok(capture_ids)
-    }
-
-    pub fn clear_context_snapshots(&self) -> Result<usize> {
-        self.conn
-            .execute("DELETE FROM context_snapshots", [])
-            .map_err(Into::into)
     }
 
     pub fn list_sessions(&self, limit: u32) -> Result<Vec<SessionRecord>> {
@@ -320,10 +203,8 @@ impl Store {
     }
 
     pub fn delete_dictionary_entry(&self, id: Uuid) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM dictionary_entries WHERE id=?1",
-            params![id.to_string()],
-        )?;
+        self.conn
+            .execute("DELETE FROM dictionary_entries WHERE id=?1", params![id.to_string()])?;
         Ok(())
     }
 
@@ -577,81 +458,5 @@ mod tests {
         assert!(store.delete_session(rec.id).unwrap());
         assert!(store.get_session(rec.id).unwrap().is_none());
         assert!(store.list_edit_events(rec.id).unwrap().is_empty());
-    }
-
-    #[test]
-    fn context_revisions_are_append_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("context.sqlite")).unwrap();
-        let capture_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let now = Utc::now();
-        let record = ContextSnapshotRecord {
-            capture_id,
-            session_id,
-            revision: 4,
-            schema_version: 1,
-            profile: "metadata".to_owned(),
-            target_generation: 1,
-            started_at: now,
-            frozen_at: now,
-            completed_at: Some(now),
-            manifest_path: "manifest.r0004.v1.json.zst".to_owned(),
-            source_presence_bitmap: 1,
-            source_status_json: "{}".to_owned(),
-            sanitized_hash: "first".to_owned(),
-            encryption: "chacha20_poly1305".to_owned(),
-            status: "complete".to_owned(),
-        };
-
-        store.save_context_snapshot(&record).unwrap();
-        let mut conflicting = record.clone();
-        conflicting.sanitized_hash = "replacement".to_owned();
-        assert!(store.save_context_snapshot(&conflicting).is_err());
-
-        let records = store.list_context_snapshots(session_id).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].sanitized_hash, "first");
-    }
-
-    #[test]
-    fn retention_prunes_only_fully_expired_captures() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("retention.sqlite")).unwrap();
-        let session_id = Uuid::new_v4();
-        let now = Utc::now();
-        let make_record = |capture_id, revision, frozen_at| ContextSnapshotRecord {
-            capture_id,
-            session_id,
-            revision,
-            schema_version: 1,
-            profile: "metadata".to_owned(),
-            target_generation: 1,
-            started_at: frozen_at,
-            frozen_at,
-            completed_at: Some(frozen_at),
-            manifest_path: format!("{capture_id}-{revision}.sealed.json"),
-            source_presence_bitmap: 1,
-            source_status_json: "{}".to_owned(),
-            sanitized_hash: format!("hash-{revision}"),
-            encryption: "chacha20_poly1305".to_owned(),
-            status: "complete".to_owned(),
-        };
-        let expired = Uuid::new_v4();
-        let current = Uuid::new_v4();
-        store
-            .save_context_snapshot(&make_record(expired, 1, now - chrono::Duration::days(8)))
-            .unwrap();
-        store
-            .save_context_snapshot(&make_record(current, 1, now))
-            .unwrap();
-
-        let pruned = store
-            .prune_context_captures_before(now - chrono::Duration::days(7))
-            .unwrap();
-        assert_eq!(pruned, vec![expired]);
-        let records = store.list_context_snapshots(session_id).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].capture_id, current);
     }
 }

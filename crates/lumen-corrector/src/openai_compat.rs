@@ -4,8 +4,7 @@ use crate::{CorrectRequest, CorrectResult, Corrector, CorrectorError, Dictionary
 use async_trait::async_trait;
 use lumen_core::CorrectorEngineId;
 use lumen_prompts::{
-    build_system_prompt, corrector_user_message_with_context, format_dictionary_block,
-    CleanupLevel,
+    build_system_prompt, corrector_user_message, format_dictionary_block, CleanupLevel,
 };
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -81,11 +80,7 @@ impl Corrector for OpenAiCompatCorrector {
 
     async fn correct(&self, req: CorrectRequest) -> Result<CorrectResult, CorrectorError> {
         let dict_block = dict_block_opt(&req.dictionary);
-        let user = corrector_user_message_with_context(
-            &req.text,
-            dict_block.as_deref(),
-            req.window_context.as_deref(),
-        );
+        let user = corrector_user_message(&req.text, dict_block.as_deref());
         let system = if req.system_prompt.trim().is_empty() {
             build_system_prompt(CleanupLevel::Medium)
         } else {

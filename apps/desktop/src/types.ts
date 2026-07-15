@@ -15,7 +15,6 @@ export type Health = {
 
 export type CorrectorStatus = {
   enabled: boolean;
-  sendContext: boolean;
   provider: string;
   baseUrl: string;
   model: string;

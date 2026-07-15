@@ -10,8 +10,6 @@ use tauri::State;
 #[serde(rename_all = "camelCase")]
 pub struct CorrectorStatus {
     pub enabled: bool,
-    /// Whether a bounded current-window text projection is sent to the model.
-    pub send_context: bool,
     pub provider: String,
     pub base_url: String,
     pub model: String,
@@ -33,7 +31,6 @@ pub struct CorrectorStatus {
 #[serde(rename_all = "camelCase")]
 pub struct CorrectorConfigInput {
     pub enabled: Option<bool>,
-    pub send_context: Option<bool>,
     pub provider: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
@@ -166,9 +163,6 @@ pub fn save_corrector_config(
     if let Some(v) = input.enabled {
         guard.corrector.enabled = v;
     }
-    if let Some(v) = input.send_context {
-        guard.context.send_to_corrector = v;
-    }
     if let Some(v) = input.provider {
         if let Some(p) = crate::provider_presets::llm_preset_by_id(&v) {
             // Switching provider fills endpoint + default model (user can still edit).
@@ -254,7 +248,6 @@ pub fn save_corrector_config(
 pub(crate) fn status_from(cfg: &AppConfig) -> CorrectorStatus {
     CorrectorStatus {
         enabled: cfg.corrector.enabled,
-        send_context: cfg.context.send_to_corrector,
         provider: cfg.corrector.provider.clone(),
         base_url: cfg.corrector.base_url.clone(),
         model: cfg.corrector.model.clone(),
@@ -337,15 +330,4 @@ pub async fn correct_text(
 #[tauri::command]
 pub fn default_corrector_config() -> CorrectorConfig {
     CorrectorConfig::default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn context_transmission_is_off_in_default_corrector_status() {
-        let status = status_from(&AppConfig::default());
-        assert!(!status.send_context);
-    }
 }
