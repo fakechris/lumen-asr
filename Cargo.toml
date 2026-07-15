@@ -10,7 +10,6 @@ members = [
   "crates/lumen-platform",
   "crates/lumen-platform-macos",
   "crates/lumen-prompts",
-  "crates/lumen-bench",
   "apps/desktop/src-tauri",
 ]
 default-members = [
@@ -22,7 +21,6 @@ default-members = [
   "crates/lumen-inject",
   "crates/lumen-platform",
   "crates/lumen-prompts",
-  "crates/lumen-bench",
 ]
 
 [workspace.package]
