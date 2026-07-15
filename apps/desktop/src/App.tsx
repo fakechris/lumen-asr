@@ -1038,6 +1038,7 @@ function SettingsPanel({
 }) {
   const [cfg, setCfg] = useState<CorrectorStatus | null>(null);
   const [enabled, setEnabled] = useState(true);
+  const [sendContext, setSendContext] = useState(false);
   const [provider, setProvider] = useState("ollama");
   const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:11434/v1");
   const [model, setModel] = useState("qwen3.5:9b");
@@ -1074,6 +1075,8 @@ function SettingsPanel({
   const [asrApiKey, setAsrApiKey] = useState("");
   const [asrLanguage, setAsrLanguage] = useState("");
   const [asrHasKey, setAsrHasKey] = useState(false);
+  const [asrModels, setAsrModels] = useState<import("./api").AsrModelStatus | null>(null);
+  const [asrCustomPath, setAsrCustomPath] = useState("");
   const [cleanup, setCleanup] = useState("medium");
   const [style, setStyle] = useState("neutral");
   const [casing, setCasing] = useState("sentence");
@@ -1101,11 +1104,12 @@ function SettingsPanel({
   useEffect(() => {
     void (async () => {
       try {
-        const [c, presets, asrP, asrC] = await Promise.all([
+        const [c, presets, asrP, asrC, asrStatus] = await Promise.all([
           api.getCorrectorConfig(),
           api.listLlmPresets(),
           api.listAsrPresets(),
           api.getAsrServiceConfig(),
+          api.checkAsrModelStatus(),
         ]);
         setCfg(c);
         setLlmPresets(presets);
@@ -1115,7 +1119,10 @@ function SettingsPanel({
         setAsrModel(asrC.model);
         setAsrLanguage(asrC.language || "");
         setAsrHasKey(asrC.hasApiKey);
+        setAsrModels(asrStatus);
+        setAsrCustomPath(asrStatus.activeModelDir || "");
         setEnabled(c.enabled);
+        setSendContext(!!c.sendContext);
         setProvider(c.provider);
         setBaseUrl(c.baseUrl);
         setModel(c.model);
@@ -1158,6 +1165,7 @@ function SettingsPanel({
     try {
       const input: Parameters<typeof api.saveCorrectorConfig>[0] = {
         enabled,
+        sendContext,
         provider,
         baseUrl,
         model,
@@ -1175,6 +1183,7 @@ function SettingsPanel({
       }
       const c = await api.saveCorrectorConfig(input);
       setCfg(c);
+      setSendContext(!!c.sendContext);
       setCleanup(c.cleanup || cleanup);
       setStyle(c.style || style);
       setCasing(c.casing || casing);
@@ -1443,6 +1452,89 @@ function SettingsPanel({
           <p className="muted-text" style={{ fontSize: "0.82rem", marginTop: 0 }}>
             {asrPresets.find((p) => p.id === asrProvider)?.notes}
           </p>
+        )}
+        {asrProvider.startsWith("local") && asrModels && (
+          <div className="onboard-status" style={{ marginBottom: 12 }}>
+            <div className="muted-text">Lumen 共享模型目录</div>
+            <p className="muted-text" style={{ wordBreak: "break-all", marginTop: 4 }}>
+              <code>{asrModels.modelsRoot}</code>
+            </p>
+            {asrModels.candidates
+              .filter(
+                (candidate) =>
+                  candidate.ready &&
+                  candidate.engine ===
+                    (asrProvider === "local_whisper" ? "whisper" : "sensevoice"),
+              )
+              .map((candidate) => (
+                <div key={`${candidate.engine}:${candidate.path}`} className="onboard-candidate">
+                  <span className="muted-text" style={{ wordBreak: "break-all" }}>
+                    {candidate.label}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={busy}
+                    onClick={() =>
+                      void (async () => {
+                        onBusy(true);
+                        onError(null);
+                        try {
+                          const engine =
+                            asrProvider === "local_whisper" ? "whisper" : "sensevoice";
+                          const status = await api.useExistingAsrModel(candidate.path, engine);
+                          setAsrModels(status);
+                          setAsrCustomPath(status.activeModelDir);
+                          onSaved();
+                        } catch (e) {
+                          onError(String(e));
+                        } finally {
+                          onBusy(false);
+                        }
+                      })()
+                    }
+                  >
+                    使用
+                  </button>
+                </div>
+              ))}
+            <div className="form-row" style={{ marginTop: 10 }}>
+              <input
+                className="input"
+                value={asrCustomPath}
+                disabled={busy}
+                placeholder="或粘贴本地模型目录路径…"
+                onChange={(event) => setAsrCustomPath(event.target.value)}
+              />
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={busy || !asrCustomPath.trim()}
+                onClick={() =>
+                  void (async () => {
+                    onBusy(true);
+                    onError(null);
+                    try {
+                      const engine = asrProvider === "local_whisper" ? "whisper" : "sensevoice";
+                      const status = await api.useExistingAsrModel(
+                        asrCustomPath.trim(),
+                        engine,
+                      );
+                      setAsrModels(status);
+                      setAsrCustomPath(status.activeModelDir);
+                      onSaved();
+                    } catch (e) {
+                      onError(String(e));
+                    } finally {
+                      onBusy(false);
+                    }
+                  })()
+                }
+              >
+                验证并使用
+              </button>
+            </div>
+          </div>
         )}
         {!asrProvider.startsWith("local") && (
           <>
@@ -1824,6 +1916,21 @@ function SettingsPanel({
             启用模型修正
           </label>
         </div>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={sendContext}
+              disabled={busy}
+              onChange={(e) => setSendContext(e.target.checked)}
+            />{" "}
+            使用当前窗口上下文辅助修正（实验性）
+          </label>
+        </div>
+        <p className="muted-text" style={{ marginTop: -4, fontSize: "0.82rem" }}>
+          默认关闭。打开后只发送最多约 2,000 字符的精简文本；不会发送截图、AX/DOM tree、坐标、OCR box
+          或来源信息。关闭此项不会停止本地上下文采集。
+        </p>
         <div className="cleanup-level-block">
           <div className="field-label">自动整理强度</div>
           <div className="cleanup-seg" role="group" aria-label="整理强度">

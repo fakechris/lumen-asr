@@ -1,5 +1,11 @@
 # macOS local signing (no paid Apple Developer Program)
 
+> This document covers the daily development loop on one machine. Public test builds use
+> **ad-hoc signing + DMG + GitHub Release** instead; see
+> [MACOS_GITHUB_RELEASE.md](./MACOS_GITHUB_RELEASE.md). A stable local identity preserves TCC
+> permissions during development, while an ad-hoc identity is intentionally used for portable CI
+> builds that require no certificate.
+
 ## What’s going wrong
 
 Two separate issues get mixed together:
@@ -103,10 +109,12 @@ For friends testing: zip the ad-hoc/self-signed app + “right-click → Open”
 
 ## Tauri note
 
-`tauri.conf.json` can set `bundle.macOS.signingIdentity`. We keep identity selection in **scripts** so:
+`tauri.conf.json` sets `bundle.macOS.signingIdentity` to `-` so release builds made by Tauri are
+ad-hoc signed by default. The daily install script then re-signs that app with the stable local
+identity:
 
-- local = self-signed or free Development  
-- CI / future paid account = env override  
+- direct Tauri / CI release build = ad-hoc
+- `scripts/macos/dev-install.sh` = stable self-signed or free Development identity
 
 ```bash
 # full tauri bundle then our stable sign

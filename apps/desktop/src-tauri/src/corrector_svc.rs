@@ -2,8 +2,8 @@
 
 use crate::config::{AppConfig, CorrectorConfig};
 use lumen_corrector::{
-    correct_or_fallback_with, preprocess_only, CorrectResult, Corrector, DictionaryContext,
-    NullCorrector, OpenAiCompatConfig, OpenAiCompatCorrector,
+    correct_or_fallback_with_context, preprocess_only, CorrectResult, Corrector,
+    DictionaryContext, NullCorrector, OpenAiCompatConfig, OpenAiCompatCorrector,
 };
 use lumen_core::CorrectorEngineId;
 use lumen_dictionary::{split_for_injection, DictionaryEntry};
@@ -84,6 +84,16 @@ pub async fn run_correct_with_intent(
     entries: &[DictionaryEntry],
     intent: IntentSpec,
 ) -> CorrectResult {
+    run_correct_with_intent_and_context(app, text, entries, intent, None).await
+}
+
+pub async fn run_correct_with_intent_and_context(
+    app: &AppConfig,
+    text: &str,
+    entries: &[DictionaryEntry],
+    intent: IntentSpec,
+    window_context: Option<String>,
+) -> CorrectResult {
     let dict = dictionary_context(entries);
     let input: PromptBuildInput = app.output.prompt_input(intent);
     let level = effective_cleanup(&input);
@@ -102,11 +112,27 @@ pub async fn run_correct_with_intent(
     let temperature = level.temperature();
     match build_corrector(&app.corrector) {
         Ok(c) => {
-            correct_or_fallback_with(c.as_ref(), text, dict, system, temperature).await
+            correct_or_fallback_with_context(
+                c.as_ref(),
+                text,
+                dict,
+                system,
+                temperature,
+                window_context,
+            )
+            .await
         }
         Err(e) => {
             tracing::warn!(error = %e, "corrector build failed, preprocess only");
-            correct_or_fallback_with(&NullCorrector, text, dict, system, temperature).await
+            correct_or_fallback_with_context(
+                &NullCorrector,
+                text,
+                dict,
+                system,
+                temperature,
+                window_context,
+            )
+            .await
         }
     }
 }

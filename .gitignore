@@ -20,8 +20,12 @@ apps/desktop/src-tauri/gen/schemas
 .vscode/
 *.swp
 
+# Local visual brainstorming sessions
+.superpowers/
+
 # Models & local data (never commit)
 models/
+/benchmarks/
 *.onnx
 *.bin
 *.gguf

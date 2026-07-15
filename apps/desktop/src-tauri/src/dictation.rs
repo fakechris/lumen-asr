@@ -1,13 +1,16 @@
 //! Recording + local ASR + model corrector IPC (M2–M5).
 
-use crate::corrector_svc::{engine_label, run_correct_with_intent};
+use crate::config::AsrServiceConfig;
+use crate::corrector_svc::{
+    engine_label, run_correct_with_intent, run_correct_with_intent_and_context,
+};
 use crate::session_debug::{self, SessionDebugMeta};
 use crate::AppState;
-use crate::config::AsrServiceConfig;
 use lumen_asr::{
-    prepare_for_asr, sensevoice_status, whisper_status, AsrEngine, AsrRequest, AsrResult,
+    prepare_for_asr, sensevoice_ready, whisper_ready, AsrEngine, AsrRequest, AsrResult,
     AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig,
 };
+use lumen_context::TargetHint;
 use lumen_core::{FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use lumen_platform_macos::{
     activate_target, frontmost_app_name, frontmost_target, is_self_app_name, is_self_target,
@@ -69,29 +72,27 @@ static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 const BOUNCE_MS: u128 = 80;
 
 /// Snapshot frontmost app into process-local cache (sync, preferred at press).
-fn remember_target_app() {
+fn remember_target_app() -> Option<FrontmostTarget> {
     let t = frontmost_target();
-    match &t {
+    let target = match &t {
         Some(t) if !is_self_target(t) => {
             tracing::info!(
                 name = ?t.name,
                 bundle = ?t.bundle_id,
                 "dictation target remembered"
             );
-            if let Ok(mut g) = TARGET.lock() {
-                *g = Some(t.clone());
-            }
+            Some(t.clone())
         }
         other => {
             tracing::warn!(?other, "could not remember non-self frontmost target");
-            // Keep previous good target if we briefly saw ourselves.
-            if let Ok(mut g) = TARGET.lock() {
-                if g.is_none() {
-                    *g = t.filter(|x| !is_self_target(x));
-                }
-            }
+            None
         }
+    };
+    // Never reuse a target from an earlier dictation generation.
+    if let Ok(mut current) = TARGET.lock() {
+        *current = target.clone();
     }
+    target
 }
 
 /// Prepare for insert:
@@ -177,7 +178,14 @@ pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<Engi
     let (kind, provider_id) = match e.as_str() {
         "sensevoice" | "local_sensevoice" => (EngineKind::SenseVoice, "local_sensevoice"),
         "whisper" | "local_whisper" => (EngineKind::Whisper, "local_whisper"),
-        "openai_audio" | "custom" => (EngineKind::SenseVoice, if e == "custom" { "custom" } else { "openai_audio" }),
+        "openai_audio" | "custom" => (
+            EngineKind::SenseVoice,
+            if e == "custom" {
+                "custom"
+            } else {
+                "openai_audio"
+            },
+        ),
         other if other.starts_with("local_") => {
             return Err(format!("unknown local engine: {engine}"));
         }
@@ -205,7 +213,10 @@ pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<Engi
                 .unwrap_or(EngineKind::SenseVoice));
         }
     };
-    *state.engine.lock().map_err(|_| "engine lock poisoned".to_string())? = kind;
+    *state
+        .engine
+        .lock()
+        .map_err(|_| "engine lock poisoned".to_string())? = kind;
     if let Ok(mut cfg) = state.config.lock() {
         cfg.asr.provider = provider_id.into();
         if provider_id == "openai_audio" {
@@ -245,8 +256,30 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
     } else {
         asr_cfg.provider.clone()
     };
-    let sv = sensevoice_status();
-    let wh = whisper_status();
+    let sv = state
+        .sensevoice
+        .lock()
+        .map(|engine| {
+            let path = engine.model_dir();
+            EngineStatus {
+                kind: EngineKind::SenseVoice,
+                ready: sensevoice_ready(path),
+                model_dir: path.display().to_string(),
+            }
+        })
+        .unwrap_or_else(|_| lumen_asr::sensevoice_status());
+    let wh = state
+        .whisper
+        .lock()
+        .map(|engine| {
+            let path = engine.model_dir();
+            EngineStatus {
+                kind: EngineKind::Whisper,
+                ready: whisper_ready(path),
+                model_dir: path.display().to_string(),
+            }
+        })
+        .unwrap_or_else(|_| lumen_asr::whisper_status());
     let active_ready = match provider.as_str() {
         "local_sensevoice" | "sensevoice" => sv.ready,
         "local_whisper" | "whisper" => wh.ready,
@@ -280,7 +313,20 @@ pub fn start_recording(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
-    state.audio.start().map_err(|e| e.to_string())
+    if state.audio.is_recording() {
+        return Ok(());
+    }
+    let target = remember_target_app();
+    let hint = target.as_ref().map(|target| TargetHint {
+        app_name: target.name.clone(),
+        bundle_id: target.bundle_id.clone(),
+        ..TargetHint::default()
+    });
+    state.context.begin(hint);
+    state.audio.start().map_err(|error| {
+        state.context.clear_active();
+        error.to_string()
+    })
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -324,7 +370,35 @@ pub async fn stop_and_transcribe_inner(
     save: bool,
     app: Option<&AppHandle>,
 ) -> Result<TranscribeOutcome, String> {
+    let active_context = state.context.take_active();
+    let session_id = active_context
+        .as_ref()
+        .map(|active| active.session_id)
+        .unwrap_or_else(uuid::Uuid::new_v4);
     let capture = state.audio.stop().map_err(|e| e.to_string())?;
+    if let Some(active) = active_context.as_ref() {
+        if let Err(error) = active.persist_partial(&state.store).await {
+            tracing::warn!(
+                capture_id = %active.capture_id,
+                error = %error,
+                "partial context persistence failed"
+            );
+        }
+        if let Some(app) = app {
+            let active = active.clone();
+            let app = app.clone();
+            tokio::spawn(async move {
+                let state = app.state::<AppState>();
+                if let Err(error) = active.persist_late(&state.store).await {
+                    tracing::warn!(
+                        capture_id = %active.capture_id,
+                        error = %error,
+                        "late context persistence failed"
+                    );
+                }
+            });
+        }
+    }
     let num_samples = capture.samples.len();
     let sample_rate = capture.sample_rate;
     let duration_ms = if sample_rate > 0 {
@@ -395,8 +469,39 @@ pub async fn stop_and_transcribe_inner(
         .clone();
 
     let intent = take_session_intent();
-    tracing::info!(?intent, "running corrector with session intent");
-    let corr = run_correct_with_intent(&cfg, &asr_text, &entries, intent.clone()).await;
+    let window_context = if cfg.context.send_to_corrector {
+        match active_context.as_ref() {
+            Some(active) => active
+                .latest_manifest()
+                .await
+                .and_then(|manifest| {
+                    crate::context_inference::flatten_for_corrector(
+                        &manifest,
+                        crate::context_inference::CORRECTOR_CONTEXT_MAX_CHARS,
+                    )
+                }),
+            None => None,
+        }
+    } else {
+        None
+    };
+    tracing::info!(
+        ?intent,
+        context_enabled = cfg.context.send_to_corrector,
+        context_chars = window_context
+            .as_ref()
+            .map(|value| value.chars().count())
+            .unwrap_or(0),
+        "running corrector with session intent"
+    );
+    let corr = run_correct_with_intent_and_context(
+        &cfg,
+        &asr_text,
+        &entries,
+        intent.clone(),
+        window_context,
+    )
+    .await;
     let corrected_text = corr.text.trim().to_string();
     let corrector_engine = if corr.model_applied {
         engine_label(&cfg)
@@ -499,6 +604,7 @@ pub async fn stop_and_transcribe_inner(
     }
 
     let mut rec = SessionRecord::new();
+    rec.id = session_id;
     rec.status = SessionStatus::Completed;
     rec.insert_strategy = insert_strategy;
     rec.asr_raw = Some(asr_text.clone());
@@ -579,7 +685,9 @@ pub fn get_session_audio(state: State<'_, AppState>, id: String) -> Result<Vec<u
             .store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
-        let store = guard.as_ref().ok_or_else(|| "database not available".to_string())?;
+        let store = guard
+            .as_ref()
+            .ok_or_else(|| "database not available".to_string())?;
         store
             .get_session(uuid)
             .map_err(|e| e.to_string())?
@@ -619,7 +727,9 @@ pub async fn retry_session_transcription(
             .store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
-        let store = guard.as_ref().ok_or_else(|| "database not available".to_string())?;
+        let store = guard
+            .as_ref()
+            .ok_or_else(|| "database not available".to_string())?;
         store
             .get_session(uuid)
             .map_err(|e| e.to_string())?
@@ -721,6 +831,7 @@ pub fn cancel_recording(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
+    state.context.clear_active();
     if state.audio.is_recording() {
         let _ = state.audio.stop();
     }
@@ -824,8 +935,12 @@ pub enum DictationUiEvent {
         intent: String,
         target_language: Option<String>,
     },
-    Done { outcome: TranscribeOutcome },
-    Error { message: String },
+    Done {
+        outcome: TranscribeOutcome,
+    },
+    Error {
+        message: String,
+    },
     Cancelled,
 }
 
@@ -838,9 +953,7 @@ fn intent_ui_label(intent: &IntentSpec) -> (String, Option<String>, String) {
         ),
         IntentSpec::Raw => ("raw".into(), None, "仅原文".into()),
         // Never call normal path “录音” during processing — user confuses with translate.
-        IntentSpec::Default | IntentSpec::PolishOverride => {
-            ("default".into(), None, "整理".into())
-        }
+        IntentSpec::Default | IntentSpec::PolishOverride => ("default".into(), None, "整理".into()),
     }
 }
 
@@ -853,10 +966,7 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
     dictation_start_with_intent(app, IntentSpec::Default).await
 }
 
-pub async fn dictation_start_with_intent(
-    app: AppHandle,
-    intent: IntentSpec,
-) -> Result<(), String> {
+pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> Result<(), String> {
     // Only one session at a time.
     if PHASE
         .compare_exchange(
@@ -895,17 +1005,16 @@ pub async fn dictation_start_with_intent(
         .map(|c| c.hotkey.show_capsule)
         .unwrap_or(true);
 
-    // Capture typing target first (NSWorkspace is ~ms) so insert restores correctly.
-    remember_target_app();
-
-    // Then start mic; never show UI before we know the target.
+    // Context target capture is scheduled before the mic starts and never awaited here.
     match start_recording_inner(&state) {
         Ok(()) => {
             tracing::info!(%intent_kind, ?target_lang, "dictation recording live");
             // Force-show capsule on hotkey start so user always sees feedback.
             crate::capsule::set_capsule_visible(&app, true, "listening");
             if !show_capsule {
-                tracing::debug!("config show_capsule=false but forcing visible for hotkey feedback");
+                tracing::debug!(
+                    "config show_capsule=false but forcing visible for hotkey feedback"
+                );
             }
             emit_dictation(
                 &app,
@@ -923,6 +1032,7 @@ pub async fn dictation_start_with_intent(
                 *g = None;
             }
             PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+            state.context.clear_active();
             Err(e)
         }
     }
@@ -962,6 +1072,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
             *g = None;
         }
         PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        state.context.clear_active();
         emit_dictation(&app, DictationUiEvent::Idle);
         return Ok(());
     }
@@ -972,6 +1083,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
             *g = None;
         }
         PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        state.context.clear_active();
         return Ok(());
     }
 
@@ -1022,12 +1134,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
         }
         Err(e) => {
             crate::capsule::set_capsule_visible(&app, false, "idle");
-            emit_dictation(
-                &app,
-                DictationUiEvent::Error {
-                    message: e.clone(),
-                },
-            );
+            emit_dictation(&app, DictationUiEvent::Error { message: e.clone() });
             emit_dictation(&app, DictationUiEvent::Idle);
             PHASE.store(PHASE_IDLE, Ordering::SeqCst);
             Err(e)

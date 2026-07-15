@@ -1,5 +1,6 @@
 [package]
 name = "lumen-asr-desktop"
+default-run = "lumen-asr-desktop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +15,7 @@ tauri-plugin-shell = "2"
 tauri-plugin-global-shortcut = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+blake3 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lumen-platform = { workspace = true }
@@ -22,6 +24,7 @@ lumen-core = { workspace = true }
 lumen-dictionary = { workspace = true }
 lumen-asr = { workspace = true }
 lumen-corrector = { workspace = true }
+lumen-context = { workspace = true }
 lumen-prompts = { workspace = true }
 lumen-inject = { workspace = true }
 lumen-platform-macos = { workspace = true }
@@ -32,7 +35,11 @@ chrono = { workspace = true }
 cpal = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json"] }
+zstd = { workspace = true }
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+[dev-dependencies]
+tempfile = "3"
