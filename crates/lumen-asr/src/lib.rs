@@ -5,14 +5,20 @@
 
 mod audio;
 mod cloud_openai;
+mod install_lock;
 mod paths;
 mod sensevoice;
 mod whisper;
 
 pub use audio::{resample_linear, AudioCapture, AudioDeviceInfo, AudioError, CaptureResult};
 pub use cloud_openai::{OpenAiAudioAsr, OpenAiAudioConfig};
+pub use install_lock::ModelInstallLock;
 pub use paths::{
-    default_sensevoice_dir, default_whisper_dir, sensevoice_ready, whisper_ready,
+    app_models_dir, default_sensevoice_dir, default_sensevoice_dir_with_root, default_whisper_dir,
+    default_whisper_dir_with_root, legacy_model_roots, lumen_models_dir,
+    lumen_models_dir_with_override, scan_model_candidates, scan_model_candidates_with_root,
+    sensevoice_ready, shared_sensevoice_dir, shared_whisper_dir, user_home_dir, whisper_ready,
+    ModelCandidate, ENV_LUMEN_MODELS_DIR,
 };
 pub use sensevoice::SenseVoiceSherpaAsr;
 pub use whisper::WhisperAsr;
@@ -20,7 +26,6 @@ pub use whisper::WhisperAsr;
 use async_trait::async_trait;
 use lumen_core::AsrEngineId;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -84,31 +89,6 @@ impl AsrEngine for StubAsr {
             engine: self.id(),
             language: Some("zh".into()),
         })
-    }
-}
-
-/// Shared Lumen cluster models root (navi / asr / future apps).
-///
-/// Override with `LUMEN_MODELS_DIR`. Default macOS:
-/// `~/Library/Application Support/Lumen/models`.
-///
-/// Legacy per-app dirs (`LumenAsr/models`, …) are still discovered when ready;
-/// **new downloads** land here so products do not re-fetch the same package.
-pub fn app_models_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("LUMEN_MODELS_DIR") {
-        let t = p.trim();
-        if !t.is_empty() {
-            return PathBuf::from(t);
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    #[cfg(target_os = "macos")]
-    {
-        PathBuf::from(home).join("Library/Application Support/Lumen/models")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        PathBuf::from(home).join(".lumen/models")
     }
 }
 
@@ -193,5 +173,17 @@ mod tests {
         };
         let out = prepare_for_asr(&cap);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn shared_model_contract_matches_cluster_v1() {
+        let bytes = include_bytes!("../../../docs/SHARED_MODELS_CONTRACT.md");
+        assert_eq!(fnv1a64(bytes), 0xc877_89f4_de20_5e71);
+    }
+
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
     }
 }

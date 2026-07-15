@@ -7,7 +7,7 @@ use crate::corrector_svc::{
 use crate::session_debug::{self, SessionDebugMeta};
 use crate::AppState;
 use lumen_asr::{
-    prepare_for_asr, sensevoice_status, whisper_status, AsrEngine, AsrRequest, AsrResult,
+    prepare_for_asr, sensevoice_ready, whisper_ready, AsrEngine, AsrRequest, AsrResult,
     AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig,
 };
 use lumen_context::TargetHint;
@@ -256,8 +256,30 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
     } else {
         asr_cfg.provider.clone()
     };
-    let sv = sensevoice_status();
-    let wh = whisper_status();
+    let sv = state
+        .sensevoice
+        .lock()
+        .map(|engine| {
+            let path = engine.model_dir();
+            EngineStatus {
+                kind: EngineKind::SenseVoice,
+                ready: sensevoice_ready(path),
+                model_dir: path.display().to_string(),
+            }
+        })
+        .unwrap_or_else(|_| lumen_asr::sensevoice_status());
+    let wh = state
+        .whisper
+        .lock()
+        .map(|engine| {
+            let path = engine.model_dir();
+            EngineStatus {
+                kind: EngineKind::Whisper,
+                ready: whisper_ready(path),
+                model_dir: path.display().to_string(),
+            }
+        })
+        .unwrap_or_else(|_| lumen_asr::whisper_status());
     let active_ready = match provider.as_str() {
         "local_sensevoice" | "sensevoice" => sv.ready,
         "local_whisper" | "whisper" => wh.ready,

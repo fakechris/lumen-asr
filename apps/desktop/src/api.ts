@@ -51,7 +51,9 @@ export type AsrModelStatus = {
   sensevoiceDir: string;
   whisperReady: boolean;
   whisperDir: string;
+  modelsRoot: string;
   activeEngine: string;
+  activeModelDir: string;
   candidates: AsrModelCandidate[];
   downloadUrl: string;
 };

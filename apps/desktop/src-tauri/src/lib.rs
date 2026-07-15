@@ -21,8 +21,8 @@ mod volume_mon;
 
 use config::AppConfig;
 use lumen_asr::{
-    default_sensevoice_dir, default_whisper_dir, AudioCapture, EngineKind, SenseVoiceSherpaAsr,
-    WhisperAsr,
+    default_sensevoice_dir, default_whisper_dir, sensevoice_ready, whisper_ready, AudioCapture,
+    EngineKind, SenseVoiceSherpaAsr, WhisperAsr,
 };
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
@@ -139,8 +139,24 @@ pub fn run() {
         tracing::warn!(error = %error, "context retention enforcement failed");
     }
 
-    let sv_dir = default_sensevoice_dir();
-    let wh_dir = default_whisper_dir();
+    let initial_engine = if app_config.asr.provider == "local_whisper" {
+        EngineKind::Whisper
+    } else {
+        EngineKind::SenseVoice
+    };
+    let selected_model_dir = app_config.asr.model_dir.trim();
+    let selected_model_dir =
+        (!selected_model_dir.is_empty()).then(|| std::path::PathBuf::from(selected_model_dir));
+    let sv_dir = selected_model_dir
+        .as_ref()
+        .filter(|path| initial_engine == EngineKind::SenseVoice && sensevoice_ready(path))
+        .cloned()
+        .unwrap_or_else(default_sensevoice_dir);
+    let wh_dir = selected_model_dir
+        .as_ref()
+        .filter(|path| initial_engine == EngineKind::Whisper && whisper_ready(path))
+        .cloned()
+        .unwrap_or_else(default_whisper_dir);
     tracing::info!(dir = %sv_dir.display(), ready = lumen_asr::sensevoice_ready(&sv_dir), "SenseVoice model dir");
     tracing::info!(dir = %wh_dir.display(), ready = lumen_asr::whisper_ready(&wh_dir), "Whisper model dir");
 
@@ -150,7 +166,7 @@ pub fn run() {
         .manage(AppState {
             store,
             audio,
-            engine: Mutex::new(EngineKind::SenseVoice),
+            engine: Mutex::new(initial_engine),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sv_dir)),
             whisper: Mutex::new(WhisperAsr::new(wh_dir)),
             config: Mutex::new(app_config),

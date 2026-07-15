@@ -61,3 +61,4 @@ lumen-prompts = { path = "crates/lumen-prompts" }
 lumen-context = { git = "https://github.com/fakechris/lumen-navi.git", rev = "67d7cfa8114bbd9f38105494ad5574fd51634cc7" }
 parking_lot = "0.12"
 cpal = "0.15"
+fs2 = "0.4"

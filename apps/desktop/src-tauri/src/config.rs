@@ -93,6 +93,8 @@ impl ContextCaptureConfig {
 pub struct AsrServiceConfig {
     /// local_sensevoice | local_whisper | openai_audio | …
     pub provider: String,
+    /// User-selected local model directory. Empty = automatic discovery.
+    pub model_dir: String,
     pub base_url: String,
     pub model: String,
     pub api_key: String,
@@ -105,6 +107,7 @@ impl Default for AsrServiceConfig {
     fn default() -> Self {
         Self {
             provider: "local_sensevoice".into(),
+            model_dir: String::new(),
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
@@ -491,6 +494,7 @@ mod tests {
     fn roundtrip_toml() {
         let mut cfg = AppConfig::default();
         cfg.corrector.model = "test-model".into();
+        cfg.asr.model_dir = "/models/custom-sensevoice".into();
         cfg.context.browser_bridge_dir = Some(PathBuf::from("/tmp/lumen-context-group"));
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -500,6 +504,7 @@ mod tests {
         cfg.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path);
         assert_eq!(loaded.corrector.model, "test-model");
+        assert_eq!(loaded.asr.model_dir, "/models/custom-sensevoice");
         assert_eq!(
             loaded.context.browser_bridge_dir,
             Some(PathBuf::from("/tmp/lumen-context-group"))

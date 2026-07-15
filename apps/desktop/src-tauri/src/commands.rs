@@ -55,8 +55,7 @@ pub fn app_health(state: State<'_, AppState>) -> Health {
         Err(_) => (false, 0, 0),
     };
 
-    let sv = lumen_asr::sensevoice_status();
-    let wh = lumen_asr::whisper_status();
+    let asr = crate::dictation::asr_status_from(&state);
     let (corrector_enabled, corrector_label) = match state.config.lock() {
         Ok(c) => (
             c.corrector.enabled,
@@ -73,8 +72,8 @@ pub fn app_health(state: State<'_, AppState>) -> Health {
         db_ok,
         session_count,
         dictionary_count,
-        sensevoice_ready: sv.ready,
-        whisper_ready: wh.ready,
+        sensevoice_ready: asr.sensevoice.ready,
+        whisper_ready: asr.whisper.ready,
         recording: state.audio.is_recording(),
         corrector_enabled,
         corrector_label,

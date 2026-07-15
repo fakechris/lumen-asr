@@ -2,18 +2,20 @@
 
 use crate::AppState;
 use lumen_asr::{
-    default_sensevoice_dir, default_whisper_dir, sensevoice_ready, whisper_ready, EngineKind,
-    SenseVoiceSherpaAsr, WhisperAsr,
+    default_sensevoice_dir, default_whisper_dir, lumen_models_dir, scan_model_candidates,
+    sensevoice_ready, whisper_ready, EngineKind, ModelInstallLock, SenseVoiceSherpaAsr, WhisperAsr,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const SENSEVOICE_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2";
-const SENSEVOICE_ARCHIVE_NAME: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2";
+const SENSEVOICE_ARCHIVE_NAME: &str =
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2";
 
 static DOWNLOAD_CANCEL: AtomicBool = AtomicBool::new(false);
 static DOWNLOAD_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -35,7 +37,9 @@ pub struct AsrModelStatus {
     pub sensevoice_dir: String,
     pub whisper_ready: bool,
     pub whisper_dir: String,
+    pub models_root: String,
     pub active_engine: String,
+    pub active_model_dir: String,
     pub candidates: Vec<AsrModelCandidate>,
     pub download_url: String,
 }
@@ -50,106 +54,17 @@ pub struct AsrDownloadProgress {
     pub percent: Option<f32>,
 }
 
-fn home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-}
-
 fn scan_candidates() -> Vec<AsrModelCandidate> {
-    let mut out = Vec::new();
-    let mut push = |engine: &str, path: PathBuf, source: &str| {
-        if !path.exists() {
-            return;
-        }
-        let ready = match engine {
-            "sensevoice" => sensevoice_ready(&path),
-            "whisper" => whisper_ready(&path),
-            _ => false,
-        };
-        if !ready && source == "app" {
-            // still list empty app dir for "will download here"
-            out.push(AsrModelCandidate {
-                engine: engine.into(),
-                path: path.display().to_string(),
-                label: format!("{engine} ({source})"),
-                ready,
-                source: source.into(),
-            });
-            return;
-        }
-        if !ready {
-            return;
-        }
-        let name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        out.push(AsrModelCandidate {
-            engine: engine.into(),
-            path: path.display().to_string(),
-            label: format!("{name} · {source}"),
-            ready,
-            source: source.into(),
-        });
-    };
-
-    // Shared Lumen cluster (download target for all Lumen apps)
-    use lumen_asr::app_models_dir;
-    let shared_sv = app_models_dir().join("sensevoice");
-    push("sensevoice", shared_sv, "lumen-shared");
-    if let Ok(p) = std::env::var("LUMEN_SENSEVOICE_DIR") {
-        push("sensevoice", PathBuf::from(p), "env");
-    }
-    let h = home();
-    // Legacy per-app + coli (selectable; no re-download required)
-    push(
-        "sensevoice",
-        h.join("Library/Application Support/LumenAsr/models/sensevoice"),
-        "legacy-lumen-asr",
-    );
-    push(
-        "sensevoice",
-        h.join("Library/Application Support/LumenNavi/models/sensevoice"),
-        "legacy-lumen-navi",
-    );
-    for name in [
-        "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
-        "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-    ] {
-        push(
-            "sensevoice",
-            h.join(".coli/models").join(name),
-            "coli-cache",
-        );
-    }
-
-    let shared_wh = app_models_dir().join("whisper");
-    push("whisper", shared_wh, "lumen-shared");
-    if let Ok(p) = std::env::var("LUMEN_WHISPER_DIR") {
-        push("whisper", PathBuf::from(p), "env");
-    }
-    push(
-        "whisper",
-        h.join("Library/Application Support/LumenAsr/models/whisper"),
-        "legacy-lumen-asr",
-    );
-    push(
-        "whisper",
-        h.join("Library/Application Support/LumenNavi/models/whisper"),
-        "legacy-lumen-navi",
-    );
-    for name in [
-        "sherpa-onnx-whisper-tiny.en",
-        "sherpa-onnx-whisper-base.en",
-    ] {
-        push("whisper", h.join(".coli/models").join(name), "coli-cache");
-    }
-
-    // Dedupe by path
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|c| seen.insert(c.path.clone()));
-    out
+    scan_model_candidates()
+        .into_iter()
+        .map(|candidate| AsrModelCandidate {
+            engine: candidate.engine,
+            path: candidate.path.display().to_string(),
+            label: candidate.label,
+            ready: candidate.ready,
+            source: candidate.source,
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -175,6 +90,11 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
         .map(|g| g.model_dir().to_path_buf())
         .unwrap_or_else(|| wh.clone());
 
+    let active_model_dir = if engine == "whisper" {
+        wh_live.display().to_string()
+    } else {
+        sv_live.display().to_string()
+    };
     Ok(AsrModelStatus {
         sensevoice_ready: sensevoice_ready(&sv_live) || sensevoice_ready(&sv),
         sensevoice_dir: if sensevoice_ready(&sv_live) {
@@ -188,7 +108,9 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
         } else {
             wh.display().to_string()
         },
+        models_root: lumen_models_dir().display().to_string(),
         active_engine: engine,
+        active_model_dir,
         candidates: scan_candidates(),
         download_url: SENSEVOICE_ARCHIVE_URL.into(),
     })
@@ -206,7 +128,7 @@ pub struct UseAsrModelInput {
     pub engine: Option<String>,
 }
 
-/// Point runtime at an existing model directory and persist via env-style config note.
+/// Point runtime at an existing model directory and persist it for the next launch.
 #[tauri::command]
 pub fn use_existing_asr_model(
     state: State<'_, AppState>,
@@ -233,7 +155,7 @@ pub fn use_existing_asr_model(
                 .engine
                 .lock()
                 .map_err(|_| "engine lock poisoned".to_string())? = EngineKind::Whisper;
-            std::env::set_var("LUMEN_WHISPER_DIR", path.display().to_string());
+            persist_model_selection(&state, &path, EngineKind::Whisper)?;
         }
         _ => {
             if !sensevoice_ready(&path) {
@@ -251,11 +173,29 @@ pub fn use_existing_asr_model(
                 .engine
                 .lock()
                 .map_err(|_| "engine lock poisoned".to_string())? = EngineKind::SenseVoice;
-            std::env::set_var("LUMEN_SENSEVOICE_DIR", path.display().to_string());
+            persist_model_selection(&state, &path, EngineKind::SenseVoice)?;
         }
     }
     tracing::info!(path = %path.display(), %engine, "ASR model path selected");
     check_asr_model_status(state)
+}
+
+fn persist_model_selection(
+    state: &AppState,
+    path: &Path,
+    engine: EngineKind,
+) -> Result<(), String> {
+    let mut config = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    config.asr.provider = match engine {
+        EngineKind::SenseVoice => "local_sensevoice",
+        EngineKind::Whisper => "local_whisper",
+    }
+    .into();
+    config.asr.model_dir = path.display().to_string();
+    config.save()
 }
 
 #[tauri::command]
@@ -289,7 +229,7 @@ pub async fn start_asr_model_download(app: AppHandle) -> Result<AsrModelStatus, 
                 .engine
                 .lock()
                 .map_err(|_| "engine lock poisoned".to_string())? = EngineKind::SenseVoice;
-            std::env::set_var("LUMEN_SENSEVOICE_DIR", dir.display().to_string());
+            persist_model_selection(&state, &dir, EngineKind::SenseVoice)?;
             check_asr_model_status(state)
         }
         Ok(Err(e)) => Err(e),
@@ -318,11 +258,8 @@ fn emit_progress(app: &AppHandle, phase: &str, message: &str, bytes: u64, total:
 }
 
 fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
-    // Shared cluster root — same path navi uses so apps do not re-download.
-    let dest_root = lumen_asr::app_models_dir();
+    let dest_root = lumen_models_dir();
     std::fs::create_dir_all(&dest_root).map_err(|e| e.to_string())?;
-    let archive_path = dest_root.join(SENSEVOICE_ARCHIVE_NAME);
-    let extract_tmp = dest_root.join("sensevoice-extract-tmp");
     let final_dir = dest_root.join("sensevoice");
 
     if sensevoice_ready(&final_dir) {
@@ -330,28 +267,51 @@ fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
         return Ok(final_dir);
     }
 
+    let _install_lock = acquire_install_lock(app, &dest_root)?;
+    if sensevoice_ready(&final_dir) {
+        emit_progress(
+            app,
+            "done",
+            "SenseVoice installed by another Lumen app",
+            0,
+            None,
+        );
+        return Ok(final_dir);
+    }
+
     if DOWNLOAD_CANCEL.load(Ordering::SeqCst) {
         return Err("download cancelled".into());
     }
+
+    let process_id = std::process::id();
+    let archive_path = dest_root.join(format!(".{SENSEVOICE_ARCHIVE_NAME}.{process_id}.part"));
+    let extract_tmp = dest_root.join(format!(".sensevoice-extract-{process_id}"));
+    let _scratch = DownloadScratch::new(archive_path.clone(), extract_tmp.clone());
 
     emit_progress(app, "downloading", "Downloading SenseVoice model…", 0, None);
 
     // Prefer curl for progress-friendly large downloads on macOS.
-    let status = Command::new("curl")
+    let mut child = Command::new("curl")
         .args([
             "-fL",
             "--progress-bar",
             "-o",
-            archive_path.to_str().unwrap_or("/tmp/sv.tar.bz2"),
+            archive_path.to_str().ok_or("bad archive path")?,
             SENSEVOICE_ARCHIVE_URL,
         ])
-        .status()
+        .spawn()
         .map_err(|e| format!("curl failed to start: {e}"))?;
-
-    if DOWNLOAD_CANCEL.load(Ordering::SeqCst) {
-        let _ = std::fs::remove_file(&archive_path);
-        return Err("download cancelled".into());
-    }
+    let status = loop {
+        if DOWNLOAD_CANCEL.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("download cancelled".into());
+        }
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => break status,
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    };
     if !status.success() {
         return Err(format!(
             "download failed (curl exit {:?}). Check network or place model under {}",
@@ -360,16 +320,11 @@ fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
         ));
     }
 
-    let bytes = std::fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
-    emit_progress(
-        app,
-        "extracting",
-        "Extracting archive…",
-        bytes,
-        Some(bytes),
-    );
+    let bytes = std::fs::metadata(&archive_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    emit_progress(app, "extracting", "Extracting archive…", bytes, Some(bytes));
 
-    let _ = std::fs::remove_dir_all(&extract_tmp);
     std::fs::create_dir_all(&extract_tmp).map_err(|e| e.to_string())?;
 
     let tar_status = Command::new("tar")
@@ -393,16 +348,8 @@ fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
     if final_dir.exists() {
         let _ = std::fs::remove_dir_all(&final_dir);
     }
-    // Move into place
-    std::fs::rename(&found, &final_dir).or_else(|_| {
-        copy_dir_recursive(&found, &final_dir)?;
-        let _ = std::fs::remove_dir_all(&found);
-        Ok::<(), String>(())
-    })?;
-
-    let _ = std::fs::remove_dir_all(&extract_tmp);
-    // Keep archive for cache (optional) — remove to save space
-    let _ = std::fs::remove_file(&archive_path);
+    std::fs::rename(&found, &final_dir)
+        .map_err(|error| format!("publish model atomically: {error}"))?;
 
     if !sensevoice_ready(&final_dir) {
         return Err("model installed but validation failed".into());
@@ -411,6 +358,54 @@ fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
     emit_progress(app, "done", "SenseVoice ready", bytes, Some(bytes));
     tracing::info!(dir = %final_dir.display(), "SenseVoice model installed");
     Ok(final_dir)
+}
+
+fn acquire_install_lock(app: &AppHandle, models_root: &Path) -> Result<ModelInstallLock, String> {
+    let mut announced = false;
+    loop {
+        if DOWNLOAD_CANCEL.load(Ordering::SeqCst) {
+            return Err("download cancelled".into());
+        }
+        match ModelInstallLock::try_acquire(models_root).map_err(|error| error.to_string())? {
+            Some(lock) => return Ok(lock),
+            None => {
+                if !announced {
+                    emit_progress(
+                        app,
+                        "waiting",
+                        "Another Lumen app is installing SenseVoice…",
+                        0,
+                        None,
+                    );
+                    announced = true;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+struct DownloadScratch {
+    archive: PathBuf,
+    extract_dir: PathBuf,
+}
+
+impl DownloadScratch {
+    fn new(archive: PathBuf, extract_dir: PathBuf) -> Self {
+        let _ = std::fs::remove_file(&archive);
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        Self {
+            archive,
+            extract_dir,
+        }
+    }
+}
+
+impl Drop for DownloadScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.archive);
+        let _ = std::fs::remove_dir_all(&self.extract_dir);
+    }
 }
 
 fn find_sensevoice_dir(root: &Path) -> Option<PathBuf> {
@@ -432,21 +427,3 @@ fn find_sensevoice_dir(root: &Path) -> Option<PathBuf> {
     }
     None
 }
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    for e in std::fs::read_dir(src).map_err(|e| e.to_string())? {
-        let e = e.map_err(|e| e.to_string())?;
-        let to = dst.join(e.file_name());
-        if e.path().is_dir() {
-            copy_dir_recursive(&e.path(), &to)?;
-        } else {
-            std::fs::copy(e.path(), to).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-// Silence unused if Mutex imported for future download state
-#[allow(dead_code)]
-static _FUTURE: Mutex<Option<()>> = Mutex::new(None);

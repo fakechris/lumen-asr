@@ -32,6 +32,7 @@ export function OnboardingWizard({ onDone }: Props) {
   const monitoring = useRef(false);
 
   const [asr, setAsr] = useState<AsrModelStatus | null>(null);
+  const [engineChoice, setEngineChoice] = useState<"sensevoice" | "whisper">("sensevoice");
   const [dlMsg, setDlMsg] = useState("");
   const [dlPct, setDlPct] = useState<number | null>(null);
   const [customPath, setCustomPath] = useState("");
@@ -61,7 +62,9 @@ export function OnboardingWizard({ onDone }: Props) {
 
   const refreshAsr = useCallback(async () => {
     try {
-      setAsr(await api.checkAsrModelStatus());
+      const status = await api.checkAsrModelStatus();
+      setAsr(status);
+      setEngineChoice(status.activeEngine === "whisper" ? "whisper" : "sensevoice");
     } catch (e) {
       setError(String(e));
     }
@@ -285,7 +288,10 @@ export function OnboardingWizard({ onDone }: Props) {
   const axOk = perm?.accessibilityTrusted ?? false;
   const canLeavePerms = micOk;
   const meterPct = Math.min(100, Math.round(Math.max(peak, rms * 2) * 200));
-  const asrReady = asr?.sensevoiceReady ?? false;
+  const asrReady =
+    engineChoice === "whisper"
+      ? (asr?.whisperReady ?? false)
+      : (asr?.sensevoiceReady ?? false);
 
   return (
     <div
@@ -540,24 +546,44 @@ export function OnboardingWizard({ onDone }: Props) {
           <section className="onboard-step">
             <h1>本地 ASR 模型</h1>
             <p className="muted-text">默认 SenseVoice。可使用本机已有模型，或下载官方 sherpa 包。</p>
+            <div className="form-row" style={{ marginBottom: 10 }}>
+              <label className="muted-text" style={{ minWidth: 72 }}>
+                引擎
+              </label>
+              <select
+                className="input"
+                value={engineChoice}
+                disabled={busy}
+                onChange={(event) => {
+                  const next = event.target.value as "sensevoice" | "whisper";
+                  setEngineChoice(next);
+                  void api.setAsrEngine(next).catch((error) => setError(String(error)));
+                }}
+              >
+                <option value="sensevoice">SenseVoice（推荐，可下载）</option>
+                <option value="whisper">Whisper（使用已有模型）</option>
+              </select>
+            </div>
             {asr && (
               <div className={`onboard-perm-card ${asrReady ? "ok" : ""}`} style={{ marginBottom: 12 }}>
                 <div className="onboard-perm-title">
-                  SenseVoice{" "}
+                  {engineChoice === "whisper" ? "Whisper" : "SenseVoice"}{" "}
                   <span className="onboard-pill">{asrReady ? "就绪" : "未就绪"}</span>
                 </div>
                 <p className="muted-text" style={{ wordBreak: "break-all" }}>
-                  <code>{asr.sensevoiceDir}</code>
+                  <code>
+                    {engineChoice === "whisper" ? asr.whisperDir : asr.sensevoiceDir}
+                  </code>
                 </p>
               </div>
             )}
-            {asr && asr.candidates.filter((c) => c.ready && c.engine === "sensevoice").length > 0 && (
+            {asr && asr.candidates.filter((c) => c.ready && c.engine === engineChoice).length > 0 && (
               <div style={{ marginBottom: 12 }}>
                 <div className="muted-text" style={{ marginBottom: 6 }}>
                   检测到的本地模型
                 </div>
                 {asr.candidates
-                  .filter((c) => c.ready && c.engine === "sensevoice")
+                  .filter((c) => c.ready && c.engine === engineChoice)
                   .map((c) => (
                     <div key={c.path} className="onboard-candidate">
                       <span>{c.label}</span>
@@ -569,7 +595,7 @@ export function OnboardingWizard({ onDone }: Props) {
                           void (async () => {
                             setBusy(true);
                             try {
-                              setAsr(await api.useExistingAsrModel(c.path, "sensevoice"));
+                              setAsr(await api.useExistingAsrModel(c.path, engineChoice));
                             } catch (e) {
                               setError(String(e));
                             } finally {
@@ -601,7 +627,7 @@ export function OnboardingWizard({ onDone }: Props) {
                   void (async () => {
                     setBusy(true);
                     try {
-                      setAsr(await api.useExistingAsrModel(customPath.trim(), "sensevoice"));
+                      setAsr(await api.useExistingAsrModel(customPath.trim(), engineChoice));
                     } catch (e) {
                       setError(String(e));
                     } finally {
@@ -613,11 +639,16 @@ export function OnboardingWizard({ onDone }: Props) {
                 验证并使用
               </button>
             </div>
+            {engineChoice === "whisper" && !asrReady && (
+              <p className="muted-text">
+                Whisper 暂无内置下载，请从检测列表选择已有模型或粘贴模型目录。
+              </p>
+            )}
             <div className="actions" style={{ marginBottom: 8 }}>
               <button
                 type="button"
                 className="btn"
-                disabled={busy || asrReady}
+                disabled={busy || asrReady || engineChoice !== "sensevoice"}
                 onClick={() =>
                   void (async () => {
                     setBusy(true);
@@ -639,7 +670,7 @@ export function OnboardingWizard({ onDone }: Props) {
               <button
                 type="button"
                 className="btn ghost"
-                disabled={!busy}
+                disabled={!busy || engineChoice !== "sensevoice"}
                 onClick={() => void api.cancelAsrModelDownload()}
               >
                 取消下载
