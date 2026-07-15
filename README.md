@@ -170,9 +170,6 @@ Quit Lumen fully and reopen after toggling Accessibility.
 
 Default engine: **SenseVoice** (via sherpa-onnx).
 
-For the provider capability matrix and the distinction between hotwords, previous-transcript
-context, and free-text ASR prompts, see [ASR context capability selection](docs/research/ASR_CONTEXT_CAPABILITY_SELECTION.md).
-
 Put model files here (first match wins):
 
 1. `LUMEN_SENSEVOICE_DIR` (env override)  
@@ -386,9 +383,6 @@ npm run tauri dev
 #### 4. 准备本地语音模型
 
 默认引擎：**SenseVoice**（sherpa-onnx）。
-
-热词、前文续接、自由文本 Prompt 的区别以及各 ASR 引擎的接入判断，见
-[ASR 上下文能力与引擎选型](docs/research/ASR_CONTEXT_CAPABILITY_SELECTION.md)。
 
 模型目录（按优先级）：
 
