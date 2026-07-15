@@ -5,7 +5,8 @@
 
 # Node / frontend
 node_modules/
-apps/desktop/dist/assets/
+/apps/desktop/dist/
+*.tsbuildinfo
 .DS_Store
 *.local
 .env
@@ -22,6 +23,64 @@ apps/desktop/src-tauri/gen/schemas
 
 # Local visual brainstorming sessions
 .superpowers/
+
+# Local agent and browser state (never publish)
+/.codex/
+/.mcp.json
+/.playwright-mcp/
+/blind-review-*
+
+# Internal research, competitive analysis, and evolution plans (never publish)
+/.research/
+/docs/research/
+/docs/superpowers/
+/docs/internal/
+/docs/private/
+/docs/evolution/
+/docs/competitive/
+/docs/competitor/
+/docs/design/
+/docs/plans/
+/docs/planning/
+/docs/strategy/
+/docs/vendor/
+/docs/market/
+/docs/**/*[Rr][Ee][Ss][Ee][Aa][Rr][Cc][Hh]*
+/docs/**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Ii][Vv][Ee]*
+/docs/**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Oo][Rr]*
+/docs/**/*[Ee][Vv][Oo][Ll][Uu][Tt][Ii][Oo][Nn]*
+/docs/**/*[Dd][Ee][Ss][Ii][Gg][Nn]*
+/docs/**/*[Pp][Ll][Aa][Nn]*
+/docs/**/*[Mm][Ii][Ll][Ee][Ss][Tt][Oo][Nn][Ee]*
+/docs/**/*[Rr][Oo][Aa][Dd][Mm][Aa][Pp]*
+/docs/**/*[Ss][Tt][Rr][Aa][Tt][Ee][Gg][Yy]*
+/docs/**/*[Vv][Ee][Nn][Dd][Oo][Rr]*
+/docs/**/*[Mm][Aa][Rr][Kk][Ee][Tt]*
+/docs/**/*竞品*
+/docs/**/*调研*
+/docs/**/*研究*
+/docs/**/*进化*
+
+# Credentials and private key material (never publish)
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*credentials*.json
+*secrets*.json
+
+# Internal document filenames in any directory
+**/*[Rr][Ee][Ss][Ee][Aa][Rr][Cc][Hh]*.md
+**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Oo][Rr]*.md
+**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Ii][Vv][Ee]*.md
+**/*[Ee][Vv][Oo][Ll][Uu][Tt][Ii][Oo][Nn]*.md
+**/*[Ii][Mm][Pp][Ll][Ee][Mm][Ee][Nn][Tt][Aa][Tt][Ii][Oo][Nn]-[Pp][Ll][Aa][Nn]*.md
+**/*[Vv][Ee][Nn][Dd][Oo][Rr]-[Ee][Vv][Aa][Ll][Uu][Aa][Tt][Ii][Oo][Nn]*.md
+**/*[Mm][Aa][Rr][Kk][Ee][Tt]-[Ll][Aa][Nn][Dd][Ss][Cc][Aa][Pp][Ee]*.md
 
 # Models & local data (never commit)
 models/
