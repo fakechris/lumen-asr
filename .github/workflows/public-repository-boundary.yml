@@ -24,8 +24,6 @@ jobs:
 
       - name: Check pull request ancestry and size
         if: github.event_name == 'pull_request'
-        env:
-          ALLOW_LARGE_SCOPE: ${{ contains(github.event.pull_request.labels.*.name, 'large-scope-approved') }}
         run: >-
           scripts/ci/check-pr-scope.sh
           "${{ github.event.pull_request.base.sha }}"

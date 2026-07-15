@@ -46,8 +46,8 @@ be rebuilt from `origin/main`; mergeability alone is not approval.
 
 The automated scope gate rejects a branch whose pull-request base is not its
 merge base. By default it also rejects more than 5 commits, 30 changed files, or
-3,000 added lines. A deliberately large change requires the
-`large-scope-approved` label after explicit file-list review.
+3,000 added lines. There is no label or agent-controlled override; split larger
+changes before publishing.
 
 ## Enforcement
 

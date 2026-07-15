@@ -36,6 +36,8 @@ apps/desktop/src-tauri/gen/schemas
 /docs/superpowers/
 /docs/internal/
 /docs/private/
+/docs/**/internal/
+/docs/**/private/
 /docs/evolution/
 /docs/competitive/
 /docs/competitor/
@@ -81,6 +83,20 @@ id_ed25519.*
 **/*[Ii][Mm][Pp][Ll][Ee][Mm][Ee][Nn][Tt][Aa][Tt][Ii][Oo][Nn]-[Pp][Ll][Aa][Nn]*.md
 **/*[Vv][Ee][Nn][Dd][Oo][Rr]-[Ee][Vv][Aa][Ll][Uu][Aa][Tt][Ii][Oo][Nn]*.md
 **/*[Mm][Aa][Rr][Kk][Ee][Tt]-[Ll][Aa][Nn][Dd][Ss][Cc][Aa][Pp][Ee]*.md
+**/*[Rr][Ee][Ss][Ee][Aa][Rr][Cc][Hh]*.*
+**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Oo][Rr]*.*
+**/*[Cc][Oo][Mm][Pp][Ee][Tt][Ii][Tt][Ii][Vv][Ee]*.*
+**/*[Ee][Vv][Oo][Ll][Uu][Tt][Ii][Oo][Nn]*.*
+**/*[Ii][Mm][Pp][Ll][Ee][Mm][Ee][Nn][Tt][Aa][Tt][Ii][Oo][Nn]-[Pp][Ll][Aa][Nn]*.*
+**/*[Vv][Ee][Nn][Dd][Oo][Rr]-[Ee][Vv][Aa][Ll][Uu][Aa][Tt][Ii][Oo][Nn]*.*
+**/*[Mm][Aa][Rr][Kk][Ee][Tt]-[Ll][Aa][Nn][Dd][Ss][Cc][Aa][Pp][Ee]*.*
+**/*[Rr][Oo][Aa][Dd][Mm][Aa][Pp]*.*
+**/*[Mm][Ii][Ll][Ee][Ss][Tt][Oo][Nn][Ee]*.*
+**/*[Ss][Tt][Rr][Aa][Tt][Ee][Gg][Yy]*.*
+**/*[Dd][Ee][Ss][Ii][Gg][Nn]*.*
+**/[Pp][Ll][Aa][Nn][Nn][Ii][Nn][Gg]/**
+**/[Pp][Ll][Aa][Nn][Ss]/**
+**/[Ss][Tt][Rr][Aa][Tt][Ee][Gg][Yy]/**
 
 # Models & local data (never commit)
 models/
