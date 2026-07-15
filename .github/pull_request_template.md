@@ -4,7 +4,7 @@
 - [ ] This branch was created from the current `origin/main`, not a divergent local branch.
 - [ ] `git log --oneline origin/main..HEAD` contains only the commits described by this PR.
 - [ ] `git diff --stat origin/main...HEAD` matches the declared scope.
-- [ ] The automated ancestry and size gate passes; `large-scope-approved` is used only after explicit scope review.
+- [ ] The automated ancestry and size gate passes without an override.
 
 ## Public repository boundary
 

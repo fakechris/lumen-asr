@@ -22,6 +22,8 @@ while IFS= read -r -d '' path; do
     docs/superpowers/*|\
     docs/internal/*|\
     docs/private/*|\
+    docs/*/internal/*|\
+    docs/*/private/*|\
     docs/evolution/*|\
     docs/competitive/*|\
     docs/competitor/*|\
@@ -57,7 +59,7 @@ while IFS= read -r -d '' path; do
   case "$path" in
     *.md|*.mdx|*.txt|*.pdf|*.docx)
       case "$path" in
-        *research*|*competitive*|*competitor*|*evolution*|*implementation-plan*|*vendor-evaluation*|*market-landscape*|*竞品*|*调研*|*研究*|*进化*)
+        *research*|*competitive*|*competitor*|*evolution*|*implementation-plan*|*vendor-evaluation*|*market-landscape*|*roadmap*|*milestone*|*strategy*|*design*|*/planning/*|*/plans/*|*竞品*|*调研*|*研究*|*进化*)
           violations+=("$path")
           ;;
       esac
