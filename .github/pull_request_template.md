@@ -15,6 +15,7 @@
 - [ ] Each new/modified binary `docs/images/` asset has a same-commit `.public.md` sidecar and was inspected for private data.
 - [ ] `scripts/ci/test-public-repo-boundary.sh` passes.
 - [ ] `scripts/ci/check-public-repo-boundary.sh` passes.
+- [ ] `scripts/ci/check-pr-scope.sh origin/main HEAD` passes.
 - [ ] Any unusually large PR has been split or explicitly justified before review.
 
 ## Validation

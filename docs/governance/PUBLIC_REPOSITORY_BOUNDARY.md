@@ -71,4 +71,5 @@ tracked tree on every pull request and every branch push. Push checks inspect
 every new commit, including material added and removed within the same range.
 Pull-request checks additionally require the PR base to be its merge base and
 reject more than 5 commits, 30 changed files, 3,000 added lines, or any binary
-file by default. There is no agent-controlled override.
+addition outside the approved `docs/images/` formats, or an approved image that
+lacks a valid same-commit attestation. There is no agent-controlled override.

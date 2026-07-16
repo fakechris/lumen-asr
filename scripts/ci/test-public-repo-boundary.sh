@@ -125,6 +125,20 @@ printf 'ASR provider comparison matrix\n' >"$dir/notes/VOICE_OPTIONS.md"
 commit_fixture "$dir"
 expect_fail "$dir"
 
+dir="$(new_fixture research-disguised-as-governance)"
+mkdir -p "$dir/docs/governance"
+printf 'ASR provider comparison matrix\n' \
+  >"$dir/docs/governance/VOICE_OPTIONS.md"
+commit_fixture "$dir"
+expect_fail "$dir"
+
+dir="$(new_fixture selection-research-disguised-as-governance)"
+mkdir -p "$dir/docs/governance"
+printf 'ASR provider selection\nWe chose Engine X after testing.\n' \
+  >"$dir/docs/governance/VOICE_DECISION.md"
+commit_fixture "$dir"
+expect_fail "$dir"
+
 dir="$(new_fixture structured-research-csv)"
 mkdir -p "$dir/notes"
 printf 'provider,WER\nengine-x,0.12\n' >"$dir/notes/VOICE_RESULTS.csv"
@@ -185,6 +199,12 @@ expect_fail "$dir"
 dir="$(new_fixture renamed-context-source)"
 mkdir -p "$dir/src"
 printf 'pub struct ContextCaptureState;\n' >"$dir/src/private_feature.rs"
+commit_fixture "$dir"
+expect_fail "$dir"
+
+dir="$(new_fixture renamed-context-inference-source)"
+mkdir -p "$dir/src"
+printf 'pub struct ContextInferenceState;\n' >"$dir/src/private_feature.rs"
 commit_fixture "$dir"
 expect_fail "$dir"
 
@@ -268,6 +288,23 @@ git -C "$dir" commit -qm remove-private-binary-research
 if (cd "$dir" && scripts/ci/check-pr-scope.sh \
   "$base" HEAD --history-only >/dev/null 2>&1); then
   fail "expected scope checker to reject a transient binary history leak"
+fi
+
+dir="$(new_fixture git-lfs-history-leak)"
+mkdir -p "$dir/scripts/ci" "$dir/docs/product"
+cp "$checker" "$dir/scripts/ci/check-public-repo-boundary.sh"
+cp "$repo_root/scripts/ci/check-pr-scope.sh" "$dir/scripts/ci/check-pr-scope.sh"
+chmod +x "$dir/scripts/ci/"*.sh
+printf 'approved behavior\n' >"$dir/docs/product/BEHAVIOR.md"
+commit_fixture "$dir"
+base="$(git -C "$dir" rev-parse HEAD)"
+printf 'version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 12345\n' \
+  >"$dir/docs/product/VOICE_SAMPLE.wav"
+git -C "$dir" add -f docs/product/VOICE_SAMPLE.wav
+git -C "$dir" commit -qm add-lfs-backed-private-asset
+if (cd "$dir" && scripts/ci/check-pr-scope.sh \
+  "$base" HEAD --history-only >/dev/null 2>&1); then
+  fail "expected a Git LFS pointer outside approved public images to fail"
 fi
 
 dir="$(new_fixture public-image-history)"

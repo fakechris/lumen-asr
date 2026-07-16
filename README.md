@@ -69,7 +69,7 @@ git clone <your-repo-url> lumen-asr
 cd lumen-asr
 
 # Build release app, install into .app, codesign, open
-./dev-install.sh --open
+./scripts/macos/dev-install.sh --open
 ```
 
 Dev loop (hot reload UI):
@@ -80,13 +80,13 @@ npm install
 npm run tauri dev
 ```
 
-> **Signing tip:** after every release build, reinstall with `./dev-install.sh` so the `.app` signature stays valid. Prefer a trusted local Code Signing certificate or free Apple Development identity so Mic / Accessibility grants survive rebuilds. Details: [docs/release/macos/LOCAL_SIGNING.md](./docs/release/macos/LOCAL_SIGNING.md).
+> **Signing tip:** after every release build, reinstall with `./scripts/macos/dev-install.sh` so the `.app` signature stays valid. Prefer a trusted local Code Signing certificate or free Apple Development identity so Mic / Accessibility grants survive rebuilds. Details: [docs/release/macos/LOCAL_SIGNING.md](./docs/release/macos/LOCAL_SIGNING.md).
 
 ### First-time setup (step by step)
 
 #### 1. Launch Lumen ASR
 
-Open `Lumen ASR.app` (from `./dev-install.sh --open` or your install path).  
+Open `Lumen ASR.app` (from `./scripts/macos/dev-install.sh --open` or your install path).
 If the system says the app is blocked, use **right-click → Open** once (local builds are not App Store notarized).
 
 #### 2. Complete onboarding
@@ -168,7 +168,7 @@ Config file (advanced):
 
 - Prefer **hold** mode until the gesture feels natural.  
 - If paste fails, check Accessibility and whether the target app accepts clipboard paste.  
-- If audio playback sounds wrong after many rapid tests, rebuild with `./dev-install.sh` (capture fixes ship in recent builds).  
+- If audio playback sounds wrong after many rapid tests, rebuild with `./scripts/macos/dev-install.sh` (capture fixes ship in recent builds).
 - Cloud correctors: use models that support **disabling thinking** for dictation speed; Lumen sends no-thinking flags where the API allows it.  
 
 ### Project layout (for contributors)
@@ -240,7 +240,7 @@ git clone <仓库地址> lumen-asr
 cd lumen-asr
 
 # 编译 release、装入 .app、签名并打开
-./dev-install.sh --open
+./scripts/macos/dev-install.sh --open
 ```
 
 开发热更新：
@@ -251,7 +251,7 @@ npm install
 npm run tauri dev
 ```
 
-> **签名提示：** 每次 release 编译后请用 `./dev-install.sh` 重新安装，否则 `.app` 签名会失效。建议使用受信任的本地代码签名证书或免费 Apple Development 证书，以便麦克风/辅助功能授权在重装后尽量保留。详见 [docs/release/macos/LOCAL_SIGNING.md](./docs/release/macos/LOCAL_SIGNING.md)。
+> **签名提示：** 每次 release 编译后请用 `./scripts/macos/dev-install.sh` 重新安装，否则 `.app` 签名会失效。建议使用受信任的本地代码签名证书或免费 Apple Development 证书，以便麦克风/辅助功能授权在重装后尽量保留。详见 [docs/release/macos/LOCAL_SIGNING.md](./docs/release/macos/LOCAL_SIGNING.md)。
 
 ### 第一次使用（分步）
 
@@ -336,7 +336,7 @@ npm run tauri dev
 - 先用 **按住** 模式建立肌肉记忆  
 - 粘贴失败时检查辅助功能与目标 App 是否接受粘贴  
 - 云端模型：听写场景尽量选 **可关闭 thinking** 的型号，延迟更低  
-- 重新编译后请执行 `./dev-install.sh`，不要只拷贝二进制进 `.app`  
+- 重新编译后请执行 `./scripts/macos/dev-install.sh`，不要只拷贝二进制进 `.app`
 
 ### 仓库结构（给开发者）
 

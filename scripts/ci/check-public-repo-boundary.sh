@@ -135,7 +135,7 @@ document_pathspecs=(
   ':(exclude)AGENTS.md'
   ':(exclude).github/pull_request_template.md'
   ':(exclude)docs/README.md'
-  ':(exclude,glob)docs/governance/**'
+  ':(exclude)docs/governance/PUBLIC_REPOSITORY_BOUNDARY.md'
   ':(exclude)docs/product/README.md'
   ':(exclude)docs/ui/README.md'
 )
@@ -238,12 +238,12 @@ if ((${#sidecar_violations[@]} > 0)); then
   exit 1
 fi
 
-prohibited_implementation_pattern='ContextCapture(State|Config)|context_inference|lumen-context|lumen[-_]bench|private reference dataset'
+prohibited_implementation_pattern='Context(Capture|Inference)(State|Config)?|context[-_](capture|inference)|lumen[-_](context|bench)|private reference dataset'
 if [[ -n "$treeish" ]]; then
-  implementation_matches="$(git grep -I -n -E -e "$prohibited_implementation_pattern" "$treeish" -- \
+  implementation_matches="$(git grep -I -i -n -E -e "$prohibited_implementation_pattern" "$treeish" -- \
     '*.rs' '*.toml' '*.tsx' '*.ts' '*.js' '*.mjs' '*.json' 'Cargo.lock' || true)"
 else
-  implementation_matches="$(git grep -I -n -E -e "$prohibited_implementation_pattern" -- \
+  implementation_matches="$(git grep -I -i -n -E -e "$prohibited_implementation_pattern" -- \
     '*.rs' '*.toml' '*.tsx' '*.ts' '*.js' '*.mjs' '*.json' 'Cargo.lock' || true)"
 fi
 if [[ -n "$implementation_matches" ]]; then

@@ -42,6 +42,14 @@ has_valid_public_image_magic() {
   esac
 }
 
+is_git_lfs_pointer() {
+  local treeish="$1"
+  local path="$2"
+  local first_line
+  first_line="$(git cat-file blob "${treeish}:${path}" 2>/dev/null | sed -n '1p' || true)"
+  [[ "$first_line" == 'version https://git-lfs.github.com/spec/v1' ]]
+}
+
 has_valid_public_image_attestation() {
   local treeish="$1"
   local path="$2"
@@ -80,6 +88,8 @@ list_prohibited_binary_additions() {
       fi
     elif [[ "$added" == "-" || "$deleted" == "-" ]]; then
       printf '%s\n' "$path"
+    elif is_git_lfs_pointer "$treeish" "$path"; then
+      printf '%s (Git LFS pointer)\n' "$path"
     fi
   done
 }
