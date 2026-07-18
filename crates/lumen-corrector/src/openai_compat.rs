@@ -113,21 +113,22 @@ impl Corrector for OpenAiCompatCorrector {
             builder = builder.bearer_auth(&self.config.api_key);
         }
 
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| CorrectorError::Http(e.to_string()))?;
+        let resp = builder.send().await.map_err(|error| {
+            if error.is_timeout() {
+                CorrectorError::Timeout
+            } else {
+                CorrectorError::Http(error.to_string())
+            }
+        })?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(CorrectorError::Http(format!("{status}: {body}")));
+            return Err(CorrectorError::ProviderRejected(resp.status().as_u16()));
         }
 
         let parsed: ChatCompletionResponse = resp
             .json()
             .await
-            .map_err(|e| CorrectorError::Http(e.to_string()))?;
+            .map_err(|_| CorrectorError::MalformedResponse)?;
 
         let text = parsed
             .choices
@@ -142,6 +143,7 @@ impl Corrector for OpenAiCompatCorrector {
             text,
             engine: self.id(),
             model_applied: true,
+            fallback_reason: None,
         })
     }
 }
@@ -152,9 +154,7 @@ fn is_local_ollama(cfg: &OpenAiCompatConfig) -> bool {
         return true;
     }
     let u = cfg.base_url.to_ascii_lowercase();
-    u.contains("127.0.0.1:11434")
-        || u.contains("localhost:11434")
-        || u.contains("0.0.0.0:11434")
+    u.contains("127.0.0.1:11434") || u.contains("localhost:11434") || u.contains("0.0.0.0:11434")
 }
 
 /// Request-side: turn off thinking for providers that support it.

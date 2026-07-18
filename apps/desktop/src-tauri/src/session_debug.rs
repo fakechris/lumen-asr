@@ -8,6 +8,7 @@
 //!     corrected.txt
 
 use lumen_platform::default_data_dir;
+use lumen_store::{PipelineMetrics, PipelineStage};
 use serde::Serialize;
 use std::fs::{self, File};
 use std::io::Write;
@@ -18,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[serde(rename_all = "camelCase")]
 pub struct SessionDebugMeta {
     pub session_id: String,
+    pub attempt_id: String,
     pub created_at_unix_ms: u128,
     pub target_app: Option<String>,
     pub target_bundle_id: Option<String>,
@@ -35,6 +37,9 @@ pub struct SessionDebugMeta {
     pub corrected_text: String,
     pub insert_strategy: String,
     pub insert_ok: bool,
+    pub failed_stage: Option<PipelineStage>,
+    pub failure_message: Option<String>,
+    pub pipeline_metrics: PipelineMetrics,
     pub notes: Vec<String>,
 }
 
@@ -175,16 +180,21 @@ fn write_wav_f32_as_i16(path: &Path, samples: &[f32], sample_rate: u32) -> Resul
 
     // fmt chunk
     f.write_all(b"fmt ").map_err(|e| e.to_string())?;
-    f.write_all(&16u32.to_le_bytes()).map_err(|e| e.to_string())?; // chunk size
-    f.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?; // PCM
-    f.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?; // mono
+    f.write_all(&16u32.to_le_bytes())
+        .map_err(|e| e.to_string())?; // chunk size
+    f.write_all(&1u16.to_le_bytes())
+        .map_err(|e| e.to_string())?; // PCM
+    f.write_all(&1u16.to_le_bytes())
+        .map_err(|e| e.to_string())?; // mono
     f.write_all(&sample_rate.to_le_bytes())
         .map_err(|e| e.to_string())?;
     let byte_rate = sample_rate * 2;
     f.write_all(&byte_rate.to_le_bytes())
         .map_err(|e| e.to_string())?;
-    f.write_all(&2u16.to_le_bytes()).map_err(|e| e.to_string())?; // block align
-    f.write_all(&16u16.to_le_bytes()).map_err(|e| e.to_string())?; // bits
+    f.write_all(&2u16.to_le_bytes())
+        .map_err(|e| e.to_string())?; // block align
+    f.write_all(&16u16.to_le_bytes())
+        .map_err(|e| e.to_string())?; // bits
 
     // data chunk
     f.write_all(b"data").map_err(|e| e.to_string())?;

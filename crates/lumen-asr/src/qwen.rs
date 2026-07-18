@@ -138,7 +138,7 @@ impl QwenAsr {
         generation: u64,
         request_id: u64,
         path: &Path,
-    ) -> Result<WorkerResponse, AsrError> {
+    ) -> Result<(WorkerResponse, bool), AsrError> {
         let result = self
             .transcribe_path_inner(generation, request_id, path)
             .await;
@@ -158,7 +158,7 @@ impl QwenAsr {
         generation: u64,
         request_id: u64,
         path: &Path,
-    ) -> Result<WorkerResponse, AsrError> {
+    ) -> Result<(WorkerResponse, bool), AsrError> {
         let mut guard = self.worker.lock().await;
         if self.lifecycle_generation.load(Ordering::SeqCst) != generation
             || !self.active.load(Ordering::SeqCst)
@@ -167,7 +167,8 @@ impl QwenAsr {
                 "Qwen engine was deselected before transcription started".into(),
             ));
         }
-        if guard.is_none() {
+        let worker_reused = guard.is_some();
+        if !worker_reused {
             *guard = Some(self.start_worker().await?);
         }
         let worker = guard.as_mut().expect("worker initialized");
@@ -247,7 +248,7 @@ impl QwenAsr {
             *guard = None;
             return Err(AsrError::Inference(error.to_owned()));
         }
-        Ok(response)
+        Ok((response, worker_reused))
     }
 }
 
@@ -263,9 +264,7 @@ impl AsrEngine for QwenAsr {
         }
         let generation = self.lifecycle_generation.load(Ordering::SeqCst);
         if !self.active.load(Ordering::SeqCst) {
-            return Err(AsrError::NotConfigured(
-                "Qwen engine is not active".into(),
-            ));
+            return Err(AsrError::NotConfigured("Qwen engine is not active".into()));
         }
         let request_id = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let audio_file = tokio::task::spawn_blocking(move || {
@@ -281,13 +280,19 @@ impl AsrEngine for QwenAsr {
         })
         .await
         .map_err(|error| AsrError::Inference(format!("prepare Qwen audio task: {error}")))??;
-        let response = self
+        let (response, worker_reused) = self
             .transcribe_path(generation, request_id, audio_file.path())
             .await?;
+        let (model, model_revision) = crate::model_identity_from_path(&self.config.model_dir);
         Ok(AsrResult {
             text: response.text.unwrap_or_default(),
             engine: self.id(),
             language: response.language,
+            diagnostics: crate::AsrRuntimeDiagnostics {
+                worker_reused: Some(worker_reused),
+                model,
+                model_revision,
+            },
         })
     }
 }

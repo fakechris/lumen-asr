@@ -12,6 +12,7 @@ mod inject_cmd;
 mod learning;
 mod mod_chord;
 mod onboard;
+mod pipeline_attempt;
 mod permissions_cmd;
 mod provider_presets;
 mod session_debug;
@@ -253,6 +254,7 @@ pub fn run() {
             commands::app_health,
             commands::list_sessions,
             commands::get_session,
+            commands::list_session_attempts,
             commands::delete_session,
             commands::save_session,
             commands::seed_demo_session,

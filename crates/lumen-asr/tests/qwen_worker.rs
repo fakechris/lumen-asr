@@ -72,6 +72,8 @@ for line in sys.stdin:
     assert_eq!(first.text, "Qwen result");
     assert_eq!(second.text, "Qwen result");
     assert_eq!(first.engine.as_str(), "qwen3_asr");
+    assert_eq!(first.diagnostics.worker_reused, Some(false));
+    assert_eq!(second.diagnostics.worker_reused, Some(true));
     assert_eq!(std::fs::read_to_string(&starts).unwrap(), "started\n");
     let _ = std::fs::remove_dir_all(root);
 }
@@ -202,8 +204,9 @@ for line in sys.stdin:
     engine.transcribe(request()).await.unwrap();
     assert!(engine.unload());
     engine.activate();
-    engine.transcribe(request()).await.unwrap();
+    let restarted = engine.transcribe(request()).await.unwrap();
 
+    assert_eq!(restarted.diagnostics.worker_reused, Some(false));
     assert_eq!(
         std::fs::read_to_string(&starts).unwrap(),
         "started\nstarted\n"

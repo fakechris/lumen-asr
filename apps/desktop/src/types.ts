@@ -109,6 +109,88 @@ export type SessionRecord = {
   status: string;
 };
 
+export type PipelineIdentity = {
+  schema_version: number;
+  asr_provider: string;
+  asr_engine: string;
+  asr_model?: string | null;
+  asr_model_revision?: string | null;
+  corrector_provider: string;
+  corrector_engine: string;
+  corrector_model?: string | null;
+  prompt_hash?: string | null;
+  prompt_hash_algorithm?: string | null;
+  temperature?: number | null;
+  dictionary_context_hash?: string | null;
+  dictionary_context_hash_algorithm?: string | null;
+  dictionary_term_count: number;
+  dictionary_replacement_count: number;
+  enhancement_mode: EnhancementMode;
+};
+
+export type EnhancementMode = "none" | "unknown";
+export type InsertionOutcome =
+  | "not_requested"
+  | "copied"
+  | "inserted"
+  | "failed"
+  | "unknown";
+export type AttemptStatus = "in_progress" | "completed" | "failed" | "unknown";
+export type PipelineStage =
+  | "capture"
+  | "preprocess"
+  | "asr"
+  | "enhancement"
+  | "corrector"
+  | "insert"
+  | "unknown";
+export type PipelineIssueKind =
+  | "fallback"
+  | "input_unavailable"
+  | "clipboard_failure"
+  | "injection_failure"
+  | "unknown";
+
+export type PipelineMetrics = {
+  schema_version: number;
+  audio_duration_ms: number;
+  preprocess_ms: number;
+  asr_ms: number;
+  enhancement_ms: number;
+  corrector_ms: number;
+  insert_ms: number;
+  total_ms: number;
+  asr_rtf?: number | null;
+  asr_worker_reused?: boolean | null;
+  corrector_fallback: boolean;
+  insertion_outcome: InsertionOutcome;
+  insert_succeeded: boolean;
+  stage_issues: PipelineStageIssue[];
+};
+
+export type PipelineStageIssue = {
+  stage: PipelineStage;
+  kind: PipelineIssueKind;
+  message: string;
+};
+
+export type DictationAttemptRecord = {
+  id: string;
+  session_id: string;
+  attempt_ordinal: number;
+  created_at: string;
+  asr_raw?: string | null;
+  asr_enhanced?: string | null;
+  corrected?: string | null;
+  inserted?: string | null;
+  pipeline_identity: PipelineIdentity;
+  pipeline_metrics: PipelineMetrics;
+  status: AttemptStatus;
+  failed_stage?: PipelineStage | null;
+  failure_message?: string | null;
+  supersedes_attempt_id?: string | null;
+};
+
 export type EditEvent = {
   id: string;
   session_id: string;
