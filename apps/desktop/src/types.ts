@@ -44,11 +44,14 @@ export type AudioDevice = {
 
 export type AsrStatus = {
   recording: boolean;
-  engine: "sensevoice" | "whisper";
+  engine: "sensevoice" | "qwen" | "whisper";
   /** Settings ASR provider id — same source of truth as 设置 → 语音识别 */
   provider?: string;
   providerLabel?: string;
   sensevoice: { kind: string; ready: boolean; model_dir: string };
+  qwen: { kind: string; ready: boolean; model_dir: string };
+  qwenRuntimePath: string;
+  qwenRuntimeReady: boolean;
   whisper: { kind: string; ready: boolean; model_dir: string };
   activeReady: boolean;
 };

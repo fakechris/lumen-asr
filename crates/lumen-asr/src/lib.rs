@@ -1,12 +1,13 @@
 //! ASR engine abstraction + microphone capture.
 //!
-//! Default product path: SenseVoice via sherpa-onnx.
-//! Alternative: Whisper (same `AsrEngine` port).
+//! Product paths: SenseVoice via sherpa-onnx, Qwen3-ASR via a persistent
+//! local MLX worker, and Whisper. All implement the same `AsrEngine` port.
 
 mod audio;
 mod cloud_openai;
 mod install_lock;
 mod paths;
+mod qwen;
 mod sensevoice;
 mod whisper;
 
@@ -14,12 +15,14 @@ pub use audio::{resample_linear, AudioCapture, AudioDeviceInfo, AudioError, Capt
 pub use cloud_openai::{OpenAiAudioAsr, OpenAiAudioConfig};
 pub use install_lock::ModelInstallLock;
 pub use paths::{
-    app_models_dir, default_sensevoice_dir, default_sensevoice_dir_with_root, default_whisper_dir,
-    default_whisper_dir_with_root, legacy_model_roots, lumen_models_dir,
-    lumen_models_dir_with_override, scan_model_candidates, scan_model_candidates_with_root,
-    sensevoice_ready, shared_sensevoice_dir, shared_whisper_dir, user_home_dir, whisper_ready,
-    ModelCandidate, ENV_LUMEN_MODELS_DIR,
+    app_models_dir, default_qwen_dir, default_qwen_dir_with_root, default_sensevoice_dir,
+    default_sensevoice_dir_with_root, default_whisper_dir, default_whisper_dir_with_root,
+    legacy_model_roots, lumen_models_dir, lumen_models_dir_with_override, qwen_ready,
+    scan_model_candidates, scan_model_candidates_with_root, sensevoice_ready, shared_qwen_dir,
+    shared_sensevoice_dir, shared_whisper_dir, user_home_dir, whisper_ready, ModelCandidate,
+    ENV_LUMEN_MODELS_DIR,
 };
+pub use qwen::{QwenAsr, QwenAsrConfig};
 pub use sensevoice::SenseVoiceSherpaAsr;
 pub use whisper::WhisperAsr;
 
@@ -102,6 +105,7 @@ pub fn prepare_for_asr(capture: &CaptureResult) -> Vec<f32> {
 #[serde(rename_all = "snake_case")]
 pub enum EngineKind {
     SenseVoice,
+    Qwen,
     Whisper,
 }
 
@@ -109,6 +113,7 @@ impl EngineKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SenseVoice => "sensevoice",
+            Self::Qwen => "qwen",
             Self::Whisper => "whisper",
         }
     }
@@ -116,6 +121,7 @@ impl EngineKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "sensevoice" | "sensevoice_sherpa" | "sherpa" => Some(Self::SenseVoice),
+            "qwen" | "qwen3_asr" | "local_qwen" => Some(Self::Qwen),
             "whisper" => Some(Self::Whisper),
             _ => None,
         }
@@ -147,6 +153,15 @@ pub fn whisper_status() -> EngineStatus {
     }
 }
 
+pub fn qwen_status() -> EngineStatus {
+    let dir = default_qwen_dir();
+    EngineStatus {
+        kind: EngineKind::Qwen,
+        ready: qwen_ready(&dir),
+        model_dir: dir.display().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +188,14 @@ mod tests {
         };
         let out = prepare_for_asr(&cap);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn qwen_engine_kind_accepts_product_provider_names() {
+        assert_eq!(EngineKind::parse("qwen"), Some(EngineKind::Qwen));
+        assert_eq!(EngineKind::parse("qwen3_asr"), Some(EngineKind::Qwen));
+        assert_eq!(EngineKind::parse("local_qwen"), Some(EngineKind::Qwen));
+        assert_eq!(EngineKind::Qwen.as_str(), "qwen");
     }
 
     #[test]

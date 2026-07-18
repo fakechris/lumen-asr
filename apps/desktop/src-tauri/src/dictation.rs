@@ -5,7 +5,7 @@ use crate::session_debug::{self, SessionDebugMeta};
 use crate::AppState;
 use crate::config::AsrServiceConfig;
 use lumen_asr::{
-    prepare_for_asr, sensevoice_ready, whisper_ready, AsrEngine, AsrRequest, AsrResult,
+    prepare_for_asr, qwen_ready, sensevoice_ready, whisper_ready, AsrEngine, AsrRequest, AsrResult,
     AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig,
 };
 use lumen_core::{FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
@@ -146,6 +146,9 @@ pub struct AsrStatus {
     /// Settings ASR provider id (local_sensevoice | openai_audio | …) — source of truth for pipeline.
     pub provider: String,
     pub sensevoice: EngineStatus,
+    pub qwen: EngineStatus,
+    pub qwen_runtime_path: String,
+    pub qwen_runtime_ready: bool,
     pub whisper: EngineStatus,
     pub active_ready: bool,
     /// Short label for UI (e.g. "OpenAI Audio · whisper-1").
@@ -174,6 +177,7 @@ pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<Engi
     let e = engine.trim().to_ascii_lowercase();
     let (kind, provider_id) = match e.as_str() {
         "sensevoice" | "local_sensevoice" => (EngineKind::SenseVoice, "local_sensevoice"),
+        "qwen" | "qwen3_asr" | "local_qwen" => (EngineKind::Qwen, "local_qwen"),
         "whisper" | "local_whisper" => (EngineKind::Whisper, "local_whisper"),
         "openai_audio" | "custom" => (EngineKind::SenseVoice, if e == "custom" { "custom" } else { "openai_audio" }),
         other if other.starts_with("local_") => {
@@ -196,6 +200,7 @@ pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<Engi
                     let _ = cfg.save();
                 }
             }
+            unload_qwen(&state);
             return Ok(state
                 .engine
                 .lock()
@@ -204,6 +209,9 @@ pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<Engi
         }
     };
     *state.engine.lock().map_err(|_| "engine lock poisoned".to_string())? = kind;
+    if kind != EngineKind::Qwen {
+        unload_qwen(&state);
+    }
     if let Ok(mut cfg) = state.config.lock() {
         cfg.asr.provider = provider_id.into();
         if provider_id == "openai_audio" {
@@ -217,6 +225,14 @@ pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<Engi
         let _ = cfg.save();
     }
     Ok(kind)
+}
+
+fn unload_qwen(state: &AppState) {
+    if let Ok(engine) = state.qwen.lock() {
+        if !engine.unload() {
+            tracing::warn!("Qwen worker is busy and could not be unloaded during engine switch");
+        }
+    }
 }
 
 #[tauri::command]
@@ -238,6 +254,7 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
     let provider = if asr_cfg.provider.is_empty() {
         match engine {
             EngineKind::SenseVoice => "local_sensevoice".into(),
+            EngineKind::Qwen => "local_qwen".into(),
             EngineKind::Whisper => "local_whisper".into(),
         }
     } else {
@@ -267,8 +284,33 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
             }
         })
         .unwrap_or_else(|_| lumen_asr::whisper_status());
+    let (qwen, qwen_runtime_path) = state
+        .qwen
+        .lock()
+        .map(|engine| {
+            let model_dir = engine.model_dir();
+            (
+                EngineStatus {
+                    kind: EngineKind::Qwen,
+                    ready: qwen_ready(model_dir),
+                    model_dir: model_dir.display().to_string(),
+                },
+                engine.python_executable().display().to_string(),
+            )
+        })
+        .unwrap_or_else(|_| {
+            let status = lumen_asr::qwen_status();
+            (
+                status,
+                asr_cfg.qwen_python_executable().display().to_string(),
+            )
+        });
+    let qwen_runtime_ready = qwen.ready
+        && matches!(provider.as_str(), "local_qwen" | "qwen" | "qwen3_asr")
+        && qwen_runtime_available(std::path::Path::new(&qwen_runtime_path));
     let active_ready = match provider.as_str() {
         "local_sensevoice" | "sensevoice" => sv.ready,
+        "local_qwen" | "qwen" | "qwen3_asr" => qwen.ready && qwen_runtime_ready,
         "local_whisper" | "whisper" => wh.ready,
         "openai_audio" | "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
         // config_only: selectable but not runnable yet
@@ -288,10 +330,24 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         engine,
         provider,
         sensevoice: sv,
+        qwen,
+        qwen_runtime_path,
+        qwen_runtime_ready,
         whisper: wh,
         active_ready,
         provider_label,
     }
+}
+
+fn qwen_runtime_available(path: &std::path::Path) -> bool {
+    std::process::Command::new(path)
+        .args(["-c", "import mlx_qwen3_asr"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -804,6 +860,22 @@ async fn run_asr(
     if provider == "local_whisper" || matches!(engine_kind, EngineKind::Whisper) {
         let eng = state
             .whisper
+            .lock()
+            .map_err(|_| "asr lock poisoned".to_string())?
+            .clone();
+        return eng
+            .transcribe(AsrRequest {
+                samples: samples_16k,
+                sample_rate: 16_000,
+                hotwords: vec![],
+            })
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    if provider == "local_qwen" || matches!(engine_kind, EngineKind::Qwen) {
+        let eng = state
+            .qwen
             .lock()
             .map_err(|_| "asr lock poisoned".to_string())?
             .clone();

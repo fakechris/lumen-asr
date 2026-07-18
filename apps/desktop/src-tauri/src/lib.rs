@@ -19,11 +19,13 @@ mod volume_mon;
 
 use config::AppConfig;
 use lumen_asr::{
-    default_sensevoice_dir, default_whisper_dir, sensevoice_ready, whisper_ready, AudioCapture,
-    EngineKind, SenseVoiceSherpaAsr, WhisperAsr,
+    default_qwen_dir, default_sensevoice_dir, default_whisper_dir, qwen_ready, sensevoice_ready,
+    whisper_ready, AudioCapture, EngineKind, QwenAsr, QwenAsrConfig, SenseVoiceSherpaAsr,
+    WhisperAsr,
 };
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 pub struct AppState {
@@ -31,8 +33,24 @@ pub struct AppState {
     pub audio: AudioCapture,
     pub engine: Mutex<EngineKind>,
     pub sensevoice: Mutex<SenseVoiceSherpaAsr>,
+    pub qwen: Mutex<QwenAsr>,
     pub whisper: Mutex<WhisperAsr>,
     pub config: Mutex<AppConfig>,
+}
+
+fn qwen_engine_from_config(config: &config::AsrServiceConfig) -> QwenAsr {
+    let selected = PathBuf::from(config.model_dir.trim());
+    let model_dir = if !config.model_dir.trim().is_empty() && qwen_ready(&selected) {
+        selected
+    } else {
+        default_qwen_dir()
+    };
+    QwenAsr::new(QwenAsrConfig::product(
+        config.qwen_python_executable(),
+        model_dir,
+        (!config.language.trim().is_empty()).then(|| config.language.clone()),
+        std::time::Duration::from_secs(config.timeout_secs.max(30)),
+    ))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -96,10 +114,10 @@ pub fn run() {
         }
     };
 
-    let initial_engine = if app_config.asr.provider == "local_whisper" {
-        EngineKind::Whisper
-    } else {
-        EngineKind::SenseVoice
+    let initial_engine = match app_config.asr.provider.as_str() {
+        "local_qwen" => EngineKind::Qwen,
+        "local_whisper" => EngineKind::Whisper,
+        _ => EngineKind::SenseVoice,
     };
     let selected_model_dir = app_config.asr.model_dir.trim();
     let selected_model_dir =
@@ -114,8 +132,15 @@ pub fn run() {
         .filter(|path| initial_engine == EngineKind::Whisper && whisper_ready(path))
         .cloned()
         .unwrap_or_else(default_whisper_dir);
+    let qwen = qwen_engine_from_config(&app_config.asr);
     tracing::info!(dir = %sv_dir.display(), ready = lumen_asr::sensevoice_ready(&sv_dir), "SenseVoice model dir");
     tracing::info!(dir = %wh_dir.display(), ready = lumen_asr::whisper_ready(&wh_dir), "Whisper model dir");
+    tracing::info!(
+        dir = %qwen.model_dir().display(),
+        python = %qwen.python_executable().display(),
+        ready = lumen_asr::qwen_ready(qwen.model_dir()),
+        "Qwen model config"
+    );
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -125,6 +150,7 @@ pub fn run() {
             audio,
             engine: Mutex::new(initial_engine),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sv_dir)),
+            qwen: Mutex::new(qwen),
             whisper: Mutex::new(WhisperAsr::new(wh_dir)),
             config: Mutex::new(app_config),
         })

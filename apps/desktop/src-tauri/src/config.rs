@@ -42,6 +42,8 @@ pub struct AsrServiceConfig {
     pub provider: String,
     /// User-selected local model directory. Empty = automatic discovery.
     pub model_dir: String,
+    /// Python executable containing `mlx_qwen3_asr` for the local Qwen engine.
+    pub runtime_path: String,
     pub base_url: String,
     pub model: String,
     pub api_key: String,
@@ -55,12 +57,26 @@ impl Default for AsrServiceConfig {
         Self {
             provider: "local_sensevoice".into(),
             model_dir: String::new(),
+            runtime_path: String::new(),
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
             language: String::new(),
             timeout_secs: 120,
         }
+    }
+}
+
+impl AsrServiceConfig {
+    pub fn qwen_python_executable(&self) -> PathBuf {
+        let configured = self.runtime_path.trim();
+        if !configured.is_empty() {
+            return PathBuf::from(configured);
+        }
+        std::env::var_os("LUMEN_QWEN_PYTHON")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("python3"))
     }
 }
 
