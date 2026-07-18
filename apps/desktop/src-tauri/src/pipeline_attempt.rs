@@ -1,5 +1,7 @@
 use crate::config::{AppConfig, AsrServiceConfig};
-use crate::corrector_svc::{engine_label, run_correct_with_intent, run_identity};
+use crate::corrector_svc::{
+    corrector_outcome_identity, dictionary_run_identity, run_correct_with_intent, run_identity,
+};
 use crate::dictation::{canonical_asr_provider, engine_kind_for_provider};
 use crate::session_debug::{self, SessionDebugMeta};
 use crate::AppState;
@@ -29,7 +31,7 @@ pub(crate) fn build_pipeline_identity(
     let (asr_model, asr_model_revision) =
         active_asr_model_identity(state, &config.asr, engine_kind);
     PipelineIdentity {
-        schema_version: 1,
+        schema_version: 2,
         asr_provider: canonical_asr_provider(&config.asr.provider),
         asr_engine: asr_engine.to_owned(),
         asr_model,
@@ -40,6 +42,10 @@ pub(crate) fn build_pipeline_identity(
         prompt_hash: corrector.prompt_hash,
         prompt_hash_algorithm: corrector.prompt_hash_algorithm,
         temperature: corrector.temperature,
+        dictionary_context_hash: None,
+        dictionary_context_hash_algorithm: None,
+        dictionary_term_count: 0,
+        dictionary_replacement_count: 0,
         enhancement_mode: EnhancementMode::None,
     }
 }
@@ -126,40 +132,61 @@ pub(crate) async fn run_corrector_stage(
     intent: IntentSpec,
     attempt: &mut DictationAttemptRecord,
 ) -> Result<CorrectionStageOutput, String> {
-    let entries = {
+    let (entries, dictionary_error) = {
         let store_guard = state
             .store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
         match store_guard.as_ref() {
-            Some(store) => store.list_dictionary().unwrap_or_default(),
-            None => vec![],
+            Some(store) => match store.list_dictionary() {
+                Ok(entries) => (entries, None),
+                Err(error) => {
+                    tracing::warn!(error = %error, "dictionary unavailable for corrector");
+                    (Vec::new(), Some("dictionary unavailable".to_string()))
+                }
+            },
+            None => (vec![], None),
         }
     };
+    let dictionary = dictionary_run_identity(&entries);
+    attempt.pipeline_identity.dictionary_context_hash = Some(dictionary.hash);
+    attempt.pipeline_identity.dictionary_context_hash_algorithm =
+        Some(dictionary.hash_algorithm.into());
+    attempt.pipeline_identity.dictionary_term_count = dictionary.term_count;
+    attempt.pipeline_identity.dictionary_replacement_count = dictionary.replacement_count;
+    if let Some(message) = dictionary_error {
+        attempt
+            .pipeline_metrics
+            .stage_issues
+            .push(PipelineStageIssue {
+                stage: PipelineStage::Corrector,
+                kind: PipelineIssueKind::InputUnavailable,
+                message,
+            });
+    }
 
+    let run = run_identity(config, intent.clone());
     let corrector_started = Instant::now();
     let result = run_correct_with_intent(config, enhanced_text, &entries, intent).await;
     attempt.pipeline_metrics.corrector_ms = elapsed_ms(corrector_started);
     let text = result.text.trim().to_string();
-    let engine = if result.model_applied {
-        engine_label(config)
-    } else if !config.corrector.enabled || config.corrector.provider == "none" {
-        "none".into()
-    } else {
-        format!("{}:fallback", engine_label(config))
-    };
+    let outcome_identity = corrector_outcome_identity(&run, result.model_applied);
+    let engine = outcome_identity.engine;
     attempt.corrected = Some(text.clone());
     attempt.pipeline_identity.corrector_engine = engine.clone();
-    attempt.pipeline_metrics.corrector_fallback =
-        !result.model_applied && attempt.pipeline_identity.corrector_provider != "none";
+    attempt.pipeline_metrics.corrector_fallback = outcome_identity.fallback;
     if attempt.pipeline_metrics.corrector_fallback {
+        let reason = result
+            .fallback_reason
+            .map(|value| value.as_str())
+            .unwrap_or("model_not_applied");
         attempt
             .pipeline_metrics
             .stage_issues
             .push(PipelineStageIssue {
                 stage: PipelineStage::Corrector,
                 kind: PipelineIssueKind::Fallback,
-                message: format!("{engine} returned preprocess-only output"),
+                message: reason.into(),
             });
     }
     tracing::info!(
@@ -246,5 +273,73 @@ pub(crate) fn write_attempt_debug(
         tracing::warn!(error = %error, "failed to write session debug");
     } else {
         session.audio_path = Some(debug_dir.join("audio_16k.wav").display().to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_asr_result, mark_attempt_failed};
+    use lumen_asr::{AsrResult, AsrRuntimeDiagnostics};
+    use lumen_core::AsrEngineId;
+    use lumen_store::{AttemptStatus, DictationAttemptRecord, PipelineStage};
+    use std::time::Instant;
+    use uuid::Uuid;
+
+    #[test]
+    fn apply_asr_result_records_identity_enhancement_and_runtime_evidence() {
+        let mut attempt = DictationAttemptRecord::new(Uuid::new_v4());
+        attempt.pipeline_metrics.audio_duration_ms = 2_000;
+        let result = AsrResult {
+            text: "  原始听写  ".into(),
+            engine: AsrEngineId::Qwen3Asr,
+            language: Some("zh".into()),
+            diagnostics: AsrRuntimeDiagnostics {
+                worker_reused: Some(true),
+                model: Some("Qwen3-ASR-0.6B-8bit".into()),
+                model_revision: Some("revision-1".into()),
+            },
+        };
+
+        let (raw, enhanced) = apply_asr_result(&mut attempt, &result, Instant::now());
+
+        assert_eq!(raw, "原始听写");
+        assert_eq!(enhanced, raw);
+        assert_eq!(attempt.asr_raw.as_deref(), Some(raw.as_str()));
+        assert_eq!(attempt.asr_enhanced.as_deref(), Some(enhanced.as_str()));
+        assert_eq!(attempt.pipeline_metrics.asr_worker_reused, Some(true));
+        assert_eq!(
+            attempt.pipeline_identity.asr_model.as_deref(),
+            Some("Qwen3-ASR-0.6B-8bit")
+        );
+        assert_eq!(
+            attempt.pipeline_identity.asr_model_revision.as_deref(),
+            Some("revision-1")
+        );
+        assert!(attempt.pipeline_metrics.asr_rtf.is_some());
+    }
+
+    #[test]
+    fn mark_attempt_failed_preserves_forward_text_and_records_failure_stage() {
+        let mut attempt = DictationAttemptRecord::new(Uuid::new_v4());
+        attempt.asr_raw = Some("raw".into());
+        attempt.asr_enhanced = Some("enhanced".into());
+
+        mark_attempt_failed(
+            &mut attempt,
+            PipelineStage::Corrector,
+            "corrector unavailable",
+            Instant::now(),
+        );
+
+        assert_eq!(attempt.status, AttemptStatus::Failed);
+        assert_eq!(attempt.failed_stage, Some(PipelineStage::Corrector));
+        assert_eq!(
+            attempt.failure_message.as_deref(),
+            Some("corrector unavailable")
+        );
+        assert_eq!(attempt.asr_raw.as_deref(), Some("raw"));
+        assert_eq!(attempt.asr_enhanced.as_deref(), Some("enhanced"));
+        assert!(attempt.corrected.is_none());
+        assert!(attempt.pipeline_metrics.total_ms >= 0.0);
     }
 }

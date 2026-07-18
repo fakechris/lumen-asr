@@ -68,13 +68,14 @@ impl AsrEngine for OpenAiAudioAsr {
             .map_err(|e| AsrError::Inference(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AsrError::Inference(format!("{status}: {body}")));
+            return Err(AsrError::Inference(format!(
+                "provider rejected request with status {status}"
+            )));
         }
         let v: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| AsrError::Inference(e.to_string()))?;
+            .map_err(|_| AsrError::Inference("malformed provider response".into()))?;
         let text = v
             .get("text")
             .and_then(|t| t.as_str())

@@ -69,8 +69,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
           FOREIGN KEY(supersedes_attempt_id) REFERENCES dictation_attempts(id) ON DELETE SET NULL
         );
 
-        CREATE INDEX IF NOT EXISTS idx_dictation_attempts_session
-          ON dictation_attempts(session_id, attempt_ordinal);
+        DROP INDEX IF EXISTS idx_dictation_attempts_session;
+
+        CREATE INDEX IF NOT EXISTS idx_dictation_attempts_supersedes
+          ON dictation_attempts(supersedes_attempt_id);
         "#,
     )?;
 

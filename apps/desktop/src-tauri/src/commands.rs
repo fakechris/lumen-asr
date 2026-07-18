@@ -1,12 +1,10 @@
 //! Tauri IPC for store, dictionary, and edit learning (M1).
 
 use crate::AppState;
-use lumen_core::{
-    EditSource, FocusInfo, InsertStrategy, SessionRecord, SessionStatus,
-};
+use lumen_core::{EditSource, FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use lumen_dictionary::{candidates_from_edit, DictionaryEntry, LearnCandidate};
 use lumen_platform::{default_data_dir, default_db_path};
-use lumen_store::{DictationAttemptRecord, EditEventRecord};
+use lumen_store::{DictationAttemptRecord, EditEventRecord, DEFAULT_ATTEMPT_PAGE_SIZE};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -60,10 +58,7 @@ pub fn app_health(state: State<'_, AppState>) -> Health {
 
     let asr = crate::dictation::asr_status_from(&state);
     let (corrector_enabled, corrector_label) = match state.config.lock() {
-        Ok(c) => (
-            c.corrector.enabled,
-            crate::corrector_svc::engine_label(&c),
-        ),
+        Ok(c) => (c.corrector.enabled, crate::corrector_svc::engine_label(&c)),
         Err(_) => (false, "unknown".into()),
     };
 
@@ -89,13 +84,21 @@ pub fn app_health(state: State<'_, AppState>) -> Health {
 // ── Sessions ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn list_sessions(state: State<'_, AppState>, limit: Option<u32>) -> Result<Vec<SessionRecord>, String> {
+pub fn list_sessions(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+) -> Result<Vec<SessionRecord>, String> {
     let limit = limit.unwrap_or(50).clamp(1, 500);
-    with_store(&state, |s| s.list_sessions(limit).map_err(|e| e.to_string()))
+    with_store(&state, |s| {
+        s.list_sessions(limit).map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]
-pub fn get_session(state: State<'_, AppState>, id: String) -> Result<Option<SessionRecord>, String> {
+pub fn get_session(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<SessionRecord>, String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     with_store(&state, |s| s.get_session(id).map_err(|e| e.to_string()))
 }
@@ -104,11 +107,17 @@ pub fn get_session(state: State<'_, AppState>, id: String) -> Result<Option<Sess
 pub fn list_session_attempts(
     state: State<'_, AppState>,
     session_id: String,
+    limit: Option<u32>,
+    before_ordinal: Option<u32>,
 ) -> Result<Vec<DictationAttemptRecord>, String> {
     let id = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
     with_store(&state, |store| {
         store
-            .list_dictation_attempts(id)
+            .list_dictation_attempts(
+                id,
+                limit.unwrap_or(DEFAULT_ATTEMPT_PAGE_SIZE),
+                before_ordinal,
+            )
             .map_err(|error| error.to_string())
     })
 }
@@ -196,7 +205,9 @@ pub fn list_edit_events(
     session_id: String,
 ) -> Result<Vec<EditEventRecord>, String> {
     let id = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
-    with_store(&state, |s| s.list_edit_events(id).map_err(|e| e.to_string()))
+    with_store(&state, |s| {
+        s.list_edit_events(id).map_err(|e| e.to_string())
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,9 +299,11 @@ pub fn confirm_learn(
     entry.confirmed = true;
 
     with_store(&state, |s| {
-        if let (Some(sid), Some(before), Some(after)) =
-            (input.session_id.as_ref(), input.before_text.as_ref(), input.after_text.as_ref())
-        {
+        if let (Some(sid), Some(before), Some(after)) = (
+            input.session_id.as_ref(),
+            input.before_text.as_ref(),
+            input.after_text.as_ref(),
+        ) {
             if let Ok(uuid) = Uuid::parse_str(sid) {
                 if s.get_session(uuid).ok().flatten().is_some() && before != after {
                     let _ = s.add_edit_event(uuid, EditSource::Manual, before, after);

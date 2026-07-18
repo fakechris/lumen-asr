@@ -3,10 +3,10 @@
 //! Product rule: **models are required for correction quality**.
 //! Rules only normalize; on model failure we fail-soft to preprocessed text.
 
-mod preprocess;
 mod openai_compat;
+mod preprocess;
 
-pub use openai_compat::{OpenAiCompatCorrector, OpenAiCompatConfig};
+pub use openai_compat::{OpenAiCompatConfig, OpenAiCompatCorrector};
 pub use preprocess::preprocess;
 
 use async_trait::async_trait;
@@ -16,14 +16,74 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CorrectorError {
+    #[error("request timed out")]
+    Timeout,
     #[error("http error: {0}")]
     Http(String),
+    #[error("provider rejected request with status {0}")]
+    ProviderRejected(u16),
+    #[error("malformed provider response")]
+    MalformedResponse,
     #[error("empty model output")]
     EmptyOutput,
     #[error("filtered by provider")]
     Filtered,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrectorFallbackReason {
+    Timeout,
+    Http,
+    Authentication,
+    RateLimited,
+    ProviderClientError,
+    ProviderServerError,
+    ProviderRejected,
+    MalformedResponse,
+    EmptyOutput,
+    EmptyAfterSanitization,
+    BuildFailed,
+    Other,
+}
+
+impl CorrectorFallbackReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Http => "http",
+            Self::Authentication => "authentication",
+            Self::RateLimited => "rate_limited",
+            Self::ProviderClientError => "provider_client_error",
+            Self::ProviderServerError => "provider_server_error",
+            Self::ProviderRejected => "provider_rejected",
+            Self::MalformedResponse => "malformed_response",
+            Self::EmptyOutput => "empty_output",
+            Self::EmptyAfterSanitization => "empty_after_sanitization",
+            Self::BuildFailed => "build_failed",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl CorrectorError {
+    fn fallback_reason(&self) -> CorrectorFallbackReason {
+        match self {
+            Self::Timeout => CorrectorFallbackReason::Timeout,
+            Self::Http(_) => CorrectorFallbackReason::Http,
+            Self::ProviderRejected(401 | 403) => CorrectorFallbackReason::Authentication,
+            Self::ProviderRejected(429) => CorrectorFallbackReason::RateLimited,
+            Self::ProviderRejected(400..=499) => CorrectorFallbackReason::ProviderClientError,
+            Self::ProviderRejected(500..=599) => CorrectorFallbackReason::ProviderServerError,
+            Self::ProviderRejected(_) => CorrectorFallbackReason::ProviderRejected,
+            Self::MalformedResponse => CorrectorFallbackReason::MalformedResponse,
+            Self::EmptyOutput => CorrectorFallbackReason::EmptyOutput,
+            Self::Filtered => CorrectorFallbackReason::ProviderRejected,
+            Self::Other(_) => CorrectorFallbackReason::Other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -54,6 +114,9 @@ pub struct CorrectResult {
     pub engine: CorrectorEngineId,
     /// True if model ran successfully (not just preprocess fallback).
     pub model_applied: bool,
+    /// Sanitized category only; never contains provider bodies or credentials.
+    #[serde(default)]
+    pub fallback_reason: Option<CorrectorFallbackReason>,
 }
 
 #[async_trait]
@@ -70,6 +133,7 @@ pub fn preprocess_only(text: &str, dictionary: &DictionaryContext) -> CorrectRes
         text: pre,
         engine: CorrectorEngineId::None,
         model_applied: false,
+        fallback_reason: None,
     }
 }
 
@@ -126,17 +190,23 @@ pub async fn correct_or_fallback_with(
                     text: pre,
                     engine: corrector.id(),
                     model_applied: false,
+                    fallback_reason: Some(CorrectorFallbackReason::EmptyAfterSanitization),
                 }
             } else {
                 r
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, "corrector failed, using preprocess fallback");
+            let fallback_reason = e.fallback_reason();
+            tracing::warn!(
+                reason = fallback_reason.as_str(),
+                "corrector failed, using preprocess fallback"
+            );
             CorrectResult {
                 text: pre,
                 engine: corrector.id(),
                 model_applied: false,
+                fallback_reason: Some(fallback_reason),
             }
         }
     }
@@ -167,6 +237,7 @@ impl Corrector for NullCorrector {
             text: req.text,
             engine: CorrectorEngineId::None,
             model_applied: false,
+            fallback_reason: None,
         })
     }
 }
@@ -177,12 +248,8 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_on_null_is_preprocessed() {
-        let r = correct_or_fallback(
-            &NullCorrector,
-            "你好  世界",
-            DictionaryContext::default(),
-        )
-        .await;
+        let r =
+            correct_or_fallback(&NullCorrector, "你好  世界", DictionaryContext::default()).await;
         assert_eq!(r.text, "你好 世界");
         assert!(!r.model_applied);
     }
@@ -191,5 +258,50 @@ mod tests {
     fn replacements_apply() {
         let s = apply_replacements("用脱肯鉴权", &[("脱肯".into(), "Token".into())]);
         assert_eq!(s, "用Token鉴权");
+    }
+
+    struct TimeoutCorrector;
+
+    #[async_trait]
+    impl Corrector for TimeoutCorrector {
+        fn id(&self) -> CorrectorEngineId {
+            CorrectorEngineId::OpenAiCompatible
+        }
+
+        async fn correct(&self, _req: CorrectRequest) -> Result<CorrectResult, CorrectorError> {
+            Err(CorrectorError::Timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_persists_a_sanitized_timeout_category() {
+        let result =
+            correct_or_fallback(&TimeoutCorrector, "hello", DictionaryContext::default()).await;
+
+        assert!(!result.model_applied);
+        assert_eq!(
+            result.fallback_reason,
+            Some(CorrectorFallbackReason::Timeout)
+        );
+    }
+
+    #[test]
+    fn provider_statuses_map_to_retry_relevant_sanitized_categories() {
+        assert_eq!(
+            CorrectorError::ProviderRejected(401).fallback_reason(),
+            CorrectorFallbackReason::Authentication
+        );
+        assert_eq!(
+            CorrectorError::ProviderRejected(429).fallback_reason(),
+            CorrectorFallbackReason::RateLimited
+        );
+        assert_eq!(
+            CorrectorError::ProviderRejected(422).fallback_reason(),
+            CorrectorFallbackReason::ProviderClientError
+        );
+        assert_eq!(
+            CorrectorError::ProviderRejected(503).fallback_reason(),
+            CorrectorFallbackReason::ProviderServerError
+        );
     }
 }

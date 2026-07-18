@@ -1,12 +1,12 @@
 //! Recording + local ASR + model corrector IPC (M2–M5).
 
+use crate::config::AsrServiceConfig;
 use crate::pipeline_attempt::{
     apply_asr_result, build_pipeline_identity, elapsed_ms, mark_attempt_failed, persist_attempt,
     run_corrector_stage, write_attempt_debug, AttemptDebug,
 };
 use crate::session_debug;
 use crate::AppState;
-use crate::config::AsrServiceConfig;
 use lumen_asr::{
     prepare_for_asr, qwen_ready, sensevoice_ready, whisper_ready, AsrEngine, AsrRequest, AsrResult,
     AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig,
@@ -18,7 +18,8 @@ use lumen_platform_macos::{
 };
 use lumen_prompts::IntentSpec;
 use lumen_store::{
-    AttemptStatus, DictationAttemptRecord, PipelineIssueKind, PipelineStage, PipelineStageIssue,
+    AttemptStatus, DictationAttemptRecord, InsertionOutcome, PipelineIssueKind, PipelineStage,
+    PipelineStageIssue,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -143,6 +144,16 @@ fn restore_target_app_before_insert(app: Option<&AppHandle>) -> Option<String> {
     frontmost_app_name()
 }
 
+fn insertion_outcome_for_strategy(strategy: InsertStrategy) -> InsertionOutcome {
+    match strategy {
+        InsertStrategy::Paste | InsertStrategy::Ax | InsertStrategy::Type => {
+            InsertionOutcome::Inserted
+        }
+        InsertStrategy::CopyOnly => InsertionOutcome::Copied,
+        InsertStrategy::None => InsertionOutcome::Failed,
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AsrStatus {
@@ -237,7 +248,10 @@ pub fn set_asr_engine(
                 .unwrap_or(EngineKind::SenseVoice));
         }
     };
-    *state.engine.lock().map_err(|_| "engine lock poisoned".to_string())? = kind;
+    *state
+        .engine
+        .lock()
+        .map_err(|_| "engine lock poisoned".to_string())? = kind;
     if kind != EngineKind::Qwen {
         unload_qwen(&state);
     }
@@ -347,8 +361,7 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
             .qwen_runtime
             .lock()
             .map(|runtime| {
-                let current =
-                    runtime.executable == std::path::PathBuf::from(&qwen_runtime_path);
+                let current = runtime.executable == std::path::PathBuf::from(&qwen_runtime_path);
                 (current && runtime.ready, current && runtime.checking)
             })
             .unwrap_or((false, false))
@@ -475,7 +488,60 @@ pub async fn stop_and_transcribe_inner(
     app: Option<&AppHandle>,
 ) -> Result<TranscribeOutcome, String> {
     let pipeline_started = Instant::now();
-    let capture = state.audio.stop().map_err(|e| e.to_string())?;
+    let target = TARGET.lock().ok().and_then(|guard| guard.clone());
+    let mut rec = SessionRecord::new();
+    rec.focus = FocusInfo {
+        app_name: target.as_ref().and_then(|value| value.name.clone()),
+        bundle_id: target.as_ref().and_then(|value| value.bundle_id.clone()),
+        window_title: None,
+    };
+    let engine_kind = *state.engine.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("engine lock poisoned before capture stop; recovering snapshot");
+        poisoned.into_inner()
+    });
+    let cfg = state
+        .config
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            tracing::warn!("config lock poisoned before capture stop; recovering snapshot");
+            poisoned.into_inner()
+        })
+        .clone();
+    let asr_cfg = cfg.asr.clone();
+    let asr_engine_str = if asr_cfg.provider.starts_with("local") {
+        engine_kind.as_str().to_string()
+    } else {
+        asr_cfg.provider.clone()
+    };
+    let intent = take_session_intent();
+    let mut attempt = DictationAttemptRecord::new(rec.id);
+    attempt.pipeline_identity = build_pipeline_identity(
+        state,
+        &cfg,
+        engine_kind,
+        &asr_engine_str,
+        "not_run",
+        intent.clone(),
+    );
+
+    let capture = match state.audio.stop() {
+        Ok(capture) => capture,
+        Err(error) => {
+            let error = error.to_string();
+            mark_attempt_failed(
+                &mut attempt,
+                PipelineStage::Capture,
+                &error,
+                pipeline_started,
+            );
+            rec.status = SessionStatus::Failed;
+            rec.asr_engine = Some(engine_kind.as_str().into());
+            if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
+                tracing::warn!(error = %persist_error, "failed to persist capture stop failure");
+            }
+            return Err(error);
+        }
+    };
     let num_samples = capture.samples.len();
     let sample_rate = capture.sample_rate;
     let duration_ms = if sample_rate > 0 {
@@ -493,40 +559,7 @@ pub async fn stop_and_transcribe_inner(
         "audio capture stopped"
     );
 
-    let target = TARGET.lock().ok().and_then(|guard| guard.clone());
-    let mut rec = SessionRecord::new();
-    rec.focus = FocusInfo {
-        app_name: target.as_ref().and_then(|value| value.name.clone()),
-        bundle_id: target.as_ref().and_then(|value| value.bundle_id.clone()),
-        window_title: None,
-    };
-    let mut attempt = DictationAttemptRecord::new(rec.id);
     attempt.pipeline_metrics.audio_duration_ms = duration_ms;
-
-    let engine_kind = *state
-        .engine
-        .lock()
-        .map_err(|_| "engine lock poisoned".to_string())?;
-    let cfg = state
-        .config
-        .lock()
-        .map_err(|_| "config lock poisoned".to_string())?
-        .clone();
-    let asr_cfg = cfg.asr.clone();
-    let asr_engine_str = if asr_cfg.provider.starts_with("local") {
-        engine_kind.as_str().to_string()
-    } else {
-        asr_cfg.provider.clone()
-    };
-    let intent = take_session_intent();
-    attempt.pipeline_identity = build_pipeline_identity(
-        state,
-        &cfg,
-        engine_kind,
-        &asr_engine_str,
-        "not_run",
-        intent.clone(),
-    );
 
     if capture.samples.is_empty() {
         let error = "no audio captured (0 samples) — hold longer or check mic".to_string();
@@ -629,7 +662,7 @@ pub async fn stop_and_transcribe_inner(
 
     let mut insert_strategy = InsertStrategy::None;
     let mut did_insert = false;
-    let mut insert_succeeded = false;
+    let mut insertion_outcome = InsertionOutcome::NotRequested;
     let mut frontmost_before_insert = None;
     let insert_started = Instant::now();
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
@@ -646,10 +679,11 @@ pub async fn stop_and_transcribe_inner(
             match crate::inject_cmd::copy_only(&corrected_text).await {
                 Ok(()) => {
                     insert_strategy = InsertStrategy::CopyOnly;
-                    insert_succeeded = true;
+                    insertion_outcome = InsertionOutcome::Copied;
                     tracing::info!("copied result to clipboard (no AX)");
                 }
                 Err(e) => {
+                    insertion_outcome = InsertionOutcome::Failed;
                     notes.push(format!("clipboard copy failed: {e}"));
                     attempt
                         .pipeline_metrics
@@ -688,11 +722,8 @@ pub async fn stop_and_transcribe_inner(
             match crate::inject_cmd::insert_with_config(&cfg.inject, &corrected_text).await {
                 Ok(out) => {
                     insert_strategy = out.strategy;
-                    did_insert = !matches!(
-                        insert_strategy,
-                        InsertStrategy::None | InsertStrategy::CopyOnly
-                    );
-                    insert_succeeded = !matches!(insert_strategy, InsertStrategy::None);
+                    insertion_outcome = insertion_outcome_for_strategy(insert_strategy);
+                    did_insert = insertion_outcome == InsertionOutcome::Inserted;
                     tracing::info!(
                         ?insert_strategy,
                         frontmost = ?frontmost_app_name(),
@@ -700,6 +731,7 @@ pub async fn stop_and_transcribe_inner(
                     );
                 }
                 Err(e) => {
+                    insertion_outcome = InsertionOutcome::Failed;
                     notes.push(format!("insert error: {e}"));
                     attempt
                         .pipeline_metrics
@@ -715,7 +747,9 @@ pub async fn stop_and_transcribe_inner(
         }
     }
     attempt.pipeline_metrics.insert_ms = elapsed_ms(insert_started);
-    attempt.pipeline_metrics.insert_succeeded = insert_succeeded;
+    attempt
+        .pipeline_metrics
+        .set_insertion_outcome(insertion_outcome);
     attempt.inserted = did_insert.then(|| corrected_text.clone());
     attempt.status = AttemptStatus::Completed;
     attempt.pipeline_metrics.total_ms = elapsed_ms(pipeline_started);
@@ -768,7 +802,9 @@ pub fn get_session_audio(state: State<'_, AppState>, id: String) -> Result<Vec<u
             .store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
-        let store = guard.as_ref().ok_or_else(|| "database not available".to_string())?;
+        let store = guard
+            .as_ref()
+            .ok_or_else(|| "database not available".to_string())?;
         store
             .get_session(uuid)
             .map_err(|e| e.to_string())?
@@ -809,7 +845,9 @@ pub async fn retry_session_transcription(
             .store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
-        let store = guard.as_ref().ok_or_else(|| "database not available".to_string())?;
+        let store = guard
+            .as_ref()
+            .ok_or_else(|| "database not available".to_string())?;
         store
             .get_session(uuid)
             .map_err(|e| e.to_string())?
@@ -1080,8 +1118,12 @@ pub enum DictationUiEvent {
         intent: String,
         target_language: Option<String>,
     },
-    Done { outcome: TranscribeOutcome },
-    Error { message: String },
+    Done {
+        outcome: TranscribeOutcome,
+    },
+    Error {
+        message: String,
+    },
     Cancelled,
 }
 
@@ -1094,9 +1136,7 @@ fn intent_ui_label(intent: &IntentSpec) -> (String, Option<String>, String) {
         ),
         IntentSpec::Raw => ("raw".into(), None, "仅原文".into()),
         // Never call normal path “录音” during processing — user confuses with translate.
-        IntentSpec::Default | IntentSpec::PolishOverride => {
-            ("default".into(), None, "整理".into())
-        }
+        IntentSpec::Default | IntentSpec::PolishOverride => ("default".into(), None, "整理".into()),
     }
 }
 
@@ -1109,10 +1149,7 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
     dictation_start_with_intent(app, IntentSpec::Default).await
 }
 
-pub async fn dictation_start_with_intent(
-    app: AppHandle,
-    intent: IntentSpec,
-) -> Result<(), String> {
+pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> Result<(), String> {
     // Only one session at a time.
     if PHASE
         .compare_exchange(
@@ -1157,7 +1194,9 @@ pub async fn dictation_start_with_intent(
             // Force-show capsule on hotkey start so user always sees feedback.
             crate::capsule::set_capsule_visible(&app, true, "listening");
             if !show_capsule {
-                tracing::debug!("config show_capsule=false but forcing visible for hotkey feedback");
+                tracing::debug!(
+                    "config show_capsule=false but forcing visible for hotkey feedback"
+                );
             }
             emit_dictation(
                 &app,
@@ -1274,12 +1313,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
         }
         Err(e) => {
             crate::capsule::set_capsule_visible(&app, false, "idle");
-            emit_dictation(
-                &app,
-                DictationUiEvent::Error {
-                    message: e.clone(),
-                },
-            );
+            emit_dictation(&app, DictationUiEvent::Error { message: e.clone() });
             emit_dictation(&app, DictationUiEvent::Idle);
             PHASE.store(PHASE_IDLE, Ordering::SeqCst);
             Err(e)
@@ -1302,4 +1336,86 @@ pub async fn toggle_dictation(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn toggle_dictation_cmd(app: AppHandle) -> Result<(), String> {
     toggle_dictation(app).await
+}
+
+#[cfg(test)]
+mod attempt_metric_tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::{AppState, QwenRuntimeStatus};
+    use lumen_asr::{AudioCapture, SenseVoiceSherpaAsr, WhisperAsr};
+    use lumen_store::{Store, MAX_ATTEMPT_PAGE_SIZE};
+    use std::sync::Mutex;
+
+    #[test]
+    fn insertion_strategies_map_to_distinct_metric_outcomes() {
+        for strategy in [
+            InsertStrategy::Paste,
+            InsertStrategy::Ax,
+            InsertStrategy::Type,
+        ] {
+            assert_eq!(
+                insertion_outcome_for_strategy(strategy),
+                InsertionOutcome::Inserted
+            );
+        }
+        assert_eq!(
+            insertion_outcome_for_strategy(InsertStrategy::CopyOnly),
+            InsertionOutcome::Copied
+        );
+        assert_eq!(
+            insertion_outcome_for_strategy(InsertStrategy::None),
+            InsertionOutcome::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_stop_runs_and_failure_is_persisted_after_snapshot_lock_poisoning() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig::default();
+        let qwen = crate::qwen_engine_from_config(&config.asr);
+        let qwen_executable = qwen.python_executable().to_path_buf();
+        let state = AppState {
+            store: Mutex::new(Some(
+                Store::open(dir.path().join("capture.sqlite")).unwrap(),
+            )),
+            audio: AudioCapture::new(),
+            engine: Mutex::new(EngineKind::SenseVoice),
+            sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(dir.path().join("sensevoice"))),
+            qwen: Mutex::new(qwen),
+            qwen_runtime: Mutex::new(QwenRuntimeStatus {
+                executable: qwen_executable,
+                ready: false,
+                checking: false,
+                generation: 0,
+            }),
+            whisper: Mutex::new(WhisperAsr::new(dir.path().join("whisper"))),
+            config: Mutex::new(config),
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.engine.lock().unwrap();
+            panic!("poison engine snapshot lock");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.config.lock().unwrap();
+            panic!("poison config snapshot lock");
+        }));
+
+        let error = stop_and_transcribe_inner(&state, true, None)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("not recording"));
+        let store = state.store.lock().unwrap();
+        let store = store.as_ref().unwrap();
+        let sessions = store.list_sessions(1).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Failed);
+        let attempts = store
+            .list_dictation_attempts(sessions[0].id, MAX_ATTEMPT_PAGE_SIZE, None)
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(attempts[0].failed_stage, Some(PipelineStage::Capture));
+    }
 }

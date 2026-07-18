@@ -9,10 +9,15 @@ use lumen_core::{
     SessionStatus,
 };
 use lumen_dictionary::DictionaryEntry;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use serde::{Deserialize, Serialize};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_ATTEMPT_PAGE_SIZE: u32 = 100;
+pub const MAX_ATTEMPT_PAGE_SIZE: u32 = 500;
 
 /// One user edit associated with a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,8 +113,21 @@ pub enum EnhancementMode {
 #[serde(rename_all = "snake_case")]
 pub enum PipelineIssueKind {
     Fallback,
+    InputUnavailable,
     ClipboardFailure,
     InjectionFailure,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InsertionOutcome {
+    #[default]
+    NotRequested,
+    Copied,
+    Inserted,
+    Failed,
     #[serde(other)]
     Unknown,
 }
@@ -128,13 +146,17 @@ pub struct PipelineIdentity {
     pub prompt_hash: Option<String>,
     pub prompt_hash_algorithm: Option<String>,
     pub temperature: Option<f64>,
+    pub dictionary_context_hash: Option<String>,
+    pub dictionary_context_hash_algorithm: Option<String>,
+    pub dictionary_term_count: u32,
+    pub dictionary_replacement_count: u32,
     pub enhancement_mode: EnhancementMode,
 }
 
 impl Default for PipelineIdentity {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             asr_provider: String::new(),
             asr_engine: String::new(),
             asr_model: None,
@@ -145,6 +167,10 @@ impl Default for PipelineIdentity {
             prompt_hash: None,
             prompt_hash_algorithm: None,
             temperature: None,
+            dictionary_context_hash: None,
+            dictionary_context_hash_algorithm: None,
+            dictionary_term_count: 0,
+            dictionary_replacement_count: 0,
             enhancement_mode: EnhancementMode::None,
         }
     }
@@ -157,8 +183,7 @@ pub struct PipelineStageIssue {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PipelineMetrics {
     pub schema_version: u32,
     pub audio_duration_ms: u64,
@@ -171,14 +196,89 @@ pub struct PipelineMetrics {
     pub asr_rtf: Option<f64>,
     pub asr_worker_reused: Option<bool>,
     pub corrector_fallback: bool,
+    pub insertion_outcome: InsertionOutcome,
+    /// Compatibility field derived from `insertion_outcome`.
     pub insert_succeeded: bool,
     pub stage_issues: Vec<PipelineStageIssue>,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct PipelineMetricsDeserialize {
+    schema_version: u32,
+    audio_duration_ms: u64,
+    preprocess_ms: f64,
+    asr_ms: f64,
+    enhancement_ms: f64,
+    corrector_ms: f64,
+    insert_ms: f64,
+    total_ms: f64,
+    asr_rtf: Option<f64>,
+    asr_worker_reused: Option<bool>,
+    corrector_fallback: bool,
+    insertion_outcome: Option<InsertionOutcome>,
+    insert_succeeded: bool,
+    stage_issues: Vec<PipelineStageIssue>,
+}
+
+impl Default for PipelineMetricsDeserialize {
+    fn default() -> Self {
+        let current = PipelineMetrics::default();
+        Self {
+            schema_version: current.schema_version,
+            audio_duration_ms: current.audio_duration_ms,
+            preprocess_ms: current.preprocess_ms,
+            asr_ms: current.asr_ms,
+            enhancement_ms: current.enhancement_ms,
+            corrector_ms: current.corrector_ms,
+            insert_ms: current.insert_ms,
+            total_ms: current.total_ms,
+            asr_rtf: current.asr_rtf,
+            asr_worker_reused: current.asr_worker_reused,
+            corrector_fallback: current.corrector_fallback,
+            insertion_outcome: None,
+            insert_succeeded: current.insert_succeeded,
+            stage_issues: current.stage_issues,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PipelineMetrics {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = PipelineMetricsDeserialize::deserialize(deserializer)?;
+        let insertion_outcome = value.insertion_outcome.unwrap_or_else(|| {
+            if value.insert_succeeded {
+                InsertionOutcome::Inserted
+            } else {
+                InsertionOutcome::Unknown
+            }
+        });
+        Ok(Self {
+            schema_version: value.schema_version,
+            audio_duration_ms: value.audio_duration_ms,
+            preprocess_ms: value.preprocess_ms,
+            asr_ms: value.asr_ms,
+            enhancement_ms: value.enhancement_ms,
+            corrector_ms: value.corrector_ms,
+            insert_ms: value.insert_ms,
+            total_ms: value.total_ms,
+            asr_rtf: value.asr_rtf,
+            asr_worker_reused: value.asr_worker_reused,
+            corrector_fallback: value.corrector_fallback,
+            insertion_outcome,
+            insert_succeeded: insertion_outcome == InsertionOutcome::Inserted,
+            stage_issues: value.stage_issues,
+        })
+    }
 }
 
 impl Default for PipelineMetrics {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             audio_duration_ms: 0,
             preprocess_ms: 0.0,
             asr_ms: 0.0,
@@ -189,6 +289,7 @@ impl Default for PipelineMetrics {
             asr_rtf: None,
             asr_worker_reused: None,
             corrector_fallback: false,
+            insertion_outcome: InsertionOutcome::NotRequested,
             insert_succeeded: false,
             stage_issues: Vec::new(),
         }
@@ -199,6 +300,11 @@ impl PipelineMetrics {
     pub fn set_asr_rtf(&mut self) {
         self.asr_rtf =
             (self.audio_duration_ms > 0).then(|| self.asr_ms / self.audio_duration_ms as f64);
+    }
+
+    pub fn set_insertion_outcome(&mut self, outcome: InsertionOutcome) {
+        self.insertion_outcome = outcome;
+        self.insert_succeeded = outcome == InsertionOutcome::Inserted;
     }
 }
 
@@ -254,6 +360,7 @@ impl Store {
         }
         let conn =
             Connection::open(&path).with_context(|| format!("open db {}", path.display()))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
         schema::migrate(&conn)?;
         Ok(Self { conn, path })
@@ -273,7 +380,7 @@ impl Store {
         &self,
         mut record: DictationAttemptRecord,
     ) -> Result<DictationAttemptRecord> {
-        let transaction = self.conn.unchecked_transaction()?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         record = append_dictation_attempt_on(&transaction, record)?;
         transaction.commit()?;
         Ok(record)
@@ -285,14 +392,20 @@ impl Store {
         session: &SessionRecord,
         record: DictationAttemptRecord,
     ) -> Result<DictationAttemptRecord> {
-        let transaction = self.conn.unchecked_transaction()?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         save_session_on(&transaction, session)?;
         let record = append_dictation_attempt_on(&transaction, record)?;
         transaction.commit()?;
         Ok(record)
     }
 
-    pub fn list_dictation_attempts(&self, session_id: Uuid) -> Result<Vec<DictationAttemptRecord>> {
+    pub fn list_dictation_attempts(
+        &self,
+        session_id: Uuid,
+        limit: u32,
+        before_ordinal: Option<u32>,
+    ) -> Result<Vec<DictationAttemptRecord>> {
+        let limit = limit.clamp(1, MAX_ATTEMPT_PAGE_SIZE);
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, session_id, attempt_ordinal, created_at,
@@ -301,10 +414,19 @@ impl Store {
                    status, failed_stage, failure_message, supersedes_attempt_id
             FROM dictation_attempts
             WHERE session_id=?1
-            ORDER BY attempt_ordinal ASC
+              AND (?2 IS NULL OR attempt_ordinal < ?2)
+            ORDER BY attempt_ordinal DESC
+            LIMIT ?3
             "#,
         )?;
-        let rows = statement.query_map(params![session_id.to_string()], map_attempt)?;
+        let rows = statement.query_map(
+            params![
+                session_id.to_string(),
+                before_ordinal.map(i64::from),
+                i64::from(limit)
+            ],
+            map_attempt,
+        )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -847,26 +969,34 @@ mod tests {
         retry.failure_message = Some("worker exited".into());
         let retry = store.append_dictation_attempt(retry).unwrap();
 
-        let attempts = store.list_dictation_attempts(session.id).unwrap();
+        let attempts = store
+            .list_dictation_attempts(session.id, MAX_ATTEMPT_PAGE_SIZE, None)
+            .unwrap();
+        let stored_first = attempts
+            .iter()
+            .find(|attempt| attempt.attempt_ordinal == 1)
+            .unwrap();
+        let stored_retry = attempts
+            .iter()
+            .find(|attempt| attempt.attempt_ordinal == 2)
+            .unwrap();
         assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0].id, first.id);
-        assert_eq!(attempts[0].attempt_ordinal, 1);
-        assert_eq!(attempts[0].asr_raw.as_deref(), Some("cotex"));
-        assert_eq!(attempts[0].asr_enhanced.as_deref(), Some("cotex"));
-        assert_eq!(attempts[0].corrected.as_deref(), Some("Codex"));
-        assert_eq!(attempts[0].inserted.as_deref(), Some("Codex"));
-        assert_eq!(attempts[0].pipeline_metrics.asr_rtf, Some(0.08));
+        assert_eq!(stored_first.id, first.id);
+        assert_eq!(stored_first.asr_raw.as_deref(), Some("cotex"));
+        assert_eq!(stored_first.asr_enhanced.as_deref(), Some("cotex"));
+        assert_eq!(stored_first.corrected.as_deref(), Some("Codex"));
+        assert_eq!(stored_first.inserted.as_deref(), Some("Codex"));
+        assert_eq!(stored_first.pipeline_metrics.asr_rtf, Some(0.08));
         assert_eq!(
-            attempts[0].pipeline_metrics.stage_issues,
+            stored_first.pipeline_metrics.stage_issues,
             vec![PipelineStageIssue {
                 stage: PipelineStage::Corrector,
                 kind: PipelineIssueKind::Fallback,
                 message: "timeout".into(),
             }]
         );
-        assert_eq!(attempts[1].attempt_ordinal, 2);
-        assert_eq!(attempts[1].supersedes_attempt_id, Some(first.id));
-        assert_eq!(attempts[1].failed_stage, Some(PipelineStage::Asr));
+        assert_eq!(stored_retry.supersedes_attempt_id, Some(first.id));
+        assert_eq!(stored_retry.failed_stage, Some(PipelineStage::Asr));
         assert_eq!(retry.supersedes_attempt_id, Some(first.id));
     }
 
@@ -882,7 +1012,7 @@ mod tests {
 
         assert!(store.delete_session(session.id).unwrap());
         assert!(store
-            .list_dictation_attempts(session.id)
+            .list_dictation_attempts(session.id, MAX_ATTEMPT_PAGE_SIZE, None)
             .unwrap()
             .is_empty());
     }
@@ -896,6 +1026,24 @@ mod tests {
         };
         metrics.set_asr_rtf();
         assert_eq!(metrics.asr_rtf, None);
+    }
+
+    #[test]
+    fn insertion_success_is_derived_without_collapsing_other_outcomes() {
+        let mut metrics = PipelineMetrics::default();
+        for outcome in [
+            InsertionOutcome::NotRequested,
+            InsertionOutcome::Copied,
+            InsertionOutcome::Failed,
+        ] {
+            metrics.set_insertion_outcome(outcome);
+            assert_eq!(metrics.insertion_outcome, outcome);
+            assert!(!metrics.insert_succeeded);
+        }
+
+        metrics.set_insertion_outcome(InsertionOutcome::Inserted);
+        assert_eq!(metrics.insertion_outcome, InsertionOutcome::Inserted);
+        assert!(metrics.insert_succeeded);
     }
 
     #[test]
@@ -921,10 +1069,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(metrics.stage_issues[0].stage, PipelineStage::Unknown);
-        assert_eq!(
-            metrics.stage_issues[0].kind,
-            PipelineIssueKind::Unknown
-        );
+        assert_eq!(metrics.stage_issues[0].kind, PipelineIssueKind::Unknown);
+        assert_eq!(metrics.insertion_outcome, InsertionOutcome::Unknown);
+    }
+
+    #[test]
+    fn legacy_insertion_boolean_migrates_without_inventing_a_denominator() {
+        let inserted: PipelineMetrics = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "insert_succeeded": true
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(inserted.insertion_outcome, InsertionOutcome::Inserted);
+        assert!(inserted.insert_succeeded);
+
+        let ambiguous_false: PipelineMetrics = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "insert_succeeded": false
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(ambiguous_false.insertion_outcome, InsertionOutcome::Unknown);
+        assert!(!ambiguous_false.insert_succeeded);
     }
 
     #[test]
@@ -947,6 +1116,93 @@ mod tests {
 
         let stored = store.get_session(session.id).unwrap().unwrap();
         assert_eq!(stored.asr_raw.as_deref(), Some("before"));
-        assert_eq!(store.list_dictation_attempts(session.id).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_dictation_attempts(session.id, MAX_ATTEMPT_PAGE_SIZE, None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_connections_append_without_losing_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.sqlite");
+        let setup = Store::open(&path).unwrap();
+        let session = SessionRecord::new();
+        setup.save_session(&session).unwrap();
+        drop(setup);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let store = Store::open(path).unwrap();
+                    barrier.wait();
+                    for _ in 0..25 {
+                        store
+                            .append_dictation_attempt(DictationAttemptRecord::new(session.id))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let store = Store::open(path).unwrap();
+        let attempts = store
+            .list_dictation_attempts(session.id, MAX_ATTEMPT_PAGE_SIZE, None)
+            .unwrap();
+        assert_eq!(attempts.len(), 50);
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.attempt_ordinal)
+                .collect::<Vec<_>>(),
+            (1..=50).rev().collect::<Vec<_>>()
+        );
+        for pair in attempts.windows(2) {
+            assert_eq!(pair[0].supersedes_attempt_id, Some(pair[1].id));
+        }
+        assert_eq!(attempts.last().unwrap().supersedes_attempt_id, None);
+    }
+
+    #[test]
+    fn attempts_are_returned_in_bounded_cursor_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("pages.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+        for _ in 0..5 {
+            store
+                .append_dictation_attempt(DictationAttemptRecord::new(session.id))
+                .unwrap();
+        }
+
+        let newest = store.list_dictation_attempts(session.id, 2, None).unwrap();
+        assert_eq!(
+            newest
+                .iter()
+                .map(|attempt| attempt.attempt_ordinal)
+                .collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+
+        let older = store
+            .list_dictation_attempts(session.id, 2, Some(4))
+            .unwrap();
+        assert_eq!(
+            older
+                .iter()
+                .map(|attempt| attempt.attempt_ordinal)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
     }
 }
