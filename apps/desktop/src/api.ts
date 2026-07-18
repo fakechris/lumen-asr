@@ -4,6 +4,7 @@ import type {
   AudioDevice,
   CorrectorStatus,
   CorrectTextOutcome,
+  DictationAttemptRecord,
   DictionaryEntry,
   EditEvent,
   Health,
@@ -292,6 +293,9 @@ export const api = {
 
   getSession: (id: string) =>
     invoke<SessionRecord | null>("get_session", { id }),
+
+  listSessionAttempts: (sessionId: string) =>
+    invoke<DictationAttemptRecord[]>("list_session_attempts", { sessionId }),
 
   deleteSession: (id: string) => invoke<boolean>("delete_session", { id }),
 

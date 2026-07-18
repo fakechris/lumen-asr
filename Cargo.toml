@@ -56,3 +56,4 @@ lumen-prompts = { path = "crates/lumen-prompts" }
 parking_lot = "0.12"
 cpal = "0.15"
 fs2 = "0.4"
+blake3 = "1"

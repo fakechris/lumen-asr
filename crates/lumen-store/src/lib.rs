@@ -9,7 +9,7 @@ use lumen_core::{
     SessionStatus,
 };
 use lumen_dictionary::DictionaryEntry;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -25,6 +25,222 @@ pub struct EditEventRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptStatus {
+    #[default]
+    InProgress,
+    Completed,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+impl AttemptStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+fn parse_attempt_status(value: &str) -> AttemptStatus {
+    match value {
+        "completed" => AttemptStatus::Completed,
+        "failed" => AttemptStatus::Failed,
+        "in_progress" => AttemptStatus::InProgress,
+        _ => AttemptStatus::Unknown,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineStage {
+    Capture,
+    Preprocess,
+    Asr,
+    Enhancement,
+    Corrector,
+    Insert,
+    #[serde(other)]
+    Unknown,
+}
+
+impl PipelineStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Preprocess => "preprocess",
+            Self::Asr => "asr",
+            Self::Enhancement => "enhancement",
+            Self::Corrector => "corrector",
+            Self::Insert => "insert",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+fn parse_pipeline_stage(value: &str) -> Option<PipelineStage> {
+    match value {
+        "capture" => Some(PipelineStage::Capture),
+        "preprocess" => Some(PipelineStage::Preprocess),
+        "asr" => Some(PipelineStage::Asr),
+        "enhancement" => Some(PipelineStage::Enhancement),
+        "corrector" => Some(PipelineStage::Corrector),
+        "insert" => Some(PipelineStage::Insert),
+        _ => Some(PipelineStage::Unknown),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnhancementMode {
+    #[default]
+    None,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineIssueKind {
+    Fallback,
+    ClipboardFailure,
+    InjectionFailure,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PipelineIdentity {
+    pub schema_version: u32,
+    pub asr_provider: String,
+    pub asr_engine: String,
+    pub asr_model: Option<String>,
+    pub asr_model_revision: Option<String>,
+    pub corrector_provider: String,
+    pub corrector_engine: String,
+    pub corrector_model: Option<String>,
+    pub prompt_hash: Option<String>,
+    pub prompt_hash_algorithm: Option<String>,
+    pub temperature: Option<f64>,
+    pub enhancement_mode: EnhancementMode,
+}
+
+impl Default for PipelineIdentity {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            asr_provider: String::new(),
+            asr_engine: String::new(),
+            asr_model: None,
+            asr_model_revision: None,
+            corrector_provider: String::new(),
+            corrector_engine: String::new(),
+            corrector_model: None,
+            prompt_hash: None,
+            prompt_hash_algorithm: None,
+            temperature: None,
+            enhancement_mode: EnhancementMode::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PipelineStageIssue {
+    pub stage: PipelineStage,
+    pub kind: PipelineIssueKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PipelineMetrics {
+    pub schema_version: u32,
+    pub audio_duration_ms: u64,
+    pub preprocess_ms: f64,
+    pub asr_ms: f64,
+    pub enhancement_ms: f64,
+    pub corrector_ms: f64,
+    pub insert_ms: f64,
+    pub total_ms: f64,
+    pub asr_rtf: Option<f64>,
+    pub asr_worker_reused: Option<bool>,
+    pub corrector_fallback: bool,
+    pub insert_succeeded: bool,
+    pub stage_issues: Vec<PipelineStageIssue>,
+}
+
+impl Default for PipelineMetrics {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            audio_duration_ms: 0,
+            preprocess_ms: 0.0,
+            asr_ms: 0.0,
+            enhancement_ms: 0.0,
+            corrector_ms: 0.0,
+            insert_ms: 0.0,
+            total_ms: 0.0,
+            asr_rtf: None,
+            asr_worker_reused: None,
+            corrector_fallback: false,
+            insert_succeeded: false,
+            stage_issues: Vec::new(),
+        }
+    }
+}
+
+impl PipelineMetrics {
+    pub fn set_asr_rtf(&mut self) {
+        self.asr_rtf =
+            (self.audio_duration_ms > 0).then(|| self.asr_ms / self.audio_duration_ms as f64);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DictationAttemptRecord {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub attempt_ordinal: u32,
+    pub created_at: DateTime<Utc>,
+    pub asr_raw: Option<String>,
+    pub asr_enhanced: Option<String>,
+    pub corrected: Option<String>,
+    pub inserted: Option<String>,
+    pub pipeline_identity: PipelineIdentity,
+    pub pipeline_metrics: PipelineMetrics,
+    pub status: AttemptStatus,
+    pub failed_stage: Option<PipelineStage>,
+    pub failure_message: Option<String>,
+    pub supersedes_attempt_id: Option<Uuid>,
+}
+
+impl DictationAttemptRecord {
+    pub fn new(session_id: Uuid) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            session_id,
+            attempt_ordinal: 0,
+            created_at: Utc::now(),
+            asr_raw: None,
+            asr_enhanced: None,
+            corrected: None,
+            inserted: None,
+            pipeline_identity: PipelineIdentity::default(),
+            pipeline_metrics: PipelineMetrics::default(),
+            status: AttemptStatus::InProgress,
+            failed_stage: None,
+            failure_message: None,
+            supersedes_attempt_id: None,
+        }
+    }
+}
+
 pub struct Store {
     conn: Connection,
     path: PathBuf,
@@ -36,7 +252,8 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&path).with_context(|| format!("open db {}", path.display()))?;
+        let conn =
+            Connection::open(&path).with_context(|| format!("open db {}", path.display()))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
         schema::migrate(&conn)?;
         Ok(Self { conn, path })
@@ -47,39 +264,48 @@ impl Store {
     }
 
     pub fn save_session(&self, rec: &SessionRecord) -> Result<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO sessions (
-              id, created_at, focused_app, focused_bundle_id,
-              asr_raw, corrected, pasted, asr_engine, corrector_engine,
-              insert_strategy, audio_path, status
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-            ON CONFLICT(id) DO UPDATE SET
-              asr_raw=excluded.asr_raw,
-              corrected=excluded.corrected,
-              pasted=excluded.pasted,
-              asr_engine=excluded.asr_engine,
-              corrector_engine=excluded.corrector_engine,
-              insert_strategy=excluded.insert_strategy,
-              audio_path=excluded.audio_path,
-              status=excluded.status
-            "#,
-            params![
-                rec.id.to_string(),
-                rec.created_at.to_rfc3339(),
-                rec.focus.app_name,
-                rec.focus.bundle_id,
-                rec.asr_raw,
-                rec.corrected,
-                rec.pasted,
-                rec.asr_engine,
-                rec.corrector_engine,
-                strategy_str(rec.insert_strategy),
-                rec.audio_path,
-                status_str(rec.status),
-            ],
-        )?;
+        save_session_on(&self.conn, rec)?;
         Ok(())
+    }
+
+    /// Append one immutable pipeline attempt and link it to the prior attempt.
+    pub fn append_dictation_attempt(
+        &self,
+        mut record: DictationAttemptRecord,
+    ) -> Result<DictationAttemptRecord> {
+        let transaction = self.conn.unchecked_transaction()?;
+        record = append_dictation_attempt_on(&transaction, record)?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    /// Persist the mutable session snapshot and its immutable attempt atomically.
+    pub fn save_session_and_append_attempt(
+        &self,
+        session: &SessionRecord,
+        record: DictationAttemptRecord,
+    ) -> Result<DictationAttemptRecord> {
+        let transaction = self.conn.unchecked_transaction()?;
+        save_session_on(&transaction, session)?;
+        let record = append_dictation_attempt_on(&transaction, record)?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn list_dictation_attempts(&self, session_id: Uuid) -> Result<Vec<DictationAttemptRecord>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, session_id, attempt_ordinal, created_at,
+                   asr_raw, asr_enhanced, corrected, inserted,
+                   pipeline_identity_json, pipeline_metrics_json,
+                   status, failed_stage, failure_message, supersedes_attempt_id
+            FROM dictation_attempts
+            WHERE session_id=?1
+            ORDER BY attempt_ordinal ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![session_id.to_string()], map_attempt)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn list_sessions(&self, limit: u32) -> Result<Vec<SessionRecord>> {
@@ -203,8 +429,10 @@ impl Store {
     }
 
     pub fn delete_dictionary_entry(&self, id: Uuid) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM dictionary_entries WHERE id=?1", params![id.to_string()])?;
+        self.conn.execute(
+            "DELETE FROM dictionary_entries WHERE id=?1",
+            params![id.to_string()],
+        )?;
         Ok(())
     }
 
@@ -301,6 +529,130 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         audio_path: row.get(10)?,
         status: parse_status(&row.get::<_, String>(11)?),
     })
+}
+
+fn map_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<DictationAttemptRecord> {
+    let identity_json: String = row.get(8)?;
+    let metrics_json: String = row.get(9)?;
+    let pipeline_identity = serde_json::from_str(&identity_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let pipeline_metrics = serde_json::from_str(&metrics_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(DictationAttemptRecord {
+        id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+        session_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
+        attempt_ordinal: row.get::<_, i64>(2)? as u32,
+        created_at: parse_dt(&row.get::<_, String>(3)?),
+        asr_raw: row.get(4)?,
+        asr_enhanced: row.get(5)?,
+        corrected: row.get(6)?,
+        inserted: row.get(7)?,
+        pipeline_identity,
+        pipeline_metrics,
+        status: parse_attempt_status(&row.get::<_, String>(10)?),
+        failed_stage: row
+            .get::<_, Option<String>>(11)?
+            .and_then(|value| parse_pipeline_stage(&value)),
+        failure_message: row.get(12)?,
+        supersedes_attempt_id: row
+            .get::<_, Option<String>>(13)?
+            .and_then(|value| Uuid::parse_str(&value).ok()),
+    })
+}
+
+fn save_session_on(conn: &Connection, rec: &SessionRecord) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO sessions (
+          id, created_at, focused_app, focused_bundle_id,
+          asr_raw, corrected, pasted, asr_engine, corrector_engine,
+          insert_strategy, audio_path, status
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+        ON CONFLICT(id) DO UPDATE SET
+          asr_raw=excluded.asr_raw,
+          corrected=excluded.corrected,
+          pasted=excluded.pasted,
+          asr_engine=excluded.asr_engine,
+          corrector_engine=excluded.corrector_engine,
+          insert_strategy=excluded.insert_strategy,
+          audio_path=excluded.audio_path,
+          status=excluded.status
+        "#,
+        params![
+            rec.id.to_string(),
+            rec.created_at.to_rfc3339(),
+            rec.focus.app_name,
+            rec.focus.bundle_id,
+            rec.asr_raw,
+            rec.corrected,
+            rec.pasted,
+            rec.asr_engine,
+            rec.corrector_engine,
+            strategy_str(rec.insert_strategy),
+            rec.audio_path,
+            status_str(rec.status),
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_dictation_attempt_on(
+    transaction: &Transaction<'_>,
+    mut record: DictationAttemptRecord,
+) -> Result<DictationAttemptRecord> {
+    let latest: Option<(Uuid, u32)> = transaction
+        .query_row(
+            r#"
+            SELECT id, attempt_ordinal
+            FROM dictation_attempts
+            WHERE session_id=?1
+            ORDER BY attempt_ordinal DESC
+            LIMIT 1
+            "#,
+            params![record.session_id.to_string()],
+            |row| {
+                Ok((
+                    Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+                    row.get::<_, i64>(1)? as u32,
+                ))
+            },
+        )
+        .optional()?;
+    record.attempt_ordinal = latest.as_ref().map_or(1, |(_, ordinal)| ordinal + 1);
+    record.supersedes_attempt_id = latest.map(|(id, _)| id);
+    let identity_json = serde_json::to_string(&record.pipeline_identity)?;
+    let metrics_json = serde_json::to_string(&record.pipeline_metrics)?;
+    transaction.execute(
+        r#"
+        INSERT INTO dictation_attempts (
+          id, session_id, attempt_ordinal, created_at,
+          asr_raw, asr_enhanced, corrected, inserted,
+          pipeline_identity_json, pipeline_metrics_json,
+          status, failed_stage, failure_message, supersedes_attempt_id
+        ) VALUES (
+          ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14
+        )
+        "#,
+        params![
+            record.id.to_string(),
+            record.session_id.to_string(),
+            record.attempt_ordinal as i64,
+            record.created_at.to_rfc3339(),
+            record.asr_raw,
+            record.asr_enhanced,
+            record.corrected,
+            record.inserted,
+            identity_json,
+            metrics_json,
+            record.status.as_str(),
+            record.failed_stage.map(PipelineStage::as_str),
+            record.failure_message,
+            record.supersedes_attempt_id.map(|value| value.to_string()),
+        ],
+    )?;
+    Ok(record)
 }
 
 fn map_dict(row: &rusqlite::Row<'_>) -> rusqlite::Result<DictionaryEntry> {
@@ -458,5 +810,143 @@ mod tests {
         assert!(store.delete_session(rec.id).unwrap());
         assert!(store.get_session(rec.id).unwrap().is_none());
         assert!(store.list_edit_events(rec.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn attempts_are_append_only_and_preserve_pipeline_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("attempts.sqlite")).unwrap();
+        let mut session = SessionRecord::new();
+        session.status = SessionStatus::Completed;
+        store.save_session(&session).unwrap();
+
+        let mut first = DictationAttemptRecord::new(session.id);
+        first.status = AttemptStatus::Completed;
+        first.asr_raw = Some("cotex".into());
+        first.asr_enhanced = Some("cotex".into());
+        first.corrected = Some("Codex".into());
+        first.inserted = Some("Codex".into());
+        first.pipeline_identity.asr_engine = "qwen".into();
+        first.pipeline_identity.enhancement_mode = EnhancementMode::None;
+        first.pipeline_metrics.audio_duration_ms = 1_000;
+        first.pipeline_metrics.asr_ms = 80.0;
+        first
+            .pipeline_metrics
+            .stage_issues
+            .push(PipelineStageIssue {
+                stage: PipelineStage::Corrector,
+                kind: PipelineIssueKind::Fallback,
+                message: "timeout".into(),
+            });
+        first.pipeline_metrics.set_asr_rtf();
+        let first = store.append_dictation_attempt(first).unwrap();
+
+        let mut retry = DictationAttemptRecord::new(session.id);
+        retry.status = AttemptStatus::Failed;
+        retry.failed_stage = Some(PipelineStage::Asr);
+        retry.failure_message = Some("worker exited".into());
+        let retry = store.append_dictation_attempt(retry).unwrap();
+
+        let attempts = store.list_dictation_attempts(session.id).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].id, first.id);
+        assert_eq!(attempts[0].attempt_ordinal, 1);
+        assert_eq!(attempts[0].asr_raw.as_deref(), Some("cotex"));
+        assert_eq!(attempts[0].asr_enhanced.as_deref(), Some("cotex"));
+        assert_eq!(attempts[0].corrected.as_deref(), Some("Codex"));
+        assert_eq!(attempts[0].inserted.as_deref(), Some("Codex"));
+        assert_eq!(attempts[0].pipeline_metrics.asr_rtf, Some(0.08));
+        assert_eq!(
+            attempts[0].pipeline_metrics.stage_issues,
+            vec![PipelineStageIssue {
+                stage: PipelineStage::Corrector,
+                kind: PipelineIssueKind::Fallback,
+                message: "timeout".into(),
+            }]
+        );
+        assert_eq!(attempts[1].attempt_ordinal, 2);
+        assert_eq!(attempts[1].supersedes_attempt_id, Some(first.id));
+        assert_eq!(attempts[1].failed_stage, Some(PipelineStage::Asr));
+        assert_eq!(retry.supersedes_attempt_id, Some(first.id));
+    }
+
+    #[test]
+    fn deleting_session_cascades_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("cascade.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+        store
+            .append_dictation_attempt(DictationAttemptRecord::new(session.id))
+            .unwrap();
+
+        assert!(store.delete_session(session.id).unwrap());
+        assert!(store
+            .list_dictation_attempts(session.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn zero_duration_does_not_produce_invalid_rtf() {
+        let mut metrics = PipelineMetrics {
+            audio_duration_ms: 0,
+            asr_ms: 42.0,
+            ..PipelineMetrics::default()
+        };
+        metrics.set_asr_rtf();
+        assert_eq!(metrics.asr_rtf, None);
+    }
+
+    #[test]
+    fn future_enum_values_degrade_to_unknown() {
+        let identity: PipelineIdentity = serde_json::from_str(
+            r#"{
+                "schema_version": 2,
+                "enhancement_mode": "future_context_repair"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(identity.enhancement_mode, EnhancementMode::Unknown);
+
+        let metrics: PipelineMetrics = serde_json::from_str(
+            r#"{
+                "schema_version": 2,
+                "stage_issues": [{
+                    "stage": "future_stage",
+                    "kind": "future_issue",
+                    "message": "newer writer"
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(metrics.stage_issues[0].stage, PipelineStage::Unknown);
+        assert_eq!(
+            metrics.stage_issues[0].kind,
+            PipelineIssueKind::Unknown
+        );
+    }
+
+    #[test]
+    fn session_snapshot_and_attempt_commit_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("atomic.sqlite")).unwrap();
+        let mut session = SessionRecord::new();
+        session.asr_raw = Some("before".into());
+        store.save_session(&session).unwrap();
+
+        let attempt = DictationAttemptRecord::new(session.id);
+        store
+            .save_session_and_append_attempt(&session, attempt.clone())
+            .unwrap();
+
+        session.asr_raw = Some("must roll back".into());
+        assert!(store
+            .save_session_and_append_attempt(&session, attempt)
+            .is_err());
+
+        let stored = store.get_session(session.id).unwrap().unwrap();
+        assert_eq!(stored.asr_raw.as_deref(), Some("before"));
+        assert_eq!(store.list_dictation_attempts(session.id).unwrap().len(), 1);
     }
 }

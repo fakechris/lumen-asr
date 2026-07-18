@@ -28,6 +28,7 @@ pub use whisper::WhisperAsr;
 use async_trait::async_trait;
 use lumen_core::AsrEngineId;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -47,6 +48,44 @@ pub struct AsrResult {
     pub text: String,
     pub engine: AsrEngineId,
     pub language: Option<String>,
+    #[serde(default)]
+    pub diagnostics: AsrRuntimeDiagnostics,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AsrRuntimeDiagnostics {
+    /// `Some(false)` means the request paid worker/model cold-start cost.
+    /// Engines without a persistent worker leave this unknown.
+    pub worker_reused: Option<bool>,
+    /// Stable model name without exposing the absolute local filesystem path.
+    pub model: Option<String>,
+    /// Immutable model revision when the runtime path exposes one.
+    pub model_revision: Option<String>,
+}
+
+/// Derive a publish-safe identity from the model directory that actually ran.
+pub fn model_identity_from_path(path: &Path) -> (Option<String>, Option<String>) {
+    let leaf = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let is_hugging_face_snapshot = path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+        == Some("snapshots");
+    if !is_hugging_face_snapshot {
+        return (leaf, None);
+    }
+
+    let model = path
+        .parent()
+        .and_then(|value| value.parent())
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim_start_matches("models--").replace("--", "/"));
+    (model, leaf)
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +129,7 @@ impl AsrEngine for StubAsr {
             text: self.canned.clone(),
             engine: self.id(),
             language: Some("zh".into()),
+            diagnostics: AsrRuntimeDiagnostics::default(),
         })
     }
 }
@@ -195,6 +235,26 @@ mod tests {
         assert_eq!(EngineKind::parse("qwen3_asr"), Some(EngineKind::Qwen));
         assert_eq!(EngineKind::parse("local_qwen"), Some(EngineKind::Qwen));
         assert_eq!(EngineKind::Qwen.as_str(), "qwen");
+    }
+
+    #[test]
+    fn hugging_face_snapshot_identity_omits_local_path() {
+        let path =
+            Path::new("/tmp/cache/models--mlx-community--Qwen3-ASR-0.6B-8bit/snapshots/abcdef123");
+        let (model, revision) = model_identity_from_path(path);
+
+        assert_eq!(model.as_deref(), Some("mlx-community/Qwen3-ASR-0.6B-8bit"));
+        assert_eq!(revision.as_deref(), Some("abcdef123"));
+        assert!(!model.unwrap().contains("/tmp/cache"));
+    }
+
+    #[test]
+    fn direct_model_identity_uses_only_directory_name() {
+        let (model, revision) =
+            model_identity_from_path(Path::new("/private/models/sensevoice-int8"));
+
+        assert_eq!(model.as_deref(), Some("sensevoice-int8"));
+        assert_eq!(revision, None);
     }
 
     #[test]

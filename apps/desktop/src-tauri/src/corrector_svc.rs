@@ -12,6 +12,35 @@ use lumen_prompts::{
 };
 use std::time::Duration;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrectorRunIdentity {
+    pub provider: String,
+    pub model: Option<String>,
+    pub prompt_hash: Option<String>,
+    pub prompt_hash_algorithm: Option<String>,
+    pub temperature: Option<f64>,
+}
+
+pub fn run_identity(app: &AppConfig, intent: IntentSpec) -> CorrectorRunIdentity {
+    let input = app.output.prompt_input(intent);
+    let level = effective_cleanup(&input);
+    let prompt = build_system_prompt_from(&input);
+    let model_enabled =
+        level.uses_model() && app.corrector.enabled && app.corrector.provider != "none";
+    CorrectorRunIdentity {
+        provider: if model_enabled {
+            app.corrector.provider.clone()
+        } else {
+            "none".into()
+        },
+        model: model_enabled.then(|| effective_model(&app.corrector)),
+        prompt_hash: (model_enabled && !prompt.is_empty())
+            .then(|| blake3::hash(prompt.as_bytes()).to_hex().to_string()),
+        prompt_hash_algorithm: (model_enabled && !prompt.is_empty()).then(|| "blake3".into()),
+        temperature: model_enabled.then(|| level.temperature() as f64),
+    }
+}
+
 pub fn dictionary_context(entries: &[DictionaryEntry]) -> DictionaryContext {
     let (terms, replacements) = split_for_injection(entries);
     DictionaryContext {
@@ -48,14 +77,7 @@ pub fn build_corrector(cfg: &CorrectorConfig) -> Result<Box<dyn Corrector + Send
         cfg.base_url.clone()
     };
 
-    let model = if cfg.model.trim().is_empty() {
-        crate::provider_presets::llm_preset_by_id(&cfg.provider)
-            .map(|p| p.default_model)
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| "qwen3.5:9b".into())
-    } else {
-        cfg.model.clone()
-    };
+    let model = effective_model(cfg);
 
     let oc = OpenAiCompatConfig {
         base_url,
@@ -68,6 +90,17 @@ pub fn build_corrector(cfg: &CorrectorConfig) -> Result<Box<dyn Corrector + Send
     OpenAiCompatCorrector::new(oc)
         .map(|c| Box::new(c) as Box<dyn Corrector + Send + Sync>)
         .map_err(|e| e.to_string())
+}
+
+fn effective_model(cfg: &CorrectorConfig) -> String {
+    if cfg.model.trim().is_empty() {
+        crate::provider_presets::llm_preset_by_id(&cfg.provider)
+            .map(|p| p.default_model)
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| "qwen3.5:9b".into())
+    } else {
+        cfg.model.clone()
+    }
 }
 
 pub async fn run_correct(
@@ -122,7 +155,51 @@ pub fn engine_label(app: &AppConfig) -> String {
     format!(
         "{}:{}|{}",
         app.corrector.provider,
-        app.corrector.model,
+        effective_model(&app.corrector),
         level.as_str()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_identity_uses_effective_model_and_stable_prompt_hash() {
+        let mut app = AppConfig::default();
+        app.corrector.enabled = true;
+        app.corrector.provider = "minimax".into();
+        app.corrector.model = "MiniMax-M3".into();
+
+        let first = run_identity(&app, IntentSpec::Default);
+        let second = run_identity(&app, IntentSpec::Default);
+
+        assert_eq!(first.provider, "minimax");
+        assert_eq!(first.model.as_deref(), Some("MiniMax-M3"));
+        assert_eq!(first.prompt_hash, second.prompt_hash);
+        assert_eq!(first.prompt_hash_algorithm.as_deref(), Some("blake3"));
+        assert!((first.temperature.unwrap() - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn disabled_corrector_identity_does_not_claim_a_model() {
+        let mut app = AppConfig::default();
+        app.corrector.enabled = false;
+        let identity = run_identity(&app, IntentSpec::Default);
+
+        assert_eq!(identity.provider, "none");
+        assert_eq!(identity.model, None);
+        assert_eq!(identity.prompt_hash, None);
+        assert_eq!(identity.temperature, None);
+    }
+
+    #[test]
+    fn engine_label_uses_the_model_that_will_run() {
+        let mut app = AppConfig::default();
+        app.corrector.enabled = true;
+        app.corrector.provider = "minimax".into();
+        app.corrector.model.clear();
+
+        assert!(engine_label(&app).contains("MiniMax-M3"));
+    }
 }

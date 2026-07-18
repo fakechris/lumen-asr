@@ -85,6 +85,10 @@ impl AsrEngine for OpenAiAudioAsr {
             text,
             engine: AsrEngineId::Other,
             language: self.config.language.clone(),
+            diagnostics: crate::AsrRuntimeDiagnostics {
+                model: Some(self.config.model.clone()),
+                ..crate::AsrRuntimeDiagnostics::default()
+            },
         })
     }
 }

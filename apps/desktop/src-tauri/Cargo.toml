@@ -33,6 +33,7 @@ chrono = { workspace = true }
 cpal = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json"] }
+blake3 = { workspace = true }
 
 [features]
 default = ["custom-protocol"]

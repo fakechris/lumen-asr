@@ -6,7 +6,7 @@ use lumen_core::{
 };
 use lumen_dictionary::{candidates_from_edit, DictionaryEntry, LearnCandidate};
 use lumen_platform::{default_data_dir, default_db_path};
-use lumen_store::EditEventRecord;
+use lumen_store::{DictationAttemptRecord, EditEventRecord};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -98,6 +98,19 @@ pub fn list_sessions(state: State<'_, AppState>, limit: Option<u32>) -> Result<V
 pub fn get_session(state: State<'_, AppState>, id: String) -> Result<Option<SessionRecord>, String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     with_store(&state, |s| s.get_session(id).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+pub fn list_session_attempts(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<DictationAttemptRecord>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
+    with_store(&state, |store| {
+        store
+            .list_dictation_attempts(id)
+            .map_err(|error| error.to_string())
+    })
 }
 
 #[tauri::command]

@@ -152,11 +152,17 @@ impl AsrEngine for SenseVoiceSherpaAsr {
             let text = tokio::task::spawn_blocking(move || inner.decode_sync(&samples, sr))
                 .await
                 .map_err(|e| AsrError::Inference(e.to_string()))??;
+            let (model, model_revision) = crate::model_identity_from_path(&self.inner.model_dir);
 
             Ok(AsrResult {
                 text,
                 engine: AsrEngineId::SenseVoiceSherpa,
                 language: Some(self.inner.language.clone()),
+                diagnostics: crate::AsrRuntimeDiagnostics {
+                    model,
+                    model_revision,
+                    ..crate::AsrRuntimeDiagnostics::default()
+                },
             })
         }
     }

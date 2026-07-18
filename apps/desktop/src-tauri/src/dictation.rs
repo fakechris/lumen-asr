@@ -1,7 +1,10 @@
 //! Recording + local ASR + model corrector IPC (M2–M5).
 
-use crate::corrector_svc::{engine_label, run_correct_with_intent};
-use crate::session_debug::{self, SessionDebugMeta};
+use crate::pipeline_attempt::{
+    apply_asr_result, build_pipeline_identity, elapsed_ms, mark_attempt_failed, persist_attempt,
+    run_corrector_stage, write_attempt_debug, AttemptDebug,
+};
+use crate::session_debug;
 use crate::AppState;
 use crate::config::AsrServiceConfig;
 use lumen_asr::{
@@ -14,10 +17,13 @@ use lumen_platform_macos::{
     FrontmostTarget,
 };
 use lumen_prompts::IntentSpec;
+use lumen_store::{
+    AttemptStatus, DictationAttemptRecord, PipelineIssueKind, PipelineStage, PipelineStageIssue,
+};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Frontmost app captured when hotkey dictation starts — restored before paste.
@@ -468,6 +474,7 @@ pub async fn stop_and_transcribe_inner(
     save: bool,
     app: Option<&AppHandle>,
 ) -> Result<TranscribeOutcome, String> {
+    let pipeline_started = Instant::now();
     let capture = state.audio.stop().map_err(|e| e.to_string())?;
     let num_samples = capture.samples.len();
     let sample_rate = capture.sample_rate;
@@ -486,80 +493,126 @@ pub async fn stop_and_transcribe_inner(
         "audio capture stopped"
     );
 
-    if capture.samples.is_empty() {
-        return Err("no audio captured (0 samples) — hold longer or check mic".into());
-    }
-
-    let samples_16k = prepare_for_asr(&capture);
-    let (rms, peak) = session_debug::audio_stats(&samples_16k);
-    if peak < 0.005 {
-        tracing::warn!(peak, rms, "audio nearly silent — ASR likely empty");
-    }
+    let target = TARGET.lock().ok().and_then(|guard| guard.clone());
+    let mut rec = SessionRecord::new();
+    rec.focus = FocusInfo {
+        app_name: target.as_ref().and_then(|value| value.name.clone()),
+        bundle_id: target.as_ref().and_then(|value| value.bundle_id.clone()),
+        window_title: None,
+    };
+    let mut attempt = DictationAttemptRecord::new(rec.id);
+    attempt.pipeline_metrics.audio_duration_ms = duration_ms;
 
     let engine_kind = *state
         .engine
         .lock()
         .map_err(|_| "engine lock poisoned".to_string())?;
-
-    // Clone samples for debug dump (after ASR we still have this).
-    let samples_for_debug = samples_16k.clone();
-
-    let asr_cfg = state
-        .config
-        .lock()
-        .map_err(|_| "config lock poisoned".to_string())?
-        .asr
-        .clone();
-
-    let result = run_asr(state, engine_kind, &asr_cfg, samples_16k).await?;
-
-    let asr_text = result.text.trim().to_string();
-    let asr_engine_str = if asr_cfg.provider.starts_with("local") {
-        engine_kind.as_str().to_string()
-    } else {
-        asr_cfg.provider.clone()
-    };
-    tracing::info!(%asr_text, engine = %asr_engine_str, "ASR result");
-
-    let entries = {
-        let store_guard = state
-            .store
-            .lock()
-            .map_err(|_| "store lock poisoned".to_string())?;
-        match store_guard.as_ref() {
-            Some(s) => s.list_dictionary().unwrap_or_default(),
-            None => vec![],
-        }
-    };
-
     let cfg = state
         .config
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?
         .clone();
-
-    let intent = take_session_intent();
-    tracing::info!(?intent, "running corrector with session intent");
-    let corr = run_correct_with_intent(&cfg, &asr_text, &entries, intent.clone()).await;
-    let corrected_text = corr.text.trim().to_string();
-    let corrector_engine = if corr.model_applied {
-        engine_label(&cfg)
-    } else if !cfg.corrector.enabled || cfg.corrector.provider == "none" {
-        "none".into()
+    let asr_cfg = cfg.asr.clone();
+    let asr_engine_str = if asr_cfg.provider.starts_with("local") {
+        engine_kind.as_str().to_string()
     } else {
-        format!("{}:fallback", engine_label(&cfg))
+        asr_cfg.provider.clone()
     };
-    if !corr.model_applied {
-        if matches!(intent, IntentSpec::Translate { .. }) {
-            tracing::warn!(
-                %corrector_engine,
-                "translate intent but model not applied — output stays ASR language"
-            );
-        }
-    }
-    tracing::info!(%corrected_text, %corrector_engine, model_applied = corr.model_applied, "corrector result");
+    let intent = take_session_intent();
+    attempt.pipeline_identity = build_pipeline_identity(
+        state,
+        &cfg,
+        engine_kind,
+        &asr_engine_str,
+        "not_run",
+        intent.clone(),
+    );
 
-    let target = TARGET.lock().ok().and_then(|g| g.clone());
+    if capture.samples.is_empty() {
+        let error = "no audio captured (0 samples) — hold longer or check mic".to_string();
+        mark_attempt_failed(
+            &mut attempt,
+            PipelineStage::Capture,
+            &error,
+            pipeline_started,
+        );
+        rec.status = SessionStatus::Failed;
+        rec.asr_engine = Some(engine_kind.as_str().into());
+        write_attempt_debug(
+            &mut rec,
+            &attempt,
+            AttemptDebug {
+                target: target.as_ref(),
+                frontmost_before_insert: None,
+                sample_rate_capture: sample_rate,
+                num_samples_capture: num_samples,
+                samples_asr: &[],
+                rms: 0.0,
+                peak: 0.0,
+                notes: vec!["empty capture".into()],
+            },
+        );
+        if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
+            tracing::warn!(error = %persist_error, "failed to persist capture failure");
+        }
+        return Err(error);
+    }
+
+    let preprocess_started = Instant::now();
+    let samples_16k = prepare_for_asr(&capture);
+    attempt.pipeline_metrics.preprocess_ms = elapsed_ms(preprocess_started);
+    let (rms, peak) = session_debug::audio_stats(&samples_16k);
+    if peak < 0.005 {
+        tracing::warn!(peak, rms, "audio nearly silent — ASR likely empty");
+    }
+
+    // Clone samples for debug dump (after ASR we still have this).
+    let samples_for_debug = samples_16k.clone();
+
+    let asr_started = Instant::now();
+    let result = match run_asr(state, engine_kind, &asr_cfg, samples_16k).await {
+        Ok(result) => result,
+        Err(error) => {
+            attempt.pipeline_metrics.asr_ms = elapsed_ms(asr_started);
+            attempt.pipeline_metrics.set_asr_rtf();
+            mark_attempt_failed(&mut attempt, PipelineStage::Asr, &error, pipeline_started);
+            rec.status = SessionStatus::Failed;
+            rec.asr_engine = Some(engine_kind.as_str().into());
+            write_attempt_debug(
+                &mut rec,
+                &attempt,
+                AttemptDebug {
+                    target: target.as_ref(),
+                    frontmost_before_insert: None,
+                    sample_rate_capture: sample_rate,
+                    num_samples_capture: num_samples,
+                    samples_asr: &samples_for_debug,
+                    rms,
+                    peak,
+                    notes: vec!["ASR failed".into()],
+                },
+            );
+            if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
+                tracing::warn!(error = %persist_error, "failed to persist ASR failure");
+            }
+            return Err(error);
+        }
+    };
+    let (asr_text, enhanced_text) = apply_asr_result(&mut attempt, &result, asr_started);
+    tracing::info!(%asr_text, engine = %asr_engine_str, "ASR result");
+
+    tracing::info!(?intent, "running corrector with session intent");
+    let correction =
+        run_corrector_stage(state, &cfg, &enhanced_text, intent.clone(), &mut attempt).await?;
+    let corrected_text = correction.text;
+    let corrector_engine = correction.engine;
+    if !correction.model_applied && matches!(intent, IntentSpec::Translate { .. }) {
+        tracing::warn!(
+            %corrector_engine,
+            "translate intent but model not applied — output stays ASR language"
+        );
+    }
+
     let mut notes: Vec<String> = Vec::new();
     if peak < 0.005 {
         notes.push("near-silent audio".into());
@@ -567,7 +620,7 @@ pub async fn stop_and_transcribe_inner(
     if asr_text.is_empty() || asr_text == "." {
         notes.push("empty/dot ASR".into());
     }
-    if matches!(intent, IntentSpec::Translate { .. }) && !corr.model_applied {
+    if matches!(intent, IntentSpec::Translate { .. }) && !correction.model_applied {
         notes.push(format!(
             "翻译未执行：模型未响应（{}）。请在「AI 修正」里确认 Ollama 模型名可用（当前机器常见 qwen3.5:9b）",
             corrector_engine
@@ -576,7 +629,9 @@ pub async fn stop_and_transcribe_inner(
 
     let mut insert_strategy = InsertStrategy::None;
     let mut did_insert = false;
+    let mut insert_succeeded = false;
     let mut frontmost_before_insert = None;
+    let insert_started = Instant::now();
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
         let ax_ok = lumen_platform_macos::is_accessibility_trusted();
         if !ax_ok {
@@ -591,10 +646,19 @@ pub async fn stop_and_transcribe_inner(
             match crate::inject_cmd::copy_only(&corrected_text).await {
                 Ok(()) => {
                     insert_strategy = InsertStrategy::CopyOnly;
+                    insert_succeeded = true;
                     tracing::info!("copied result to clipboard (no AX)");
                 }
                 Err(e) => {
                     notes.push(format!("clipboard copy failed: {e}"));
+                    attempt
+                        .pipeline_metrics
+                        .stage_issues
+                        .push(PipelineStageIssue {
+                            stage: PipelineStage::Insert,
+                            kind: PipelineIssueKind::ClipboardFailure,
+                            message: e.to_string(),
+                        });
                 }
             }
             if let Some(app) = app {
@@ -628,6 +692,7 @@ pub async fn stop_and_transcribe_inner(
                         insert_strategy,
                         InsertStrategy::None | InsertStrategy::CopyOnly
                     );
+                    insert_succeeded = !matches!(insert_strategy, InsertStrategy::None);
                     tracing::info!(
                         ?insert_strategy,
                         frontmost = ?frontmost_app_name(),
@@ -636,13 +701,25 @@ pub async fn stop_and_transcribe_inner(
                 }
                 Err(e) => {
                     notes.push(format!("insert error: {e}"));
+                    attempt
+                        .pipeline_metrics
+                        .stage_issues
+                        .push(PipelineStageIssue {
+                            stage: PipelineStage::Insert,
+                            kind: PipelineIssueKind::InjectionFailure,
+                            message: e.to_string(),
+                        });
                     tracing::warn!(error = %e, "auto-insert failed");
                 }
             }
         }
     }
+    attempt.pipeline_metrics.insert_ms = elapsed_ms(insert_started);
+    attempt.pipeline_metrics.insert_succeeded = insert_succeeded;
+    attempt.inserted = did_insert.then(|| corrected_text.clone());
+    attempt.status = AttemptStatus::Completed;
+    attempt.pipeline_metrics.total_ms = elapsed_ms(pipeline_started);
 
-    let mut rec = SessionRecord::new();
     rec.status = SessionStatus::Completed;
     rec.insert_strategy = insert_strategy;
     rec.asr_raw = Some(asr_text.clone());
@@ -650,59 +727,27 @@ pub async fn stop_and_transcribe_inner(
     rec.pasted = Some(corrected_text.clone());
     rec.asr_engine = Some(engine_kind.as_str().into());
     rec.corrector_engine = Some(corrector_engine.clone());
-    rec.focus = FocusInfo {
-        app_name: target.as_ref().and_then(|t| t.name.clone()),
-        bundle_id: target.as_ref().and_then(|t| t.bundle_id.clone()),
-        window_title: None,
-    };
-
-    // Always write debug dump (audio + texts) for analysis.
-    let debug_dir = session_debug::new_session_dir(&rec.id.to_string());
-    let meta = SessionDebugMeta {
-        session_id: rec.id.to_string(),
-        created_at_unix_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-        target_app: target.as_ref().and_then(|t| t.name.clone()),
-        target_bundle_id: target.as_ref().and_then(|t| t.bundle_id.clone()),
-        frontmost_before_insert,
-        sample_rate_capture: sample_rate,
-        num_samples_capture: num_samples,
-        sample_rate_asr: 16_000,
-        num_samples_asr: samples_for_debug.len(),
-        duration_ms,
-        rms,
-        peak,
-        asr_engine: engine_kind.as_str().into(),
-        corrector_engine: corrector_engine.clone(),
-        asr_text: asr_text.clone(),
-        corrected_text: corrected_text.clone(),
-        insert_strategy: format!("{insert_strategy:?}"),
-        insert_ok: did_insert,
-        notes,
-    };
-    if let Err(e) = session_debug::write_session_debug(&debug_dir, &meta, &samples_for_debug) {
-        tracing::warn!(error = %e, "failed to write session debug");
-    } else {
-        rec.audio_path = Some(debug_dir.join("audio_16k.wav").display().to_string());
-    }
-
-    if save {
-        let store_guard = state
-            .store
-            .lock()
-            .map_err(|_| "store lock poisoned".to_string())?;
-        if let Some(store) = store_guard.as_ref() {
-            store.save_session(&rec).map_err(|e| e.to_string())?;
-        }
-    }
+    write_attempt_debug(
+        &mut rec,
+        &attempt,
+        AttemptDebug {
+            target: target.as_ref(),
+            frontmost_before_insert,
+            sample_rate_capture: sample_rate,
+            num_samples_capture: num_samples,
+            samples_asr: &samples_for_debug,
+            rms,
+            peak,
+            notes,
+        },
+    );
+    persist_attempt(state, save, &rec, attempt)?;
 
     Ok(TranscribeOutcome {
         text: corrected_text.clone(),
         asr_text,
         corrected_text,
-        model_applied: corr.model_applied,
+        model_applied: correction.model_applied,
         asr_engine: engine_kind.as_str().into(),
         corrector_engine,
         sample_rate,
@@ -757,6 +802,7 @@ pub async fn retry_session_transcription(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<RetryOutcome, String> {
+    let pipeline_started = Instant::now();
     let uuid = uuid::Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     let mut rec = {
         let guard = state
@@ -769,26 +815,87 @@ pub async fn retry_session_transcription(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "session not found".to_string())?
     };
-    let path = rec
-        .audio_path
-        .clone()
-        .ok_or_else(|| "此会话没有音频，无法重新转写".to_string())?;
-    let (samples, sample_rate) = session_debug::read_wav_mono_f32(std::path::Path::new(&path))?;
+    let engine_kind = *state
+        .engine
+        .lock()
+        .map_err(|_| "engine lock poisoned".to_string())?;
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?
+        .clone();
+    let asr_engine_str = if cfg.asr.provider.starts_with("local") {
+        engine_kind.as_str().to_string()
+    } else {
+        cfg.asr.provider.clone()
+    };
+    let mut attempt = DictationAttemptRecord::new(rec.id);
+    attempt.pipeline_identity = build_pipeline_identity(
+        &state,
+        &cfg,
+        engine_kind,
+        &asr_engine_str,
+        "not_run",
+        IntentSpec::Default,
+    );
+
+    let preprocess_started = Instant::now();
+    let path = match rec.audio_path.clone() {
+        Some(path) => path,
+        None => {
+            let error = "此会话没有音频，无法重新转写".to_string();
+            attempt.pipeline_metrics.preprocess_ms = elapsed_ms(preprocess_started);
+            mark_attempt_failed(
+                &mut attempt,
+                PipelineStage::Preprocess,
+                &error,
+                pipeline_started,
+            );
+            if let Err(persist_error) = persist_attempt(&state, true, &rec, attempt) {
+                tracing::warn!(error = %persist_error, "failed to persist retry failure");
+            }
+            return Err(error);
+        }
+    };
+    let (samples, sample_rate) = match session_debug::read_wav_mono_f32(std::path::Path::new(&path))
+    {
+        Ok(audio) => audio,
+        Err(error) => {
+            attempt.pipeline_metrics.preprocess_ms = elapsed_ms(preprocess_started);
+            mark_attempt_failed(
+                &mut attempt,
+                PipelineStage::Preprocess,
+                &error,
+                pipeline_started,
+            );
+            if let Err(persist_error) = persist_attempt(&state, true, &rec, attempt) {
+                tracing::warn!(error = %persist_error, "failed to persist retry failure");
+            }
+            return Err(error);
+        }
+    };
     if samples.is_empty() {
-        return Err("音频为空".into());
+        let error = "音频为空".to_string();
+        attempt.pipeline_metrics.preprocess_ms = elapsed_ms(preprocess_started);
+        mark_attempt_failed(
+            &mut attempt,
+            PipelineStage::Preprocess,
+            &error,
+            pipeline_started,
+        );
+        if let Err(persist_error) = persist_attempt(&state, true, &rec, attempt) {
+            tracing::warn!(error = %persist_error, "failed to persist retry failure");
+        }
+        return Err(error);
     }
 
-    // Resample to 16 kHz if needed
     let samples_16k = if sample_rate == 16_000 {
         samples
     } else {
         lumen_asr::resample_linear(&samples, sample_rate, 16_000)
     };
-
-    let engine_kind = *state
-        .engine
-        .lock()
-        .map_err(|_| "engine lock poisoned".to_string())?;
+    attempt.pipeline_metrics.preprocess_ms = elapsed_ms(preprocess_started);
+    attempt.pipeline_metrics.audio_duration_ms = (samples_16k.len() as u64 * 1_000) / 16_000;
 
     tracing::info!(
         %id,
@@ -797,33 +904,32 @@ pub async fn retry_session_transcription(
         "retry transcription start"
     );
 
-    let cfg = state
-        .config
-        .lock()
-        .map_err(|_| "config lock poisoned".to_string())?
-        .clone();
-    let result = run_asr(&*state, engine_kind, &cfg.asr, samples_16k.clone()).await?;
-
-    let asr_text = result.text.trim().to_string();
-    let entries = {
-        let store_guard = state
-            .store
-            .lock()
-            .map_err(|_| "store lock poisoned".to_string())?;
-        match store_guard.as_ref() {
-            Some(s) => s.list_dictionary().unwrap_or_default(),
-            None => vec![],
+    let asr_started = Instant::now();
+    let result = match run_asr(&state, engine_kind, &cfg.asr, samples_16k).await {
+        Ok(result) => result,
+        Err(error) => {
+            attempt.pipeline_metrics.asr_ms = elapsed_ms(asr_started);
+            attempt.pipeline_metrics.set_asr_rtf();
+            mark_attempt_failed(&mut attempt, PipelineStage::Asr, &error, pipeline_started);
+            if let Err(persist_error) = persist_attempt(&state, true, &rec, attempt) {
+                tracing::warn!(error = %persist_error, "failed to persist retry ASR failure");
+            }
+            return Err(error);
         }
     };
-    let corr = run_correct_with_intent(&cfg, &asr_text, &entries, IntentSpec::Default).await;
-    let corrected_text = corr.text.trim().to_string();
-    let corrector_engine = if corr.model_applied {
-        engine_label(&cfg)
-    } else if !cfg.corrector.enabled || cfg.corrector.provider == "none" {
-        "none".into()
-    } else {
-        format!("{}:fallback", engine_label(&cfg))
-    };
+    let (asr_text, enhanced_text) = apply_asr_result(&mut attempt, &result, asr_started);
+    let correction = run_corrector_stage(
+        &state,
+        &cfg,
+        &enhanced_text,
+        IntentSpec::Default,
+        &mut attempt,
+    )
+    .await?;
+    let corrected_text = correction.text;
+    let corrector_engine = correction.engine;
+    attempt.status = AttemptStatus::Completed;
+    attempt.pipeline_metrics.total_ms = elapsed_ms(pipeline_started);
 
     rec.asr_raw = Some(asr_text.clone());
     rec.corrected = Some(corrected_text.clone());
@@ -832,21 +938,9 @@ pub async fn retry_session_transcription(
     rec.corrector_engine = Some(corrector_engine.clone());
     rec.status = SessionStatus::Completed;
 
-    // Refresh sidecar text dumps if debug dir is the parent of audio_path.
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        let _ = std::fs::write(parent.join("asr.txt"), &asr_text);
-        let _ = std::fs::write(parent.join("corrected.txt"), &corrected_text);
-    }
-
-    {
-        let store_guard = state
-            .store
-            .lock()
-            .map_err(|_| "store lock poisoned".to_string())?;
-        if let Some(store) = store_guard.as_ref() {
-            store.save_session(&rec).map_err(|e| e.to_string())?;
-        }
-    }
+    // The original debug text files remain immutable. The retry result is a
+    // new attempt row rather than overwriting the first attempt's sidecars.
+    persist_attempt(&state, true, &rec, attempt)?;
 
     tracing::info!(%id, %asr_text, %corrected_text, "retry transcription done");
     Ok(RetryOutcome {
@@ -855,7 +949,7 @@ pub async fn retry_session_transcription(
         corrected_text,
         asr_engine: engine_kind.as_str().into(),
         corrector_engine,
-        model_applied: corr.model_applied,
+        model_applied: correction.model_applied,
     })
 }
 
