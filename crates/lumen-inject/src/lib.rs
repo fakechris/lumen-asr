@@ -1,6 +1,6 @@
 //! Text injection orchestration.
 //!
-//! Product default: **paste-first** with clipboard restore, then AX, then type.
+//! Product default: **paste-first** with clipboard restore, then type, then AX.
 //! Platform backends implement [`TextInjectorBackend`].
 
 use async_trait::async_trait;
@@ -23,7 +23,7 @@ pub enum InjectError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InjectMode {
-    /// Paste first (default product behavior), then AX, then type.
+    /// Paste first (default product behavior), then type, then AX.
     Auto,
     Paste,
     Ax,
@@ -45,7 +45,7 @@ impl Default for InsertPolicy {
         Self {
             mode: InjectMode::Auto,
             preserve_clipboard: true,
-            // Prefer type-at-cursor; field kept for config compatibility.
+            // Prefer clipboard paste; field retained for explicit type-first compatibility.
             paste_first: true,
         }
     }
@@ -169,18 +169,11 @@ impl<B: TextInjectorBackend> TextInjector<B> {
 }
 
 /// Stub backend for unit tests / non-mac CI.
+#[derive(Default)]
 pub struct StubInjectorBackend {
     pub fail_paste: bool,
     pub fail_ax: bool,
-}
-
-impl Default for StubInjectorBackend {
-    fn default() -> Self {
-        Self {
-            fail_paste: false,
-            fail_ax: false,
-        }
-    }
+    pub fail_type: bool,
 }
 
 #[async_trait]
@@ -202,7 +195,11 @@ impl TextInjectorBackend for StubInjectorBackend {
     }
 
     async fn type_unicode(&self, _text: &str) -> Result<(), InjectError> {
-        Ok(())
+        if self.fail_type {
+            Err(InjectError::Other("type failed".into()))
+        } else {
+            Ok(())
+        }
     }
 
     async fn copy_only(&self, _text: &str) -> Result<(), InjectError> {
@@ -215,29 +212,100 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn auto_type_first_succeeds() {
+    async fn auto_paste_first_succeeds_by_default() {
         let inj = TextInjector::new(StubInjectorBackend::default(), InsertPolicy::default());
         let o = inj.insert("hi").await.unwrap();
-        // Type is first in Auto sequence now.
-        assert_eq!(o.strategy, InsertStrategy::Type);
+        assert_eq!(o.strategy, InsertStrategy::Paste);
+        assert!(o.restored_clipboard);
     }
 
     #[tokio::test]
-    async fn auto_falls_back_to_paste_then_ax() {
-        // Stub type always succeeds — verify paste path via Paste-only mode.
-        let backend = StubInjectorBackend {
-            fail_paste: false,
-            fail_ax: false,
-        };
+    async fn auto_type_first_succeeds_when_configured() {
         let inj = TextInjector::new(
-            backend,
+            StubInjectorBackend::default(),
             InsertPolicy {
-                mode: InjectMode::Paste,
+                mode: InjectMode::Auto,
                 preserve_clipboard: true,
-                paste_first: true,
+                paste_first: false,
+            },
+        );
+        let o = inj.insert("hi").await.unwrap();
+        assert_eq!(o.strategy, InsertStrategy::Type);
+        assert!(!o.restored_clipboard);
+    }
+
+    #[tokio::test]
+    async fn auto_paste_first_falls_back_to_type_then_ax() {
+        let inj = TextInjector::new(
+            StubInjectorBackend {
+                fail_paste: true,
+                fail_type: false,
+                fail_ax: true,
+            },
+            InsertPolicy::default(),
+        );
+        let o = inj.insert("hi").await.unwrap();
+        assert_eq!(o.strategy, InsertStrategy::Type);
+
+        let inj = TextInjector::new(
+            StubInjectorBackend {
+                fail_paste: true,
+                fail_type: true,
+                fail_ax: false,
+            },
+            InsertPolicy::default(),
+        );
+        let o = inj.insert("hi").await.unwrap();
+        assert_eq!(o.strategy, InsertStrategy::Ax);
+    }
+
+    #[tokio::test]
+    async fn auto_type_first_falls_back_to_paste() {
+        let inj = TextInjector::new(
+            StubInjectorBackend {
+                fail_paste: false,
+                fail_type: true,
+                fail_ax: true,
+            },
+            InsertPolicy {
+                mode: InjectMode::Auto,
+                preserve_clipboard: true,
+                paste_first: false,
             },
         );
         let o = inj.insert("hi").await.unwrap();
         assert_eq!(o.strategy, InsertStrategy::Paste);
+    }
+
+    #[tokio::test]
+    async fn auto_reports_all_failures_in_attempt_order() {
+        let inj = TextInjector::new(
+            StubInjectorBackend {
+                fail_paste: true,
+                fail_type: true,
+                fail_ax: true,
+            },
+            InsertPolicy::default(),
+        );
+        let error = inj.insert("hi").await.unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "all strategies failed: Paste: paste failed; Type: type failed; Ax: ax failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_text_is_a_noop() {
+        let inj = TextInjector::new(
+            StubInjectorBackend {
+                fail_paste: true,
+                fail_type: true,
+                fail_ax: true,
+            },
+            InsertPolicy::default(),
+        );
+        let outcome = inj.insert("").await.unwrap();
+        assert_eq!(outcome.strategy, InsertStrategy::None);
+        assert!(!outcome.restored_clipboard);
     }
 }
