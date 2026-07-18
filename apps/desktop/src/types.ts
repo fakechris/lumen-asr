@@ -7,7 +7,10 @@ export type Health = {
   session_count: number;
   dictionary_count: number;
   sensevoice_ready: boolean;
+  qwen_ready: boolean;
   whisper_ready: boolean;
+  active_asr_ready: boolean;
+  active_asr_label: string;
   recording: boolean;
   corrector_enabled: boolean;
   corrector_label: string;
@@ -44,11 +47,15 @@ export type AudioDevice = {
 
 export type AsrStatus = {
   recording: boolean;
-  engine: "sensevoice" | "whisper";
+  engine: "sensevoice" | "qwen" | "whisper";
   /** Settings ASR provider id — same source of truth as 设置 → 语音识别 */
   provider?: string;
   providerLabel?: string;
   sensevoice: { kind: string; ready: boolean; model_dir: string };
+  qwen: { kind: string; ready: boolean; model_dir: string };
+  qwenRuntimePath: string;
+  qwenRuntimeReady: boolean;
+  qwenRuntimeChecking: boolean;
   whisper: { kind: string; ready: boolean; model_dir: string };
   activeReady: boolean;
 };

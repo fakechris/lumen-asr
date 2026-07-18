@@ -4,7 +4,7 @@ use crate::config::{AppConfig, CorrectorConfig};
 use crate::corrector_svc::{engine_label, run_correct};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +59,7 @@ pub fn list_asr_presets() -> Vec<crate::provider_presets::AsrProviderPreset> {
 #[serde(rename_all = "camelCase")]
 pub struct AsrServiceStatus {
     pub provider: String,
+    pub runtime_path: String,
     pub base_url: String,
     pub model: String,
     pub has_api_key: bool,
@@ -70,6 +71,7 @@ pub struct AsrServiceStatus {
 #[serde(rename_all = "camelCase")]
 pub struct AsrServiceInput {
     pub provider: Option<String>,
+    pub runtime_path: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
@@ -84,7 +86,8 @@ pub fn get_asr_service_config(state: State<'_, AppState>) -> Result<AsrServiceSt
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?;
     Ok(AsrServiceStatus {
-        provider: cfg.asr.provider.clone(),
+        provider: crate::dictation::canonical_asr_provider(&cfg.asr.provider),
+        runtime_path: cfg.asr.runtime_path.clone(),
         base_url: cfg.asr.base_url.clone(),
         model: cfg.asr.model.clone(),
         has_api_key: !cfg.asr.api_key.is_empty(),
@@ -95,6 +98,7 @@ pub fn get_asr_service_config(state: State<'_, AppState>) -> Result<AsrServiceSt
 
 #[tauri::command]
 pub fn save_asr_service_config(
+    app: AppHandle,
     state: State<'_, AppState>,
     input: AsrServiceInput,
 ) -> Result<AsrServiceStatus, String> {
@@ -103,6 +107,7 @@ pub fn save_asr_service_config(
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?;
     if let Some(v) = input.provider {
+        let v = crate::dictation::canonical_asr_provider(&v);
         // Apply preset defaults when switching provider.
         if let Some(p) = crate::provider_presets::asr_preset_by_id(&v) {
             if !p.base_url.is_empty() {
@@ -113,6 +118,9 @@ pub fn save_asr_service_config(
             }
         }
         guard.asr.provider = v;
+    }
+    if let Some(v) = input.runtime_path {
+        guard.asr.runtime_path = v;
     }
     if let Some(v) = input.base_url {
         guard.asr.base_url = v;
@@ -130,14 +138,36 @@ pub fn save_asr_service_config(
         guard.asr.timeout_secs = v.max(15);
     }
     guard.save()?;
-    Ok(AsrServiceStatus {
+    let asr_config = guard.asr.clone();
+    let status = AsrServiceStatus {
         provider: guard.asr.provider.clone(),
+        runtime_path: guard.asr.runtime_path.clone(),
         base_url: guard.asr.base_url.clone(),
         model: guard.asr.model.clone(),
         has_api_key: !guard.asr.api_key.is_empty(),
         language: guard.asr.language.clone(),
         timeout_secs: guard.asr.timeout_secs,
-    })
+    };
+    drop(guard);
+    crate::dictation::unload_qwen(&state);
+    {
+        let mut qwen = state
+            .qwen
+            .lock()
+            .map_err(|_| "qwen lock poisoned".to_string())?;
+        *qwen = crate::qwen_engine_from_config(&asr_config);
+    }
+    let selected_local_engine = crate::dictation::engine_kind_for_provider(&asr_config.provider);
+    if let Some(engine) = selected_local_engine {
+        *state
+            .engine
+            .lock()
+            .map_err(|_| "engine lock poisoned".to_string())? = engine;
+    }
+    if selected_local_engine == Some(lumen_asr::EngineKind::Qwen) {
+        crate::schedule_qwen_runtime_refresh(app)?;
+    }
+    Ok(status)
 }
 
 #[tauri::command]

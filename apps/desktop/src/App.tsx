@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api } from "./api";
+import { api, type AsrModelStatus } from "./api";
 import { HotkeyRecorder } from "./HotkeyRecorder";
 import { OnboardingWizard } from "./OnboardingWizard";
 import { formatHotkeyLabel } from "./hotkeyFormat";
@@ -29,6 +29,25 @@ function formatTime(iso: string): string {
     return new Date(iso).toLocaleString();
   } catch {
     return iso;
+  }
+}
+
+type LocalAsrEngine = "sensevoice" | "qwen" | "whisper";
+
+function localAsrEngine(provider: string): LocalAsrEngine {
+  if (provider === "local_qwen") return "qwen";
+  if (provider === "local_whisper") return "whisper";
+  return "sensevoice";
+}
+
+function localAsrModelDir(status: AsrModelStatus, provider: string): string {
+  switch (localAsrEngine(provider)) {
+    case "qwen":
+      return status.qwenDir;
+    case "whisper":
+      return status.whisperDir;
+    case "sensevoice":
+      return status.sensevoiceDir;
   }
 }
 
@@ -532,11 +551,9 @@ export default function App() {
         <span>
           ASR{" "}
           <strong>
-            {health?.sensevoice_ready
-              ? "SenseVoice"
-              : health?.whisper_ready
-                ? "Whisper?"
-                : "模型未就绪"}
+            {health
+              ? `${health.active_asr_label}${health.active_asr_ready ? "" : "（未就绪）"}`
+              : "—"}
           </strong>
         </span>
         <span className="sep">·</span>
@@ -620,6 +637,12 @@ function RecordPanel({
     })();
   }, [onError, refreshStatus]);
 
+  useEffect(() => {
+    if (!status?.qwenRuntimeChecking) return;
+    const timer = window.setInterval(() => void refreshStatus(), 500);
+    return () => window.clearInterval(timer);
+  }, [refreshStatus, status?.qwenRuntimeChecking]);
+
   // Hotkey dictation done → fill result + baseline for learning
   useEffect(() => {
     const handler = (ev: Event) => {
@@ -668,9 +691,8 @@ function RecordPanel({
     onBusy(true);
     onError(null);
     try {
-      // Single source of truth: Settings ASR config + local EngineKind for local models.
+      // Saving the provider also switches the matching local engine atomically.
       await api.saveAsrServiceConfig({ provider: providerId });
-      await api.setAsrEngine(providerId);
       await refreshStatus();
     } catch (e) {
       onError(String(e));
@@ -804,9 +826,18 @@ function RecordPanel({
   // Synced with 设置 → 语音识别 (config.asr.provider).
   const provider =
     status?.provider ||
-    (status?.engine === "whisper" ? "local_whisper" : "local_sensevoice");
+    (status?.engine === "qwen"
+      ? "local_qwen"
+      : status?.engine === "whisper"
+        ? "local_whisper"
+        : "local_sensevoice");
   const ready = status?.activeReady ?? false;
-  const isLocal = provider.startsWith("local") || provider === "sensevoice" || provider === "whisper";
+  const isLocal =
+    provider.startsWith("local") ||
+    provider === "sensevoice" ||
+    provider === "qwen" ||
+    provider === "qwen3_asr" ||
+    provider === "whisper";
 
   return (
     <>
@@ -849,6 +880,14 @@ function RecordPanel({
             <option value="local_sensevoice">
               本地 SenseVoice {status?.sensevoice.ready ? "✓" : "（模型未就绪）"}
             </option>
+            <option value="local_qwen">
+              本地 Qwen3-ASR 0.6B 8-bit（实验）{" "}
+              {status?.qwenRuntimeChecking
+                ? "（正在检查运行环境…）"
+                : status?.qwen.ready && status?.qwenRuntimeReady
+                  ? "✓"
+                  : "（模型或运行环境未就绪）"}
+            </option>
             <option value="local_whisper">
               本地 Whisper {status?.whisper.ready ? "✓" : "（模型未就绪）"}
             </option>
@@ -876,7 +915,9 @@ function RecordPanel({
             <code>
               {provider.includes("whisper")
                 ? status.whisper.model_dir
-                : status.sensevoice.model_dir}
+                : provider.includes("qwen")
+                  ? status.qwen.model_dir
+                  : status.sensevoice.model_dir}
             </code>
           </p>
         )}
@@ -918,9 +959,12 @@ function RecordPanel({
         </div>
         {!ready && isLocal && (
           <p className="muted-text" style={{ marginTop: 12 }}>
-            当前本地引擎未就绪。将 SenseVoice 的{" "}
-            <code>model.int8.onnx</code> + <code>tokens.txt</code> 放到模型目录，或到「设置 →
-            语音识别」切换其它 ASR。
+            当前本地引擎未就绪。
+            {provider.includes("qwen")
+              ? "请到「设置 → 语音识别」选择 Qwen MLX 模型目录，并填写包含 mlx_qwen3_asr 的 Python 可执行文件。"
+              : provider.includes("whisper")
+                ? "请到「设置 → 语音识别」选择可用的 Whisper 模型目录。"
+                : "请将 SenseVoice 的 model.int8.onnx 与 tokens.txt 放到模型目录，或到「设置 → 语音识别」切换其它 ASR。"}
           </p>
         )}
       </section>
@@ -1069,12 +1113,13 @@ function SettingsPanel({
     }[]
   >([]);
   const [asrProvider, setAsrProvider] = useState("local_sensevoice");
+  const [asrRuntimePath, setAsrRuntimePath] = useState("");
   const [asrBaseUrl, setAsrBaseUrl] = useState("");
   const [asrModel, setAsrModel] = useState("");
   const [asrApiKey, setAsrApiKey] = useState("");
   const [asrLanguage, setAsrLanguage] = useState("");
   const [asrHasKey, setAsrHasKey] = useState(false);
-  const [asrModels, setAsrModels] = useState<import("./api").AsrModelStatus | null>(null);
+  const [asrModels, setAsrModels] = useState<AsrModelStatus | null>(null);
   const [asrCustomPath, setAsrCustomPath] = useState("");
   const [cleanup, setCleanup] = useState("medium");
   const [style, setStyle] = useState("neutral");
@@ -1114,6 +1159,7 @@ function SettingsPanel({
         setLlmPresets(presets);
         setAsrPresets(asrP);
         setAsrProvider(asrC.provider);
+        setAsrRuntimePath(asrC.runtimePath || "");
         setAsrBaseUrl(asrC.baseUrl);
         setAsrModel(asrC.model);
         setAsrLanguage(asrC.language || "");
@@ -1416,7 +1462,8 @@ function SettingsPanel({
       <section className="card settings-section">
         <h2>语音识别（ASR）</h2>
         <p className="muted-text">
-          默认本地 SenseVoice。也可选用 OpenAI 兼容的云端识别；部分厂商入口已预置，完整流式接入会分阶段开放。
+          SenseVoice 与 Qwen 是两条独立的本地识别前端；识别后共用当前的文本整理、插入与学习流程。Qwen
+          当前为实验选项。
         </p>
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text" style={{ minWidth: 72 }}>
@@ -1429,6 +1476,9 @@ function SettingsPanel({
             onChange={(e) => {
               const id = e.target.value;
               setAsrProvider(id);
+              if (asrModels) {
+                setAsrCustomPath(localAsrModelDir(asrModels, id));
+              }
               const p = asrPresets.find((x) => x.id === id);
               if (p) {
                 if (p.baseUrl) setAsrBaseUrl(p.baseUrl);
@@ -1451,16 +1501,15 @@ function SettingsPanel({
         )}
         {asrProvider.startsWith("local") && asrModels && (
           <div className="onboard-status" style={{ marginBottom: 12 }}>
-            <div className="muted-text">Lumen 共享模型目录</div>
+            <div className="muted-text">当前解析的模型目录</div>
             <p className="muted-text" style={{ wordBreak: "break-all", marginTop: 4 }}>
-              <code>{asrModels.modelsRoot}</code>
+              <code>{localAsrModelDir(asrModels, asrProvider)}</code>
             </p>
             {asrModels.candidates
               .filter(
                 (candidate) =>
                   candidate.ready &&
-                  candidate.engine ===
-                    (asrProvider === "local_whisper" ? "whisper" : "sensevoice"),
+                  candidate.engine === localAsrEngine(asrProvider),
               )
               .map((candidate) => (
                 <div key={`${candidate.engine}:${candidate.path}`} className="onboard-candidate">
@@ -1476,8 +1525,7 @@ function SettingsPanel({
                         onBusy(true);
                         onError(null);
                         try {
-                          const engine =
-                            asrProvider === "local_whisper" ? "whisper" : "sensevoice";
+                          const engine = localAsrEngine(asrProvider);
                           const status = await api.useExistingAsrModel(candidate.path, engine);
                           setAsrModels(status);
                           setAsrCustomPath(status.activeModelDir);
@@ -1511,7 +1559,7 @@ function SettingsPanel({
                     onBusy(true);
                     onError(null);
                     try {
-                      const engine = asrProvider === "local_whisper" ? "whisper" : "sensevoice";
+                      const engine = localAsrEngine(asrProvider);
                       const status = await api.useExistingAsrModel(
                         asrCustomPath.trim(),
                         engine,
@@ -1530,6 +1578,20 @@ function SettingsPanel({
                 验证并使用
               </button>
             </div>
+          </div>
+        )}
+        {asrProvider === "local_qwen" && (
+          <div className="form-row" style={{ marginBottom: 10 }}>
+            <label className="muted-text" style={{ minWidth: 120 }}>
+              Qwen Python
+            </label>
+            <input
+              className="input"
+              value={asrRuntimePath}
+              disabled={busy}
+              onChange={(event) => setAsrRuntimePath(event.target.value)}
+              placeholder="包含 mlx_qwen3_asr 的 Python 可执行文件"
+            />
           </div>
         )}
         {!asrProvider.startsWith("local") && (
@@ -1600,6 +1662,7 @@ function SettingsPanel({
                 try {
                   const input: Parameters<typeof api.saveAsrServiceConfig>[0] = {
                     provider: asrProvider,
+                    runtimePath: asrRuntimePath,
                     baseUrl: asrBaseUrl,
                     model: asrModel,
                     language: asrLanguage,
@@ -1607,17 +1670,12 @@ function SettingsPanel({
                   if (asrApiKey.trim()) input.apiKey = asrApiKey.trim();
                   const s = await api.saveAsrServiceConfig(input);
                   setAsrProvider(s.provider);
+                  setAsrRuntimePath(s.runtimePath || "");
                   setAsrBaseUrl(s.baseUrl);
                   setAsrModel(s.model);
                   setAsrLanguage(s.language);
                   setAsrHasKey(s.hasApiKey);
                   setAsrApiKey("");
-                  // Keep Record tab engine dropdown in sync (local EngineKind + provider).
-                  try {
-                    await api.setAsrEngine(s.provider);
-                  } catch {
-                    /* cloud-only providers keep local engine kind */
-                  }
                   onSaved();
                 } catch (e) {
                   onError(String(e));
@@ -2300,6 +2358,8 @@ function Overview({
             <dd>{health.dictionary_count}</dd>
             <dt>SenseVoice</dt>
             <dd>{health.sensevoice_ready ? "就绪" : "未就绪"}</dd>
+            <dt>Qwen3-ASR</dt>
+            <dd>{health.qwen_ready ? "就绪" : "未就绪"}</dd>
             <dt>Whisper</dt>
             <dd>{health.whisper_ready ? "就绪" : "未就绪"}</dd>
             <dt>Corrector</dt>

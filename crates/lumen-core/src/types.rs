@@ -48,6 +48,7 @@ pub enum DictEntrySource {
 pub enum AsrEngineId {
     SenseVoiceSherpa,
     Whisper,
+    Qwen3Asr,
     #[serde(other)]
     Other,
 }
@@ -57,6 +58,7 @@ impl AsrEngineId {
         match self {
             Self::SenseVoiceSherpa => "sensevoice_sherpa",
             Self::Whisper => "whisper",
+            Self::Qwen3Asr => "qwen3_asr",
             Self::Other => "other",
         }
     }

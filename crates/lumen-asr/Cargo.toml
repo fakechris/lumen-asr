@@ -3,7 +3,7 @@ name = "lumen-asr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ASR engine ports (SenseVoice via sherpa, Whisper) + mic capture"
+description = "ASR engine ports (SenseVoice, Qwen3-ASR, Whisper) + mic capture"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -18,6 +18,7 @@ fs2 = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3"
 # Offline SenseVoice / Whisper via official bindings (downloads prebuilt static lib on first build)
 sherpa-onnx = { version = "1.13.4", optional = true }
 

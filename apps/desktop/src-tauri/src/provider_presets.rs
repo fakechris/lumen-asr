@@ -264,6 +264,17 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             notes: "默认；离线 sherpa-onnx".into(),
         },
         AsrProviderPreset {
+            id: "local_qwen".into(),
+            label: "本地 Qwen3-ASR 0.6B 8-bit（实验）".into(),
+            kind: "local".into(),
+            base_url: String::new(),
+            default_model: "Qwen3-ASR-0.6B-8bit".into(),
+            models: vec!["Qwen3-ASR-0.6B-8bit".into()],
+            needs_api_key: false,
+            status: "wired".into(),
+            notes: "实验性离线 MLX 引擎；模型常驻复用，识别后沿用当前文本整理流程。".into(),
+        },
+        AsrProviderPreset {
             id: "local_whisper".into(),
             label: "本地 Whisper".into(),
             kind: "local".into(),

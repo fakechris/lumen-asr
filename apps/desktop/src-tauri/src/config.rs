@@ -34,14 +34,20 @@ impl Default for AppConfig {
     }
 }
 
-/// ASR provider selection (local SenseVoice vs cloud transcription).
+/// ASR provider selection across local and cloud transcription engines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AsrServiceConfig {
-    /// local_sensevoice | local_whisper | openai_audio | …
+    /// local_sensevoice | local_qwen | local_whisper | openai_audio | …
     pub provider: String,
-    /// User-selected local model directory. Empty = automatic discovery.
+    /// Legacy/current-engine model directory retained for backward compatibility.
     pub model_dir: String,
+    /// Engine-specific paths preserve independent local pipelines across switches.
+    pub sensevoice_model_dir: String,
+    pub qwen_model_dir: String,
+    pub whisper_model_dir: String,
+    /// Python executable containing `mlx_qwen3_asr` for the local Qwen engine.
+    pub runtime_path: String,
     pub base_url: String,
     pub model: String,
     pub api_key: String,
@@ -55,6 +61,10 @@ impl Default for AsrServiceConfig {
         Self {
             provider: "local_sensevoice".into(),
             model_dir: String::new(),
+            sensevoice_model_dir: String::new(),
+            qwen_model_dir: String::new(),
+            whisper_model_dir: String::new(),
+            runtime_path: String::new(),
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
@@ -62,6 +72,97 @@ impl Default for AsrServiceConfig {
             timeout_secs: 120,
         }
     }
+}
+
+impl AsrServiceConfig {
+    fn migrate_legacy_model_dir(&mut self) {
+        let legacy = self.model_dir.trim().to_owned();
+        if legacy.is_empty() {
+            return;
+        }
+        let legacy_path = std::path::Path::new(&legacy);
+        if lumen_asr::sensevoice_ready(legacy_path) {
+            if self.sensevoice_model_dir.trim().is_empty() {
+                self.sensevoice_model_dir = legacy.clone();
+            }
+            return;
+        }
+        if lumen_asr::qwen_ready(legacy_path) {
+            if self.qwen_model_dir.trim().is_empty() {
+                self.qwen_model_dir = legacy.clone();
+            }
+            return;
+        }
+        if lumen_asr::whisper_ready(legacy_path) {
+            if self.whisper_model_dir.trim().is_empty() {
+                self.whisper_model_dir = legacy.clone();
+            }
+            return;
+        }
+        match self.provider.trim().to_ascii_lowercase().as_str() {
+            "sensevoice" | "local_sensevoice" if self.sensevoice_model_dir.trim().is_empty() => {
+                self.sensevoice_model_dir = legacy.clone();
+            }
+            "qwen" | "qwen3_asr" | "local_qwen" if self.qwen_model_dir.trim().is_empty() => {
+                self.qwen_model_dir = legacy.clone();
+            }
+            "whisper" | "local_whisper" if self.whisper_model_dir.trim().is_empty() => {
+                self.whisper_model_dir = legacy;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn model_dir_for(&self, engine: lumen_asr::EngineKind) -> PathBuf {
+        let engine_specific = match engine {
+            lumen_asr::EngineKind::SenseVoice => self.sensevoice_model_dir.trim(),
+            lumen_asr::EngineKind::Qwen => self.qwen_model_dir.trim(),
+            lumen_asr::EngineKind::Whisper => self.whisper_model_dir.trim(),
+        };
+        PathBuf::from(if engine_specific.is_empty() {
+            self.model_dir.trim()
+        } else {
+            engine_specific
+        })
+    }
+
+    pub fn set_model_dir_for(&mut self, engine: lumen_asr::EngineKind, path: &std::path::Path) {
+        self.migrate_legacy_model_dir();
+        let value = path.display().to_string();
+        match engine {
+            lumen_asr::EngineKind::SenseVoice => self.sensevoice_model_dir = value.clone(),
+            lumen_asr::EngineKind::Qwen => self.qwen_model_dir = value.clone(),
+            lumen_asr::EngineKind::Whisper => self.whisper_model_dir = value.clone(),
+        }
+        // Older builds still read this field, so keep it pointed at the active engine.
+        self.model_dir = value;
+    }
+
+    pub fn qwen_python_executable(&self) -> PathBuf {
+        let configured = self.runtime_path.trim();
+        if !configured.is_empty() {
+            return expand_user_path(configured);
+        }
+        std::env::var_os("LUMEN_QWEN_PYTHON")
+            .filter(|value| !value.is_empty())
+            .map(|value| expand_user_path(&value.to_string_lossy()))
+            .unwrap_or_else(|| {
+                PathBuf::from(if cfg!(windows) { "python" } else { "python3" })
+            })
+    }
+}
+
+fn expand_user_path(value: &str) -> PathBuf {
+    if value == "~" {
+        return lumen_asr::user_home_dir();
+    }
+    if let Some(relative) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        return lumen_asr::user_home_dir().join(relative);
+    }
+    PathBuf::from(value)
 }
 
 /// Post-ASR text shaping profile.
@@ -410,6 +511,7 @@ impl AppConfig {
             Ok(s) => match toml::from_str::<Self>(&s) {
                 Ok(mut c) => {
                     ensure_default_intents(&mut c.hotkey);
+                    c.asr.migrate_legacy_model_dir();
                     c
                 }
                 Err(e) => {
@@ -456,6 +558,71 @@ mod tests {
         let loaded = AppConfig::load_from(&path);
         assert_eq!(loaded.corrector.model, "test-model");
         assert_eq!(loaded.asr.model_dir, "/models/custom-sensevoice");
+        assert_eq!(
+            loaded.asr.sensevoice_model_dir,
+            "/models/custom-sensevoice"
+        );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn local_engine_model_paths_survive_provider_round_trips() {
+        let mut asr = AsrServiceConfig::default();
+        asr.model_dir = "/models/original-sensevoice".into();
+        asr.set_model_dir_for(
+            lumen_asr::EngineKind::Qwen,
+            std::path::Path::new("/models/qwen"),
+        );
+        asr.provider = "local_qwen".into();
+        asr.set_model_dir_for(
+            lumen_asr::EngineKind::Whisper,
+            std::path::Path::new("/models/whisper"),
+        );
+
+        assert_eq!(
+            asr.model_dir_for(lumen_asr::EngineKind::SenseVoice),
+            PathBuf::from("/models/original-sensevoice")
+        );
+        assert_eq!(
+            asr.model_dir_for(lumen_asr::EngineKind::Qwen),
+            PathBuf::from("/models/qwen")
+        );
+        assert_eq!(
+            asr.model_dir_for(lumen_asr::EngineKind::Whisper),
+            PathBuf::from("/models/whisper")
+        );
+    }
+
+    #[test]
+    fn legacy_model_migration_does_not_reassign_a_known_model_to_another_engine() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let model_dir = std::env::temp_dir().join(format!("lumen-sensevoice-model-{n}"));
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.int8.onnx"), b"model").unwrap();
+        std::fs::write(model_dir.join("tokens.txt"), b"tokens").unwrap();
+
+        let mut asr = AsrServiceConfig::default();
+        asr.model_dir = model_dir.display().to_string();
+        asr.migrate_legacy_model_dir();
+        asr.provider = "local_qwen".into();
+        asr.migrate_legacy_model_dir();
+
+        assert_eq!(asr.sensevoice_model_dir, model_dir.display().to_string());
+        assert!(asr.qwen_model_dir.is_empty());
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn qwen_runtime_path_expands_home_prefix() {
+        let mut asr = AsrServiceConfig::default();
+        asr.runtime_path = "~/qwen-env/bin/python".into();
+
+        assert_eq!(
+            asr.qwen_python_executable(),
+            lumen_asr::user_home_dir().join("qwen-env/bin/python")
+        );
     }
 }

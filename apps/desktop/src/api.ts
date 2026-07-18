@@ -51,6 +51,8 @@ export type AsrModelStatus = {
   sensevoiceDir: string;
   whisperReady: boolean;
   whisperDir: string;
+  qwenReady: boolean;
+  qwenDir: string;
   modelsRoot: string;
   activeEngine: string;
   activeModelDir: string;
@@ -148,6 +150,7 @@ export const api = {
   getAsrServiceConfig: () =>
     invoke<{
       provider: string;
+      runtimePath: string;
       baseUrl: string;
       model: string;
       hasApiKey: boolean;
@@ -156,6 +159,7 @@ export const api = {
     }>("get_asr_service_config"),
   saveAsrServiceConfig: (input: {
     provider?: string;
+    runtimePath?: string;
     baseUrl?: string;
     model?: string;
     apiKey?: string;
@@ -164,6 +168,7 @@ export const api = {
   }) =>
     invoke<{
       provider: string;
+      runtimePath: string;
       baseUrl: string;
       model: string;
       hasApiKey: boolean;

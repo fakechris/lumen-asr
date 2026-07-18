@@ -120,6 +120,19 @@ pub fn default_whisper_dir_with_root(models_root: Option<&Path>) -> PathBuf {
     shared
 }
 
+pub fn default_qwen_dir() -> PathBuf {
+    let app_dir = qwen_app_model_dir();
+    if qwen_ready(&app_dir) {
+        return app_dir;
+    }
+    for (path, _) in qwen_discovery_paths() {
+        if path != app_dir && qwen_ready(&path) {
+            return path;
+        }
+    }
+    app_dir
+}
+
 fn sensevoice_discovery_paths(models_root: Option<&Path>) -> Vec<(PathBuf, &'static str)> {
     let shared_root = lumen_models_dir_with_override(models_root);
     let mut paths = vec![(shared_root.join("sensevoice"), "lumen-shared")];
@@ -191,6 +204,35 @@ fn whisper_discovery_paths(models_root: Option<&Path>) -> Vec<(PathBuf, &'static
     paths
 }
 
+fn qwen_discovery_paths() -> Vec<(PathBuf, &'static str)> {
+    let mut paths = vec![(qwen_app_model_dir(), "lumen-asr")];
+    let snapshots = user_home_dir()
+        .join(".cache/huggingface/hub")
+        .join("models--mlx-community--Qwen3-ASR-0.6B-8bit")
+        .join("snapshots");
+    if let Ok(entries) = std::fs::read_dir(snapshots) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                paths.push((path, "huggingface-cache"));
+            }
+        }
+    }
+    paths
+}
+
+fn qwen_app_model_dir() -> PathBuf {
+    let home = user_home_dir();
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Application Support/LumenAsr/models/qwen3-asr-0.6b-8bit")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".lumen-asr/models/qwen3-asr-0.6b-8bit")
+    }
+}
+
 pub fn scan_model_candidates() -> Vec<ModelCandidate> {
     scan_model_candidates_with_root(None)
 }
@@ -213,6 +255,9 @@ pub fn scan_model_candidates_with_root(models_root: Option<&Path>) -> Vec<ModelC
         let install_target = path == shared_whisper;
         push_candidate(&mut out, "whisper", path, source, install_target);
     }
+    for (path, source) in qwen_discovery_paths() {
+        push_candidate(&mut out, "qwen", path, source, false);
+    }
     let mut seen = HashSet::new();
     out.retain(|candidate| seen.insert((candidate.engine.clone(), candidate.path.clone())));
     out.sort_by(|left, right| {
@@ -233,6 +278,7 @@ fn push_candidate(
     let ready = match engine {
         "sensevoice" => sensevoice_ready(&path),
         "whisper" => whisper_ready(&path),
+        "qwen" => qwen_ready(&path),
         _ => false,
     };
     if !ready && !install_target {
@@ -270,6 +316,36 @@ pub fn whisper_ready(dir: &Path) -> bool {
     whisper_encoder_path(dir).is_some()
         && whisper_decoder_path(dir).is_some()
         && whisper_tokens_path(dir).is_some()
+}
+
+pub fn qwen_ready(dir: &Path) -> bool {
+    dir.join("config.json").is_file()
+        && (dir.join("model.safetensors").is_file() || qwen_sharded_weights_ready(dir))
+        && dir.join("vocab.json").is_file()
+        && dir.join("merges.txt").is_file()
+}
+
+fn qwen_sharded_weights_ready(dir: &Path) -> bool {
+    let Ok(contents) = std::fs::read(dir.join("model.safetensors.index.json")) else {
+        return false;
+    };
+    let Ok(index) = serde_json::from_slice::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    let Some(weight_map) = index.get("weight_map").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    let shards: HashSet<&str> = weight_map
+        .values()
+        .filter_map(|value| value.as_str())
+        .collect();
+    !shards.is_empty()
+        && shards.iter().all(|shard| {
+            let path = Path::new(shard);
+            path.components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+                && dir.join(path).is_file()
+        })
 }
 
 pub fn sensevoice_model_path(dir: &Path) -> Option<PathBuf> {
@@ -374,5 +450,39 @@ mod tests {
                 && candidate.path == root.join("whisper")
                 && !candidate.ready
         }));
+    }
+
+    #[test]
+    fn qwen_ready_requires_model_config_and_tokenizer_assets() {
+        let root = temp_dir("qwen-ready");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.json"), b"{}").unwrap();
+        std::fs::write(root.join("model.safetensors"), b"model").unwrap();
+        assert!(!qwen_ready(&root));
+
+        std::fs::write(root.join("tokenizer_config.json"), b"{}").unwrap();
+        assert!(!qwen_ready(&root));
+        std::fs::write(root.join("vocab.json"), b"{}").unwrap();
+        assert!(!qwen_ready(&root));
+        std::fs::write(root.join("merges.txt"), b"").unwrap();
+        assert!(qwen_ready(&root));
+
+        std::fs::remove_file(root.join("model.safetensors")).unwrap();
+        std::fs::write(
+            root.join("model.safetensors.index.json"),
+            br#"{
+                "weight_map": {
+                    "encoder": "model-00001-of-00002.safetensors",
+                    "decoder": "model-00002-of-00002.safetensors"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(!qwen_ready(&root));
+        std::fs::write(root.join("model-00001-of-00002.safetensors"), b"model").unwrap();
+        assert!(!qwen_ready(&root));
+        std::fs::write(root.join("model-00002-of-00002.safetensors"), b"model").unwrap();
+        assert!(qwen_ready(&root));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
