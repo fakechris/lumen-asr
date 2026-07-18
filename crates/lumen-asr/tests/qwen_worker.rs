@@ -10,6 +10,14 @@ fn temp_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("lumen-qwen-{name}-{nonce}"))
 }
 
+fn python_executable() -> PathBuf {
+    std::env::var_os("LUMEN_QWEN_TEST_PYTHON")
+        .or_else(|| std::env::var_os("PYTHON"))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "python" } else { "python3" }))
+}
+
 #[tokio::test]
 async fn qwen_worker_is_reused_between_transcriptions() {
     let root = temp_dir("reuse");
@@ -45,7 +53,7 @@ for line in sys.stdin:
     std::fs::create_dir_all(&model).unwrap();
 
     let engine = QwenAsr::new(QwenAsrConfig {
-        python_executable: PathBuf::from("/usr/bin/python3"),
+        python_executable: python_executable(),
         worker_script: worker,
         model_dir: model,
         language: Some("zh".into()),
@@ -125,7 +133,7 @@ for line in sys.stdin:
     let model = root.join("model");
     std::fs::create_dir_all(&model).unwrap();
     let engine = QwenAsr::new(QwenAsrConfig {
-        python_executable: PathBuf::from("/usr/bin/python3"),
+        python_executable: python_executable(),
         worker_script: worker,
         model_dir: model,
         language: None,
@@ -178,7 +186,7 @@ for line in sys.stdin:
     let model = root.join("model");
     std::fs::create_dir_all(&model).unwrap();
     let engine = QwenAsr::new(QwenAsrConfig {
-        python_executable: PathBuf::from("/usr/bin/python3"),
+        python_executable: python_executable(),
         worker_script: worker,
         model_dir: model,
         language: None,
@@ -234,7 +242,7 @@ for line in sys.stdin:
     let model = root.join("model");
     std::fs::create_dir_all(&model).unwrap();
     let engine = QwenAsr::new(QwenAsrConfig {
-        python_executable: PathBuf::from("/usr/bin/python3"),
+        python_executable: python_executable(),
         worker_script: worker,
         model_dir: model,
         language: None,
@@ -299,7 +307,7 @@ for line in sys.stdin:
     let model = root.join("model");
     std::fs::create_dir_all(&model).unwrap();
     let engine = QwenAsr::new(QwenAsrConfig {
-        python_executable: PathBuf::from("/usr/bin/python3"),
+        python_executable: python_executable(),
         worker_script: worker,
         model_dir: model,
         language: None,
@@ -372,7 +380,7 @@ for line in sys.stdin:
     let model = root.join("model");
     std::fs::create_dir_all(&model).unwrap();
     let engine = QwenAsr::new(QwenAsrConfig {
-        python_executable: PathBuf::from("/usr/bin/python3"),
+        python_executable: python_executable(),
         worker_script: worker,
         model_dir: model,
         language: None,
@@ -429,7 +437,7 @@ for line in sys.stdin:
     let model = root.join("model");
     std::fs::create_dir_all(&model).unwrap();
     let engine = QwenAsr::new(QwenAsrConfig {
-        python_executable: PathBuf::from("/usr/bin/python3"),
+        python_executable: python_executable(),
         worker_script: worker,
         model_dir: model,
         language: None,
@@ -482,7 +490,7 @@ for line in sys.stdin:
     let model = root.join("model");
     std::fs::create_dir_all(&model).unwrap();
     let engine = QwenAsr::new(QwenAsrConfig {
-        python_executable: PathBuf::from("/usr/bin/python3"),
+        python_executable: python_executable(),
         worker_script: worker,
         model_dir: model,
         language: None,

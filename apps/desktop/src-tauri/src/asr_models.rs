@@ -167,7 +167,7 @@ pub fn use_existing_asr_model(
                 );
             }
             crate::dictation::unload_qwen(&state);
-            {
+            let asr_config = {
                 let mut config = state
                     .config
                     .lock()
@@ -175,12 +175,13 @@ pub fn use_existing_asr_model(
                 config.asr.set_model_dir_for(EngineKind::Qwen, &path);
                 config.asr.provider = "local_qwen".into();
                 config.save()?;
-                *state
-                    .qwen
-                    .lock()
-                    .map_err(|_| "qwen lock poisoned".to_string())? =
-                    crate::qwen_engine_from_config(&config.asr);
-            }
+                config.asr.clone()
+            };
+            *state
+                .qwen
+                .lock()
+                .map_err(|_| "qwen lock poisoned".to_string())? =
+                crate::qwen_engine_from_config(&asr_config);
             *state
                 .engine
                 .lock()

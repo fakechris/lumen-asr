@@ -141,13 +141,28 @@ impl AsrServiceConfig {
     pub fn qwen_python_executable(&self) -> PathBuf {
         let configured = self.runtime_path.trim();
         if !configured.is_empty() {
-            return PathBuf::from(configured);
+            return expand_user_path(configured);
         }
         std::env::var_os("LUMEN_QWEN_PYTHON")
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("python3"))
+            .map(|value| expand_user_path(&value.to_string_lossy()))
+            .unwrap_or_else(|| {
+                PathBuf::from(if cfg!(windows) { "python" } else { "python3" })
+            })
     }
+}
+
+fn expand_user_path(value: &str) -> PathBuf {
+    if value == "~" {
+        return lumen_asr::user_home_dir();
+    }
+    if let Some(relative) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        return lumen_asr::user_home_dir().join(relative);
+    }
+    PathBuf::from(value)
 }
 
 /// Post-ASR text shaping profile.
@@ -598,5 +613,16 @@ mod tests {
         assert_eq!(asr.sensevoice_model_dir, model_dir.display().to_string());
         assert!(asr.qwen_model_dir.is_empty());
         let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn qwen_runtime_path_expands_home_prefix() {
+        let mut asr = AsrServiceConfig::default();
+        asr.runtime_path = "~/qwen-env/bin/python".into();
+
+        assert_eq!(
+            asr.qwen_python_executable(),
+            lumen_asr::user_home_dir().join("qwen-env/bin/python")
+        );
     }
 }
