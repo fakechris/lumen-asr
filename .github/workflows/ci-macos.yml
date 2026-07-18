@@ -1,0 +1,66 @@
+name: macOS CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+jobs:
+  test:
+    name: Build, test, and lint
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Check formatting of changed Rust files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          changed="$(git diff --name-only "$BASE_SHA" HEAD -- '*.rs')"
+          if [[ -z "$changed" ]]; then
+            exit 0
+          fi
+          rustfmt --edition 2021 --check $changed
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Build desktop frontend
+        run: npm run build
+        working-directory: apps/desktop
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Run workspace clippy
+        run: cargo clippy --workspace --all-targets
