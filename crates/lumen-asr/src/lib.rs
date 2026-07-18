@@ -15,12 +15,11 @@ pub use audio::{resample_linear, AudioCapture, AudioDeviceInfo, AudioError, Capt
 pub use cloud_openai::{OpenAiAudioAsr, OpenAiAudioConfig};
 pub use install_lock::ModelInstallLock;
 pub use paths::{
-    app_models_dir, default_qwen_dir, default_qwen_dir_with_root, default_sensevoice_dir,
-    default_sensevoice_dir_with_root, default_whisper_dir, default_whisper_dir_with_root,
-    legacy_model_roots, lumen_models_dir, lumen_models_dir_with_override, qwen_ready,
-    scan_model_candidates, scan_model_candidates_with_root, sensevoice_ready, shared_qwen_dir,
-    shared_sensevoice_dir, shared_whisper_dir, user_home_dir, whisper_ready, ModelCandidate,
-    ENV_LUMEN_MODELS_DIR,
+    app_models_dir, default_qwen_dir, default_sensevoice_dir, default_sensevoice_dir_with_root,
+    default_whisper_dir, default_whisper_dir_with_root, legacy_model_roots, lumen_models_dir,
+    lumen_models_dir_with_override, qwen_ready,
+    scan_model_candidates, scan_model_candidates_with_root, sensevoice_ready, shared_sensevoice_dir,
+    shared_whisper_dir, user_home_dir, whisper_ready, ModelCandidate, ENV_LUMEN_MODELS_DIR,
 };
 pub use qwen::{QwenAsr, QwenAsrConfig};
 pub use sensevoice::SenseVoiceSherpaAsr;

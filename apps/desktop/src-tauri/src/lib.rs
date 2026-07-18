@@ -25,8 +25,21 @@ use lumen_asr::{
 };
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tauri::Manager;
+
+const QWEN_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone)]
+pub struct QwenRuntimeStatus {
+    pub executable: PathBuf,
+    pub ready: bool,
+    pub checking: bool,
+    pub generation: u64,
+}
 
 pub struct AppState {
     pub store: Mutex<Option<Store>>,
@@ -34,13 +47,14 @@ pub struct AppState {
     pub engine: Mutex<EngineKind>,
     pub sensevoice: Mutex<SenseVoiceSherpaAsr>,
     pub qwen: Mutex<QwenAsr>,
+    pub qwen_runtime: Mutex<QwenRuntimeStatus>,
     pub whisper: Mutex<WhisperAsr>,
     pub config: Mutex<AppConfig>,
 }
 
 fn qwen_engine_from_config(config: &config::AsrServiceConfig) -> QwenAsr {
-    let selected = PathBuf::from(config.model_dir.trim());
-    let model_dir = if !config.model_dir.trim().is_empty() && qwen_ready(&selected) {
+    let selected = config.model_dir_for(EngineKind::Qwen);
+    let model_dir = if !selected.as_os_str().is_empty() && qwen_ready(&selected) {
         selected
     } else {
         default_qwen_dir()
@@ -51,6 +65,86 @@ fn qwen_engine_from_config(config: &config::AsrServiceConfig) -> QwenAsr {
         (!config.language.trim().is_empty()).then(|| config.language.clone()),
         std::time::Duration::from_secs(config.timeout_secs.max(30)),
     ))
+}
+
+fn qwen_runtime_available(path: &Path) -> bool {
+    qwen_runtime_available_with_timeout(path, QWEN_RUNTIME_PROBE_TIMEOUT)
+}
+
+fn qwen_runtime_available_with_timeout(path: &Path, timeout: Duration) -> bool {
+    let Ok(mut child) = Command::new(path)
+        .args([
+            "-c",
+            "import sys;from mlx_qwen3_asr import Session;sys.exit(0 if callable(Session) and callable(getattr(Session,'transcribe',None)) else 1)",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+pub(crate) fn schedule_qwen_runtime_refresh(app: tauri::AppHandle) -> Result<(), String> {
+    let (executable, model_ready) = app
+        .state::<AppState>()
+        .qwen
+        .lock()
+        .map(|engine| {
+            (
+                engine.python_executable().to_path_buf(),
+                qwen_ready(engine.model_dir()),
+            )
+        })
+        .map_err(|_| "qwen lock poisoned".to_string())?;
+    let generation = {
+        let state = app.state::<AppState>();
+        let mut runtime = state
+            .qwen_runtime
+            .lock()
+            .map_err(|_| "qwen runtime lock poisoned".to_string())?;
+        runtime.generation = runtime.generation.wrapping_add(1);
+        runtime.executable = executable.clone();
+        runtime.ready = false;
+        runtime.checking = model_ready;
+        runtime.generation
+    };
+    if !model_ready {
+        return Ok(());
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let probe_executable = executable.clone();
+        let ready =
+            tokio::task::spawn_blocking(move || qwen_runtime_available(&probe_executable))
+                .await
+                .unwrap_or(false);
+        let state = app.state::<AppState>();
+        let Ok(mut runtime) = state.qwen_runtime.lock() else {
+            tracing::warn!("qwen runtime lock poisoned after probe");
+            return;
+        };
+        if runtime.generation == generation && runtime.executable == executable {
+            runtime.ready = ready;
+            runtime.checking = false;
+        }
+    });
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -114,25 +208,25 @@ pub fn run() {
         }
     };
 
-    let initial_engine = match app_config.asr.provider.as_str() {
-        "local_qwen" => EngineKind::Qwen,
-        "local_whisper" => EngineKind::Whisper,
-        _ => EngineKind::SenseVoice,
-    };
-    let selected_model_dir = app_config.asr.model_dir.trim();
-    let selected_model_dir =
-        (!selected_model_dir.is_empty()).then(|| std::path::PathBuf::from(selected_model_dir));
-    let sv_dir = selected_model_dir
-        .as_ref()
-        .filter(|path| initial_engine == EngineKind::SenseVoice && sensevoice_ready(path))
-        .cloned()
+    let initial_engine = dictation::engine_kind_for_provider(&app_config.asr.provider)
+        .unwrap_or(EngineKind::SenseVoice);
+    let selected_sensevoice_dir = app_config.asr.model_dir_for(EngineKind::SenseVoice);
+    let sv_dir = (!selected_sensevoice_dir.as_os_str().is_empty()
+        && sensevoice_ready(&selected_sensevoice_dir))
+    .then_some(selected_sensevoice_dir)
         .unwrap_or_else(default_sensevoice_dir);
-    let wh_dir = selected_model_dir
-        .as_ref()
-        .filter(|path| initial_engine == EngineKind::Whisper && whisper_ready(path))
-        .cloned()
+    let selected_whisper_dir = app_config.asr.model_dir_for(EngineKind::Whisper);
+    let wh_dir = (!selected_whisper_dir.as_os_str().is_empty()
+        && whisper_ready(&selected_whisper_dir))
+    .then_some(selected_whisper_dir)
         .unwrap_or_else(default_whisper_dir);
     let qwen = qwen_engine_from_config(&app_config.asr);
+    let qwen_runtime = QwenRuntimeStatus {
+        executable: qwen.python_executable().to_path_buf(),
+        ready: false,
+        checking: false,
+        generation: 0,
+    };
     tracing::info!(dir = %sv_dir.display(), ready = lumen_asr::sensevoice_ready(&sv_dir), "SenseVoice model dir");
     tracing::info!(dir = %wh_dir.display(), ready = lumen_asr::whisper_ready(&wh_dir), "Whisper model dir");
     tracing::info!(
@@ -151,6 +245,7 @@ pub fn run() {
             engine: Mutex::new(initial_engine),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sv_dir)),
             qwen: Mutex::new(qwen),
+            qwen_runtime: Mutex::new(qwen_runtime),
             whisper: Mutex::new(WhisperAsr::new(wh_dir)),
             config: Mutex::new(app_config),
         })
@@ -236,6 +331,17 @@ pub fn run() {
             if let Err(e) = hotkey::setup_hotkeys(app.handle()) {
                 tracing::warn!(error = %e, "hotkey setup failed");
             }
+            let qwen_selected = app
+                .state::<AppState>()
+                .engine
+                .lock()
+                .map(|engine| *engine == EngineKind::Qwen)
+                .unwrap_or(false);
+            if qwen_selected {
+                if let Err(error) = schedule_qwen_runtime_refresh(app.handle().clone()) {
+                    tracing::warn!(%error, "could not schedule Qwen runtime probe");
+                }
+            }
             if !lumen_platform_macos::is_accessibility_trusted() {
                 tracing::warn!(
                     "hotkey event-tap needs Accessibility; using fallback monitors until granted"
@@ -256,4 +362,83 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn probe_script(name: &str, body: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("lumen-qwen-probe-{name}-{nonce}"));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[test]
+    fn qwen_runtime_probe_handles_success_failure_missing_and_timeout() {
+        let success = probe_script("success", "exit 0");
+        let failure = probe_script("failure", "exit 7");
+        let hanging = probe_script("hanging", "exec sleep 5");
+
+        assert!(qwen_runtime_available_with_timeout(
+            &success,
+            Duration::from_secs(1)
+        ));
+        assert!(!qwen_runtime_available_with_timeout(
+            &failure,
+            Duration::from_secs(1)
+        ));
+        assert!(!qwen_runtime_available_with_timeout(
+            Path::new("/does/not/exist"),
+            Duration::from_secs(1)
+        ));
+        assert!(!qwen_runtime_available_with_timeout(
+            &hanging,
+            Duration::from_millis(50)
+        ));
+
+        let _ = std::fs::remove_file(success);
+        let _ = std::fs::remove_file(failure);
+        let _ = std::fs::remove_file(hanging);
+    }
+
+    #[test]
+    fn qwen_provider_aliases_share_one_canonical_engine_contract() {
+        for alias in ["qwen", "qwen3_asr", "local_qwen"] {
+            assert_eq!(
+                dictation::canonical_asr_provider(alias),
+                "local_qwen"
+            );
+            assert_eq!(
+                dictation::engine_kind_for_provider(alias),
+                Some(EngineKind::Qwen)
+            );
+        }
+    }
+
+    #[test]
+    fn backend_recording_gate_rejects_unready_qwen() {
+        let error = dictation::ensure_active_asr_ready(
+            "local_qwen",
+            "本地 Qwen3-ASR 0.6B 8-bit（实验）",
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("Qwen"));
+        assert!(error.contains("未就绪"));
+        let checking =
+            dictation::ensure_active_asr_ready("local_qwen", "Qwen", false, true).unwrap_err();
+        assert!(checking.contains("正在检查"));
+        assert!(dictation::ensure_active_asr_ready("local_qwen", "Qwen", true, false).is_ok());
+    }
 }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api } from "./api";
+import { api, type AsrModelStatus } from "./api";
 import { HotkeyRecorder } from "./HotkeyRecorder";
 import { OnboardingWizard } from "./OnboardingWizard";
 import { formatHotkeyLabel } from "./hotkeyFormat";
@@ -29,6 +29,25 @@ function formatTime(iso: string): string {
     return new Date(iso).toLocaleString();
   } catch {
     return iso;
+  }
+}
+
+type LocalAsrEngine = "sensevoice" | "qwen" | "whisper";
+
+function localAsrEngine(provider: string): LocalAsrEngine {
+  if (provider === "local_qwen") return "qwen";
+  if (provider === "local_whisper") return "whisper";
+  return "sensevoice";
+}
+
+function localAsrModelDir(status: AsrModelStatus, provider: string): string {
+  switch (localAsrEngine(provider)) {
+    case "qwen":
+      return status.qwenDir;
+    case "whisper":
+      return status.whisperDir;
+    case "sensevoice":
+      return status.sensevoiceDir;
   }
 }
 
@@ -532,11 +551,9 @@ export default function App() {
         <span>
           ASR{" "}
           <strong>
-            {health?.sensevoice_ready
-              ? "SenseVoice"
-              : health?.whisper_ready
-                ? "Whisper?"
-                : "模型未就绪"}
+            {health
+              ? `${health.active_asr_label}${health.active_asr_ready ? "" : "（未就绪）"}`
+              : "—"}
           </strong>
         </span>
         <span className="sep">·</span>
@@ -620,6 +637,12 @@ function RecordPanel({
     })();
   }, [onError, refreshStatus]);
 
+  useEffect(() => {
+    if (!status?.qwenRuntimeChecking) return;
+    const timer = window.setInterval(() => void refreshStatus(), 500);
+    return () => window.clearInterval(timer);
+  }, [refreshStatus, status?.qwenRuntimeChecking]);
+
   // Hotkey dictation done → fill result + baseline for learning
   useEffect(() => {
     const handler = (ev: Event) => {
@@ -668,9 +691,8 @@ function RecordPanel({
     onBusy(true);
     onError(null);
     try {
-      // Single source of truth: Settings ASR config + local EngineKind for local models.
+      // Saving the provider also switches the matching local engine atomically.
       await api.saveAsrServiceConfig({ provider: providerId });
-      await api.setAsrEngine(providerId);
       await refreshStatus();
     } catch (e) {
       onError(String(e));
@@ -810,7 +832,12 @@ function RecordPanel({
         ? "local_whisper"
         : "local_sensevoice");
   const ready = status?.activeReady ?? false;
-  const isLocal = provider.startsWith("local") || provider === "sensevoice" || provider === "whisper";
+  const isLocal =
+    provider.startsWith("local") ||
+    provider === "sensevoice" ||
+    provider === "qwen" ||
+    provider === "qwen3_asr" ||
+    provider === "whisper";
 
   return (
     <>
@@ -855,9 +882,11 @@ function RecordPanel({
             </option>
             <option value="local_qwen">
               本地 Qwen3-ASR 0.6B 8-bit（实验）{" "}
-              {status?.qwen.ready && status?.qwenRuntimeReady
-                ? "✓"
-                : "（模型或运行环境未就绪）"}
+              {status?.qwenRuntimeChecking
+                ? "（正在检查运行环境…）"
+                : status?.qwen.ready && status?.qwenRuntimeReady
+                  ? "✓"
+                  : "（模型或运行环境未就绪）"}
             </option>
             <option value="local_whisper">
               本地 Whisper {status?.whisper.ready ? "✓" : "（模型未就绪）"}
@@ -1090,7 +1119,7 @@ function SettingsPanel({
   const [asrApiKey, setAsrApiKey] = useState("");
   const [asrLanguage, setAsrLanguage] = useState("");
   const [asrHasKey, setAsrHasKey] = useState(false);
-  const [asrModels, setAsrModels] = useState<import("./api").AsrModelStatus | null>(null);
+  const [asrModels, setAsrModels] = useState<AsrModelStatus | null>(null);
   const [asrCustomPath, setAsrCustomPath] = useState("");
   const [cleanup, setCleanup] = useState("medium");
   const [style, setStyle] = useState("neutral");
@@ -1448,9 +1477,7 @@ function SettingsPanel({
               const id = e.target.value;
               setAsrProvider(id);
               if (asrModels) {
-                if (id === "local_qwen") setAsrCustomPath(asrModels.qwenDir);
-                if (id === "local_whisper") setAsrCustomPath(asrModels.whisperDir);
-                if (id === "local_sensevoice") setAsrCustomPath(asrModels.sensevoiceDir);
+                setAsrCustomPath(localAsrModelDir(asrModels, id));
               }
               const p = asrPresets.find((x) => x.id === id);
               if (p) {
@@ -1474,20 +1501,15 @@ function SettingsPanel({
         )}
         {asrProvider.startsWith("local") && asrModels && (
           <div className="onboard-status" style={{ marginBottom: 12 }}>
-            <div className="muted-text">Lumen 共享模型目录</div>
+            <div className="muted-text">当前解析的模型目录</div>
             <p className="muted-text" style={{ wordBreak: "break-all", marginTop: 4 }}>
-              <code>{asrModels.modelsRoot}</code>
+              <code>{localAsrModelDir(asrModels, asrProvider)}</code>
             </p>
             {asrModels.candidates
               .filter(
                 (candidate) =>
                   candidate.ready &&
-                  candidate.engine ===
-                    (asrProvider === "local_qwen"
-                      ? "qwen"
-                      : asrProvider === "local_whisper"
-                        ? "whisper"
-                        : "sensevoice"),
+                  candidate.engine === localAsrEngine(asrProvider),
               )
               .map((candidate) => (
                 <div key={`${candidate.engine}:${candidate.path}`} className="onboard-candidate">
@@ -1503,12 +1525,7 @@ function SettingsPanel({
                         onBusy(true);
                         onError(null);
                         try {
-                          const engine =
-                            asrProvider === "local_qwen"
-                              ? "qwen"
-                              : asrProvider === "local_whisper"
-                                ? "whisper"
-                                : "sensevoice";
+                          const engine = localAsrEngine(asrProvider);
                           const status = await api.useExistingAsrModel(candidate.path, engine);
                           setAsrModels(status);
                           setAsrCustomPath(status.activeModelDir);
@@ -1542,12 +1559,7 @@ function SettingsPanel({
                     onBusy(true);
                     onError(null);
                     try {
-                      const engine =
-                        asrProvider === "local_qwen"
-                          ? "qwen"
-                          : asrProvider === "local_whisper"
-                            ? "whisper"
-                            : "sensevoice";
+                      const engine = localAsrEngine(asrProvider);
                       const status = await api.useExistingAsrModel(
                         asrCustomPath.trim(),
                         engine,
@@ -1664,12 +1676,6 @@ function SettingsPanel({
                   setAsrLanguage(s.language);
                   setAsrHasKey(s.hasApiKey);
                   setAsrApiKey("");
-                  // Keep Record tab engine dropdown in sync (local EngineKind + provider).
-                  try {
-                    await api.setAsrEngine(s.provider);
-                  } catch {
-                    /* cloud-only providers keep local engine kind */
-                  }
                   onSaved();
                 } catch (e) {
                   onError(String(e));
@@ -2352,6 +2358,8 @@ function Overview({
             <dd>{health.dictionary_count}</dd>
             <dt>SenseVoice</dt>
             <dd>{health.sensevoice_ready ? "就绪" : "未就绪"}</dd>
+            <dt>Qwen3-ASR</dt>
+            <dd>{health.qwen_ready ? "就绪" : "未就绪"}</dd>
             <dt>Whisper</dt>
             <dd>{health.whisper_ready ? "就绪" : "未就绪"}</dd>
             <dt>Corrector</dt>

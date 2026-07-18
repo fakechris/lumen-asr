@@ -147,6 +147,7 @@ pub struct UseAsrModelInput {
 /// Point runtime at an existing model directory and persist it for the next launch.
 #[tauri::command]
 pub fn use_existing_asr_model(
+    app: AppHandle,
     state: State<'_, AppState>,
     input: UseAsrModelInput,
 ) -> Result<AsrModelStatus, String> {
@@ -154,25 +155,25 @@ pub fn use_existing_asr_model(
     if !path.is_dir() {
         return Err(format!("not a directory: {}", path.display()));
     }
-    let engine = input
-        .engine
-        .unwrap_or_else(|| "sensevoice".into())
-        .to_ascii_lowercase();
+    let engine = crate::dictation::canonical_asr_provider(
+        &input.engine.unwrap_or_else(|| "sensevoice".into()),
+    );
     match engine.as_str() {
-        "qwen" | "qwen3_asr" => {
+        "local_qwen" => {
             if !qwen_ready(&path) {
                 return Err(
                     "folder is not a valid Qwen3-ASR MLX model dir (need config, safetensors and tokenizer assets)"
                         .into(),
                 );
             }
+            crate::dictation::unload_qwen(&state);
             {
                 let mut config = state
                     .config
                     .lock()
                     .map_err(|_| "config lock poisoned".to_string())?;
+                config.asr.set_model_dir_for(EngineKind::Qwen, &path);
                 config.asr.provider = "local_qwen".into();
-                config.asr.model_dir = path.display().to_string();
                 config.save()?;
                 *state
                     .qwen
@@ -184,11 +185,13 @@ pub fn use_existing_asr_model(
                 .engine
                 .lock()
                 .map_err(|_| "engine lock poisoned".to_string())? = EngineKind::Qwen;
+            crate::schedule_qwen_runtime_refresh(app)?;
         }
-        "whisper" => {
+        "local_whisper" => {
             if !whisper_ready(&path) {
                 return Err("folder is not a valid Whisper (sherpa) model dir".into());
             }
+            crate::dictation::unload_qwen(&state);
             *state
                 .whisper
                 .lock()
@@ -206,6 +209,7 @@ pub fn use_existing_asr_model(
                         .into(),
                 );
             }
+            crate::dictation::unload_qwen(&state);
             *state
                 .sensevoice
                 .lock()
@@ -231,13 +235,13 @@ fn persist_model_selection(
         .config
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?;
+    config.asr.set_model_dir_for(engine, path);
     config.asr.provider = match engine {
         EngineKind::SenseVoice => "local_sensevoice",
         EngineKind::Qwen => "local_qwen",
         EngineKind::Whisper => "local_whisper",
     }
     .into();
-    config.asr.model_dir = path.display().to_string();
     config.save()
 }
 
@@ -263,6 +267,7 @@ pub async fn start_asr_model_download(app: AppHandle) -> Result<AsrModelStatus, 
         Ok(Ok(dir)) => {
             // Reload into app state
             let state = app.state::<AppState>();
+            crate::dictation::unload_qwen(&state);
             *state
                 .sensevoice
                 .lock()

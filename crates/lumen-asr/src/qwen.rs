@@ -5,14 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 const PRODUCT_WORKER: &str = include_str!("qwen_worker.py");
+const MAX_WORKER_RESPONSE_BYTES: usize = 1024 * 1024;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,8 @@ impl QwenAsrConfig {
 pub struct QwenAsr {
     config: QwenAsrConfig,
     worker: Arc<Mutex<Option<QwenWorker>>>,
+    active: Arc<AtomicBool>,
+    lifecycle_generation: Arc<AtomicU64>,
 }
 
 impl QwenAsr {
@@ -55,6 +58,8 @@ impl QwenAsr {
         Self {
             config,
             worker: Arc::new(Mutex::new(None)),
+            active: Arc::new(AtomicBool::new(true)),
+            lifecycle_generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -66,16 +71,23 @@ impl QwenAsr {
         &self.config.python_executable
     }
 
+    pub fn activate(&self) {
+        self.lifecycle_generation.fetch_add(1, Ordering::SeqCst);
+        self.active.store(true, Ordering::SeqCst);
+    }
+
     /// Release the loaded model when the user switches to another ASR engine.
     ///
-    /// Engine selection is disabled while transcribing, so failure to acquire
-    /// the worker lock only means an in-flight request owns it.
+    /// If a request is in flight, it finishes normally and releases the model
+    /// before another request can reuse the worker.
     pub fn unload(&self) -> bool {
+        self.active.store(false, Ordering::SeqCst);
+        self.lifecycle_generation.fetch_add(1, Ordering::SeqCst);
         let Ok(mut guard) = self.worker.try_lock() else {
-            return false;
+            return true;
         };
-        if let Some(mut worker) = guard.take() {
-            let _ = worker.child.start_kill();
+        if let Some(worker) = guard.take() {
+            schedule_worker_stop(worker);
         }
         true
     }
@@ -123,10 +135,38 @@ impl QwenAsr {
 
     async fn transcribe_path(
         &self,
+        generation: u64,
+        request_id: u64,
+        path: &Path,
+    ) -> Result<WorkerResponse, AsrError> {
+        let result = self
+            .transcribe_path_inner(generation, request_id, path)
+            .await;
+        if self.lifecycle_generation.load(Ordering::SeqCst) != generation
+            && !self.active.load(Ordering::SeqCst)
+        {
+            let mut guard = self.worker.lock().await;
+            if let Some(mut worker) = guard.take() {
+                let _ = worker.child.kill().await;
+            }
+        }
+        result
+    }
+
+    async fn transcribe_path_inner(
+        &self,
+        generation: u64,
         request_id: u64,
         path: &Path,
     ) -> Result<WorkerResponse, AsrError> {
         let mut guard = self.worker.lock().await;
+        if self.lifecycle_generation.load(Ordering::SeqCst) != generation
+            || !self.active.load(Ordering::SeqCst)
+        {
+            return Err(AsrError::NotConfigured(
+                "Qwen engine was deselected before transcription started".into(),
+            ));
+        }
         if guard.is_none() {
             *guard = Some(self.start_worker().await?);
         }
@@ -142,15 +182,24 @@ impl QwenAsr {
         let exchange = async {
             worker.stdin.write_all(&encoded).await?;
             worker.stdin.flush().await?;
-            let mut line = String::new();
-            let bytes = worker.stdout.read_line(&mut line).await?;
+            let mut line = Vec::new();
+            let bytes = (&mut worker.stdout)
+                .take((MAX_WORKER_RESPONSE_BYTES + 1) as u64)
+                .read_until(b'\n', &mut line)
+                .await?;
             if bytes == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "Qwen worker exited",
                 ));
             }
-            Ok::<String, std::io::Error>(line)
+            if bytes > MAX_WORKER_RESPONSE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Qwen worker response exceeded 1 MiB",
+                ));
+            }
+            Ok::<Vec<u8>, std::io::Error>(line)
         };
 
         let line = match tokio::time::timeout(self.config.timeout, exchange).await {
@@ -169,7 +218,7 @@ impl QwenAsr {
                 )));
             }
         };
-        let response: WorkerResponse = match serde_json::from_str(&line) {
+        let response: WorkerResponse = match serde_json::from_slice(&line) {
             Ok(response) => response,
             Err(error) => {
                 if let Some(worker) = guard.as_mut() {
@@ -192,6 +241,10 @@ impl QwenAsr {
             )));
         }
         if let Some(error) = response.error.as_deref().filter(|value| !value.is_empty()) {
+            if let Some(worker) = guard.as_mut() {
+                let _ = worker.child.kill().await;
+            }
+            *guard = None;
             return Err(AsrError::Inference(error.to_owned()));
         }
         Ok(response)
@@ -208,17 +261,29 @@ impl AsrEngine for QwenAsr {
         if req.samples.is_empty() {
             return Err(AsrError::EmptyAudio);
         }
+        let generation = self.lifecycle_generation.load(Ordering::SeqCst);
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(AsrError::NotConfigured(
+                "Qwen engine is not active".into(),
+            ));
+        }
         let request_id = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let mut audio_file = tempfile::Builder::new()
-            .prefix("lumen-qwen-")
-            .suffix(".wav")
-            .tempfile()
-            .map_err(|error| AsrError::Inference(format!("create Qwen audio: {error}")))?;
-        audio_file
-            .write_all(&samples_to_wav_mono_i16(&req.samples, req.sample_rate))
-            .and_then(|_| audio_file.flush())
-            .map_err(|error| AsrError::Inference(format!("write Qwen audio: {error}")))?;
-        let response = self.transcribe_path(request_id, audio_file.path()).await?;
+        let audio_file = tokio::task::spawn_blocking(move || {
+            let mut audio_file = tempfile::Builder::new()
+                .prefix("lumen-qwen-")
+                .suffix(".wav")
+                .tempfile()
+                .map_err(|error| AsrError::Inference(format!("create Qwen audio: {error}")))?;
+            write_wav_mono_i16(&mut audio_file, &req.samples, req.sample_rate)
+                .and_then(|_| audio_file.flush())
+                .map_err(|error| AsrError::Inference(format!("write Qwen audio: {error}")))?;
+            Ok::<_, AsrError>(audio_file)
+        })
+        .await
+        .map_err(|error| AsrError::Inference(format!("prepare Qwen audio task: {error}")))??;
+        let response = self
+            .transcribe_path(generation, request_id, audio_file.path())
+            .await?;
         Ok(AsrResult {
             text: response.text.unwrap_or_default(),
             engine: self.id(),
@@ -247,25 +312,57 @@ struct QwenWorker {
     stdout: BufReader<ChildStdout>,
 }
 
-fn samples_to_wav_mono_i16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+fn schedule_worker_stop(mut worker: QwenWorker) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            let _ = worker.child.kill().await;
+        });
+    } else {
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match runtime {
+                Ok(runtime) => runtime.block_on(async move {
+                    let _ = worker.child.kill().await;
+                }),
+                Err(_) => {
+                    let _ = worker.child.start_kill();
+                }
+            }
+        });
+    }
+}
+
+fn write_wav_mono_i16(
+    output: &mut impl Write,
+    samples: &[f32],
+    sample_rate: u32,
+) -> std::io::Result<()> {
     let sample_rate = sample_rate.max(1);
     let data_len = samples.len().saturating_mul(2);
-    let mut output = Vec::with_capacity(44 + data_len);
-    output.extend_from_slice(b"RIFF");
-    output.extend_from_slice(&(36u32.saturating_add(data_len as u32)).to_le_bytes());
-    output.extend_from_slice(b"WAVEfmt ");
-    output.extend_from_slice(&16u32.to_le_bytes());
-    output.extend_from_slice(&1u16.to_le_bytes());
-    output.extend_from_slice(&1u16.to_le_bytes());
-    output.extend_from_slice(&sample_rate.to_le_bytes());
-    output.extend_from_slice(&sample_rate.saturating_mul(2).to_le_bytes());
-    output.extend_from_slice(&2u16.to_le_bytes());
-    output.extend_from_slice(&16u16.to_le_bytes());
-    output.extend_from_slice(b"data");
-    output.extend_from_slice(&(data_len as u32).to_le_bytes());
+    let data_len_u32 = u32::try_from(data_len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Qwen WAV input exceeds the RIFF size limit",
+        )
+    })?;
+    let mut output = std::io::BufWriter::new(output);
+    output.write_all(b"RIFF")?;
+    output.write_all(&36u32.saturating_add(data_len_u32).to_le_bytes())?;
+    output.write_all(b"WAVEfmt ")?;
+    output.write_all(&16u32.to_le_bytes())?;
+    output.write_all(&1u16.to_le_bytes())?;
+    output.write_all(&1u16.to_le_bytes())?;
+    output.write_all(&sample_rate.to_le_bytes())?;
+    output.write_all(&sample_rate.saturating_mul(2).to_le_bytes())?;
+    output.write_all(&2u16.to_le_bytes())?;
+    output.write_all(&16u16.to_le_bytes())?;
+    output.write_all(b"data")?;
+    output.write_all(&data_len_u32.to_le_bytes())?;
     for sample in samples {
         let value = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-        output.extend_from_slice(&value.to_le_bytes());
+        output.write_all(&value.to_le_bytes())?;
     }
-    output
+    output.flush()
 }

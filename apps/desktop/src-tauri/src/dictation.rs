@@ -141,14 +141,15 @@ fn restore_target_app_before_insert(app: Option<&AppHandle>) -> Option<String> {
 #[serde(rename_all = "camelCase")]
 pub struct AsrStatus {
     pub recording: bool,
-    /// Local runtime engine (sensevoice | whisper) when provider is local.
+    /// Local runtime engine when the selected provider runs on-device.
     pub engine: EngineKind,
-    /// Settings ASR provider id (local_sensevoice | openai_audio | …) — source of truth for pipeline.
+    /// Settings provider id (local_sensevoice | local_qwen | openai_audio | …).
     pub provider: String,
     pub sensevoice: EngineStatus,
     pub qwen: EngineStatus,
     pub qwen_runtime_path: String,
     pub qwen_runtime_ready: bool,
+    pub qwen_runtime_checking: bool,
     pub whisper: EngineStatus,
     pub active_ready: bool,
     /// Short label for UI (e.g. "OpenAI Audio · whisper-1").
@@ -171,15 +172,37 @@ pub fn set_audio_device(state: State<'_, AppState>, name: Option<String>) -> Res
     Ok(())
 }
 
+pub(crate) fn canonical_asr_provider(provider: &str) -> String {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "sensevoice" | "local_sensevoice" => "local_sensevoice".into(),
+        "qwen" | "qwen3_asr" | "local_qwen" => "local_qwen".into(),
+        "whisper" | "local_whisper" => "local_whisper".into(),
+        other => other.into(),
+    }
+}
+
+pub(crate) fn engine_kind_for_provider(provider: &str) -> Option<EngineKind> {
+    match canonical_asr_provider(provider).as_str() {
+        "local_sensevoice" => Some(EngineKind::SenseVoice),
+        "local_qwen" => Some(EngineKind::Qwen),
+        "local_whisper" => Some(EngineKind::Whisper),
+        _ => None,
+    }
+}
+
 #[tauri::command]
-pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<EngineKind, String> {
+pub fn set_asr_engine(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    engine: String,
+) -> Result<EngineKind, String> {
     // Accept either local engine names or full provider ids from Settings.
-    let e = engine.trim().to_ascii_lowercase();
-    let (kind, provider_id) = match e.as_str() {
-        "sensevoice" | "local_sensevoice" => (EngineKind::SenseVoice, "local_sensevoice"),
-        "qwen" | "qwen3_asr" | "local_qwen" => (EngineKind::Qwen, "local_qwen"),
-        "whisper" | "local_whisper" => (EngineKind::Whisper, "local_whisper"),
-        "openai_audio" | "custom" => (EngineKind::SenseVoice, if e == "custom" { "custom" } else { "openai_audio" }),
+    let provider_id = canonical_asr_provider(&engine);
+    let kind = match provider_id.as_str() {
+        "local_sensevoice" => EngineKind::SenseVoice,
+        "local_qwen" => EngineKind::Qwen,
+        "local_whisper" => EngineKind::Whisper,
+        "openai_audio" | "custom" => EngineKind::SenseVoice,
         other if other.starts_with("local_") => {
             return Err(format!("unknown local engine: {engine}"));
         }
@@ -213,7 +236,7 @@ pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<Engi
         unload_qwen(&state);
     }
     if let Ok(mut cfg) = state.config.lock() {
-        cfg.asr.provider = provider_id.into();
+        cfg.asr.provider = provider_id.clone();
         if provider_id == "openai_audio" {
             if cfg.asr.base_url.is_empty() {
                 cfg.asr.base_url = "https://api.openai.com/v1".into();
@@ -224,10 +247,18 @@ pub fn set_asr_engine(state: State<'_, AppState>, engine: String) -> Result<Engi
         }
         let _ = cfg.save();
     }
+    if kind == EngineKind::Qwen {
+        state
+            .qwen
+            .lock()
+            .map_err(|_| "qwen lock poisoned".to_string())?
+            .activate();
+        crate::schedule_qwen_runtime_refresh(app)?;
+    }
     Ok(kind)
 }
 
-fn unload_qwen(state: &AppState) {
+pub(crate) fn unload_qwen(state: &AppState) {
     if let Ok(engine) = state.qwen.lock() {
         if !engine.unload() {
             tracing::warn!("Qwen worker is busy and could not be unloaded during engine switch");
@@ -258,7 +289,7 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
             EngineKind::Whisper => "local_whisper".into(),
         }
     } else {
-        asr_cfg.provider.clone()
+        canonical_asr_provider(&asr_cfg.provider)
     };
     let sv = state
         .sensevoice
@@ -305,20 +336,30 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
                 asr_cfg.qwen_python_executable().display().to_string(),
             )
         });
-    let qwen_runtime_ready = qwen.ready
-        && matches!(provider.as_str(), "local_qwen" | "qwen" | "qwen3_asr")
-        && qwen_runtime_available(std::path::Path::new(&qwen_runtime_path));
+    let (qwen_runtime_ready, qwen_runtime_checking) = if qwen.ready {
+        state
+            .qwen_runtime
+            .lock()
+            .map(|runtime| {
+                let current =
+                    runtime.executable == std::path::PathBuf::from(&qwen_runtime_path);
+                (current && runtime.ready, current && runtime.checking)
+            })
+            .unwrap_or((false, false))
+    } else {
+        (false, false)
+    };
     let active_ready = match provider.as_str() {
-        "local_sensevoice" | "sensevoice" => sv.ready,
-        "local_qwen" | "qwen" | "qwen3_asr" => qwen.ready && qwen_runtime_ready,
-        "local_whisper" | "whisper" => wh.ready,
+        "local_sensevoice" => sv.ready,
+        "local_qwen" => qwen.ready && qwen_runtime_ready,
+        "local_whisper" => wh.ready,
         "openai_audio" | "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
         // config_only: selectable but not runnable yet
         _ => false,
     };
     let provider_label = crate::provider_presets::asr_preset_by_id(&provider)
         .map(|p| {
-            if asr_cfg.model.is_empty() {
+            if provider.starts_with("local_") || asr_cfg.model.is_empty() {
                 p.label
             } else {
                 format!("{} · {}", p.label, asr_cfg.model)
@@ -333,21 +374,11 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         qwen,
         qwen_runtime_path,
         qwen_runtime_ready,
+        qwen_runtime_checking,
         whisper: wh,
         active_ready,
         provider_label,
     }
-}
-
-fn qwen_runtime_available(path: &std::path::Path) -> bool {
-    std::process::Command::new(path)
-        .args(["-c", "import mlx_qwen3_asr"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -355,10 +386,43 @@ pub fn start_recording(state: State<'_, AppState>) -> Result<(), String> {
     start_recording_inner(&state)
 }
 
+pub(crate) fn ensure_active_asr_ready(
+    provider: &str,
+    provider_label: &str,
+    ready: bool,
+    checking: bool,
+) -> Result<(), String> {
+    if ready {
+        return Ok(());
+    }
+    if checking {
+        return Err(format!(
+            "{provider_label} 正在检查本地运行环境，请稍后再试。"
+        ));
+    }
+    let guidance = match canonical_asr_provider(provider).as_str() {
+        "local_qwen" => {
+            "请先选择有效的 Qwen MLX 模型目录和能够导入 mlx_qwen3_asr.Session 的 Python。"
+        }
+        "local_sensevoice" => "请先安装或选择有效的 SenseVoice 模型。",
+        "local_whisper" => "请先选择有效的 Whisper 模型。",
+        "openai_audio" | "custom" => "请先完成在线 ASR 的地址与凭据配置。",
+        _ => "当前 ASR 尚未接入可运行的识别客户端。",
+    };
+    Err(format!("{provider_label} 未就绪。{guidance}"))
+}
+
 pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     if state.audio.is_recording() {
         return Ok(());
     }
+    let status = asr_status_from(state);
+    ensure_active_asr_ready(
+        &status.provider,
+        &status.provider_label,
+        status.active_ready,
+        status.qwen_runtime_checking,
+    )?;
     remember_target_app();
     state.audio.start().map_err(|e| e.to_string())
 }
@@ -813,7 +877,8 @@ async fn run_asr(
     asr_cfg: &AsrServiceConfig,
     samples_16k: Vec<f32>,
 ) -> Result<AsrResult, String> {
-    let provider = asr_cfg.provider.as_str();
+    let provider = canonical_asr_provider(&asr_cfg.provider);
+    let provider = provider.as_str();
 
     if matches!(
         provider,
@@ -857,7 +922,8 @@ async fn run_asr(
             .map_err(|e| e.to_string());
     }
 
-    if provider == "local_whisper" || matches!(engine_kind, EngineKind::Whisper) {
+    let selected_local_engine = engine_kind_for_provider(provider).unwrap_or(engine_kind);
+    if selected_local_engine == EngineKind::Whisper {
         let eng = state
             .whisper
             .lock()
@@ -873,7 +939,7 @@ async fn run_asr(
             .map_err(|e| e.to_string());
     }
 
-    if provider == "local_qwen" || matches!(engine_kind, EngineKind::Qwen) {
+    if selected_local_engine == EngineKind::Qwen {
         let eng = state
             .qwen
             .lock()

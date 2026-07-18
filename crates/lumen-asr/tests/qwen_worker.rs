@@ -193,6 +193,7 @@ for line in sys.stdin:
 
     engine.transcribe(request()).await.unwrap();
     assert!(engine.unload());
+    engine.activate();
     engine.transcribe(request()).await.unwrap();
 
     assert_eq!(
@@ -200,4 +201,321 @@ for line in sys.stdin:
         "started\nstarted\n"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn qwen_finishes_inflight_request_then_honors_pending_unload() {
+    let root = temp_dir("pending-unload");
+    std::fs::create_dir_all(&root).unwrap();
+    let worker = root.join("slow_worker.py");
+    let starts = root.join("starts.txt");
+    std::fs::write(
+        &worker,
+        r#"
+import argparse
+import json
+import pathlib
+import sys
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+parser.add_argument("--startup-marker", required=True)
+args = parser.parse_args()
+with pathlib.Path(args.startup_marker).open("a", encoding="utf-8") as output:
+    output.write("started\n")
+for line in sys.stdin:
+    request = json.loads(line)
+    time.sleep(0.15)
+    print(json.dumps({"id": request["id"], "text": "ok"}), flush=True)
+"#,
+    )
+    .unwrap();
+    let model = root.join("model");
+    std::fs::create_dir_all(&model).unwrap();
+    let engine = QwenAsr::new(QwenAsrConfig {
+        python_executable: PathBuf::from("/usr/bin/python3"),
+        worker_script: worker,
+        model_dir: model,
+        language: None,
+        timeout: std::time::Duration::from_secs(5),
+        extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
+    });
+    let request = || AsrRequest {
+        samples: vec![0.0; 1_600],
+        sample_rate: 16_000,
+        hotwords: vec![],
+    };
+
+    let in_flight_engine = engine.clone();
+    let in_flight = tokio::spawn(async move { in_flight_engine.transcribe(request()).await });
+    for _ in 0..100 {
+        if starts.is_file() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(starts.is_file(), "worker did not start");
+    assert!(engine.unload());
+    assert_eq!(in_flight.await.unwrap().unwrap().text, "ok");
+
+    engine.activate();
+    assert_eq!(engine.transcribe(request()).await.unwrap().text, "ok");
+    assert_eq!(
+        std::fs::read_to_string(&starts).unwrap(),
+        "started\nstarted\n"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn qwen_deselection_invalidates_requests_already_waiting_for_worker() {
+    let root = temp_dir("queued-unload");
+    std::fs::create_dir_all(&root).unwrap();
+    let worker = root.join("slow_worker.py");
+    let starts = root.join("starts.txt");
+    std::fs::write(
+        &worker,
+        r#"
+import argparse
+import json
+import pathlib
+import sys
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+parser.add_argument("--startup-marker", required=True)
+args = parser.parse_args()
+with pathlib.Path(args.startup_marker).open("a", encoding="utf-8") as output:
+    output.write("started\n")
+for line in sys.stdin:
+    request = json.loads(line)
+    time.sleep(0.15)
+    print(json.dumps({"id": request["id"], "text": "ok"}), flush=True)
+"#,
+    )
+    .unwrap();
+    let model = root.join("model");
+    std::fs::create_dir_all(&model).unwrap();
+    let engine = QwenAsr::new(QwenAsrConfig {
+        python_executable: PathBuf::from("/usr/bin/python3"),
+        worker_script: worker,
+        model_dir: model,
+        language: None,
+        timeout: std::time::Duration::from_secs(5),
+        extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
+    });
+    let request = || AsrRequest {
+        samples: vec![0.0; 1_600],
+        sample_rate: 16_000,
+        hotwords: vec![],
+    };
+
+    let first_engine = engine.clone();
+    let first = tokio::spawn(async move { first_engine.transcribe(request()).await });
+    for _ in 0..100 {
+        if starts.is_file() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(starts.is_file(), "worker did not start");
+
+    let queued_engine = engine.clone();
+    let queued = tokio::spawn(async move { queued_engine.transcribe(request()).await });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(engine.unload());
+
+    assert_eq!(first.await.unwrap().unwrap().text, "ok");
+    assert!(queued.await.unwrap().is_err());
+    engine.activate();
+    assert_eq!(engine.transcribe(request()).await.unwrap().text, "ok");
+    assert_eq!(
+        std::fs::read_to_string(&starts).unwrap(),
+        "started\nstarted\n"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn qwen_restarts_after_worker_reports_inference_error() {
+    let root = temp_dir("worker-error");
+    std::fs::create_dir_all(&root).unwrap();
+    let worker = root.join("error_worker.py");
+    let starts = root.join("starts.txt");
+    std::fs::write(
+        &worker,
+        r#"
+import argparse
+import json
+import pathlib
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+parser.add_argument("--startup-marker", required=True)
+args = parser.parse_args()
+marker = pathlib.Path(args.startup_marker)
+start_count = len(marker.read_text(encoding="utf-8").splitlines()) if marker.exists() else 0
+with marker.open("a", encoding="utf-8") as output:
+    output.write("started\n")
+for line in sys.stdin:
+    request = json.loads(line)
+    if start_count == 0:
+        print(json.dumps({"id": request["id"], "error": "session poisoned"}), flush=True)
+    else:
+        print(json.dumps({"id": request["id"], "text": "recovered"}), flush=True)
+"#,
+    )
+    .unwrap();
+    let model = root.join("model");
+    std::fs::create_dir_all(&model).unwrap();
+    let engine = QwenAsr::new(QwenAsrConfig {
+        python_executable: PathBuf::from("/usr/bin/python3"),
+        worker_script: worker,
+        model_dir: model,
+        language: None,
+        timeout: std::time::Duration::from_secs(5),
+        extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
+    });
+    let request = || AsrRequest {
+        samples: vec![0.0; 1_600],
+        sample_rate: 16_000,
+        hotwords: vec![],
+    };
+
+    assert!(engine.transcribe(request()).await.is_err());
+    assert_eq!(engine.transcribe(request()).await.unwrap().text, "recovered");
+    assert_eq!(
+        std::fs::read_to_string(&starts).unwrap(),
+        "started\nstarted\n"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn qwen_rejects_oversized_worker_response_and_restarts() {
+    let root = temp_dir("oversized-response");
+    std::fs::create_dir_all(&root).unwrap();
+    let worker = root.join("oversized_worker.py");
+    let starts = root.join("starts.txt");
+    std::fs::write(
+        &worker,
+        r#"
+import argparse
+import json
+import pathlib
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+parser.add_argument("--startup-marker", required=True)
+args = parser.parse_args()
+marker = pathlib.Path(args.startup_marker)
+start_count = len(marker.read_text(encoding="utf-8").splitlines()) if marker.exists() else 0
+with marker.open("a", encoding="utf-8") as output:
+    output.write("started\n")
+for line in sys.stdin:
+    request = json.loads(line)
+    if start_count == 0:
+        sys.stdout.write("x" * 1048577)
+        sys.stdout.flush()
+    else:
+        print(json.dumps({"id": request["id"], "text": "recovered"}), flush=True)
+"#,
+    )
+    .unwrap();
+    let model = root.join("model");
+    std::fs::create_dir_all(&model).unwrap();
+    let engine = QwenAsr::new(QwenAsrConfig {
+        python_executable: PathBuf::from("/usr/bin/python3"),
+        worker_script: worker,
+        model_dir: model,
+        language: None,
+        timeout: std::time::Duration::from_secs(5),
+        extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
+    });
+    let request = || AsrRequest {
+        samples: vec![0.0; 1_600],
+        sample_rate: 16_000,
+        hotwords: vec![],
+    };
+
+    let error = engine.transcribe(request()).await.unwrap_err();
+    assert!(error.to_string().contains("exceeded 1 MiB"));
+    assert_eq!(engine.transcribe(request()).await.unwrap().text, "recovered");
+    assert_eq!(
+        std::fs::read_to_string(&starts).unwrap(),
+        "started\nstarted\n"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn qwen_unload_reaps_worker_without_an_active_tokio_runtime() {
+    let root = temp_dir("sync-unload");
+    std::fs::create_dir_all(&root).unwrap();
+    let worker = root.join("pid_worker.py");
+    let pid_file = root.join("worker.pid");
+    std::fs::write(
+        &worker,
+        r#"
+import argparse
+import json
+import os
+import pathlib
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+parser.add_argument("--pid-file", required=True)
+args = parser.parse_args()
+pathlib.Path(args.pid_file).write_text(str(os.getpid()), encoding="utf-8")
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({"id": request["id"], "text": "ok"}), flush=True)
+"#,
+    )
+    .unwrap();
+    let model = root.join("model");
+    std::fs::create_dir_all(&model).unwrap();
+    let engine = QwenAsr::new(QwenAsrConfig {
+        python_executable: PathBuf::from("/usr/bin/python3"),
+        worker_script: worker,
+        model_dir: model,
+        language: None,
+        timeout: std::time::Duration::from_secs(5),
+        extra_args: vec!["--pid-file".into(), pid_file.display().to_string()],
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(engine.transcribe(AsrRequest {
+            samples: vec![0.0; 1_600],
+            sample_rate: 16_000,
+            hotwords: vec![],
+        }))
+        .unwrap();
+    drop(runtime);
+
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    assert!(engine.unload());
+    for _ in 0..100 {
+        if !std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("Qwen worker process {pid} was not reaped after unload");
 }
