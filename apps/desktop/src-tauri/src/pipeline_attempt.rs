@@ -132,12 +132,8 @@ pub(crate) async fn run_corrector_stage(
     intent: IntentSpec,
     attempt: &mut DictationAttemptRecord,
 ) -> Result<CorrectionStageOutput, String> {
-    let (entries, dictionary_error) = {
-        let store_guard = state
-            .store
-            .lock()
-            .map_err(|_| "store lock poisoned".to_string())?;
-        match store_guard.as_ref() {
+    let (entries, dictionary_error) = match state.store.lock() {
+        Ok(store_guard) => match store_guard.as_ref() {
             Some(store) => match store.list_dictionary() {
                 Ok(entries) => (entries, None),
                 Err(error) => {
@@ -146,6 +142,10 @@ pub(crate) async fn run_corrector_stage(
                 }
             },
             None => (vec![], None),
+        },
+        Err(_) => {
+            tracing::warn!("dictionary store lock poisoned; continuing without dictionary");
+            (Vec::new(), Some("dictionary unavailable".to_string()))
         }
     };
     let dictionary = dictionary_run_identity(&entries);
@@ -190,7 +190,8 @@ pub(crate) async fn run_corrector_stage(
             });
     }
     tracing::info!(
-        corrected_text = %text,
+        attempt_id = %attempt.id,
+        corrected_chars = text.chars().count(),
         corrector_engine = %engine,
         model_applied = result.model_applied,
         "corrector result"

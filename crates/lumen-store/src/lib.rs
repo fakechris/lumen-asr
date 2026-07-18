@@ -392,6 +392,13 @@ impl Store {
         session: &SessionRecord,
         record: DictationAttemptRecord,
     ) -> Result<DictationAttemptRecord> {
+        if session.id != record.session_id {
+            anyhow::bail!(
+                "attempt session mismatch: session_id={}, attempt_session_id={}",
+                session.id,
+                record.session_id
+            );
+        }
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         save_session_on(&transaction, session)?;
         let record = append_dictation_attempt_on(&transaction, record)?;
@@ -662,10 +669,23 @@ fn map_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<DictationAttemptReco
     let pipeline_metrics = serde_json::from_str(&metrics_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(error))
     })?;
+    let id = parse_uuid_column(row, 0)?;
+    let session_id = parse_uuid_column(row, 1)?;
+    let attempt_ordinal = parse_u32_column(row, 2)?;
+    let supersedes_attempt_id = match row.get::<_, Option<String>>(13)? {
+        Some(value) => Some(Uuid::parse_str(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?),
+        None => None,
+    };
     Ok(DictationAttemptRecord {
-        id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
-        session_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
-        attempt_ordinal: row.get::<_, i64>(2)? as u32,
+        id,
+        session_id,
+        attempt_ordinal,
         created_at: parse_dt(&row.get::<_, String>(3)?),
         asr_raw: row.get(4)?,
         asr_enhanced: row.get(5)?,
@@ -678,9 +698,29 @@ fn map_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<DictationAttemptReco
             .get::<_, Option<String>>(11)?
             .and_then(|value| parse_pipeline_stage(&value)),
         failure_message: row.get(12)?,
-        supersedes_attempt_id: row
-            .get::<_, Option<String>>(13)?
-            .and_then(|value| Uuid::parse_str(&value).ok()),
+        supersedes_attempt_id,
+    })
+}
+
+fn parse_uuid_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Uuid> {
+    let value: String = row.get(index)?;
+    Uuid::parse_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn parse_u32_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u32> {
+    let value: i64 = row.get(index)?;
+    u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
     })
 }
 
@@ -734,15 +774,13 @@ fn append_dictation_attempt_on(
             LIMIT 1
             "#,
             params![record.session_id.to_string()],
-            |row| {
-                Ok((
-                    Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
-                    row.get::<_, i64>(1)? as u32,
-                ))
-            },
+            |row| Ok((parse_uuid_column(row, 0)?, parse_u32_column(row, 1)?)),
         )
         .optional()?;
-    record.attempt_ordinal = latest.as_ref().map_or(1, |(_, ordinal)| ordinal + 1);
+    record.attempt_ordinal = match latest.as_ref() {
+        Some((_, ordinal)) => ordinal.checked_add(1).context("attempt ordinal overflow")?,
+        None => 1,
+    };
     record.supersedes_attempt_id = latest.map(|(id, _)| id);
     let identity_json = serde_json::to_string(&record.pipeline_identity)?;
     let metrics_json = serde_json::to_string(&record.pipeline_metrics)?;
@@ -1123,6 +1161,72 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn session_snapshot_rejects_an_attempt_for_another_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("session-mismatch.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        let other_session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+
+        let result = store.save_session_and_append_attempt(
+            &session,
+            DictationAttemptRecord::new(other_session.id),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(&session.id.to_string()));
+        assert!(error.contains(&other_session.id.to_string()));
+        assert!(store
+            .list_dictation_attempts(session.id, MAX_ATTEMPT_PAGE_SIZE, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn malformed_attempt_identifiers_are_rejected_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("malformed-read.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+        let attempt = store
+            .append_dictation_attempt(DictationAttemptRecord::new(session.id))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE dictation_attempts SET id='not-a-uuid' WHERE id=?1",
+                params![attempt.id.to_string()],
+            )
+            .unwrap();
+
+        assert!(store
+            .list_dictation_attempts(session.id, MAX_ATTEMPT_PAGE_SIZE, None)
+            .is_err());
+    }
+
+    #[test]
+    fn malformed_latest_ordinal_is_rejected_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("malformed-latest.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+        let attempt = store
+            .append_dictation_attempt(DictationAttemptRecord::new(session.id))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE dictation_attempts SET attempt_ordinal=-1 WHERE id=?1",
+                params![attempt.id.to_string()],
+            )
+            .unwrap();
+
+        assert!(store
+            .append_dictation_attempt(DictationAttemptRecord::new(session.id))
+            .is_err());
     }
 
     #[test]

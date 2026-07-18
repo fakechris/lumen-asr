@@ -75,6 +75,7 @@ impl CorrectorError {
             Self::Http(_) => CorrectorFallbackReason::Http,
             Self::ProviderRejected(401 | 403) => CorrectorFallbackReason::Authentication,
             Self::ProviderRejected(429) => CorrectorFallbackReason::RateLimited,
+            Self::ProviderRejected(408) => CorrectorFallbackReason::Timeout,
             Self::ProviderRejected(400..=499) => CorrectorFallbackReason::ProviderClientError,
             Self::ProviderRejected(500..=599) => CorrectorFallbackReason::ProviderServerError,
             Self::ProviderRejected(_) => CorrectorFallbackReason::ProviderRejected,
@@ -294,6 +295,10 @@ mod tests {
         assert_eq!(
             CorrectorError::ProviderRejected(429).fallback_reason(),
             CorrectorFallbackReason::RateLimited
+        );
+        assert_eq!(
+            CorrectorError::ProviderRejected(408).fallback_reason(),
+            CorrectorFallbackReason::Timeout
         );
         assert_eq!(
             CorrectorError::ProviderRejected(422).fallback_reason(),

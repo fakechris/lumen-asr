@@ -632,7 +632,12 @@ pub async fn stop_and_transcribe_inner(
         }
     };
     let (asr_text, enhanced_text) = apply_asr_result(&mut attempt, &result, asr_started);
-    tracing::info!(%asr_text, engine = %asr_engine_str, "ASR result");
+    tracing::info!(
+        attempt_id = %attempt.id,
+        asr_chars = asr_text.chars().count(),
+        engine = %asr_engine_str,
+        "ASR result"
+    );
 
     tracing::info!(?intent, "running corrector with session intent");
     let correction =
@@ -669,18 +674,19 @@ pub async fn stop_and_transcribe_inner(
         let ax_ok = lumen_platform_macos::is_accessibility_trusted();
         if !ax_ok {
             // Without Accessibility, synthetic keys only hit *this* process — copy instead.
-            notes.push(
-                "accessibility denied — text copied to clipboard; enable Accessibility for insert"
-                    .into(),
-            );
             tracing::error!(
                 "Accessibility not granted; cannot inject into other apps. Open System Settings → Privacy & Security → Accessibility and enable this process"
             );
-            match crate::inject_cmd::copy_only(&corrected_text).await {
+            let clipboard_copied = match crate::inject_cmd::copy_only(&corrected_text).await {
                 Ok(()) => {
                     insert_strategy = InsertStrategy::CopyOnly;
                     insertion_outcome = InsertionOutcome::Copied;
+                    notes.push(
+                        "accessibility denied — text copied to clipboard; enable Accessibility for insert"
+                            .into(),
+                    );
                     tracing::info!("copied result to clipboard (no AX)");
+                    true
                 }
                 Err(e) => {
                     insertion_outcome = InsertionOutcome::Failed;
@@ -693,13 +699,19 @@ pub async fn stop_and_transcribe_inner(
                             kind: PipelineIssueKind::ClipboardFailure,
                             message: e.to_string(),
                         });
+                    false
                 }
-            }
+            };
             if let Some(app) = app {
+                let message = if clipboard_copied {
+                    "需要「辅助功能」权限才能插入到其他 App。请到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop），然后重试。文字已复制到剪贴板。"
+                } else {
+                    "需要「辅助功能」权限才能插入到其他 App，并且复制到剪贴板也失败了。请先手动复制结果，并到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop）后重试。"
+                };
                 emit_dictation(
                     app,
                     DictationUiEvent::Error {
-                        message: "需要「辅助功能」权限才能插入到其他 App。请到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop），然后重试。文字已复制到剪贴板。".into(),
+                        message: message.into(),
                     },
                 );
             }
@@ -980,7 +992,12 @@ pub async fn retry_session_transcription(
     // new attempt row rather than overwriting the first attempt's sidecars.
     persist_attempt(&state, true, &rec, attempt)?;
 
-    tracing::info!(%id, %asr_text, %corrected_text, "retry transcription done");
+    tracing::info!(
+        %id,
+        asr_chars = asr_text.chars().count(),
+        corrected_chars = corrected_text.chars().count(),
+        "retry transcription done"
+    );
     Ok(RetryOutcome {
         session: rec,
         asr_text,

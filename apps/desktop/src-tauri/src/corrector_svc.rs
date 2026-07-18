@@ -221,13 +221,13 @@ mod tests {
         let mut app = AppConfig::default();
         app.corrector.enabled = true;
         app.corrector.provider = "minimax".into();
-        app.corrector.model = "MiniMax-M3".into();
+        app.corrector.model = "test-corrector-model".into();
 
         let first = run_identity(&app, IntentSpec::Default);
         let second = run_identity(&app, IntentSpec::Default);
 
         assert_eq!(first.provider, "minimax");
-        assert_eq!(first.model.as_deref(), Some("MiniMax-M3"));
+        assert_eq!(first.model.as_deref(), Some("test-corrector-model"));
         assert_eq!(first.prompt_hash, second.prompt_hash);
         assert_eq!(first.prompt_hash_algorithm.as_deref(), Some("blake3"));
         assert!((first.temperature.unwrap() - 0.3).abs() < 1e-6);
@@ -250,7 +250,7 @@ mod tests {
         let mut app = AppConfig::default();
         app.corrector.enabled = true;
         app.corrector.provider = "minimax".into();
-        app.corrector.model = "MiniMax-M3".into();
+        app.corrector.model = "test-corrector-model".into();
 
         let identity = run_identity(&app, IntentSpec::Raw);
         let outcome = corrector_outcome_identity(&identity, false);
@@ -266,7 +266,7 @@ mod tests {
         let mut app = AppConfig::default();
         app.corrector.enabled = true;
         app.corrector.provider = "minimax".into();
-        app.corrector.model = "MiniMax-M3".into();
+        app.corrector.model = "test-corrector-model".into();
 
         let identity = run_identity(&app, IntentSpec::Default);
         let success = corrector_outcome_identity(&identity, true);
