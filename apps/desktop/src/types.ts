@@ -151,6 +151,55 @@ export type PipelineIssueKind =
   | "injection_failure"
   | "unknown";
 
+export type QwenDecodeMode =
+  | "greedy_only"
+  | "official_fallback"
+  | "unknown";
+
+export type AsrTokenEvidence = {
+  chunk_index: number;
+  token_index: number;
+  token_id: number;
+  text: string;
+  selected_logprob: number;
+  entropy: number;
+  top1_top2_margin: number;
+};
+
+export type QwenRuntimeMetrics = {
+  schema_version: number;
+  runtime_version?: string | null;
+  decode_mode: QwenDecodeMode;
+  diagnostics_complete: boolean;
+  fallback_reason?: string | null;
+  chunk_count?: number | null;
+  audio_encode_count?: number | null;
+  prompt_prefill_count?: number | null;
+  generated_token_count?: number | null;
+  max_new_tokens?: number | null;
+  finish_reason?: string | null;
+  token_evidence_truncated: boolean;
+  audio_feature_ms?: number | null;
+  prompt_prefill_ms?: number | null;
+  greedy_decode_ms?: number | null;
+  worker_total_ms: number;
+  mlx_peak_memory_bytes?: number | null;
+  mlx_active_memory_bytes_before_cleanup?: number | null;
+  mlx_active_memory_bytes_after_cleanup?: number | null;
+  mlx_cache_memory_bytes_after_cleanup?: number | null;
+  process_max_rss_bytes: number;
+  process_user_cpu_ms: number;
+  process_system_cpu_ms: number;
+};
+
+export type AsrRuntimeDiagnostics = {
+  worker_reused?: boolean | null;
+  model?: string | null;
+  model_revision?: string | null;
+  token_evidence: AsrTokenEvidence[];
+  qwen?: QwenRuntimeMetrics | null;
+};
+
 export type PipelineMetrics = {
   schema_version: number;
   audio_duration_ms: number;
@@ -166,6 +215,7 @@ export type PipelineMetrics = {
   insertion_outcome: InsertionOutcome;
   insert_succeeded: boolean;
   stage_issues: PipelineStageIssue[];
+  asr_runtime?: AsrRuntimeDiagnostics | null;
 };
 
 export type PipelineStageIssue = {

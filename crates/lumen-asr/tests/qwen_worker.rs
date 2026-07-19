@@ -1,4 +1,4 @@
-use lumen_asr::{AsrEngine, AsrRequest, QwenAsr, QwenAsrConfig};
+use lumen_asr::{AsrEngine, AsrRequest, QwenAsr, QwenAsrConfig, QwenDecodeMode};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,6 +75,182 @@ for line in sys.stdin:
     assert_eq!(first.diagnostics.worker_reused, Some(false));
     assert_eq!(second.diagnostics.worker_reused, Some(true));
     assert_eq!(std::fs::read_to_string(&starts).unwrap(), "started\n");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn qwen_exposes_greedy_token_and_resource_diagnostics() {
+    let root = temp_dir("greedy-diagnostics");
+    std::fs::create_dir_all(&root).unwrap();
+    let worker = root.join("diagnostic_worker.py");
+    std::fs::write(
+        &worker,
+        r#"
+import argparse
+import json
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+args = parser.parse_args()
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "id": request["id"],
+        "text": "Qwen",
+        "language": "English",
+        "token_evidence": [{
+            "chunk_index": 0,
+            "token_index": 0,
+            "token_id": 101,
+            "text": "Q",
+            "selected_logprob": -0.25,
+            "entropy": 0.75,
+            "top1_top2_margin": 1.5
+        }],
+        "qwen_metrics": {
+            "schema_version": 1,
+            "runtime_version": "0.3.5",
+            "decode_mode": "greedy_only",
+            "diagnostics_complete": True,
+            "fallback_reason": None,
+            "chunk_count": 1,
+            "audio_encode_count": 1,
+            "prompt_prefill_count": 1,
+            "generated_token_count": 1,
+            "max_new_tokens": 128,
+            "finish_reason": "eos",
+            "token_evidence_truncated": False,
+            "audio_feature_ms": 2.5,
+            "prompt_prefill_ms": 3.5,
+            "greedy_decode_ms": 4.5,
+            "worker_total_ms": 11.0,
+            "mlx_peak_memory_bytes": 1000,
+            "mlx_active_memory_bytes_before_cleanup": 900,
+            "mlx_active_memory_bytes_after_cleanup": 700,
+            "mlx_cache_memory_bytes_after_cleanup": 200,
+            "process_max_rss_bytes": 2000,
+            "process_user_cpu_ms": 8.0,
+            "process_system_cpu_ms": 1.0
+        }
+    }), flush=True)
+"#,
+    )
+    .unwrap();
+    let model = root.join("model");
+    std::fs::create_dir_all(&model).unwrap();
+    let engine = QwenAsr::new(QwenAsrConfig {
+        python_executable: python_executable(),
+        worker_script: worker,
+        model_dir: model,
+        language: None,
+        timeout: std::time::Duration::from_secs(5),
+        extra_args: vec![],
+    });
+
+    let result = engine
+        .transcribe(AsrRequest {
+            samples: vec![0.0; 1_600],
+            sample_rate: 16_000,
+            hotwords: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "Qwen");
+    assert_eq!(result.diagnostics.token_evidence.len(), 1);
+    let token = &result.diagnostics.token_evidence[0];
+    assert_eq!(token.chunk_index, 0);
+    assert_eq!(token.token_index, 0);
+    assert_eq!(token.token_id, 101);
+    assert_eq!(token.text, "Q");
+    assert_eq!(token.selected_logprob, -0.25);
+    assert_eq!(token.entropy, 0.75);
+    assert_eq!(token.top1_top2_margin, 1.5);
+
+    let metrics = result.diagnostics.qwen.as_ref().unwrap();
+    assert_eq!(metrics.decode_mode, QwenDecodeMode::GreedyOnly);
+    assert!(metrics.diagnostics_complete);
+    assert!(metrics.fallback_reason.is_none());
+    assert_eq!(metrics.chunk_count, Some(1));
+    assert_eq!(metrics.audio_encode_count, Some(1));
+    assert_eq!(metrics.prompt_prefill_count, Some(1));
+    assert_eq!(metrics.generated_token_count, Some(1));
+    assert_eq!(metrics.max_new_tokens, Some(128));
+    assert_eq!(metrics.finish_reason.as_deref(), Some("eos"));
+    assert_eq!(metrics.mlx_peak_memory_bytes, Some(1000));
+    assert_eq!(metrics.process_max_rss_bytes, 2000);
+    assert_eq!(metrics.process_user_cpu_ms, 8.0);
+    assert_eq!(metrics.process_system_cpu_ms, 1.0);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn qwen_exposes_official_fallback_reason_without_claiming_complete_diagnostics() {
+    let root = temp_dir("official-fallback");
+    std::fs::create_dir_all(&root).unwrap();
+    let worker = root.join("fallback_worker.py");
+    std::fs::write(
+        &worker,
+        r#"
+import argparse
+import json
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+args = parser.parse_args()
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "id": request["id"],
+        "text": "official",
+        "language": "Chinese",
+        "qwen_metrics": {
+            "schema_version": 1,
+            "runtime_version": "0.3.6",
+            "decode_mode": "official_fallback",
+            "fallback_reason": "unsupported_runtime_version"
+        }
+    }), flush=True)
+"#,
+    )
+    .unwrap();
+    let model = root.join("model");
+    std::fs::create_dir_all(&model).unwrap();
+    let engine = QwenAsr::new(QwenAsrConfig {
+        python_executable: python_executable(),
+        worker_script: worker,
+        model_dir: model,
+        language: None,
+        timeout: std::time::Duration::from_secs(5),
+        extra_args: vec![],
+    });
+
+    let result = engine
+        .transcribe(AsrRequest {
+            samples: vec![0.0; 1_600],
+            sample_rate: 16_000,
+            hotwords: vec![],
+        })
+        .await
+        .unwrap();
+    let metrics = result.diagnostics.qwen.as_ref().unwrap();
+
+    assert_eq!(result.text, "official");
+    assert_eq!(metrics.decode_mode, QwenDecodeMode::OfficialFallback);
+    assert!(!metrics.diagnostics_complete);
+    assert_eq!(
+        metrics.fallback_reason.as_deref(),
+        Some("unsupported_runtime_version")
+    );
+    assert!(result.diagnostics.token_evidence.is_empty());
+    assert!(metrics.chunk_count.is_none());
+    assert!(metrics.audio_encode_count.is_none());
+    assert!(metrics.prompt_prefill_count.is_none());
+    assert!(metrics.mlx_peak_memory_bytes.is_none());
+
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -397,7 +573,10 @@ for line in sys.stdin:
     };
 
     assert!(engine.transcribe(request()).await.is_err());
-    assert_eq!(engine.transcribe(request()).await.unwrap().text, "recovered");
+    assert_eq!(
+        engine.transcribe(request()).await.unwrap().text,
+        "recovered"
+    );
     assert_eq!(
         std::fs::read_to_string(&starts).unwrap(),
         "started\nstarted\n"
@@ -455,7 +634,10 @@ for line in sys.stdin:
 
     let error = engine.transcribe(request()).await.unwrap_err();
     assert!(error.to_string().contains("exceeded 1 MiB"));
-    assert_eq!(engine.transcribe(request()).await.unwrap().text, "recovered");
+    assert_eq!(
+        engine.transcribe(request()).await.unwrap().text,
+        "recovered"
+    );
     assert_eq!(
         std::fs::read_to_string(&starts).unwrap(),
         "started\nstarted\n"

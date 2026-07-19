@@ -1,4 +1,4 @@
-use crate::{AsrEngine, AsrError, AsrRequest, AsrResult};
+use crate::{AsrEngine, AsrError, AsrRequest, AsrResult, AsrTokenEvidence, QwenRuntimeMetrics};
 use async_trait::async_trait;
 use lumen_core::AsrEngineId;
 use serde::{Deserialize, Serialize};
@@ -284,14 +284,23 @@ impl AsrEngine for QwenAsr {
             .transcribe_path(generation, request_id, audio_file.path())
             .await?;
         let (model, model_revision) = crate::model_identity_from_path(&self.config.model_dir);
+        let WorkerResponse {
+            text,
+            language,
+            token_evidence,
+            qwen_metrics,
+            ..
+        } = response;
         Ok(AsrResult {
-            text: response.text.unwrap_or_default(),
+            text: text.unwrap_or_default(),
             engine: self.id(),
-            language: response.language,
+            language,
             diagnostics: crate::AsrRuntimeDiagnostics {
                 worker_reused: Some(worker_reused),
                 model,
                 model_revision,
+                token_evidence,
+                qwen: qwen_metrics,
             },
         })
     }
@@ -309,6 +318,10 @@ struct WorkerResponse {
     text: Option<String>,
     language: Option<String>,
     error: Option<String>,
+    #[serde(default)]
+    token_evidence: Vec<AsrTokenEvidence>,
+    #[serde(default)]
+    qwen_metrics: Option<QwenRuntimeMetrics>,
 }
 
 struct QwenWorker {

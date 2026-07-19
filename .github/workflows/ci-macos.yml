@@ -50,6 +50,11 @@ jobs:
             rustfmt --edition 2021 --config skip_children=true --check "$file"
           done < <(git diff -z --name-only "$BASE_SHA" HEAD -- '*.rs')
 
+      - name: Check Qwen worker
+        run: |
+          python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("crates/lumen-asr/src/qwen_worker.py").read_text())'
+          python3 crates/lumen-asr/tests/test_qwen_worker.py
+
       - name: Install frontend dependencies
         run: npm ci
         working-directory: apps/desktop
