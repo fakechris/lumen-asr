@@ -917,7 +917,10 @@ class GreedyDiagnostics:
         )
         self.mx.eval(logits)
         self._eval_cache(cache)
-        prefill_logits = logits
+        want_shadow = shadow is not None and bool(
+            shadow.get("enabled", False)
+        )
+        prefill_logits = logits if want_shadow else None
         prompt_prefill_ms = (time.perf_counter() - prefill_started) * 1000
 
         next_pos_base = self.mx.arange(
@@ -989,7 +992,7 @@ class GreedyDiagnostics:
         )
         shadow_diagnostics = None
         if shadow is not None:
-            if not bool(shadow.get("enabled", False)):
+            if not want_shadow:
                 shadow_diagnostics = _empty_shadow_diagnostics(
                     "disabled",
                     chunk_count=1,

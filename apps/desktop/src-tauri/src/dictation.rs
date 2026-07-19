@@ -1126,6 +1126,13 @@ async fn run_asr(
 }
 
 fn qwen_shadow_request_from_store(state: &AppState, enabled: bool) -> QwenShadowRequest {
+    if !enabled {
+        return QwenShadowRequest {
+            enabled: false,
+            ..QwenShadowRequest::default()
+        }
+        .bounded();
+    }
     let entries = match state.store.lock() {
         Ok(store) => match store.as_ref().map(|store| store.list_dictionary()) {
             Some(Ok(entries)) => entries,
@@ -1149,6 +1156,13 @@ fn qwen_shadow_request_from_store(state: &AppState, enabled: bool) -> QwenShadow
 }
 
 fn build_qwen_shadow_request(entries: &[DictionaryEntry], enabled: bool) -> QwenShadowRequest {
+    if !enabled {
+        return QwenShadowRequest {
+            enabled: false,
+            ..QwenShadowRequest::default()
+        }
+        .bounded();
+    }
     let mut terms = Vec::new();
     for entry in entries.iter().filter(|entry| entry.confirmed) {
         if terms.len() >= QWEN_SHADOW_TERM_LIMIT {
@@ -1479,6 +1493,11 @@ mod attempt_metric_tests {
             .terms
             .iter()
             .all(|term| term.source == "personal_dictionary"));
+
+        let disabled =
+            build_qwen_shadow_request(&[DictionaryEntry::term("must not leave the app")], false);
+        assert!(!disabled.enabled);
+        assert!(disabled.terms.is_empty());
     }
 
     #[tokio::test]

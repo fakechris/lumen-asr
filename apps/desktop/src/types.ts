@@ -192,12 +192,65 @@ export type QwenRuntimeMetrics = {
   process_system_cpu_ms?: number | null;
 };
 
+export type QwenShadowStatus =
+  | "disabled"
+  | "completed"
+  | "no_trigger"
+  | "unavailable"
+  | "failed"
+  | "unknown";
+
+export type QwenShadowScore = {
+  sum_logprob?: number | null;
+  mean_logprob?: number | null;
+  min_token_logprob?: number | null;
+};
+
+export type QwenShadowCandidate = {
+  surface: string;
+  source: string;
+  beam_rank?: number | null;
+  score: QwenShadowScore;
+  candidate_minus_current?: number | null;
+  disposition: string;
+};
+
+export type QwenShadowSpan = {
+  chunk_index: number;
+  token_start: number;
+  token_end: number;
+  current_surface: string;
+  detector_reasons: string[];
+  current_score: QwenShadowScore;
+  candidates: QwenShadowCandidate[];
+};
+
+export type QwenShadowDiagnostics = {
+  schema_version: number;
+  status: QwenShadowStatus;
+  policy_version: string;
+  chunk_count: number;
+  triggered_span_count: number;
+  candidate_count: number;
+  proposal_count: number;
+  cache_clone_count: number;
+  decoder_step_count: number;
+  shadow_total_ms?: number | null;
+  detector_ms?: number | null;
+  beam_ms?: number | null;
+  verifier_ms?: number | null;
+  user_output_changed: boolean;
+  fallback_reason?: string | null;
+  spans: QwenShadowSpan[];
+};
+
 export type AsrRuntimeDiagnostics = {
   worker_reused?: boolean | null;
   model?: string | null;
   model_revision?: string | null;
   token_evidence: AsrTokenEvidence[];
   qwen?: QwenRuntimeMetrics | null;
+  qwen_shadow?: QwenShadowDiagnostics | null;
 };
 
 export type PipelineMetrics = {
