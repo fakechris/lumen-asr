@@ -1,4 +1,7 @@
-use lumen_asr::{AsrEngine, AsrRequest, QwenAsr, QwenAsrConfig, QwenDecodeMode};
+use lumen_asr::{
+    AsrEngine, AsrRequest, QwenAsr, QwenAsrConfig, QwenDecodeMode, QwenShadowRequest,
+    QwenShadowStatus, QwenShadowTerm,
+};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +19,50 @@ fn python_executable() -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "python" } else { "python3" }))
+}
+
+#[test]
+fn qwen_shadow_request_enforces_product_resource_and_payload_bounds() {
+    let request = QwenShadowRequest {
+        schema_version: 99,
+        enabled: true,
+        terms: (0..80)
+            .map(|index| QwenShadowTerm {
+                surface: format!("  term-{index}-{}  ", "x".repeat(80)),
+                source: "source-that-is-longer-than-the-public-contract".into(),
+            })
+            .collect(),
+        max_spans_per_chunk: 99,
+        beam_width: 99,
+        beam_depth: 99,
+    }
+    .bounded();
+
+    assert_eq!(request.schema_version, 1);
+    assert_eq!(request.terms.len(), 64);
+    assert!(request
+        .terms
+        .iter()
+        .all(|term| !term.surface.starts_with(' ') && !term.surface.ends_with(' ')));
+    assert!(request
+        .terms
+        .iter()
+        .all(|term| term.surface.chars().count() <= 64));
+    assert!(request
+        .terms
+        .iter()
+        .all(|term| term.source.chars().count() <= 32));
+    assert!(
+        request
+            .terms
+            .iter()
+            .map(|term| term.surface.chars().count())
+            .sum::<usize>()
+            <= 4096
+    );
+    assert_eq!(request.max_spans_per_chunk, 2);
+    assert_eq!(request.beam_width, 4);
+    assert_eq!(request.beam_depth, 4);
 }
 
 #[tokio::test]
@@ -183,6 +230,98 @@ for line in sys.stdin:
     assert_eq!(metrics.process_max_rss_bytes, Some(2000));
     assert_eq!(metrics.process_user_cpu_ms, Some(8.0));
     assert_eq!(metrics.process_system_cpu_ms, Some(1.0));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn qwen_shadow_uses_the_same_worker_request_and_returns_bounded_diagnostics() {
+    let root = temp_dir("shadow-contract");
+    std::fs::create_dir_all(&root).unwrap();
+    let worker = root.join("shadow_worker.py");
+    std::fs::write(
+        &worker,
+        r#"
+import argparse
+import json
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", required=True)
+args = parser.parse_args()
+for line in sys.stdin:
+    request = json.loads(line)
+    shadow = request["shadow"]
+    assert shadow["enabled"] is True
+    assert shadow["beam_width"] == 4
+    assert shadow["beam_depth"] == 4
+    assert shadow["max_spans_per_chunk"] == 2
+    assert shadow["terms"] == [{
+        "surface": "Codex",
+        "source": "personal_dictionary"
+    }]
+    print(json.dumps({
+        "id": request["id"],
+        "text": "cotex",
+        "language": "Chinese",
+        "qwen_shadow": {
+            "schema_version": 1,
+            "status": "completed",
+            "policy_version": "qwen_shadow_v1",
+            "chunk_count": 1,
+            "triggered_span_count": 1,
+            "candidate_count": 1,
+            "proposal_count": 1,
+            "cache_clone_count": 0,
+            "decoder_step_count": 24,
+            "shadow_total_ms": 245.0,
+            "detector_ms": 0.5,
+            "beam_ms": 220.0,
+            "verifier_ms": 24.5,
+            "user_output_changed": False,
+            "spans": []
+        }
+    }), flush=True)
+"#,
+    )
+    .unwrap();
+    let model = root.join("model");
+    std::fs::create_dir_all(&model).unwrap();
+    let engine = QwenAsr::new(QwenAsrConfig {
+        python_executable: python_executable(),
+        worker_script: worker,
+        model_dir: model,
+        language: None,
+        timeout: std::time::Duration::from_secs(5),
+        extra_args: vec![],
+    });
+
+    let result = engine
+        .transcribe_with_shadow(
+            AsrRequest {
+                samples: vec![0.0; 1_600],
+                sample_rate: 16_000,
+                hotwords: vec![],
+            },
+            Some(QwenShadowRequest {
+                terms: vec![QwenShadowTerm {
+                    surface: "Codex".into(),
+                    source: "personal_dictionary".into(),
+                }],
+                ..QwenShadowRequest::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "cotex");
+    let shadow = result.diagnostics.qwen_shadow.as_ref().unwrap();
+    assert_eq!(shadow.status, QwenShadowStatus::Completed);
+    assert_eq!(shadow.triggered_span_count, 1);
+    assert_eq!(shadow.candidate_count, 1);
+    assert_eq!(shadow.proposal_count, 1);
+    assert_eq!(shadow.cache_clone_count, 0);
+    assert!(!shadow.user_output_changed);
 
     let _ = std::fs::remove_dir_all(root);
 }

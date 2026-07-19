@@ -27,7 +27,11 @@ pub use whisper::WhisperAsr;
 
 use async_trait::async_trait;
 use lumen_core::AsrEngineId;
-pub use lumen_core::{AsrRuntimeDiagnostics, AsrTokenEvidence, QwenDecodeMode, QwenRuntimeMetrics};
+pub use lumen_core::{
+    AsrRuntimeDiagnostics, AsrTokenEvidence, QwenDecodeMode, QwenRuntimeMetrics,
+    QwenShadowCandidate, QwenShadowDiagnostics, QwenShadowScore, QwenShadowSpan, QwenShadowStatus,
+};
+pub use qwen::{QwenShadowRequest, QwenShadowTerm};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;

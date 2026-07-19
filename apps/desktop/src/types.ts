@@ -128,7 +128,7 @@ export type PipelineIdentity = {
   enhancement_mode: EnhancementMode;
 };
 
-export type EnhancementMode = "none" | "unknown";
+export type EnhancementMode = "none" | "qwen_shadow" | "unknown";
 export type InsertionOutcome =
   | "not_requested"
   | "copied"

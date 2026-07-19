@@ -105,6 +105,7 @@ fn parse_pipeline_stage(value: &str) -> Option<PipelineStage> {
 pub enum EnhancementMode {
     #[default]
     None,
+    QwenShadow,
     #[serde(other)]
     Unknown,
 }

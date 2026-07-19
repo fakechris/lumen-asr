@@ -152,6 +152,7 @@ export const api = {
     invoke<{
       provider: string;
       runtimePath: string;
+      qwenShadowEnabled: boolean;
       baseUrl: string;
       model: string;
       hasApiKey: boolean;
@@ -161,6 +162,7 @@ export const api = {
   saveAsrServiceConfig: (input: {
     provider?: string;
     runtimePath?: string;
+    qwenShadowEnabled?: boolean;
     baseUrl?: string;
     model?: string;
     apiKey?: string;
@@ -170,6 +172,7 @@ export const api = {
     invoke<{
       provider: string;
       runtimePath: string;
+      qwenShadowEnabled: boolean;
       baseUrl: string;
       model: string;
       hasApiKey: boolean;

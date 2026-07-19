@@ -265,14 +265,14 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
         },
         AsrProviderPreset {
             id: "local_qwen".into(),
-            label: "本地 Qwen3-ASR 0.6B 8-bit（实验）".into(),
+            label: "本地 Qwen3-ASR 0.6B 8-bit（高准确率）".into(),
             kind: "local".into(),
             base_url: String::new(),
             default_model: "Qwen3-ASR-0.6B-8bit".into(),
             models: vec!["Qwen3-ASR-0.6B-8bit".into()],
             needs_api_key: false,
             status: "wired".into(),
-            notes: "实验性离线 MLX 引擎；模型常驻复用，识别后沿用当前文本整理流程。".into(),
+            notes: "本地 MLX 高准确率引擎；模型常驻复用，可运行不改输出的术语候选分析，识别后沿用当前文本整理流程。".into(),
         },
         AsrProviderPreset {
             id: "local_whisper".into(),
