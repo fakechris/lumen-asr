@@ -5,8 +5,8 @@ mod schema;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use lumen_core::{
-    DictEntryKind, DictEntrySource, EditSource, FocusInfo, InsertStrategy, SessionRecord,
-    SessionStatus,
+    AsrRuntimeDiagnostics, DictEntryKind, DictEntrySource, EditSource, FocusInfo, InsertStrategy,
+    SessionRecord, SessionStatus,
 };
 use lumen_dictionary::DictionaryEntry;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -195,6 +195,7 @@ pub struct PipelineMetrics {
     pub total_ms: f64,
     pub asr_rtf: Option<f64>,
     pub asr_worker_reused: Option<bool>,
+    pub asr_runtime: Option<AsrRuntimeDiagnostics>,
     pub corrector_fallback: bool,
     pub insertion_outcome: InsertionOutcome,
     /// Compatibility field derived from `insertion_outcome`.
@@ -215,6 +216,7 @@ struct PipelineMetricsDeserialize {
     total_ms: f64,
     asr_rtf: Option<f64>,
     asr_worker_reused: Option<bool>,
+    asr_runtime: Option<AsrRuntimeDiagnostics>,
     corrector_fallback: bool,
     insertion_outcome: Option<InsertionOutcome>,
     insert_succeeded: bool,
@@ -235,6 +237,7 @@ impl Default for PipelineMetricsDeserialize {
             total_ms: current.total_ms,
             asr_rtf: current.asr_rtf,
             asr_worker_reused: current.asr_worker_reused,
+            asr_runtime: current.asr_runtime,
             corrector_fallback: current.corrector_fallback,
             insertion_outcome: None,
             insert_succeeded: current.insert_succeeded,
@@ -267,6 +270,7 @@ impl<'de> Deserialize<'de> for PipelineMetrics {
             total_ms: value.total_ms,
             asr_rtf: value.asr_rtf,
             asr_worker_reused: value.asr_worker_reused,
+            asr_runtime: value.asr_runtime,
             corrector_fallback: value.corrector_fallback,
             insertion_outcome,
             insert_succeeded: insertion_outcome == InsertionOutcome::Inserted,
@@ -278,7 +282,7 @@ impl<'de> Deserialize<'de> for PipelineMetrics {
 impl Default for PipelineMetrics {
     fn default() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             audio_duration_ms: 0,
             preprocess_ms: 0.0,
             asr_ms: 0.0,
@@ -288,6 +292,7 @@ impl Default for PipelineMetrics {
             total_ms: 0.0,
             asr_rtf: None,
             asr_worker_reused: None,
+            asr_runtime: None,
             corrector_fallback: false,
             insertion_outcome: InsertionOutcome::NotRequested,
             insert_succeeded: false,
@@ -1036,6 +1041,50 @@ mod tests {
         assert_eq!(stored_retry.supersedes_attempt_id, Some(first.id));
         assert_eq!(stored_retry.failed_stage, Some(PipelineStage::Asr));
         assert_eq!(retry.supersedes_attempt_id, Some(first.id));
+    }
+
+    #[test]
+    fn attempt_round_trips_asr_runtime_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("runtime-diagnostics.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+
+        let mut attempt = DictationAttemptRecord::new(session.id);
+        attempt.pipeline_metrics.asr_runtime = Some(AsrRuntimeDiagnostics {
+            worker_reused: Some(true),
+            model: Some("Qwen3-ASR-0.6B-8bit".into()),
+            token_evidence: vec![lumen_core::AsrTokenEvidence {
+                token_index: 3,
+                token_id: 42,
+                selected_logprob: -0.5,
+                ..lumen_core::AsrTokenEvidence::default()
+            }],
+            qwen: Some(lumen_core::QwenRuntimeMetrics {
+                chunk_count: Some(1),
+                audio_encode_count: Some(1),
+                prompt_prefill_count: Some(1),
+                ..lumen_core::QwenRuntimeMetrics::default()
+            }),
+            ..AsrRuntimeDiagnostics::default()
+        });
+        store.append_dictation_attempt(attempt).unwrap();
+
+        let stored = store
+            .list_dictation_attempts(session.id, MAX_ATTEMPT_PAGE_SIZE, None)
+            .unwrap();
+        let diagnostics = stored[0].pipeline_metrics.asr_runtime.as_ref().unwrap();
+        assert_eq!(stored[0].pipeline_metrics.schema_version, 3);
+        assert_eq!(diagnostics.worker_reused, Some(true));
+        assert_eq!(diagnostics.token_evidence[0].token_index, 3);
+        assert_eq!(
+            diagnostics.qwen.as_ref().unwrap().audio_encode_count,
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics.qwen.as_ref().unwrap().prompt_prefill_count,
+            Some(1)
+        );
     }
 
     #[test]

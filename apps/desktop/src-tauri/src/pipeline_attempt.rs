@@ -94,6 +94,7 @@ pub(crate) fn apply_asr_result(
 ) -> (String, String) {
     attempt.pipeline_metrics.asr_ms = elapsed_ms(asr_started);
     attempt.pipeline_metrics.asr_worker_reused = result.diagnostics.worker_reused;
+    attempt.pipeline_metrics.asr_runtime = Some(result.diagnostics.clone());
     attempt.pipeline_metrics.set_asr_rtf();
     if result.diagnostics.model.is_some() {
         attempt.pipeline_identity.asr_model = result.diagnostics.model.clone();
@@ -298,6 +299,7 @@ mod tests {
                 worker_reused: Some(true),
                 model: Some("Qwen3-ASR-0.6B-8bit".into()),
                 model_revision: Some("revision-1".into()),
+                ..AsrRuntimeDiagnostics::default()
             },
         };
 
@@ -308,6 +310,14 @@ mod tests {
         assert_eq!(attempt.asr_raw.as_deref(), Some(raw.as_str()));
         assert_eq!(attempt.asr_enhanced.as_deref(), Some(enhanced.as_str()));
         assert_eq!(attempt.pipeline_metrics.asr_worker_reused, Some(true));
+        assert_eq!(
+            attempt
+                .pipeline_metrics
+                .asr_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.worker_reused),
+            Some(true)
+        );
         assert_eq!(
             attempt.pipeline_identity.asr_model.as_deref(),
             Some("Qwen3-ASR-0.6B-8bit")
