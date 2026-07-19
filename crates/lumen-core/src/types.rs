@@ -114,6 +114,94 @@ pub struct QwenRuntimeMetrics {
     pub process_system_cpu_ms: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QwenShadowStatus {
+    Disabled,
+    Completed,
+    NoTrigger,
+    Unavailable,
+    Failed,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QwenShadowScore {
+    pub sum_logprob: Option<f64>,
+    pub mean_logprob: Option<f64>,
+    pub min_token_logprob: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QwenShadowCandidate {
+    pub surface: String,
+    pub source: String,
+    pub beam_rank: Option<u32>,
+    pub score: QwenShadowScore,
+    pub candidate_minus_current: Option<f64>,
+    pub disposition: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QwenShadowSpan {
+    pub chunk_index: u32,
+    pub token_start: u32,
+    pub token_end: u32,
+    pub current_surface: String,
+    pub detector_reasons: Vec<String>,
+    pub current_score: QwenShadowScore,
+    pub candidates: Vec<QwenShadowCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QwenShadowDiagnostics {
+    pub schema_version: u32,
+    pub status: QwenShadowStatus,
+    pub policy_version: String,
+    pub chunk_count: u32,
+    pub triggered_span_count: u32,
+    pub candidate_count: u32,
+    pub proposal_count: u32,
+    pub cache_clone_count: u32,
+    pub decoder_step_count: u32,
+    pub shadow_total_ms: Option<f64>,
+    pub detector_ms: Option<f64>,
+    pub beam_ms: Option<f64>,
+    pub verifier_ms: Option<f64>,
+    pub user_output_changed: bool,
+    pub fallback_reason: Option<String>,
+    pub spans: Vec<QwenShadowSpan>,
+}
+
+impl Default for QwenShadowDiagnostics {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            status: QwenShadowStatus::Unknown,
+            policy_version: String::new(),
+            chunk_count: 0,
+            triggered_span_count: 0,
+            candidate_count: 0,
+            proposal_count: 0,
+            cache_clone_count: 0,
+            decoder_step_count: 0,
+            shadow_total_ms: None,
+            detector_ms: None,
+            beam_ms: None,
+            verifier_ms: None,
+            user_output_changed: false,
+            fallback_reason: None,
+            spans: Vec::new(),
+        }
+    }
+}
+
 impl Default for QwenRuntimeMetrics {
     fn default() -> Self {
         Self {
@@ -156,6 +244,7 @@ pub struct AsrRuntimeDiagnostics {
     pub model_revision: Option<String>,
     pub token_evidence: Vec<AsrTokenEvidence>,
     pub qwen: Option<QwenRuntimeMetrics>,
+    pub qwen_shadow: Option<QwenShadowDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

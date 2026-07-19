@@ -1,4 +1,7 @@
-use crate::{AsrEngine, AsrError, AsrRequest, AsrResult, AsrTokenEvidence, QwenRuntimeMetrics};
+use crate::{
+    AsrEngine, AsrError, AsrRequest, AsrResult, AsrTokenEvidence, QwenRuntimeMetrics,
+    QwenShadowDiagnostics,
+};
 use async_trait::async_trait;
 use lumen_core::AsrEngineId;
 use serde::{Deserialize, Serialize};
@@ -14,7 +17,82 @@ use tokio::sync::Mutex;
 
 const PRODUCT_WORKER: &str = include_str!("qwen_worker.py");
 const MAX_WORKER_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_SHADOW_TERMS: usize = 64;
+const MAX_SHADOW_TERM_CHARS: usize = 64;
+const MAX_SHADOW_SOURCE_CHARS: usize = 32;
+const MAX_SHADOW_TOTAL_TERM_CHARS: usize = 4096;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QwenShadowTerm {
+    pub surface: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QwenShadowRequest {
+    pub schema_version: u32,
+    pub enabled: bool,
+    pub terms: Vec<QwenShadowTerm>,
+    pub max_spans_per_chunk: u32,
+    pub beam_width: u32,
+    pub beam_depth: u32,
+}
+
+impl Default for QwenShadowRequest {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            enabled: true,
+            terms: Vec::new(),
+            max_spans_per_chunk: 2,
+            beam_width: 4,
+            beam_depth: 4,
+        }
+    }
+}
+
+impl QwenShadowRequest {
+    /// Apply the product's fixed compute and payload limits before serialization.
+    pub fn bounded(mut self) -> Self {
+        let mut total_chars = 0usize;
+        let mut terms = Vec::with_capacity(self.terms.len().min(MAX_SHADOW_TERMS));
+        for term in self.terms {
+            if terms.len() >= MAX_SHADOW_TERMS || total_chars >= MAX_SHADOW_TOTAL_TERM_CHARS {
+                break;
+            }
+            let surface = truncate_chars(term.surface.trim(), MAX_SHADOW_TERM_CHARS);
+            if surface.is_empty() {
+                continue;
+            }
+            let remaining = MAX_SHADOW_TOTAL_TERM_CHARS - total_chars;
+            let surface = truncate_chars(&surface, remaining);
+            if surface.is_empty()
+                || terms
+                    .iter()
+                    .any(|existing: &QwenShadowTerm| existing.surface == surface)
+            {
+                continue;
+            }
+            total_chars += surface.chars().count();
+            terms.push(QwenShadowTerm {
+                surface,
+                source: truncate_chars(term.source.trim(), MAX_SHADOW_SOURCE_CHARS),
+            });
+        }
+
+        self.schema_version = 1;
+        self.terms = terms;
+        self.max_spans_per_chunk = self.max_spans_per_chunk.clamp(1, 2);
+        self.beam_width = self.beam_width.clamp(1, 4);
+        self.beam_depth = self.beam_depth.clamp(1, 4);
+        self
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct QwenAsrConfig {
@@ -138,9 +216,10 @@ impl QwenAsr {
         generation: u64,
         request_id: u64,
         path: &Path,
+        shadow: Option<QwenShadowRequest>,
     ) -> Result<(WorkerResponse, bool), AsrError> {
         let result = self
-            .transcribe_path_inner(generation, request_id, path)
+            .transcribe_path_inner(generation, request_id, path, shadow)
             .await;
         if self.lifecycle_generation.load(Ordering::SeqCst) != generation
             && !self.active.load(Ordering::SeqCst)
@@ -158,6 +237,7 @@ impl QwenAsr {
         generation: u64,
         request_id: u64,
         path: &Path,
+        shadow: Option<QwenShadowRequest>,
     ) -> Result<(WorkerResponse, bool), AsrError> {
         let mut guard = self.worker.lock().await;
         if self.lifecycle_generation.load(Ordering::SeqCst) != generation
@@ -175,6 +255,7 @@ impl QwenAsr {
         let request = WorkerRequest {
             id: request_id,
             audio_path: path.display().to_string(),
+            shadow: shadow.map(QwenShadowRequest::bounded),
         };
         let mut encoded = serde_json::to_vec(&request)
             .map_err(|error| AsrError::Inference(format!("encode Qwen request: {error}")))?;
@@ -250,15 +331,12 @@ impl QwenAsr {
         }
         Ok((response, worker_reused))
     }
-}
 
-#[async_trait]
-impl AsrEngine for QwenAsr {
-    fn id(&self) -> AsrEngineId {
-        AsrEngineId::Qwen3Asr
-    }
-
-    async fn transcribe(&self, req: AsrRequest) -> Result<AsrResult, AsrError> {
+    pub async fn transcribe_with_shadow(
+        &self,
+        req: AsrRequest,
+        shadow: Option<QwenShadowRequest>,
+    ) -> Result<AsrResult, AsrError> {
         if req.samples.is_empty() {
             return Err(AsrError::EmptyAudio);
         }
@@ -281,7 +359,7 @@ impl AsrEngine for QwenAsr {
         .await
         .map_err(|error| AsrError::Inference(format!("prepare Qwen audio task: {error}")))??;
         let (response, worker_reused) = self
-            .transcribe_path(generation, request_id, audio_file.path())
+            .transcribe_path(generation, request_id, audio_file.path(), shadow)
             .await?;
         let (model, model_revision) = crate::model_identity_from_path(&self.config.model_dir);
         let WorkerResponse {
@@ -289,6 +367,7 @@ impl AsrEngine for QwenAsr {
             language,
             token_evidence,
             qwen_metrics,
+            qwen_shadow,
             ..
         } = response;
         Ok(AsrResult {
@@ -301,8 +380,20 @@ impl AsrEngine for QwenAsr {
                 model_revision,
                 token_evidence,
                 qwen: qwen_metrics,
+                qwen_shadow,
             },
         })
+    }
+}
+
+#[async_trait]
+impl AsrEngine for QwenAsr {
+    fn id(&self) -> AsrEngineId {
+        AsrEngineId::Qwen3Asr
+    }
+
+    async fn transcribe(&self, req: AsrRequest) -> Result<AsrResult, AsrError> {
+        self.transcribe_with_shadow(req, None).await
     }
 }
 
@@ -310,6 +401,8 @@ impl AsrEngine for QwenAsr {
 struct WorkerRequest {
     id: u64,
     audio_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadow: Option<QwenShadowRequest>,
 }
 
 #[derive(Deserialize)]
@@ -322,6 +415,8 @@ struct WorkerResponse {
     token_evidence: Vec<AsrTokenEvidence>,
     #[serde(default)]
     qwen_metrics: Option<QwenRuntimeMetrics>,
+    #[serde(default)]
+    qwen_shadow: Option<QwenShadowDiagnostics>,
 }
 
 struct QwenWorker {

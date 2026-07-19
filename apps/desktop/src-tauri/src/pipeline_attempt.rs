@@ -5,7 +5,7 @@ use crate::corrector_svc::{
 use crate::dictation::{canonical_asr_provider, engine_kind_for_provider};
 use crate::session_debug::{self, SessionDebugMeta};
 use crate::AppState;
-use lumen_asr::{model_identity_from_path, AsrResult, EngineKind};
+use lumen_asr::{model_identity_from_path, AsrResult, EngineKind, QwenShadowStatus};
 use lumen_core::SessionRecord;
 use lumen_platform_macos::FrontmostTarget;
 use lumen_prompts::IntentSpec;
@@ -92,7 +92,32 @@ pub(crate) fn apply_asr_result(
     result: &AsrResult,
     asr_started: Instant,
 ) -> (String, String) {
-    attempt.pipeline_metrics.asr_ms = elapsed_ms(asr_started);
+    let asr_wall_ms = elapsed_ms(asr_started);
+    if let Some(shadow) = result.diagnostics.qwen_shadow.as_ref() {
+        if shadow.status != QwenShadowStatus::Disabled {
+            attempt.pipeline_identity.enhancement_mode = EnhancementMode::QwenShadow;
+            attempt.pipeline_metrics.enhancement_ms =
+                shadow.shadow_total_ms.unwrap_or_default().max(0.0);
+        }
+        if matches!(
+            shadow.status,
+            QwenShadowStatus::Failed | QwenShadowStatus::Unavailable
+        ) {
+            attempt
+                .pipeline_metrics
+                .stage_issues
+                .push(PipelineStageIssue {
+                    stage: PipelineStage::Enhancement,
+                    kind: PipelineIssueKind::Fallback,
+                    message: shadow
+                        .fallback_reason
+                        .clone()
+                        .unwrap_or_else(|| "qwen_shadow_unavailable".into()),
+                });
+        }
+    }
+    attempt.pipeline_metrics.asr_ms =
+        (asr_wall_ms - attempt.pipeline_metrics.enhancement_ms).max(0.0);
     attempt.pipeline_metrics.asr_worker_reused = result.diagnostics.worker_reused;
     attempt.pipeline_metrics.asr_runtime = Some(result.diagnostics.clone());
     attempt.pipeline_metrics.set_asr_rtf();
@@ -281,9 +306,11 @@ pub(crate) fn write_attempt_debug(
 #[cfg(test)]
 mod tests {
     use super::{apply_asr_result, mark_attempt_failed};
-    use lumen_asr::{AsrResult, AsrRuntimeDiagnostics};
+    use lumen_asr::{AsrResult, AsrRuntimeDiagnostics, QwenShadowDiagnostics, QwenShadowStatus};
     use lumen_core::AsrEngineId;
-    use lumen_store::{AttemptStatus, DictationAttemptRecord, PipelineStage};
+    use lumen_store::{
+        AttemptStatus, DictationAttemptRecord, EnhancementMode, PipelineIssueKind, PipelineStage,
+    };
     use std::time::Instant;
     use uuid::Uuid;
 
@@ -299,6 +326,12 @@ mod tests {
                 worker_reused: Some(true),
                 model: Some("Qwen3-ASR-0.6B-8bit".into()),
                 model_revision: Some("revision-1".into()),
+                qwen_shadow: Some(QwenShadowDiagnostics {
+                    status: QwenShadowStatus::Completed,
+                    shadow_total_ms: Some(245.0),
+                    user_output_changed: false,
+                    ..QwenShadowDiagnostics::default()
+                }),
                 ..AsrRuntimeDiagnostics::default()
             },
         };
@@ -326,7 +359,67 @@ mod tests {
             attempt.pipeline_identity.asr_model_revision.as_deref(),
             Some("revision-1")
         );
+        assert_eq!(
+            attempt.pipeline_identity.enhancement_mode,
+            EnhancementMode::QwenShadow
+        );
+        assert_eq!(attempt.pipeline_metrics.enhancement_ms, 245.0);
         assert!(attempt.pipeline_metrics.asr_rtf.is_some());
+    }
+
+    #[test]
+    fn disabled_qwen_shadow_does_not_claim_an_enhancement_stage() {
+        let mut attempt = DictationAttemptRecord::new(Uuid::new_v4());
+        let result = AsrResult {
+            text: "原始听写".into(),
+            engine: AsrEngineId::Qwen3Asr,
+            language: Some("zh".into()),
+            diagnostics: AsrRuntimeDiagnostics {
+                qwen_shadow: Some(QwenShadowDiagnostics {
+                    status: QwenShadowStatus::Disabled,
+                    ..QwenShadowDiagnostics::default()
+                }),
+                ..AsrRuntimeDiagnostics::default()
+            },
+        };
+
+        apply_asr_result(&mut attempt, &result, Instant::now());
+
+        assert_eq!(
+            attempt.pipeline_identity.enhancement_mode,
+            EnhancementMode::None
+        );
+        assert_eq!(attempt.pipeline_metrics.enhancement_ms, 0.0);
+    }
+
+    #[test]
+    fn failed_qwen_shadow_records_an_enhancement_fallback() {
+        let mut attempt = DictationAttemptRecord::new(Uuid::new_v4());
+        let result = AsrResult {
+            text: "原始听写".into(),
+            engine: AsrEngineId::Qwen3Asr,
+            language: Some("zh".into()),
+            diagnostics: AsrRuntimeDiagnostics {
+                qwen_shadow: Some(QwenShadowDiagnostics {
+                    status: QwenShadowStatus::Failed,
+                    fallback_reason: Some("shadow_runtime_error".into()),
+                    ..QwenShadowDiagnostics::default()
+                }),
+                ..AsrRuntimeDiagnostics::default()
+            },
+        };
+
+        apply_asr_result(&mut attempt, &result, Instant::now());
+
+        assert_eq!(
+            attempt.pipeline_identity.enhancement_mode,
+            EnhancementMode::QwenShadow
+        );
+        assert_eq!(attempt.pipeline_metrics.stage_issues.len(), 1);
+        let issue = &attempt.pipeline_metrics.stage_issues[0];
+        assert_eq!(issue.stage, PipelineStage::Enhancement);
+        assert_eq!(issue.kind, PipelineIssueKind::Fallback);
+        assert_eq!(issue.message, "shadow_runtime_error");
     }
 
     #[test]

@@ -12,8 +12,8 @@ mod inject_cmd;
 mod learning;
 mod mod_chord;
 mod onboard;
-mod pipeline_attempt;
 mod permissions_cmd;
+mod pipeline_attempt;
 mod provider_presets;
 mod session_debug;
 mod volume_mon;
@@ -131,10 +131,9 @@ pub(crate) fn schedule_qwen_runtime_refresh(app: tauri::AppHandle) -> Result<(),
 
     tauri::async_runtime::spawn(async move {
         let probe_executable = executable.clone();
-        let ready =
-            tokio::task::spawn_blocking(move || qwen_runtime_available(&probe_executable))
-                .await
-                .unwrap_or(false);
+        let ready = tokio::task::spawn_blocking(move || qwen_runtime_available(&probe_executable))
+            .await
+            .unwrap_or(false);
         let state = app.state::<AppState>();
         let Ok(mut runtime) = state.qwen_runtime.lock() else {
             tracing::warn!("qwen runtime lock poisoned after probe");
@@ -175,9 +174,7 @@ pub fn run() {
             tracing::info!(path = %log_path.display(), "file logging enabled");
         }
         Err(e) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
             tracing::warn!(error = %e, "file logging unavailable");
         }
     }
@@ -215,12 +212,12 @@ pub fn run() {
     let sv_dir = (!selected_sensevoice_dir.as_os_str().is_empty()
         && sensevoice_ready(&selected_sensevoice_dir))
     .then_some(selected_sensevoice_dir)
-        .unwrap_or_else(default_sensevoice_dir);
+    .unwrap_or_else(default_sensevoice_dir);
     let selected_whisper_dir = app_config.asr.model_dir_for(EngineKind::Whisper);
     let wh_dir = (!selected_whisper_dir.as_os_str().is_empty()
         && whisper_ready(&selected_whisper_dir))
     .then_some(selected_whisper_dir)
-        .unwrap_or_else(default_whisper_dir);
+    .unwrap_or_else(default_whisper_dir);
     let qwen = qwen_engine_from_config(&app_config.asr);
     let qwen_runtime = QwenRuntimeStatus {
         executable: qwen.python_executable().to_path_buf(),
@@ -416,10 +413,7 @@ mod tests {
     #[test]
     fn qwen_provider_aliases_share_one_canonical_engine_contract() {
         for alias in ["qwen", "qwen3_asr", "local_qwen"] {
-            assert_eq!(
-                dictation::canonical_asr_provider(alias),
-                "local_qwen"
-            );
+            assert_eq!(dictation::canonical_asr_provider(alias), "local_qwen");
             assert_eq!(
                 dictation::engine_kind_for_provider(alias),
                 Some(EngineKind::Qwen)
@@ -431,7 +425,7 @@ mod tests {
     fn backend_recording_gate_rejects_unready_qwen() {
         let error = dictation::ensure_active_asr_ready(
             "local_qwen",
-            "本地 Qwen3-ASR 0.6B 8-bit（实验）",
+            "本地 Qwen3-ASR 0.6B 8-bit（高准确率）",
             false,
             false,
         )

@@ -881,7 +881,7 @@ function RecordPanel({
               本地 SenseVoice {status?.sensevoice.ready ? "✓" : "（模型未就绪）"}
             </option>
             <option value="local_qwen">
-              本地 Qwen3-ASR 0.6B 8-bit（实验）{" "}
+              本地 Qwen3-ASR 0.6B 8-bit（高准确率）{" "}
               {status?.qwenRuntimeChecking
                 ? "（正在检查运行环境…）"
                 : status?.qwen.ready && status?.qwenRuntimeReady
@@ -1114,6 +1114,7 @@ function SettingsPanel({
   >([]);
   const [asrProvider, setAsrProvider] = useState("local_sensevoice");
   const [asrRuntimePath, setAsrRuntimePath] = useState("");
+  const [qwenShadowEnabled, setQwenShadowEnabled] = useState(false);
   const [asrBaseUrl, setAsrBaseUrl] = useState("");
   const [asrModel, setAsrModel] = useState("");
   const [asrApiKey, setAsrApiKey] = useState("");
@@ -1160,6 +1161,7 @@ function SettingsPanel({
         setAsrPresets(asrP);
         setAsrProvider(asrC.provider);
         setAsrRuntimePath(asrC.runtimePath || "");
+        setQwenShadowEnabled(asrC.qwenShadowEnabled);
         setAsrBaseUrl(asrC.baseUrl);
         setAsrModel(asrC.model);
         setAsrLanguage(asrC.language || "");
@@ -1462,8 +1464,8 @@ function SettingsPanel({
       <section className="card settings-section">
         <h2>语音识别（ASR）</h2>
         <p className="muted-text">
-          SenseVoice 与 Qwen 是两条独立的本地识别前端；识别后共用当前的文本整理、插入与学习流程。Qwen
-          当前为实验选项。
+          SenseVoice 与 Qwen 是两条独立的本地识别前端；Qwen
+          优先准确率，SenseVoice 优先较低资源占用。识别后共用当前的文本整理、插入与学习流程。
         </p>
         <div className="form-row" style={{ marginBottom: 10 }}>
           <label className="muted-text" style={{ minWidth: 72 }}>
@@ -1581,18 +1583,33 @@ function SettingsPanel({
           </div>
         )}
         {asrProvider === "local_qwen" && (
-          <div className="form-row" style={{ marginBottom: 10 }}>
-            <label className="muted-text" style={{ minWidth: 120 }}>
-              Qwen Python
-            </label>
-            <input
-              className="input"
-              value={asrRuntimePath}
-              disabled={busy}
-              onChange={(event) => setAsrRuntimePath(event.target.value)}
-              placeholder="包含 mlx_qwen3_asr 的 Python 可执行文件"
-            />
-          </div>
+          <>
+            <div className="form-row" style={{ marginBottom: 10 }}>
+              <label className="muted-text" style={{ minWidth: 120 }}>
+                Qwen Python
+              </label>
+              <input
+                className="input"
+                value={asrRuntimePath}
+                disabled={busy}
+                onChange={(event) => setAsrRuntimePath(event.target.value)}
+                placeholder="包含 mlx_qwen3_asr 的 Python 可执行文件"
+              />
+            </div>
+            <div className="form-row" style={{ marginBottom: 10 }}>
+              <label className="muted-text">
+                <input
+                  type="checkbox"
+                  checked={qwenShadowEnabled}
+                  disabled={busy}
+                  onChange={(event) =>
+                    setQwenShadowEnabled(event.target.checked)
+                  }
+                />{" "}
+                启用本地术语候选分析（不改变输出）
+              </label>
+            </div>
+          </>
         )}
         {!asrProvider.startsWith("local") && (
           <>
@@ -1663,6 +1680,7 @@ function SettingsPanel({
                   const input: Parameters<typeof api.saveAsrServiceConfig>[0] = {
                     provider: asrProvider,
                     runtimePath: asrRuntimePath,
+                    qwenShadowEnabled,
                     baseUrl: asrBaseUrl,
                     model: asrModel,
                     language: asrLanguage,
@@ -1671,6 +1689,7 @@ function SettingsPanel({
                   const s = await api.saveAsrServiceConfig(input);
                   setAsrProvider(s.provider);
                   setAsrRuntimePath(s.runtimePath || "");
+                  setQwenShadowEnabled(s.qwenShadowEnabled);
                   setAsrBaseUrl(s.baseUrl);
                   setAsrModel(s.model);
                   setAsrLanguage(s.language);

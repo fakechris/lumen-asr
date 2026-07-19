@@ -10,8 +10,10 @@ use crate::AppState;
 use lumen_asr::{
     prepare_for_asr, qwen_ready, sensevoice_ready, whisper_ready, AsrEngine, AsrRequest, AsrResult,
     AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig,
+    QwenShadowRequest, QwenShadowTerm,
 };
-use lumen_core::{FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
+use lumen_core::{DictEntryKind, FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
+use lumen_dictionary::DictionaryEntry;
 use lumen_platform_macos::{
     activate_target, frontmost_app_name, frontmost_target, is_self_app_name, is_self_target,
     FrontmostTarget,
@@ -35,6 +37,7 @@ static SESSION_INTENT: Mutex<IntentSpec> = Mutex::new(IntentSpec::Default);
 /// UI-facing copy of session intent; kept until capsule goes idle so processing
 /// phase still knows “翻译” after take_session_intent() for the corrector.
 static UI_SESSION_INTENT: Mutex<IntentSpec> = Mutex::new(IntentSpec::Default);
+const QWEN_SHADOW_TERM_LIMIT: usize = 64;
 
 pub fn set_session_intent(intent: IntentSpec) {
     if let Ok(mut g) = SESSION_INTENT.lock() {
@@ -1094,12 +1097,16 @@ async fn run_asr(
             .lock()
             .map_err(|_| "asr lock poisoned".to_string())?
             .clone();
+        let shadow = qwen_shadow_request_from_store(state, asr_cfg.qwen_shadow_enabled);
         return eng
-            .transcribe(AsrRequest {
-                samples: samples_16k,
-                sample_rate: 16_000,
-                hotwords: vec![],
-            })
+            .transcribe_with_shadow(
+                AsrRequest {
+                    samples: samples_16k,
+                    sample_rate: 16_000,
+                    hotwords: vec![],
+                },
+                Some(shadow),
+            )
             .await
             .map_err(|e| e.to_string());
     }
@@ -1116,6 +1123,75 @@ async fn run_asr(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+fn qwen_shadow_request_from_store(state: &AppState, enabled: bool) -> QwenShadowRequest {
+    if !enabled {
+        return QwenShadowRequest {
+            enabled: false,
+            ..QwenShadowRequest::default()
+        }
+        .bounded();
+    }
+    let entries = match state.store.lock() {
+        Ok(store) => match store.as_ref().map(|store| store.list_dictionary()) {
+            Some(Ok(entries)) => entries,
+            Some(Err(error)) => {
+                tracing::warn!(
+                    error = %error,
+                    "dictionary unavailable; Qwen shadow will run without personal terms"
+                );
+                Vec::new()
+            }
+            None => Vec::new(),
+        },
+        Err(_) => {
+            tracing::warn!(
+                "dictionary store lock poisoned; Qwen shadow will run without personal terms"
+            );
+            Vec::new()
+        }
+    };
+    build_qwen_shadow_request(&entries, enabled)
+}
+
+fn build_qwen_shadow_request(entries: &[DictionaryEntry], enabled: bool) -> QwenShadowRequest {
+    if !enabled {
+        return QwenShadowRequest {
+            enabled: false,
+            ..QwenShadowRequest::default()
+        }
+        .bounded();
+    }
+    let mut terms = Vec::new();
+    for entry in entries.iter().filter(|entry| entry.confirmed) {
+        if terms.len() >= QWEN_SHADOW_TERM_LIMIT {
+            break;
+        }
+        let surface = match entry.kind {
+            DictEntryKind::Term => entry.term.as_deref(),
+            DictEntryKind::Replacement => entry.to_text.as_deref(),
+        };
+        let Some(surface) = surface.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if terms
+            .iter()
+            .any(|term: &QwenShadowTerm| term.surface == surface)
+        {
+            continue;
+        }
+        terms.push(QwenShadowTerm {
+            surface: surface.to_owned(),
+            source: "personal_dictionary".into(),
+        });
+    }
+    QwenShadowRequest {
+        enabled,
+        terms,
+        ..QwenShadowRequest::default()
+    }
+    .bounded()
 }
 
 /// Capsule / hotkey lifecycle events for the UI.
@@ -1361,6 +1437,7 @@ mod attempt_metric_tests {
     use crate::config::AppConfig;
     use crate::{AppState, QwenRuntimeStatus};
     use lumen_asr::{AudioCapture, SenseVoiceSherpaAsr, WhisperAsr};
+    use lumen_dictionary::DictionaryEntry;
     use lumen_store::{Store, MAX_ATTEMPT_PAGE_SIZE};
     use std::sync::Mutex;
 
@@ -1384,6 +1461,43 @@ mod attempt_metric_tests {
             insertion_outcome_for_strategy(InsertStrategy::None),
             InsertionOutcome::Failed
         );
+    }
+
+    #[test]
+    fn qwen_shadow_uses_only_confirmed_personal_dictionary_surfaces() {
+        let confirmed_term = DictionaryEntry::term("Codex");
+        let confirmed_replacement = DictionaryEntry::replacement("cotex", "Codex CLI");
+        let mut unconfirmed = DictionaryEntry::term("private draft");
+        unconfirmed.confirmed = false;
+
+        let request = build_qwen_shadow_request(
+            &[
+                confirmed_term,
+                confirmed_replacement,
+                unconfirmed,
+                DictionaryEntry::term("Codex"),
+            ],
+            true,
+        );
+
+        assert!(request.enabled);
+        assert_eq!(
+            request
+                .terms
+                .iter()
+                .map(|term| term.surface.as_str())
+                .collect::<Vec<_>>(),
+            ["Codex", "Codex CLI"]
+        );
+        assert!(request
+            .terms
+            .iter()
+            .all(|term| term.source == "personal_dictionary"));
+
+        let disabled =
+            build_qwen_shadow_request(&[DictionaryEntry::term("must not leave the app")], false);
+        assert!(!disabled.enabled);
+        assert!(disabled.terms.is_empty());
     }
 
     #[tokio::test]

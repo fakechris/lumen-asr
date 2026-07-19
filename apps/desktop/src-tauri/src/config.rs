@@ -48,6 +48,8 @@ pub struct AsrServiceConfig {
     pub whisper_model_dir: String,
     /// Python executable containing `mlx_qwen3_asr` for the local Qwen engine.
     pub runtime_path: String,
+    /// Opt into bounded same-worker Qwen candidate analysis without changing output.
+    pub qwen_shadow_enabled: bool,
     pub base_url: String,
     pub model: String,
     pub api_key: String,
@@ -65,6 +67,7 @@ impl Default for AsrServiceConfig {
             qwen_model_dir: String::new(),
             whisper_model_dir: String::new(),
             runtime_path: String::new(),
+            qwen_shadow_enabled: false,
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
@@ -146,9 +149,7 @@ impl AsrServiceConfig {
         std::env::var_os("LUMEN_QWEN_PYTHON")
             .filter(|value| !value.is_empty())
             .map(|value| expand_user_path(&value.to_string_lossy()))
-            .unwrap_or_else(|| {
-                PathBuf::from(if cfg!(windows) { "python" } else { "python3" })
-            })
+            .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "python" } else { "python3" }))
     }
 }
 
@@ -304,8 +305,7 @@ impl Default for CorrectorConfig {
             enabled: true,
             provider: "ollama".into(),
             base_url: "http://127.0.0.1:11434/v1".into(),
-            model: std::env::var("LUMEN_CORRECTOR_MODEL")
-                .unwrap_or_else(|_| "qwen3.5:9b".into()),
+            model: std::env::var("LUMEN_CORRECTOR_MODEL").unwrap_or_else(|_| "qwen3.5:9b".into()),
             api_key: std::env::var("LUMEN_CORRECTOR_API_KEY").unwrap_or_default(),
             timeout_secs: 60,
         }
@@ -389,11 +389,7 @@ impl Default for HotkeyConfig {
 
 /// Ensure a usable translate intent exists; align mode with primary hotkey.
 pub fn ensure_default_intents(cfg: &mut HotkeyConfig) {
-    let primary_mode = if cfg.is_hold_mode() {
-        "hold"
-    } else {
-        "toggle"
-    };
+    let primary_mode = if cfg.is_hold_mode() { "hold" } else { "toggle" };
     if cfg.intents.is_empty() {
         cfg.intents.push(HotkeyIntentConfig {
             mode: primary_mode.into(),
@@ -558,10 +554,7 @@ mod tests {
         let loaded = AppConfig::load_from(&path);
         assert_eq!(loaded.corrector.model, "test-model");
         assert_eq!(loaded.asr.model_dir, "/models/custom-sensevoice");
-        assert_eq!(
-            loaded.asr.sensevoice_model_dir,
-            "/models/custom-sensevoice"
-        );
+        assert_eq!(loaded.asr.sensevoice_model_dir, "/models/custom-sensevoice");
         let _ = fs::remove_file(path);
     }
 
@@ -624,5 +617,18 @@ mod tests {
             asr.qwen_python_executable(),
             lumen_asr::user_home_dir().join("qwen-env/bin/python")
         );
+    }
+
+    #[test]
+    fn qwen_shadow_remains_opt_in_for_existing_configs_without_the_new_field() {
+        let asr: AsrServiceConfig = toml::from_str(
+            r#"
+provider = "local_qwen"
+runtime_path = "/qwen/bin/python"
+"#,
+        )
+        .unwrap();
+
+        assert!(!asr.qwen_shadow_enabled);
     }
 }
