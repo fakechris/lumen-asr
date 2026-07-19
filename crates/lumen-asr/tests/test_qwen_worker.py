@@ -42,6 +42,34 @@ class OutputLanguageTests(unittest.TestCase):
         )
 
 
+class ResourceMetricsTests(unittest.TestCase):
+    def test_resource_metrics_are_unknown_without_platform_support(self) -> None:
+        original_resource = WORKER.resource
+        WORKER.resource = None
+        try:
+            self.assertIsNone(WORKER._resource_usage())
+            self.assertEqual(
+                WORKER._resource_metrics(None),
+                {
+                    "process_max_rss_bytes": None,
+                    "process_user_cpu_ms": None,
+                    "process_system_cpu_ms": None,
+                },
+            )
+        finally:
+            WORKER.resource = original_resource
+
+    def test_unavailable_or_invalid_metrics_remain_unknown(self) -> None:
+        self.assertIsNone(WORKER._finite_or_none(float("nan")))
+        self.assertIsNone(WORKER._finite_or_none(float("inf")))
+        self.assertIsNone(WORKER._sum_known([1.0, None]))
+        self.assertIsNone(WORKER._max_known([1, None]))
+
+        diagnostics = object.__new__(WORKER.GreedyDiagnostics)
+        diagnostics.mx = object()
+        self.assertIsNone(diagnostics._memory("get_peak_memory"))
+
+
 class RequestFailureTests(unittest.TestCase):
     def test_greedy_failure_does_not_transcribe_audio_twice(self) -> None:
         class Greedy:

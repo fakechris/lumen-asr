@@ -178,10 +178,11 @@ for line in sys.stdin:
     assert_eq!(metrics.generated_token_count, Some(1));
     assert_eq!(metrics.max_new_tokens, Some(128));
     assert_eq!(metrics.finish_reason.as_deref(), Some("eos"));
+    assert_eq!(metrics.worker_total_ms, Some(11.0));
     assert_eq!(metrics.mlx_peak_memory_bytes, Some(1000));
-    assert_eq!(metrics.process_max_rss_bytes, 2000);
-    assert_eq!(metrics.process_user_cpu_ms, 8.0);
-    assert_eq!(metrics.process_system_cpu_ms, 1.0);
+    assert_eq!(metrics.process_max_rss_bytes, Some(2000));
+    assert_eq!(metrics.process_user_cpu_ms, Some(8.0));
+    assert_eq!(metrics.process_system_cpu_ms, Some(1.0));
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -249,6 +250,7 @@ for line in sys.stdin:
     assert!(metrics.chunk_count.is_none());
     assert!(metrics.audio_encode_count.is_none());
     assert!(metrics.prompt_prefill_count.is_none());
+    assert!(metrics.worker_total_ms.is_none());
     assert!(metrics.mlx_peak_memory_bytes.is_none());
 
     let _ = std::fs::remove_dir_all(root);

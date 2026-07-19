@@ -182,14 +182,14 @@ export type QwenRuntimeMetrics = {
   audio_feature_ms?: number | null;
   prompt_prefill_ms?: number | null;
   greedy_decode_ms?: number | null;
-  worker_total_ms: number;
+  worker_total_ms?: number | null;
   mlx_peak_memory_bytes?: number | null;
   mlx_active_memory_bytes_before_cleanup?: number | null;
   mlx_active_memory_bytes_after_cleanup?: number | null;
   mlx_cache_memory_bytes_after_cleanup?: number | null;
-  process_max_rss_bytes: number;
-  process_user_cpu_ms: number;
-  process_system_cpu_ms: number;
+  process_max_rss_bytes?: number | null;
+  process_user_cpu_ms?: number | null;
+  process_system_cpu_ms?: number | null;
 };
 
 export type AsrRuntimeDiagnostics = {

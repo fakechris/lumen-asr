@@ -104,14 +104,14 @@ pub struct QwenRuntimeMetrics {
     pub audio_feature_ms: Option<f64>,
     pub prompt_prefill_ms: Option<f64>,
     pub greedy_decode_ms: Option<f64>,
-    pub worker_total_ms: f64,
+    pub worker_total_ms: Option<f64>,
     pub mlx_peak_memory_bytes: Option<u64>,
     pub mlx_active_memory_bytes_before_cleanup: Option<u64>,
     pub mlx_active_memory_bytes_after_cleanup: Option<u64>,
     pub mlx_cache_memory_bytes_after_cleanup: Option<u64>,
-    pub process_max_rss_bytes: u64,
-    pub process_user_cpu_ms: f64,
-    pub process_system_cpu_ms: f64,
+    pub process_max_rss_bytes: Option<u64>,
+    pub process_user_cpu_ms: Option<f64>,
+    pub process_system_cpu_ms: Option<f64>,
 }
 
 impl Default for QwenRuntimeMetrics {
@@ -132,14 +132,14 @@ impl Default for QwenRuntimeMetrics {
             audio_feature_ms: None,
             prompt_prefill_ms: None,
             greedy_decode_ms: None,
-            worker_total_ms: 0.0,
+            worker_total_ms: None,
             mlx_peak_memory_bytes: None,
             mlx_active_memory_bytes_before_cleanup: None,
             mlx_active_memory_bytes_after_cleanup: None,
             mlx_cache_memory_bytes_after_cleanup: None,
-            process_max_rss_bytes: 0,
-            process_user_cpu_ms: 0.0,
-            process_system_cpu_ms: 0.0,
+            process_max_rss_bytes: None,
+            process_user_cpu_ms: None,
+            process_system_cpu_ms: None,
         }
     }
 }

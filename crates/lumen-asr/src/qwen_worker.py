@@ -5,10 +5,14 @@ import contextlib
 import importlib.metadata
 import json
 import math
-import resource
 import sys
 import time
 import traceback
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 
 MAX_TOKEN_EVIDENCE = 2048
@@ -22,12 +26,29 @@ def _runtime_version() -> str | None:
         return None
 
 
-def _finite(value: float) -> float:
+def _finite_or_none(value: float) -> float | None:
     value = float(value)
-    return value if math.isfinite(value) else 0.0
+    return value if math.isfinite(value) else None
 
 
-def _resource_usage() -> dict:
+def _sum_known(values) -> float | None:
+    values = list(values)
+    if any(value is None for value in values):
+        return None
+    return _finite_or_none(sum(values))
+
+
+def _max_known(values) -> int | None:
+    values = list(values)
+    if not values or any(value is None for value in values):
+        return None
+    return max(values)
+
+
+def _resource_usage() -> dict | None:
+    if resource is None:
+        return None
+
     usage = resource.getrusage(resource.RUSAGE_SELF)
     max_rss = int(usage.ru_maxrss)
     if sys.platform != "darwin":
@@ -39,18 +60,25 @@ def _resource_usage() -> dict:
     }
 
 
-def _resource_metrics(started: dict) -> dict:
+def _resource_metrics(started: dict | None) -> dict:
     finished = _resource_usage()
+    if started is None or finished is None:
+        return {
+            "process_max_rss_bytes": None,
+            "process_user_cpu_ms": None,
+            "process_system_cpu_ms": None,
+        }
+
     return {
         "process_max_rss_bytes": finished["max_rss_bytes"],
-        "process_user_cpu_ms": _finite(
+        "process_user_cpu_ms": _finite_or_none(
             max(
                 finished["user_cpu_seconds"] - started["user_cpu_seconds"],
                 0.0,
             )
             * 1000
         ),
-        "process_system_cpu_ms": _finite(
+        "process_system_cpu_ms": _finite_or_none(
             max(
                 finished["system_cpu_seconds"]
                 - started["system_cpu_seconds"],
@@ -106,7 +134,7 @@ def _official_fallback(
             "audio_feature_ms": None,
             "prompt_prefill_ms": None,
             "greedy_decode_ms": None,
-            "worker_total_ms": _finite(
+            "worker_total_ms": _finite_or_none(
                 (time.perf_counter() - started) * 1000
             ),
             "mlx_peak_memory_bytes": None,
@@ -171,9 +199,9 @@ class GreedyDiagnostics:
         if tensors:
             self.mx.eval(tensors)
 
-    def _memory(self, name: str) -> int:
+    def _memory(self, name: str) -> int | None:
         getter = getattr(self.mx, name, None)
-        return int(getter()) if callable(getter) else 0
+        return int(getter()) if callable(getter) else None
 
     def _sync(self) -> None:
         synchronize = getattr(self.mx, "synchronize", None)
@@ -190,30 +218,48 @@ class GreedyDiagnostics:
         *,
         chunk_index: int,
         token_index: int,
-    ) -> tuple[int, dict]:
+    ) -> tuple[int, dict | None]:
         step_logits = logits.reshape(-1).astype(self.mx.float32)
-        selected = int(self.mx.argmax(step_logits).item())
+        selected_tensor = self.mx.argmax(step_logits)
         logprobs = step_logits - self.mx.logsumexp(step_logits)
-        selected_logprob = _finite(logprobs[selected].item())
+        selected_logprob_tensor = logprobs[selected_tensor]
         probabilities = self.mx.exp(logprobs)
         entropy_terms = self.mx.where(
             probabilities > 0,
             probabilities * logprobs,
             self.mx.zeros_like(logprobs),
         )
-        entropy = _finite((-self.mx.sum(entropy_terms)).item())
+        entropy_tensor = -self.mx.sum(entropy_terms)
 
         size = int(step_logits.size)
         margin = 0.0
         if size >= 2:
             partition = self.mx.argpartition(step_logits, size - 2)
             top_values = self.mx.take(step_logits, partition[-2:])
-            self.mx.eval(top_values)
+            self.mx.eval(
+                selected_tensor,
+                selected_logprob_tensor,
+                entropy_tensor,
+                top_values,
+            )
             ordered = sorted(
                 (float(value) for value in top_values.tolist()),
                 reverse=True,
             )
-            margin = _finite(ordered[0] - ordered[1])
+            margin = _finite_or_none(ordered[0] - ordered[1])
+        else:
+            self.mx.eval(
+                selected_tensor,
+                selected_logprob_tensor,
+                entropy_tensor,
+            )
+
+        selected = int(selected_tensor.item())
+        selected_logprob = _finite_or_none(selected_logprob_tensor.item())
+        entropy = _finite_or_none(entropy_tensor.item())
+
+        if selected_logprob is None or entropy is None or margin is None:
+            return selected, None
 
         return selected, {
             "chunk_index": chunk_index,
@@ -306,6 +352,7 @@ class GreedyDiagnostics:
 
         generated: list[int] = []
         evidence: list[dict] = []
+        evidence_complete = True
         greedy_started = time.perf_counter()
         for step in range(max_new_tokens):
             token, row = self._token_and_evidence(
@@ -315,7 +362,10 @@ class GreedyDiagnostics:
             )
             generated.append(token)
             if token not in config.eos_token_ids:
-                evidence.append(row)
+                if row is None:
+                    evidence_complete = False
+                else:
+                    evidence.append(row)
 
             if token in config.eos_token_ids:
                 break
@@ -362,6 +412,7 @@ class GreedyDiagnostics:
             "language": detected_language,
             "tokens": visible_tokens,
             "evidence": evidence,
+            "evidence_complete": evidence_complete,
             "finish_reason": finish_reason,
             "max_new_tokens": max_new_tokens,
             "audio_feature_ms": audio_feature_ms,
@@ -420,6 +471,9 @@ class GreedyDiagnostics:
         ]
         evidence_truncated = len(all_evidence) > MAX_TOKEN_EVIDENCE
         all_evidence = all_evidence[:MAX_TOKEN_EVIDENCE]
+        diagnostics_complete = all(
+            result["evidence_complete"] for result in chunk_results
+        )
 
         return {
             "text": text,
@@ -429,8 +483,12 @@ class GreedyDiagnostics:
                 "schema_version": 1,
                 "runtime_version": self.runtime_version,
                 "decode_mode": "greedy_only",
-                "diagnostics_complete": True,
-                "fallback_reason": None,
+                "diagnostics_complete": diagnostics_complete,
+                "fallback_reason": (
+                    None
+                    if diagnostics_complete
+                    else "non_finite_token_evidence"
+                ),
                 "chunk_count": len(chunk_results),
                 "audio_encode_count": len(chunk_results),
                 "prompt_prefill_count": len(chunk_results),
@@ -442,29 +500,24 @@ class GreedyDiagnostics:
                 ),
                 "finish_reason": finish_reason,
                 "token_evidence_truncated": evidence_truncated,
-                "audio_feature_ms": _finite(
-                    sum(
-                        result["audio_feature_ms"]
-                        for result in chunk_results
-                    )
+                "audio_feature_ms": _sum_known(
+                    result["audio_feature_ms"] for result in chunk_results
                 ),
-                "prompt_prefill_ms": _finite(
-                    sum(
-                        result["prompt_prefill_ms"]
-                        for result in chunk_results
-                    )
+                "prompt_prefill_ms": _sum_known(
+                    result["prompt_prefill_ms"] for result in chunk_results
                 ),
-                "greedy_decode_ms": _finite(
-                    sum(
-                        result["greedy_decode_ms"]
-                        for result in chunk_results
-                    )
+                "greedy_decode_ms": _sum_known(
+                    result["greedy_decode_ms"] for result in chunk_results
                 ),
-                "worker_total_ms": _finite(
+                "worker_total_ms": _finite_or_none(
                     (time.perf_counter() - started) * 1000
                 ),
-                "mlx_peak_memory_bytes": self._memory("get_peak_memory"),
-                "mlx_active_memory_bytes_before_cleanup": max(
+                "mlx_peak_memory_bytes": (
+                    self._memory("get_peak_memory")
+                    if callable(reset_peak)
+                    else None
+                ),
+                "mlx_active_memory_bytes_before_cleanup": _max_known(
                     result["active_before_cleanup"]
                     for result in chunk_results
                 ),
