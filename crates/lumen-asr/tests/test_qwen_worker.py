@@ -118,10 +118,12 @@ class ShadowPolicyTests(unittest.TestCase):
             {"surface": "Codex", "source": "personal_dictionary"},
             {"surface": "codex", "source": "personal_dictionary"},
             {"surface": "Qdrant", "source": "personal_dictionary"},
+            {"surface": "he", "source": "personal_dictionary"},
         ]
         hypotheses = [
             {"rank": 1, "text": "Codex is"},
             {"rank": 2, "text": "Cortex"},
+            {"rank": 3, "text": "hello"},
         ]
 
         candidates = WORKER._dictionary_candidates(terms, hypotheses)

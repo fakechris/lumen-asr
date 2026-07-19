@@ -122,6 +122,8 @@ def _select_shadow_spans(
         ranked,
         key=lambda span: (-span["_priority"], span["token_start"]),
     )[: max(0, max_spans)]
+    # Process right-to-left: local beam scoring rewinds and mutates the shared
+    # KV cache in place, so later spans must only depend on untouched history.
     selected.sort(key=lambda span: span["token_start"], reverse=True)
     for span in selected:
         span.pop("_priority", None)
@@ -143,8 +145,14 @@ def _dictionary_candidates(
             (
                 int(hypothesis["rank"])
                 for hypothesis in hypotheses
-                if _surface_key(hypothesis.get("text", "")).startswith(
-                    surface_key
+                if (
+                    _surface_key(hypothesis.get("text", ""))
+                    == surface_key
+                    or _surface_key(
+                        hypothesis.get("text", "")
+                    ).startswith(
+                        surface_key + " "
+                    )
                 )
             ),
             None,
