@@ -1205,6 +1205,12 @@ function SettingsPanel({
     })();
   }, [onError]);
 
+  async function refreshActiveCleanupProfile() {
+    const activeCorrector = await api.getCorrectorConfig();
+    setCfg(activeCorrector);
+    setCleanup(activeCorrector.cleanup || "medium");
+  }
+
   async function save() {
     onBusy(true);
     onError(null);
@@ -1531,6 +1537,7 @@ function SettingsPanel({
                           const status = await api.useExistingAsrModel(candidate.path, engine);
                           setAsrModels(status);
                           setAsrCustomPath(status.activeModelDir);
+                          await refreshActiveCleanupProfile();
                           onSaved();
                         } catch (e) {
                           onError(String(e));
@@ -1568,6 +1575,7 @@ function SettingsPanel({
                       );
                       setAsrModels(status);
                       setAsrCustomPath(status.activeModelDir);
+                      await refreshActiveCleanupProfile();
                       onSaved();
                     } catch (e) {
                       onError(String(e));
@@ -1695,6 +1703,7 @@ function SettingsPanel({
                   setAsrLanguage(s.language);
                   setAsrHasKey(s.hasApiKey);
                   setAsrApiKey("");
+                  await refreshActiveCleanupProfile();
                   onSaved();
                 } catch (e) {
                   onError(String(e));
@@ -1991,6 +2000,11 @@ function SettingsPanel({
         </div>
         <div className="cleanup-level-block">
           <div className="field-label">自动整理强度</div>
+          <p className="muted-text cleanup-hint">
+            {cfg?.cleanupProfile === "qwen"
+              ? "当前生效：Qwen 独立整理配置。切回 SenseVoice 会恢复原来的整理强度。"
+              : "当前生效：SenseVoice／其他 ASR 的默认整理配置。Qwen 会使用独立设置。"}
+          </p>
           <div className="cleanup-seg" role="group" aria-label="整理强度">
             {(
               [

@@ -21,7 +21,7 @@ pub struct CorrectorRunIdentity {
 }
 
 pub fn run_identity(app: &AppConfig, intent: IntentSpec) -> CorrectorRunIdentity {
-    let input = app.output.prompt_input(intent);
+    let input = app.corrector_prompt_input(intent);
     let level = effective_cleanup(&input);
     let prompt = build_system_prompt_from(&input);
     let model_enabled =
@@ -182,7 +182,7 @@ pub async fn run_correct_with_intent(
     intent: IntentSpec,
 ) -> CorrectResult {
     let dict = dictionary_context(entries);
-    let input: PromptBuildInput = app.output.prompt_input(intent);
+    let input: PromptBuildInput = app.corrector_prompt_input(intent);
     let level = effective_cleanup(&input);
 
     // No model: cleanup none (and not translate).
@@ -231,6 +231,25 @@ mod tests {
         assert_eq!(first.prompt_hash, second.prompt_hash);
         assert_eq!(first.prompt_hash_algorithm.as_deref(), Some("blake3"));
         assert!((first.temperature.unwrap() - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn run_identity_tracks_the_active_asr_cleanup_profile() {
+        let mut app = AppConfig::default();
+        app.corrector.enabled = true;
+        app.corrector.provider = "minimax".into();
+        app.corrector.model = "test-corrector-model".into();
+
+        app.asr.provider = "local_sensevoice".into();
+        let sensevoice = run_identity(&app, IntentSpec::Default);
+        assert!(sensevoice.engine_label.ends_with("|medium"));
+        assert!((sensevoice.temperature.unwrap() - 0.3).abs() < 1e-6);
+
+        app.asr.provider = "local_qwen".into();
+        let qwen = run_identity(&app, IntentSpec::Default);
+        assert!(qwen.engine_label.ends_with("|light"));
+        assert!((qwen.temperature.unwrap() - 0.2).abs() < 1e-6);
+        assert_ne!(sensevoice.prompt_hash, qwen.prompt_hash);
     }
 
     #[test]

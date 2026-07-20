@@ -19,6 +19,8 @@ pub struct CorrectorStatus {
     pub label: String,
     /// none | light | medium | strong
     pub cleanup: String,
+    /// qwen | default — identifies which persisted ASR-specific profile is active.
+    pub cleanup_profile: String,
     pub style: String,
     pub casing: String,
     pub punctuation: String,
@@ -236,11 +238,10 @@ pub fn save_corrector_config(
         guard.corrector.timeout_secs = v.max(5);
     }
     if let Some(v) = input.cleanup {
-        if lumen_prompts::CleanupLevel::parse(&v).is_some() {
-            guard.output.cleanup = v.to_ascii_lowercase();
-        } else {
-            return Err(format!("unknown cleanup level: {v}"));
-        }
+        let asr_provider = guard.asr.provider.clone();
+        guard
+            .output
+            .set_cleanup_for_asr_provider(&asr_provider, &v)?;
     }
     if let Some(v) = input.style {
         if lumen_prompts::Style::parse(&v).is_some() {
@@ -291,7 +292,15 @@ pub(crate) fn status_from(cfg: &AppConfig) -> CorrectorStatus {
         has_api_key: !cfg.corrector.api_key.is_empty(),
         timeout_secs: cfg.corrector.timeout_secs,
         label: engine_label(cfg),
-        cleanup: cfg.output.cleanup_level().as_str().into(),
+        cleanup: cfg
+            .output
+            .cleanup_level_for_asr_provider(&cfg.asr.provider)
+            .as_str()
+            .into(),
+        cleanup_profile: cfg
+            .output
+            .cleanup_profile_for_asr_provider(&cfg.asr.provider)
+            .into(),
         style: cfg.output.style().as_str().into(),
         casing: cfg.output.casing().as_str().into(),
         punctuation: cfg.output.punctuation().as_str().into(),
@@ -367,4 +376,25 @@ pub async fn correct_text(
 #[tauri::command]
 pub fn default_corrector_config() -> CorrectorConfig {
     CorrectorConfig::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_from;
+    use crate::config::AppConfig;
+
+    #[test]
+    fn corrector_status_exposes_the_active_cleanup_profile() {
+        let mut config = AppConfig::default();
+
+        config.asr.provider = "local_sensevoice".into();
+        let sensevoice = status_from(&config);
+        assert_eq!(sensevoice.cleanup, "medium");
+        assert_eq!(sensevoice.cleanup_profile, "default");
+
+        config.asr.provider = "local_qwen".into();
+        let qwen = status_from(&config);
+        assert_eq!(qwen.cleanup, "light");
+        assert_eq!(qwen.cleanup_profile, "qwen");
+    }
 }
