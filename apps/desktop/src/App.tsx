@@ -615,8 +615,10 @@ function RecordPanel({
       const s = await api.getAsrStatus();
       setStatus(s);
       setRecording(s.recording);
+      return s;
     } catch (e) {
       onError(String(e));
+      return null;
     }
   }, [onError]);
 
@@ -639,9 +641,18 @@ function RecordPanel({
 
   useEffect(() => {
     if (!status?.qwenRuntimeChecking) return;
-    const timer = window.setInterval(() => void refreshStatus(), 500);
+    const timer = window.setInterval(
+      () =>
+        void (async () => {
+          const next = await refreshStatus();
+          if (next && !next.qwenRuntimeChecking) {
+            await onSaved();
+          }
+        })(),
+      500,
+    );
     return () => window.clearInterval(timer);
-  }, [refreshStatus, status?.qwenRuntimeChecking]);
+  }, [onSaved, refreshStatus, status?.qwenRuntimeChecking]);
 
   // Hotkey dictation done → fill result + baseline for learning
   useEffect(() => {
@@ -694,6 +705,7 @@ function RecordPanel({
       // Saving the provider also switches the matching local engine atomically.
       await api.saveAsrServiceConfig({ provider: providerId });
       await refreshStatus();
+      await onSaved();
     } catch (e) {
       onError(String(e));
     } finally {
@@ -1123,6 +1135,7 @@ function SettingsPanel({
   const [asrModels, setAsrModels] = useState<AsrModelStatus | null>(null);
   const [asrCustomPath, setAsrCustomPath] = useState("");
   const [cleanup, setCleanup] = useState("medium");
+  const cleanupDrafts = useRef<Record<string, string>>({});
   const [style, setStyle] = useState("neutral");
   const [casing, setCasing] = useState("sentence");
   const [punctuation, setPunctuation] = useState("standard");
@@ -1206,12 +1219,22 @@ function SettingsPanel({
   }, [onError]);
 
   async function refreshActiveCleanupProfile() {
+    if (cfg?.cleanupProfile && cleanup !== (cfg.cleanup || "medium")) {
+      cleanupDrafts.current[cfg.cleanupProfile] = cleanup;
+    }
     const activeCorrector = await api.getCorrectorConfig();
     setCfg(activeCorrector);
-    setCleanup(activeCorrector.cleanup || "medium");
+    const activeProfile = activeCorrector.cleanupProfile || "default";
+    setCleanup(
+      cleanupDrafts.current[activeProfile] || activeCorrector.cleanup || "medium",
+    );
   }
 
   async function save() {
+    if (!cfg?.cleanupProfile) {
+      onError("整理配置仍在加载，请稍后再保存。");
+      return;
+    }
     onBusy(true);
     onError(null);
     try {
@@ -1222,6 +1245,7 @@ function SettingsPanel({
         model,
         timeoutSecs,
         cleanup,
+        cleanupProfile: cfg.cleanupProfile,
         style,
         casing,
         punctuation,
@@ -1234,6 +1258,7 @@ function SettingsPanel({
       }
       const c = await api.saveCorrectorConfig(input);
       setCfg(c);
+      delete cleanupDrafts.current[c.cleanupProfile || "default"];
       setCleanup(c.cleanup || cleanup);
       setStyle(c.style || style);
       setCasing(c.casing || casing);
@@ -2229,7 +2254,7 @@ function SettingsPanel({
           </p>
         )}
         <div className="actions">
-          <button type="button" className="btn" disabled={busy} onClick={() => void save()}>
+          <button type="button" className="btn" disabled={busy || !cfg} onClick={() => void save()}>
             保存
           </button>
           <button

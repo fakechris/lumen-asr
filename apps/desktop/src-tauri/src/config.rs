@@ -1,7 +1,7 @@
 //! App settings persisted as TOML under Application Support.
 
 use lumen_platform::default_config_path;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
@@ -167,8 +167,7 @@ fn expand_user_path(value: &str) -> PathBuf {
 }
 
 /// Post-ASR text shaping profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OutputConfig {
     /// Default cleanup for SenseVoice and providers without a dedicated profile.
     pub cleanup: String,
@@ -185,6 +184,54 @@ pub struct OutputConfig {
     pub polish: Vec<String>,
     pub custom_enabled: bool,
     pub custom_instruction: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct OutputConfigWire {
+    cleanup: Option<String>,
+    qwen_cleanup: Option<String>,
+    style: Option<String>,
+    casing: Option<String>,
+    punctuation: Option<String>,
+    polish: Option<Vec<String>>,
+    custom_enabled: Option<bool>,
+    custom_instruction: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for OutputConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = OutputConfigWire::deserialize(deserializer)?;
+        let mut output = Self::default();
+        if let Some(value) = wire.cleanup {
+            output.cleanup = value;
+        }
+        // Before Qwen had its own profile, `cleanup` controlled every ASR. Preserve
+        // that explicit behavior when an existing config has no Qwen field.
+        output.qwen_cleanup = wire.qwen_cleanup.unwrap_or_else(|| output.cleanup.clone());
+        if let Some(value) = wire.style {
+            output.style = value;
+        }
+        if let Some(value) = wire.casing {
+            output.casing = value;
+        }
+        if let Some(value) = wire.punctuation {
+            output.punctuation = value;
+        }
+        if let Some(value) = wire.polish {
+            output.polish = value;
+        }
+        if let Some(value) = wire.custom_enabled {
+            output.custom_enabled = value;
+        }
+        if let Some(value) = wire.custom_instruction {
+            output.custom_instruction = value;
+        }
+        Ok(output)
+    }
 }
 
 impl Default for OutputConfig {
@@ -707,7 +754,7 @@ runtime_path = "/qwen/bin/python"
     }
 
     #[test]
-    fn existing_config_without_qwen_cleanup_gets_the_safe_qwen_default() {
+    fn existing_config_without_qwen_cleanup_preserves_the_previous_cleanup() {
         let config: AppConfig = toml::from_str(
             r#"
 [output]
@@ -727,7 +774,26 @@ provider = "local_sensevoice"
         );
         assert_eq!(
             config.output.cleanup_level_for_asr_provider("local_qwen"),
-            lumen_prompts::CleanupLevel::Light
+            lumen_prompts::CleanupLevel::Strong
+        );
+    }
+
+    #[test]
+    fn existing_disabled_cleanup_does_not_enable_qwen_correction_on_upgrade() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[output]
+cleanup = "none"
+
+[asr]
+provider = "local_qwen"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.output.cleanup_level_for_asr_provider("local_qwen"),
+            lumen_prompts::CleanupLevel::None
         );
     }
 

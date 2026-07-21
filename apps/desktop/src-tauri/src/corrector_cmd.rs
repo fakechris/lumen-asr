@@ -39,12 +39,29 @@ pub struct CorrectorConfigInput {
     pub api_key: Option<String>,
     pub timeout_secs: Option<u64>,
     pub cleanup: Option<String>,
+    /// qwen | default — reject stale writes if the active ASR profile changed.
+    pub cleanup_profile: Option<String>,
     pub style: Option<String>,
     pub casing: Option<String>,
     pub punctuation: Option<String>,
     pub polish: Option<Vec<String>>,
     pub custom_enabled: Option<bool>,
     pub custom_instruction: Option<String>,
+}
+
+fn validate_cleanup_profile(cfg: &AppConfig, expected_profile: Option<&str>) -> Result<(), String> {
+    let expected_profile = expected_profile
+        .ok_or_else(|| "cleanup profile is required; refresh settings and retry".to_string())?;
+    let active_profile = cfg
+        .output
+        .cleanup_profile_for_asr_provider(&cfg.asr.provider);
+    if expected_profile == active_profile {
+        Ok(())
+    } else {
+        Err(format!(
+            "cleanup profile changed from {expected_profile} to {active_profile}; refresh settings and retry"
+        ))
+    }
 }
 
 #[tauri::command]
@@ -198,6 +215,10 @@ pub fn save_corrector_config(
         .config
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?;
+
+    if input.cleanup.is_some() {
+        validate_cleanup_profile(&guard, input.cleanup_profile.as_deref())?;
+    }
 
     if let Some(v) = input.enabled {
         guard.corrector.enabled = v;
@@ -380,7 +401,7 @@ pub fn default_corrector_config() -> CorrectorConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::status_from;
+    use super::{status_from, validate_cleanup_profile};
     use crate::config::AppConfig;
 
     #[test]
@@ -396,5 +417,15 @@ mod tests {
         let qwen = status_from(&config);
         assert_eq!(qwen.cleanup, "light");
         assert_eq!(qwen.cleanup_profile, "qwen");
+    }
+
+    #[test]
+    fn stale_cleanup_profile_is_rejected_before_a_save() {
+        let mut config = AppConfig::default();
+        config.asr.provider = "local_qwen".into();
+
+        assert!(validate_cleanup_profile(&config, Some("qwen")).is_ok());
+        assert!(validate_cleanup_profile(&config, None).is_err());
+        assert!(validate_cleanup_profile(&config, Some("default")).is_err());
     }
 }
