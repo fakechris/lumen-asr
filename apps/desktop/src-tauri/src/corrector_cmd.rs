@@ -19,6 +19,8 @@ pub struct CorrectorStatus {
     pub label: String,
     /// none | light | medium | strong
     pub cleanup: String,
+    /// qwen | default — identifies which persisted ASR-specific profile is active.
+    pub cleanup_profile: String,
     pub style: String,
     pub casing: String,
     pub punctuation: String,
@@ -37,12 +39,29 @@ pub struct CorrectorConfigInput {
     pub api_key: Option<String>,
     pub timeout_secs: Option<u64>,
     pub cleanup: Option<String>,
+    /// qwen | default — reject stale writes if the active ASR profile changed.
+    pub cleanup_profile: Option<String>,
     pub style: Option<String>,
     pub casing: Option<String>,
     pub punctuation: Option<String>,
     pub polish: Option<Vec<String>>,
     pub custom_enabled: Option<bool>,
     pub custom_instruction: Option<String>,
+}
+
+fn validate_cleanup_profile(cfg: &AppConfig, expected_profile: Option<&str>) -> Result<(), String> {
+    let expected_profile = expected_profile
+        .ok_or_else(|| "cleanup profile is required; refresh settings and retry".to_string())?;
+    let active_profile = cfg
+        .output
+        .cleanup_profile_for_asr_provider(&cfg.asr.provider);
+    if expected_profile == active_profile {
+        Ok(())
+    } else {
+        Err(format!(
+            "cleanup profile changed from {expected_profile} to {active_profile}; refresh settings and retry"
+        ))
+    }
 }
 
 #[tauri::command]
@@ -197,6 +216,10 @@ pub fn save_corrector_config(
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?;
 
+    if input.cleanup.is_some() {
+        validate_cleanup_profile(&guard, input.cleanup_profile.as_deref())?;
+    }
+
     if let Some(v) = input.enabled {
         guard.corrector.enabled = v;
     }
@@ -236,11 +259,10 @@ pub fn save_corrector_config(
         guard.corrector.timeout_secs = v.max(5);
     }
     if let Some(v) = input.cleanup {
-        if lumen_prompts::CleanupLevel::parse(&v).is_some() {
-            guard.output.cleanup = v.to_ascii_lowercase();
-        } else {
-            return Err(format!("unknown cleanup level: {v}"));
-        }
+        let asr_provider = guard.asr.provider.clone();
+        guard
+            .output
+            .set_cleanup_for_asr_provider(&asr_provider, &v)?;
     }
     if let Some(v) = input.style {
         if lumen_prompts::Style::parse(&v).is_some() {
@@ -291,7 +313,15 @@ pub(crate) fn status_from(cfg: &AppConfig) -> CorrectorStatus {
         has_api_key: !cfg.corrector.api_key.is_empty(),
         timeout_secs: cfg.corrector.timeout_secs,
         label: engine_label(cfg),
-        cleanup: cfg.output.cleanup_level().as_str().into(),
+        cleanup: cfg
+            .output
+            .cleanup_level_for_asr_provider(&cfg.asr.provider)
+            .as_str()
+            .into(),
+        cleanup_profile: cfg
+            .output
+            .cleanup_profile_for_asr_provider(&cfg.asr.provider)
+            .into(),
         style: cfg.output.style().as_str().into(),
         casing: cfg.output.casing().as_str().into(),
         punctuation: cfg.output.punctuation().as_str().into(),
@@ -367,4 +397,35 @@ pub async fn correct_text(
 #[tauri::command]
 pub fn default_corrector_config() -> CorrectorConfig {
     CorrectorConfig::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{status_from, validate_cleanup_profile};
+    use crate::config::AppConfig;
+
+    #[test]
+    fn corrector_status_exposes_the_active_cleanup_profile() {
+        let mut config = AppConfig::default();
+
+        config.asr.provider = "local_sensevoice".into();
+        let sensevoice = status_from(&config);
+        assert_eq!(sensevoice.cleanup, "medium");
+        assert_eq!(sensevoice.cleanup_profile, "default");
+
+        config.asr.provider = "local_qwen".into();
+        let qwen = status_from(&config);
+        assert_eq!(qwen.cleanup, "light");
+        assert_eq!(qwen.cleanup_profile, "qwen");
+    }
+
+    #[test]
+    fn stale_cleanup_profile_is_rejected_before_a_save() {
+        let mut config = AppConfig::default();
+        config.asr.provider = "local_qwen".into();
+
+        assert!(validate_cleanup_profile(&config, Some("qwen")).is_ok());
+        assert!(validate_cleanup_profile(&config, None).is_err());
+        assert!(validate_cleanup_profile(&config, Some("default")).is_err());
+    }
 }

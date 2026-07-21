@@ -26,6 +26,8 @@ export type CorrectorStatus = {
   label: string;
   /** none | light | medium | strong */
   cleanup?: string;
+  /** qwen | default */
+  cleanupProfile?: string;
   style?: string;
   casing?: string;
   punctuation?: string;

@@ -1,7 +1,7 @@
 //! App settings persisted as TOML under Application Support.
 
 use lumen_platform::default_config_path;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
@@ -167,11 +167,13 @@ fn expand_user_path(value: &str) -> PathBuf {
 }
 
 /// Post-ASR text shaping profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OutputConfig {
-    /// none | light | medium | strong — default medium.
+    /// Default cleanup for SenseVoice and providers without a dedicated profile.
     pub cleanup: String,
+    /// Qwen-specific cleanup. Kept separate so switching ASR does not overwrite
+    /// the user's lower-resource SenseVoice pipeline.
+    pub qwen_cleanup: String,
     /// formal | neutral | casual | very_casual
     pub style: String,
     /// preserve | sentence | lower
@@ -184,10 +186,64 @@ pub struct OutputConfig {
     pub custom_instruction: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct OutputConfigWire {
+    cleanup: Option<String>,
+    qwen_cleanup: Option<String>,
+    style: Option<String>,
+    casing: Option<String>,
+    punctuation: Option<String>,
+    polish: Option<Vec<String>>,
+    custom_enabled: Option<bool>,
+    custom_instruction: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for OutputConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = OutputConfigWire::deserialize(deserializer)?;
+        let mut output = Self::default();
+        match (wire.cleanup, wire.qwen_cleanup) {
+            (Some(cleanup), qwen_cleanup) => {
+                output.cleanup = cleanup.clone();
+                // Before Qwen had its own profile, an explicit `cleanup` value
+                // controlled every ASR and must keep doing so after upgrade.
+                output.qwen_cleanup = qwen_cleanup.unwrap_or(cleanup);
+            }
+            (None, Some(qwen_cleanup)) => output.qwen_cleanup = qwen_cleanup,
+            // No prior choice exists, so retain the new-profile default (`light`).
+            (None, None) => {}
+        }
+        if let Some(value) = wire.style {
+            output.style = value;
+        }
+        if let Some(value) = wire.casing {
+            output.casing = value;
+        }
+        if let Some(value) = wire.punctuation {
+            output.punctuation = value;
+        }
+        if let Some(value) = wire.polish {
+            output.polish = value;
+        }
+        if let Some(value) = wire.custom_enabled {
+            output.custom_enabled = value;
+        }
+        if let Some(value) = wire.custom_instruction {
+            output.custom_instruction = value;
+        }
+        Ok(output)
+    }
+}
+
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             cleanup: "medium".into(),
+            qwen_cleanup: "light".into(),
             style: "neutral".into(),
             casing: "sentence".into(),
             punctuation: "standard".into(),
@@ -202,6 +258,39 @@ impl OutputConfig {
     pub fn cleanup_level(&self) -> lumen_prompts::CleanupLevel {
         lumen_prompts::CleanupLevel::parse(&self.cleanup)
             .unwrap_or(lumen_prompts::CleanupLevel::Medium)
+    }
+
+    pub fn cleanup_level_for_asr_provider(&self, provider: &str) -> lumen_prompts::CleanupLevel {
+        if is_qwen_provider(provider) {
+            lumen_prompts::CleanupLevel::parse(&self.qwen_cleanup)
+                .unwrap_or(lumen_prompts::CleanupLevel::Light)
+        } else {
+            self.cleanup_level()
+        }
+    }
+
+    pub fn cleanup_profile_for_asr_provider(&self, provider: &str) -> &'static str {
+        if is_qwen_provider(provider) {
+            "qwen"
+        } else {
+            "default"
+        }
+    }
+
+    pub fn set_cleanup_for_asr_provider(
+        &mut self,
+        provider: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        let Some(level) = lumen_prompts::CleanupLevel::parse(value) else {
+            return Err(format!("unknown cleanup level: {value}"));
+        };
+        if is_qwen_provider(provider) {
+            self.qwen_cleanup = level.as_str().into();
+        } else {
+            self.cleanup = level.as_str().into();
+        }
+        Ok(())
     }
 
     pub fn style(&self) -> lumen_prompts::Style {
@@ -247,6 +336,21 @@ impl OutputConfig {
             intent,
         }
     }
+
+    pub fn prompt_input_for_asr_provider(
+        &self,
+        provider: &str,
+        intent: lumen_prompts::IntentSpec,
+    ) -> lumen_prompts::PromptBuildInput {
+        let mut input = self.prompt_input(intent);
+        input.cleanup = self.cleanup_level_for_asr_provider(provider);
+        input
+    }
+}
+
+fn is_qwen_provider(provider: &str) -> bool {
+    lumen_asr::EngineKind::parse(&provider.trim().to_ascii_lowercase())
+        == Some(lumen_asr::EngineKind::Qwen)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,6 +594,14 @@ impl InjectConfig {
 }
 
 impl AppConfig {
+    pub fn corrector_prompt_input(
+        &self,
+        intent: lumen_prompts::IntentSpec,
+    ) -> lumen_prompts::PromptBuildInput {
+        self.output
+            .prompt_input_for_asr_provider(&self.asr.provider, intent)
+    }
+
     pub fn load() -> Self {
         let path = default_config_path();
         Self::load_from(&path)
@@ -630,5 +742,102 @@ runtime_path = "/qwen/bin/python"
         .unwrap();
 
         assert!(!asr.qwen_shadow_enabled);
+    }
+
+    #[test]
+    fn output_cleanup_defaults_are_isolated_by_asr_provider() {
+        let output = OutputConfig::default();
+
+        assert_eq!(
+            output.cleanup_level_for_asr_provider("local_sensevoice"),
+            lumen_prompts::CleanupLevel::Medium
+        );
+        assert_eq!(
+            output.cleanup_level_for_asr_provider("local_qwen"),
+            lumen_prompts::CleanupLevel::Light
+        );
+    }
+
+    #[test]
+    fn existing_config_without_qwen_cleanup_preserves_the_previous_cleanup() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[output]
+cleanup = "strong"
+
+[asr]
+provider = "local_sensevoice"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config
+                .output
+                .cleanup_level_for_asr_provider("local_sensevoice"),
+            lumen_prompts::CleanupLevel::Strong
+        );
+        assert_eq!(
+            config.output.cleanup_level_for_asr_provider("local_qwen"),
+            lumen_prompts::CleanupLevel::Strong
+        );
+    }
+
+    #[test]
+    fn existing_disabled_cleanup_does_not_enable_qwen_correction_on_upgrade() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[output]
+cleanup = "none"
+
+[asr]
+provider = "local_qwen"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.output.cleanup_level_for_asr_provider("local_qwen"),
+            lumen_prompts::CleanupLevel::None
+        );
+    }
+
+    #[test]
+    fn config_without_an_explicit_cleanup_uses_the_new_qwen_default() {
+        let config: AppConfig = toml::from_str("[output]").unwrap();
+
+        assert_eq!(
+            config.output.cleanup_level_for_asr_provider("local_qwen"),
+            lumen_prompts::CleanupLevel::Light
+        );
+    }
+
+    #[test]
+    fn cleanup_profiles_can_be_changed_without_cross_contamination() {
+        let mut output = OutputConfig::default();
+
+        output
+            .set_cleanup_for_asr_provider("local_qwen", "strong")
+            .unwrap();
+        assert_eq!(
+            output.cleanup_level_for_asr_provider("local_qwen"),
+            lumen_prompts::CleanupLevel::Strong
+        );
+        assert_eq!(
+            output.cleanup_level_for_asr_provider("local_sensevoice"),
+            lumen_prompts::CleanupLevel::Medium
+        );
+
+        output
+            .set_cleanup_for_asr_provider("local_sensevoice", "none")
+            .unwrap();
+        assert_eq!(
+            output.cleanup_level_for_asr_provider("local_sensevoice"),
+            lumen_prompts::CleanupLevel::None
+        );
+        assert_eq!(
+            output.cleanup_level_for_asr_provider("local_qwen"),
+            lumen_prompts::CleanupLevel::Strong
+        );
     }
 }

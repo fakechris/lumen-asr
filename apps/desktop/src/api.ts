@@ -114,6 +114,7 @@ export const api = {
     apiKey?: string;
     timeoutSecs?: number;
     cleanup?: string;
+    cleanupProfile?: string;
     style?: string;
     casing?: string;
     punctuation?: string;

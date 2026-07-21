@@ -609,14 +609,18 @@ function RecordPanel({
   const [baseline, setBaseline] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [liveCandidates, setLiveCandidates] = useState<LearnCandidate[]>([]);
+  const onSavedRef = useRef(onSaved);
+  onSavedRef.current = onSaved;
 
   const refreshStatus = useCallback(async () => {
     try {
       const s = await api.getAsrStatus();
       setStatus(s);
       setRecording(s.recording);
+      return s;
     } catch (e) {
       onError(String(e));
+      return null;
     }
   }, [onError]);
 
@@ -639,7 +643,16 @@ function RecordPanel({
 
   useEffect(() => {
     if (!status?.qwenRuntimeChecking) return;
-    const timer = window.setInterval(() => void refreshStatus(), 500);
+    const timer = window.setInterval(
+      () =>
+        void (async () => {
+          const next = await refreshStatus();
+          if (next && !next.qwenRuntimeChecking) {
+            await onSavedRef.current();
+          }
+        })(),
+      500,
+    );
     return () => window.clearInterval(timer);
   }, [refreshStatus, status?.qwenRuntimeChecking]);
 
@@ -694,6 +707,7 @@ function RecordPanel({
       // Saving the provider also switches the matching local engine atomically.
       await api.saveAsrServiceConfig({ provider: providerId });
       await refreshStatus();
+      await onSaved();
     } catch (e) {
       onError(String(e));
     } finally {
@@ -1123,6 +1137,7 @@ function SettingsPanel({
   const [asrModels, setAsrModels] = useState<AsrModelStatus | null>(null);
   const [asrCustomPath, setAsrCustomPath] = useState("");
   const [cleanup, setCleanup] = useState("medium");
+  const cleanupDrafts = useRef<Record<string, string>>({});
   const [style, setStyle] = useState("neutral");
   const [casing, setCasing] = useState("sentence");
   const [punctuation, setPunctuation] = useState("standard");
@@ -1205,7 +1220,23 @@ function SettingsPanel({
     })();
   }, [onError]);
 
+  async function refreshActiveCleanupProfile() {
+    if (cfg?.cleanupProfile && cleanup !== (cfg.cleanup || "medium")) {
+      cleanupDrafts.current[cfg.cleanupProfile] = cleanup;
+    }
+    const activeCorrector = await api.getCorrectorConfig();
+    setCfg(activeCorrector);
+    const activeProfile = activeCorrector.cleanupProfile || "default";
+    setCleanup(
+      cleanupDrafts.current[activeProfile] || activeCorrector.cleanup || "medium",
+    );
+  }
+
   async function save() {
+    if (!cfg?.cleanupProfile) {
+      onError("整理配置仍在加载，请稍后再保存。");
+      return;
+    }
     onBusy(true);
     onError(null);
     try {
@@ -1216,6 +1247,7 @@ function SettingsPanel({
         model,
         timeoutSecs,
         cleanup,
+        cleanupProfile: cfg.cleanupProfile,
         style,
         casing,
         punctuation,
@@ -1228,6 +1260,7 @@ function SettingsPanel({
       }
       const c = await api.saveCorrectorConfig(input);
       setCfg(c);
+      delete cleanupDrafts.current[c.cleanupProfile || "default"];
       setCleanup(c.cleanup || cleanup);
       setStyle(c.style || style);
       setCasing(c.casing || casing);
@@ -1531,6 +1564,7 @@ function SettingsPanel({
                           const status = await api.useExistingAsrModel(candidate.path, engine);
                           setAsrModels(status);
                           setAsrCustomPath(status.activeModelDir);
+                          await refreshActiveCleanupProfile();
                           onSaved();
                         } catch (e) {
                           onError(String(e));
@@ -1568,6 +1602,7 @@ function SettingsPanel({
                       );
                       setAsrModels(status);
                       setAsrCustomPath(status.activeModelDir);
+                      await refreshActiveCleanupProfile();
                       onSaved();
                     } catch (e) {
                       onError(String(e));
@@ -1695,6 +1730,7 @@ function SettingsPanel({
                   setAsrLanguage(s.language);
                   setAsrHasKey(s.hasApiKey);
                   setAsrApiKey("");
+                  await refreshActiveCleanupProfile();
                   onSaved();
                 } catch (e) {
                   onError(String(e));
@@ -1991,6 +2027,11 @@ function SettingsPanel({
         </div>
         <div className="cleanup-level-block">
           <div className="field-label">自动整理强度</div>
+          <p className="muted-text cleanup-hint">
+            {cfg?.cleanupProfile === "qwen"
+              ? "当前生效：Qwen 独立整理配置。切回 SenseVoice 会恢复原来的整理强度。"
+              : "当前生效：SenseVoice／其他 ASR 的默认整理配置。Qwen 会使用独立设置。"}
+          </p>
           <div className="cleanup-seg" role="group" aria-label="整理强度">
             {(
               [
@@ -2215,7 +2256,7 @@ function SettingsPanel({
           </p>
         )}
         <div className="actions">
-          <button type="button" className="btn" disabled={busy} onClick={() => void save()}>
+          <button type="button" className="btn" disabled={busy || !cfg} onClick={() => void save()}>
             保存
           </button>
           <button
