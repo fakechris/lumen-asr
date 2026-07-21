@@ -206,12 +206,17 @@ impl<'de> Deserialize<'de> for OutputConfig {
     {
         let wire = OutputConfigWire::deserialize(deserializer)?;
         let mut output = Self::default();
-        if let Some(value) = wire.cleanup {
-            output.cleanup = value;
+        match (wire.cleanup, wire.qwen_cleanup) {
+            (Some(cleanup), qwen_cleanup) => {
+                output.cleanup = cleanup.clone();
+                // Before Qwen had its own profile, an explicit `cleanup` value
+                // controlled every ASR and must keep doing so after upgrade.
+                output.qwen_cleanup = qwen_cleanup.unwrap_or(cleanup);
+            }
+            (None, Some(qwen_cleanup)) => output.qwen_cleanup = qwen_cleanup,
+            // No prior choice exists, so retain the new-profile default (`light`).
+            (None, None) => {}
         }
-        // Before Qwen had its own profile, `cleanup` controlled every ASR. Preserve
-        // that explicit behavior when an existing config has no Qwen field.
-        output.qwen_cleanup = wire.qwen_cleanup.unwrap_or_else(|| output.cleanup.clone());
         if let Some(value) = wire.style {
             output.style = value;
         }
@@ -794,6 +799,16 @@ provider = "local_qwen"
         assert_eq!(
             config.output.cleanup_level_for_asr_provider("local_qwen"),
             lumen_prompts::CleanupLevel::None
+        );
+    }
+
+    #[test]
+    fn config_without_an_explicit_cleanup_uses_the_new_qwen_default() {
+        let config: AppConfig = toml::from_str("[output]").unwrap();
+
+        assert_eq!(
+            config.output.cleanup_level_for_asr_provider("local_qwen"),
+            lumen_prompts::CleanupLevel::Light
         );
     }
 

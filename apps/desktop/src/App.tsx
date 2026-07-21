@@ -609,6 +609,8 @@ function RecordPanel({
   const [baseline, setBaseline] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [liveCandidates, setLiveCandidates] = useState<LearnCandidate[]>([]);
+  const onSavedRef = useRef(onSaved);
+  onSavedRef.current = onSaved;
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -646,13 +648,13 @@ function RecordPanel({
         void (async () => {
           const next = await refreshStatus();
           if (next && !next.qwenRuntimeChecking) {
-            await onSaved();
+            await onSavedRef.current();
           }
         })(),
       500,
     );
     return () => window.clearInterval(timer);
-  }, [onSaved, refreshStatus, status?.qwenRuntimeChecking]);
+  }, [refreshStatus, status?.qwenRuntimeChecking]);
 
   // Hotkey dictation done → fill result + baseline for learning
   useEffect(() => {
