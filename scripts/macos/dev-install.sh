@@ -62,7 +62,7 @@ if [[ ! -d "$APP_DIR" ]]; then
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
   <key>CFBundleExecutable</key><string>lumen-asr-desktop</string>
-  <key>CFBundleIdentifier</key><string>com.lumenasr.desktop</string>
+  <key>CFBundleIdentifier</key><string>com.lumenopen.asr</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Lumen ASR</string>
   <key>CFBundlePackageType</key><string>APPL</string>
