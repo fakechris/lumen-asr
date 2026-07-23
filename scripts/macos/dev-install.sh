@@ -92,6 +92,10 @@ mkdir -p "$(dirname "$BIN_DST")"
 cp -f "$BIN_SRC" "$BIN_DST"
 chmod +x "$BIN_DST"
 
+echo "==> app icon (generated from the mark SVG; not committed as a binary)"
+"$ROOT/scripts/macos/gen-app-icon.sh" "$APP_DIR" \
+  || echo "  icon generation skipped (install rsvg-convert or ImageMagick)"
+
 echo "==> sign"
 "$ROOT/scripts/macos/sign-app.sh" "$APP_DIR"
 
