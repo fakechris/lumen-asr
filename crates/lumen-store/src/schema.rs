@@ -77,6 +77,35 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_dictation_attempts_supersedes
           ON dictation_attempts(supersedes_attempt_id);
 
+        CREATE TABLE IF NOT EXISTS edit_observations (
+          id TEXT PRIMARY KEY NOT NULL,
+          session_id TEXT NOT NULL,
+          attempt_id TEXT NOT NULL,
+          source TEXT NOT NULL,
+          status TEXT NOT NULL,
+          end_reason TEXT NOT NULL,
+          target_app_name TEXT,
+          target_bundle_id TEXT,
+          target_fingerprint_hash TEXT,
+          inserted_text_hash TEXT NOT NULL,
+          field_initial_hash TEXT,
+          field_final_hash TEXT,
+          normalized_edit_distance REAL,
+          started_at TEXT NOT NULL,
+          completed_at TEXT NOT NULL,
+          edit_event_id TEXT,
+          UNIQUE(attempt_id),
+          FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+          FOREIGN KEY(attempt_id) REFERENCES dictation_attempts(id) ON DELETE CASCADE,
+          FOREIGN KEY(edit_event_id) REFERENCES edit_events(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_edit_observations_session
+          ON edit_observations(session_id, completed_at);
+
+        CREATE INDEX IF NOT EXISTS idx_edit_observations_edit_event
+          ON edit_observations(edit_event_id);
+
         CREATE TABLE IF NOT EXISTS context_snapshots (
           capture_id TEXT NOT NULL,
           session_id TEXT NOT NULL,
@@ -154,6 +183,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (4)",
         [],
     )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (5)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -212,7 +245,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -342,6 +375,34 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn version_five_adds_edit_observation_terminal_records() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(edit_observations)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert!(columns.contains(&"status".to_owned()));
+        assert!(columns.contains(&"end_reason".to_owned()));
+        assert!(columns.contains(&"normalized_edit_distance".to_owned()));
+        assert!(columns.contains(&"edit_event_id".to_owned()));
+
+        let indexes: Vec<String> = connection
+            .prepare("PRAGMA index_list(edit_observations)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(indexes.contains(&"idx_edit_observations_edit_event".to_owned()));
     }
 }

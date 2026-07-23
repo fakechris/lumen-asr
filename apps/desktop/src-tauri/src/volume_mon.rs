@@ -141,10 +141,7 @@ fn run_monitor(
     Ok(())
 }
 
-fn resolve_device(
-    host: &cpal::Host,
-    preferred: Option<&str>,
-) -> Result<cpal::Device, String> {
+fn resolve_device(host: &cpal::Host, preferred: Option<&str>) -> Result<cpal::Device, String> {
     if let Some(name) = preferred {
         if let Ok(devices) = host.input_devices() {
             for d in devices {
@@ -210,10 +207,7 @@ where
 }
 
 #[tauri::command]
-pub fn start_volume_monitoring_cmd(
-    app: AppHandle,
-    device: Option<String>,
-) -> Result<(), String> {
+pub fn start_volume_monitoring_cmd(app: AppHandle, device: Option<String>) -> Result<(), String> {
     start_volume_monitoring(app, device)
 }
 

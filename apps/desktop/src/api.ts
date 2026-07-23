@@ -8,6 +8,7 @@ import type {
   DictationAttemptRecord,
   DictionaryEntry,
   EditEvent,
+  EditObservation,
   Health,
   LearnCandidate,
   SessionRecord,
@@ -110,6 +111,7 @@ export const api = {
   getCorrectorConfig: () => invoke<CorrectorStatus>("get_corrector_config"),
   saveCorrectorConfig: (input: {
     enabled?: boolean;
+    useCapturedContext?: boolean;
     provider?: string;
     baseUrl?: string;
     model?: string;
@@ -341,6 +343,8 @@ export const api = {
 
   listEditEvents: (sessionId: string) =>
     invoke<EditEvent[]>("list_edit_events", { sessionId }),
+  listEditObservations: (sessionId: string) =>
+    invoke<EditObservation[]>("list_edit_observations", { sessionId }),
 
   recordEditEvent: (input: {
     sessionId: string;

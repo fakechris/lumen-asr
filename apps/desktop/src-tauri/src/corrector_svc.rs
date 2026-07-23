@@ -3,8 +3,9 @@
 use crate::config::{AppConfig, CorrectorConfig};
 use lumen_core::CorrectorEngineId;
 use lumen_corrector::{
-    correct_or_fallback_with, preprocess_only, CorrectResult, Corrector, CorrectorFallbackReason,
-    DictionaryContext, NullCorrector, OpenAiCompatConfig, OpenAiCompatCorrector,
+    correct_or_fallback_with_context, preprocess_only, CorrectResult, Corrector,
+    CorrectorFallbackReason, DictionaryContext, NullCorrector, OpenAiCompatConfig,
+    OpenAiCompatCorrector,
 };
 use lumen_dictionary::{split_for_injection, DictionaryEntry};
 use lumen_prompts::{build_system_prompt_from, effective_cleanup, IntentSpec, PromptBuildInput};
@@ -181,6 +182,16 @@ pub async fn run_correct_with_intent(
     entries: &[DictionaryEntry],
     intent: IntentSpec,
 ) -> CorrectResult {
+    run_correct_with_intent_and_context(app, text, entries, intent, None).await
+}
+
+pub async fn run_correct_with_intent_and_context(
+    app: &AppConfig,
+    text: &str,
+    entries: &[DictionaryEntry],
+    intent: IntentSpec,
+    context_json: Option<&str>,
+) -> CorrectResult {
     let dict = dictionary_context(entries);
     let input: PromptBuildInput = app.corrector_prompt_input(intent);
     let level = effective_cleanup(&input);
@@ -195,7 +206,17 @@ pub async fn run_correct_with_intent(
 
     let temperature = level.temperature();
     match build_corrector(&app.corrector) {
-        Ok(c) => correct_or_fallback_with(c.as_ref(), text, dict, system, temperature).await,
+        Ok(c) => {
+            correct_or_fallback_with_context(
+                c.as_ref(),
+                text,
+                dict,
+                context_json.map(str::to_owned),
+                system,
+                temperature,
+            )
+            .await
+        }
         Err(_) => {
             tracing::warn!(
                 reason = "build_failed",

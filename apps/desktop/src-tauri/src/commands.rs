@@ -5,7 +5,8 @@ use lumen_core::{EditSource, FocusInfo, InsertStrategy, SessionRecord, SessionSt
 use lumen_dictionary::{candidates_from_edit, DictionaryEntry, LearnCandidate};
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::{
-    ContextSnapshotRecord, DictationAttemptRecord, EditEventRecord, DEFAULT_ATTEMPT_PAGE_SIZE,
+    ContextSnapshotRecord, DictationAttemptRecord, EditEventRecord, EditObservationRecord,
+    DEFAULT_ATTEMPT_PAGE_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -222,6 +223,19 @@ pub fn list_edit_events(
     let id = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
     with_store(&state, |s| {
         s.list_edit_events(id).map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+pub fn list_edit_observations(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<EditObservationRecord>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(|error| error.to_string())?;
+    with_store(&state, |store| {
+        store
+            .list_edit_observations(id)
+            .map_err(|error| error.to_string())
     })
 }
 

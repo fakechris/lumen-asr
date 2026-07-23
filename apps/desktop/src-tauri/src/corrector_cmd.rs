@@ -10,6 +10,7 @@ use tauri::{AppHandle, State};
 #[serde(rename_all = "camelCase")]
 pub struct CorrectorStatus {
     pub enabled: bool,
+    pub use_captured_context: bool,
     pub provider: String,
     pub base_url: String,
     pub model: String,
@@ -33,6 +34,7 @@ pub struct CorrectorStatus {
 #[serde(rename_all = "camelCase")]
 pub struct CorrectorConfigInput {
     pub enabled: Option<bool>,
+    pub use_captured_context: Option<bool>,
     pub provider: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
@@ -223,6 +225,9 @@ pub fn save_corrector_config(
     if let Some(v) = input.enabled {
         guard.corrector.enabled = v;
     }
+    if let Some(v) = input.use_captured_context {
+        guard.corrector.use_captured_context = v;
+    }
     if let Some(v) = input.provider {
         if let Some(p) = crate::provider_presets::llm_preset_by_id(&v) {
             // Switching provider fills endpoint + default model (user can still edit).
@@ -307,6 +312,7 @@ pub fn save_corrector_config(
 pub(crate) fn status_from(cfg: &AppConfig) -> CorrectorStatus {
     CorrectorStatus {
         enabled: cfg.corrector.enabled,
+        use_captured_context: cfg.corrector.use_captured_context,
         provider: cfg.corrector.provider.clone(),
         base_url: cfg.corrector.base_url.clone(),
         model: cfg.corrector.model.clone(),

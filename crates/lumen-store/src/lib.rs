@@ -63,6 +63,28 @@ impl Default for EditAttribution {
     }
 }
 
+/// Terminal outcome of the post-insert observation protocol. Unlike an edit
+/// event, this record also exists when no edit was captured or tracking failed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EditObservationRecord {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub attempt_id: Uuid,
+    pub source: String,
+    pub status: String,
+    pub end_reason: String,
+    pub target_app_name: Option<String>,
+    pub target_bundle_id: Option<String>,
+    pub target_fingerprint_hash: Option<String>,
+    pub inserted_text_hash: String,
+    pub field_initial_hash: Option<String>,
+    pub field_final_hash: Option<String>,
+    pub normalized_edit_distance: Option<f64>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub edit_event_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptStatus {
@@ -695,6 +717,48 @@ impl Store {
         Ok(id)
     }
 
+    /// Atomically persists an attributed edit and its terminal observation.
+    /// Dictionary learning runs after this transaction so it cannot hide or
+    /// split the primary audit record.
+    pub fn add_edit_event_with_observation(
+        &self,
+        session_id: Uuid,
+        source: EditSource,
+        before: &str,
+        after: &str,
+        attribution: &EditAttribution,
+        observation: &EditObservationRecord,
+    ) -> Result<Uuid> {
+        anyhow::ensure!(
+            observation.session_id == session_id
+                && attribution.attempt_id == Some(observation.attempt_id),
+            "edit event and observation attribution must identify the same attempt"
+        );
+        let transaction = self.conn.unchecked_transaction()?;
+        let edit_event_id = Uuid::new_v4();
+        transaction.execute(
+            r#"
+            INSERT INTO edit_events (
+              id, session_id, source, before_text, after_text, created_at, attribution_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                edit_event_id.to_string(),
+                session_id.to_string(),
+                edit_source_str(source),
+                before,
+                after,
+                Utc::now().to_rfc3339(),
+                serde_json::to_string(attribution)?,
+            ],
+        )?;
+        let mut linked_observation = observation.clone();
+        linked_observation.edit_event_id = Some(edit_event_id);
+        save_edit_observation_on(&transaction, &linked_observation)?;
+        transaction.commit()?;
+        Ok(edit_event_id)
+    }
+
     pub fn list_edit_events(&self, session_id: Uuid) -> Result<Vec<EditEventRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -705,6 +769,26 @@ impl Store {
             "#,
         )?;
         let rows = stmt.query_map(params![session_id.to_string()], map_edit)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn save_edit_observation(&self, record: &EditObservationRecord) -> Result<()> {
+        save_edit_observation_on(&self.conn, record)
+    }
+
+    pub fn list_edit_observations(&self, session_id: Uuid) -> Result<Vec<EditObservationRecord>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, session_id, attempt_id, source, status, end_reason,
+                   target_app_name, target_bundle_id, target_fingerprint_hash,
+                   inserted_text_hash, field_initial_hash, field_final_hash,
+                   normalized_edit_distance, started_at, completed_at, edit_event_id
+            FROM edit_observations
+            WHERE session_id=?1
+            ORDER BY completed_at ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![session_id.to_string()], map_edit_observation)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -834,6 +918,67 @@ impl Store {
     }
 }
 
+fn save_edit_observation_on(connection: &Connection, record: &EditObservationRecord) -> Result<()> {
+    let changed = connection.execute(
+        r#"
+        INSERT INTO edit_observations (
+          id, session_id, attempt_id, source, status, end_reason,
+          target_app_name, target_bundle_id, target_fingerprint_hash,
+          inserted_text_hash, field_initial_hash, field_final_hash,
+          normalized_edit_distance, started_at, completed_at, edit_event_id
+        )
+        SELECT
+          ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16
+        FROM dictation_attempts AS attempt
+        WHERE attempt.id=?3
+          AND attempt.session_id=?2
+          AND (
+            ?16 IS NULL OR EXISTS (
+              SELECT 1
+              FROM edit_events AS edit
+              WHERE edit.id=?16 AND edit.session_id=?2
+            )
+          )
+        ON CONFLICT(attempt_id) DO UPDATE SET
+          status=excluded.status,
+          end_reason=excluded.end_reason,
+          target_app_name=excluded.target_app_name,
+          target_bundle_id=excluded.target_bundle_id,
+          target_fingerprint_hash=excluded.target_fingerprint_hash,
+          inserted_text_hash=excluded.inserted_text_hash,
+          field_initial_hash=excluded.field_initial_hash,
+          field_final_hash=excluded.field_final_hash,
+          normalized_edit_distance=excluded.normalized_edit_distance,
+          completed_at=excluded.completed_at,
+          edit_event_id=excluded.edit_event_id
+        "#,
+        params![
+            record.id.to_string(),
+            record.session_id.to_string(),
+            record.attempt_id.to_string(),
+            record.source,
+            record.status,
+            record.end_reason,
+            record.target_app_name,
+            record.target_bundle_id,
+            record.target_fingerprint_hash,
+            record.inserted_text_hash,
+            record.field_initial_hash,
+            record.field_final_hash,
+            record.normalized_edit_distance,
+            record.started_at.to_rfc3339(),
+            record.completed_at.to_rfc3339(),
+            record.edit_event_id.map(|value| value.to_string()),
+        ],
+    )?;
+    if changed == 0 {
+        anyhow::bail!(
+            "edit observation must reference an attempt and edit event from the same session"
+        );
+    }
+    Ok(())
+}
+
 fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
         id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
@@ -920,6 +1065,37 @@ fn map_context_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextSnap
         sanitized_hash: row.get(12)?,
         encryption: row.get(13)?,
         status: row.get(14)?,
+    })
+}
+
+fn map_edit_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<EditObservationRecord> {
+    Ok(EditObservationRecord {
+        id: parse_uuid_column(row, 0)?,
+        session_id: parse_uuid_column(row, 1)?,
+        attempt_id: parse_uuid_column(row, 2)?,
+        source: row.get(3)?,
+        status: row.get(4)?,
+        end_reason: row.get(5)?,
+        target_app_name: row.get(6)?,
+        target_bundle_id: row.get(7)?,
+        target_fingerprint_hash: row.get(8)?,
+        inserted_text_hash: row.get(9)?,
+        field_initial_hash: row.get(10)?,
+        field_final_hash: row.get(11)?,
+        normalized_edit_distance: row.get(12)?,
+        started_at: parse_dt(&row.get::<_, String>(13)?),
+        completed_at: parse_dt(&row.get::<_, String>(14)?),
+        edit_event_id: row
+            .get::<_, Option<String>>(15)?
+            .map(|value| Uuid::parse_str(&value))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    15,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
     })
 }
 
@@ -1248,6 +1424,166 @@ mod tests {
         let recent = store.list_recent_edit_events(1).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].attribution, attribution);
+    }
+
+    #[test]
+    fn edit_observation_records_both_terminal_reason_and_linked_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("edit-observation.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+        let attempt = store
+            .append_dictation_attempt(DictationAttemptRecord::new(session.id))
+            .unwrap();
+        let edit_id = store
+            .add_edit_event(session.id, EditSource::PostPasteAx, "Cortex", "Codex")
+            .unwrap();
+        let now = Utc::now();
+        let observation = EditObservationRecord {
+            id: Uuid::new_v4(),
+            session_id: session.id,
+            attempt_id: attempt.id,
+            source: "focused_field_poll_v3".into(),
+            status: "completed_with_edit".into(),
+            end_reason: "stable_edit_captured".into(),
+            target_app_name: Some("TextEdit".into()),
+            target_bundle_id: Some("com.apple.TextEdit".into()),
+            target_fingerprint_hash: Some("target".into()),
+            inserted_text_hash: "inserted".into(),
+            field_initial_hash: Some("initial".into()),
+            field_final_hash: Some("final".into()),
+            normalized_edit_distance: Some(0.33),
+            started_at: now,
+            completed_at: now,
+            edit_event_id: Some(edit_id),
+        };
+
+        store.save_edit_observation(&observation).unwrap();
+        let records = store.list_edit_observations(session.id).unwrap();
+
+        assert_eq!(records, vec![observation]);
+    }
+
+    #[test]
+    fn edit_observation_rejects_cross_session_attempts_and_edit_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("edit-observation-integrity.sqlite")).unwrap();
+        let first = SessionRecord::new();
+        let second = SessionRecord::new();
+        store.save_session(&first).unwrap();
+        store.save_session(&second).unwrap();
+        let first_attempt = store
+            .append_dictation_attempt(DictationAttemptRecord::new(first.id))
+            .unwrap();
+        let second_attempt = store
+            .append_dictation_attempt(DictationAttemptRecord::new(second.id))
+            .unwrap();
+        let second_edit = store
+            .add_edit_event(second.id, EditSource::PostPasteAx, "before", "after")
+            .unwrap();
+        let now = Utc::now();
+        let base = EditObservationRecord {
+            id: Uuid::new_v4(),
+            session_id: first.id,
+            attempt_id: first_attempt.id,
+            source: "focused_field_poll_v3".into(),
+            status: "completed_no_edit".into(),
+            end_reason: "observation_window_elapsed".into(),
+            target_app_name: None,
+            target_bundle_id: None,
+            target_fingerprint_hash: None,
+            inserted_text_hash: "inserted".into(),
+            field_initial_hash: None,
+            field_final_hash: None,
+            normalized_edit_distance: Some(0.0),
+            started_at: now,
+            completed_at: now,
+            edit_event_id: None,
+        };
+
+        let mut wrong_attempt = base.clone();
+        wrong_attempt.attempt_id = second_attempt.id;
+        assert!(store.save_edit_observation(&wrong_attempt).is_err());
+
+        let mut wrong_edit = base;
+        wrong_edit.edit_event_id = Some(second_edit);
+        assert!(store.save_edit_observation(&wrong_edit).is_err());
+        assert!(store.list_edit_observations(first.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn attributed_edit_and_terminal_observation_commit_or_roll_back_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("atomic-edit-observation.sqlite")).unwrap();
+        let first = SessionRecord::new();
+        let second = SessionRecord::new();
+        store.save_session(&first).unwrap();
+        store.save_session(&second).unwrap();
+        let first_attempt = store
+            .append_dictation_attempt(DictationAttemptRecord::new(first.id))
+            .unwrap();
+        let second_attempt = store
+            .append_dictation_attempt(DictationAttemptRecord::new(second.id))
+            .unwrap();
+        let now = Utc::now();
+        let observation = EditObservationRecord {
+            id: Uuid::new_v4(),
+            session_id: first.id,
+            attempt_id: first_attempt.id,
+            source: "focused_field_poll_v3".into(),
+            status: "completed_with_edit".into(),
+            end_reason: "stable_edit_captured".into(),
+            target_app_name: Some("TextEdit".into()),
+            target_bundle_id: Some("com.apple.TextEdit".into()),
+            target_fingerprint_hash: Some("target".into()),
+            inserted_text_hash: "inserted".into(),
+            field_initial_hash: Some("before".into()),
+            field_final_hash: Some("after".into()),
+            normalized_edit_distance: Some(0.25),
+            started_at: now,
+            completed_at: now,
+            edit_event_id: None,
+        };
+        let attribution = EditAttribution {
+            attempt_id: Some(first_attempt.id),
+            status: "confirmed_same_field_span".into(),
+            ..EditAttribution::default()
+        };
+        let edit_event_id = store
+            .add_edit_event_with_observation(
+                first.id,
+                EditSource::PostPasteAx,
+                "Cortex",
+                "Codex",
+                &attribution,
+                &observation,
+            )
+            .unwrap();
+        assert_eq!(
+            store.list_edit_observations(first.id).unwrap()[0].edit_event_id,
+            Some(edit_event_id)
+        );
+        assert_eq!(store.list_edit_events(first.id).unwrap().len(), 1);
+
+        let mut invalid_observation = observation;
+        invalid_observation.id = Uuid::new_v4();
+        invalid_observation.attempt_id = second_attempt.id;
+        let invalid_attribution = EditAttribution {
+            attempt_id: Some(second_attempt.id),
+            status: "confirmed_same_field_span".into(),
+            ..EditAttribution::default()
+        };
+        assert!(store
+            .add_edit_event_with_observation(
+                first.id,
+                EditSource::PostPasteAx,
+                "bad",
+                "data",
+                &invalid_attribution,
+                &invalid_observation,
+            )
+            .is_err());
+        assert_eq!(store.list_edit_events(first.id).unwrap().len(), 1);
     }
 
     #[test]

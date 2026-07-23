@@ -92,44 +92,43 @@ pub fn probe_corrector() -> Result<CorrectorProbeResult, String> {
         .ok()
         .filter(|s| !s.is_empty());
 
-    let (suggested_provider, suggested_base_url, suggested_model, message) =
-        if ollama_running {
-            let model = if has_qwen25_7b {
-                "qwen2.5:7b".into()
-            } else if let Some(m) = ollama_models.first() {
-                m.clone()
-            } else {
-                "qwen2.5:7b".into()
-            };
-            (
-                "ollama".into(),
-                format!("{ollama_url}/v1"),
-                model,
-                if has_qwen25_7b {
-                    "Ollama 可用，已检测到 qwen2.5:7b".into()
-                } else if ollama_models.is_empty() {
-                    "Ollama 在运行但还没有模型，建议拉取 qwen2.5:7b".into()
-                } else {
-                    format!("Ollama 可用，共 {} 个模型", ollama_models.len())
-                },
-            )
-        } else if let Some(ref base) = env_openai_base {
-            (
-                "openai_compatible".into(),
-                base.clone(),
-                env_lumen_model
-                    .clone()
-                    .unwrap_or_else(|| "gpt-4o-mini".into()),
-                "检测到环境变量中的 OpenAI 兼容配置".into(),
-            )
+    let (suggested_provider, suggested_base_url, suggested_model, message) = if ollama_running {
+        let model = if has_qwen25_7b {
+            "qwen2.5:7b".into()
+        } else if let Some(m) = ollama_models.first() {
+            m.clone()
         } else {
-            (
-                "none".into(),
-                format!("{ollama_url}/v1"),
-                "qwen2.5:7b".into(),
-                "未检测到 Ollama 或 OpenAI 兼容环境变量，可跳过修正或稍后安装 Ollama".into(),
-            )
+            "qwen2.5:7b".into()
         };
+        (
+            "ollama".into(),
+            format!("{ollama_url}/v1"),
+            model,
+            if has_qwen25_7b {
+                "Ollama 可用，已检测到 qwen2.5:7b".into()
+            } else if ollama_models.is_empty() {
+                "Ollama 在运行但还没有模型，建议拉取 qwen2.5:7b".into()
+            } else {
+                format!("Ollama 可用，共 {} 个模型", ollama_models.len())
+            },
+        )
+    } else if let Some(ref base) = env_openai_base {
+        (
+            "openai_compatible".into(),
+            base.clone(),
+            env_lumen_model
+                .clone()
+                .unwrap_or_else(|| "gpt-4o-mini".into()),
+            "检测到环境变量中的 OpenAI 兼容配置".into(),
+        )
+    } else {
+        (
+            "none".into(),
+            format!("{ollama_url}/v1"),
+            "qwen2.5:7b".into(),
+            "未检测到 Ollama 或 OpenAI 兼容环境变量，可跳过修正或稍后安装 Ollama".into(),
+        )
+    };
 
     Ok(CorrectorProbeResult {
         ollama_running,

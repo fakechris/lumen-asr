@@ -421,6 +421,9 @@ impl Default for AudioConfig {
 pub struct CorrectorConfig {
     /// When false, only rule preprocess + dictionary replacements run.
     pub enabled: bool,
+    /// Send a bounded, source-labelled projection of the current app/editor
+    /// context to the configured model corrector.
+    pub use_captured_context: bool,
     /// ollama | openai_compatible | none
     pub provider: String,
     pub base_url: String,
@@ -433,6 +436,7 @@ impl Default for CorrectorConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            use_captured_context: false,
             provider: "ollama".into(),
             base_url: "http://127.0.0.1:11434/v1".into(),
             model: std::env::var("LUMEN_CORRECTOR_MODEL").unwrap_or_else(|_| "qwen3.5:9b".into()),
@@ -888,5 +892,19 @@ provider = "local_qwen"
 
         assert!(config.context.enabled);
         assert_eq!(config.context.profile, "visible");
+    }
+
+    #[test]
+    fn existing_corrector_config_keeps_context_upload_opt_in() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[corrector]
+enabled = true
+provider = "minimax"
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.corrector.use_captured_context);
     }
 }

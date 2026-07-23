@@ -15,6 +15,7 @@ import type {
   CorrectorStatus,
   DictionaryEntry,
   EditEvent,
+  EditObservation,
   Health,
   LearnCandidate,
   LearningConfig,
@@ -34,6 +35,25 @@ function formatTime(iso: string): string {
   } catch {
     return iso;
   }
+}
+
+function editObservationReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    stable_edit_captured: "修改稳定后已捕获",
+    stable_edit_captured_without_edit_event: "已观察到修改，但编辑记录保存失败",
+    observation_window_elapsed: "观察时间结束",
+    anchor_unavailable: "插入后无法建立文本锚点",
+    anchor_task_failed: "锚点任务失败",
+    inserted_text_not_found: "在输入框里找不到刚插入的文字",
+    inserted_text_not_unique: "输入框里有多处相同文字，无法唯一定位",
+    target_field_unavailable: "目标输入框不可读取",
+    focused_field_changed: "焦点已切换到其他输入框",
+    anchor_mismatch: "锚点外文本发生变化",
+    next_dictation_started: "开始了下一次听写",
+    edit_not_stable_before_timeout: "修改尚未稳定时观察结束",
+    edit_event_persistence_failed: "修改已观察到，但数据库保存失败",
+  };
+  return labels[reason] || reason;
 }
 
 type LocalAsrEngine = "sensevoice" | "qwen" | "whisper";
@@ -188,6 +208,16 @@ export default function App() {
     });
     return () => un?.();
   }, [refreshDict]);
+
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    listen<EditObservation>("edit-observation-completed", () => {
+      setEditFeedbackRevision((value) => value + 1);
+    }).then((fn) => {
+      un = fn;
+    });
+    return () => un?.();
+  }, []);
 
   // Global hotkey / capsule events
   useEffect(() => {
@@ -1176,6 +1206,7 @@ function SettingsPanel({
   const [polish, setPolish] = useState<string[]>([]);
   const [customEnabled, setCustomEnabled] = useState(false);
   const [customInstruction, setCustomInstruction] = useState("");
+  const [useCapturedContext, setUseCapturedContext] = useState(false);
   const [probe, setProbe] = useState<string>("");
   const [perm, setPerm] = useState<import("./api").PermissionStatus | null>(null);
   const [autoInsert, setAutoInsert] = useState(true);
@@ -1227,6 +1258,7 @@ function SettingsPanel({
         setPolish(c.polish || []);
         setCustomEnabled(!!c.customEnabled);
         setCustomInstruction(c.customInstruction || "");
+        setUseCapturedContext(c.useCapturedContext);
         const p = await api.getPermissionStatus();
         setPerm(p);
         const inj = await api.getInjectConfig();
@@ -1274,6 +1306,7 @@ function SettingsPanel({
     try {
       const input: Parameters<typeof api.saveCorrectorConfig>[0] = {
         enabled,
+        useCapturedContext,
         provider,
         baseUrl,
         model,
@@ -1300,6 +1333,7 @@ function SettingsPanel({
       setPolish(c.polish || polish);
       setCustomEnabled(!!c.customEnabled);
       setCustomInstruction(c.customInstruction || "");
+      setUseCapturedContext(c.useCapturedContext);
       setApiKey("");
       onSaved();
       setProbe("已保存");
@@ -2105,6 +2139,22 @@ function SettingsPanel({
             启用模型修正
           </label>
         </div>
+        <div className="form-row">
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={useCapturedContext}
+              disabled={busy || !enabled}
+              onChange={(e) => setUseCapturedContext(e.target.checked)}
+              aria-describedby="captured-context-help"
+            />{" "}
+            用当前应用和光标附近文字辅助纠错
+          </label>
+          <p id="captured-context-help" className="muted-text">
+            仅发送有长度上限的应用、窗口、选区和光标附近文字；完整上下文仍只在本机加密保存。
+            若当前 Corrector 是云模型，这份精简内容会随本次请求上传。
+          </p>
+        </div>
         <div className="cleanup-level-block">
           <div className="field-label">自动整理强度</div>
           <p className="muted-text cleanup-hint">
@@ -2601,6 +2651,7 @@ function HistoryPanel({
   const [showPipeline, setShowPipeline] = useState(false);
   const [retryNote, setRetryNote] = useState<string | null>(null);
   const [editEvents, setEditEvents] = useState<EditEvent[]>([]);
+  const [editObservations, setEditObservations] = useState<EditObservation[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
 
@@ -2627,12 +2678,18 @@ function HistoryPanel({
     let cancelled = false;
     if (!selected) {
       setEditEvents([]);
+      setEditObservations([]);
       return;
     }
-    void api
-      .listEditEvents(selected.id)
-      .then((events) => {
-        if (!cancelled) setEditEvents(events);
+    void Promise.all([
+      api.listEditEvents(selected.id),
+      api.listEditObservations(selected.id),
+    ])
+      .then(([events, observations]) => {
+        if (!cancelled) {
+          setEditEvents(events);
+          setEditObservations(observations);
+        }
       })
       .catch((error) => {
         if (!cancelled) onError(`读取编辑反馈失败: ${String(error)}`);
@@ -2927,6 +2984,53 @@ function HistoryPanel({
                   ))}
                 </ol>
               </section>
+            )}
+
+            {editObservations.length > 0 && (
+              <details
+                className={`history-observations ${
+                  editObservations.some((observation) => observation.status === "failed")
+                    ? "has-failure"
+                    : ""
+                }`}
+              >
+                <summary>
+                  <span>
+                    {editObservations.some((observation) => observation.status === "failed")
+                      ? "编辑反馈跟踪有失败"
+                      : "编辑反馈跟踪已完成"}
+                  </span>
+                  <span className="chip">{editObservations.length}</span>
+                </summary>
+                <p className="muted-text history-edits-note">
+                  这里记录观察终态，用来区分用户未修改和系统未能继续跟踪。
+                </p>
+                <ol className="history-edit-list">
+                  {editObservations.map((observation) => (
+                    <li
+                      key={observation.id}
+                      className={`history-edit-item observation-${observation.status}`}
+                    >
+                      <div className="history-edit-meta">
+                        <span>{formatTime(observation.completed_at)}</span>
+                        <span>
+                          {observation.status === "completed_with_edit"
+                            ? "已捕获修改"
+                            : observation.status === "completed_no_edit"
+                              ? "观察期内未修改"
+                              : "跟踪失败"}
+                        </span>
+                      </div>
+                      <div className="muted-text">
+                        结束原因：{editObservationReasonLabel(observation.end_reason)}
+                        {observation.normalized_edit_distance != null
+                          ? ` · 编辑距离 ${observation.normalized_edit_distance.toFixed(2)}`
+                          : ""}
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              </details>
             )}
 
             {/* Recovery path: emphasized only when quality is bad */}

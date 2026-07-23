@@ -18,6 +18,7 @@ export type Health = {
 
 export type CorrectorStatus = {
   enabled: boolean;
+  useCapturedContext: boolean;
   provider: string;
   baseUrl: string;
   model: string;
@@ -363,6 +364,25 @@ export type EditEvent = {
     field_after_hash?: string | null;
     status: string;
   };
+};
+
+export type EditObservation = {
+  id: string;
+  session_id: string;
+  attempt_id: string;
+  source: string;
+  status: string;
+  end_reason: string;
+  target_app_name?: string | null;
+  target_bundle_id?: string | null;
+  target_fingerprint_hash?: string | null;
+  inserted_text_hash: string;
+  field_initial_hash?: string | null;
+  field_final_hash?: string | null;
+  normalized_edit_distance?: number | null;
+  started_at: string;
+  completed_at: string;
+  edit_event_id?: string | null;
 };
 
 export type DictionaryEntry = {

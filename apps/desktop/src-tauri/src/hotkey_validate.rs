@@ -28,7 +28,11 @@ pub fn validate_hotkey(shortcut: String) -> HotkeyValidation {
     }
 
     let upper = s.to_ascii_uppercase();
-    let parts: Vec<&str> = upper.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = upper
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.is_empty() {
         errors.push("无法解析快捷键".into());
     }
