@@ -1281,10 +1281,17 @@ pub fn emit_dictation(app: &AppHandle, event: DictationUiEvent) {
     let _ = app.emit("dictation", &event);
 }
 
-fn show_transient_error(app: &AppHandle, message: String) {
-    let notice_epoch = UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-    crate::capsule::set_capsule_visible(app, true, "error");
-    emit_dictation(app, DictationUiEvent::Error { message });
+fn finish_with_transient_error(app: &AppHandle, message: String) {
+    let notice_epoch = {
+        let _transition = UI_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        let notice_epoch = UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        crate::capsule::set_capsule_visible(app, true, "error");
+        emit_dictation(app, DictationUiEvent::Error { message });
+        notice_epoch
+    };
 
     let app_for_notice = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1374,8 +1381,7 @@ pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> 
             if let Ok(mut g) = RECORD_STARTED.lock() {
                 *g = None;
             }
-            PHASE.store(PHASE_IDLE, Ordering::SeqCst);
-            show_transient_error(&app, e.clone());
+            finish_with_transient_error(&app, e.clone());
             Err(e)
         }
     }
@@ -1474,8 +1480,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
             Ok(())
         }
         Err(e) => {
-            PHASE.store(PHASE_IDLE, Ordering::SeqCst);
-            show_transient_error(&app, e.clone());
+            finish_with_transient_error(&app, e.clone());
             Err(e)
         }
     }
