@@ -32,6 +32,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
           before_text TEXT NOT NULL,
           after_text TEXT NOT NULL,
           created_at TEXT NOT NULL,
+          attribution_json TEXT NOT NULL DEFAULT '{"schema_version":1,"attempt_id":null,"target_app_name":null,"target_bundle_id":null,"observer":null,"target_fingerprint_hash":null,"field_before_hash":null,"field_after_hash":null,"status":"unattributed"}',
           FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
 
@@ -128,6 +129,26 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)",
         [],
     )?;
+    let has_edit_attribution = {
+        let mut statement = conn.prepare("PRAGMA table_info(edit_events)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "attribution_json")
+    };
+    if !has_edit_attribution {
+        conn.execute(
+            r#"ALTER TABLE edit_events
+               ADD COLUMN attribution_json TEXT NOT NULL
+               DEFAULT '{"schema_version":1,"attempt_id":null,"target_app_name":null,"target_bundle_id":null,"observer":null,"target_fingerprint_hash":null,"field_before_hash":null,"field_after_hash":null,"status":"unattributed"}'"#,
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (4)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -186,7 +207,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -260,5 +281,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(context_table, 1);
+    }
+
+    #[test]
+    fn version_four_preserves_existing_edits_and_marks_them_unattributed() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (3);
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  focused_app TEXT,
+                  focused_bundle_id TEXT,
+                  asr_raw TEXT,
+                  corrected TEXT,
+                  pasted TEXT,
+                  asr_engine TEXT,
+                  corrector_engine TEXT,
+                  insert_strategy TEXT NOT NULL DEFAULT 'none',
+                  audio_path TEXT,
+                  status TEXT NOT NULL DEFAULT 'in_progress'
+                );
+                CREATE TABLE edit_events (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  session_id TEXT NOT NULL,
+                  source TEXT NOT NULL,
+                  before_text TEXT NOT NULL,
+                  after_text TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                INSERT INTO edit_events (
+                  id, session_id, source, before_text, after_text, created_at
+                ) VALUES (
+                  'edit', 'session', 'post_paste_ax', '旧', '新', '2026-07-23T00:00:00Z'
+                );
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let attribution: String = connection
+            .query_row(
+                "SELECT attribution_json FROM edit_events WHERE id='edit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(attribution.contains(r#""status":"unattributed""#));
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 4);
     }
 }

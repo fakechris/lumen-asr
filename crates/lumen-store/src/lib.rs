@@ -28,6 +28,38 @@ pub struct EditEventRecord {
     pub before_text: String,
     pub after_text: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub attribution: EditAttribution,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EditAttribution {
+    pub schema_version: u32,
+    pub attempt_id: Option<Uuid>,
+    pub target_app_name: Option<String>,
+    pub target_bundle_id: Option<String>,
+    pub observer: Option<String>,
+    pub target_fingerprint_hash: Option<String>,
+    pub field_before_hash: Option<String>,
+    pub field_after_hash: Option<String>,
+    pub status: String,
+}
+
+impl Default for EditAttribution {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            attempt_id: None,
+            target_app_name: None,
+            target_bundle_id: None,
+            observer: None,
+            target_fingerprint_hash: None,
+            field_before_hash: None,
+            field_after_hash: None,
+            status: "unattributed".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -623,11 +655,30 @@ impl Store {
         before: &str,
         after: &str,
     ) -> Result<Uuid> {
+        self.add_edit_event_with_attribution(
+            session_id,
+            source,
+            before,
+            after,
+            &EditAttribution::default(),
+        )
+    }
+
+    pub fn add_edit_event_with_attribution(
+        &self,
+        session_id: Uuid,
+        source: EditSource,
+        before: &str,
+        after: &str,
+        attribution: &EditAttribution,
+    ) -> Result<Uuid> {
         let id = Uuid::new_v4();
+        let attribution_json = serde_json::to_string(attribution)?;
         self.conn.execute(
             r#"
-            INSERT INTO edit_events (id, session_id, source, before_text, after_text, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO edit_events (
+              id, session_id, source, before_text, after_text, created_at, attribution_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
             params![
                 id.to_string(),
@@ -636,6 +687,7 @@ impl Store {
                 before,
                 after,
                 Utc::now().to_rfc3339(),
+                attribution_json,
             ],
         )?;
         Ok(id)
@@ -644,7 +696,7 @@ impl Store {
     pub fn list_edit_events(&self, session_id: Uuid) -> Result<Vec<EditEventRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, session_id, source, before_text, after_text, created_at
+            SELECT id, session_id, source, before_text, after_text, created_at, attribution_json
             FROM edit_events
             WHERE session_id=?1
             ORDER BY created_at ASC
@@ -769,7 +821,7 @@ impl Store {
     pub fn list_recent_edit_events(&self, limit: u32) -> Result<Vec<EditEventRecord>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, session_id, source, before_text, after_text, created_at
+            SELECT id, session_id, source, before_text, after_text, created_at, attribution_json
             FROM edit_events
             ORDER BY created_at DESC
             LIMIT ?1
@@ -1010,6 +1062,10 @@ fn map_dict(row: &rusqlite::Row<'_>) -> rusqlite::Result<DictionaryEntry> {
 }
 
 fn map_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EditEventRecord> {
+    let attribution_json: String = row.get(6)?;
+    let attribution = serde_json::from_str(&attribution_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     Ok(EditEventRecord {
         id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
         session_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
@@ -1017,6 +1073,7 @@ fn map_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EditEventRecord> {
         before_text: row.get(3)?,
         after_text: row.get(4)?,
         created_at: parse_dt(&row.get::<_, String>(5)?),
+        attribution,
     })
 }
 
@@ -1150,6 +1207,45 @@ mod tests {
         assert!(store.delete_session(rec.id).unwrap());
         assert!(store.get_session(rec.id).unwrap().is_none());
         assert!(store.list_edit_events(rec.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn attributed_edit_round_trips_attempt_target_and_field_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("attributed-edit.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+        let attempt_id = Uuid::new_v4();
+        let attribution = EditAttribution {
+            attempt_id: Some(attempt_id),
+            target_app_name: Some("TextEdit".into()),
+            target_bundle_id: Some("com.apple.TextEdit".into()),
+            observer: Some("focused_field_poll_v2".into()),
+            target_fingerprint_hash: Some("target-hash".into()),
+            field_before_hash: Some("before-hash".into()),
+            field_after_hash: Some("after-hash".into()),
+            status: "confirmed_same_field_span".into(),
+            ..EditAttribution::default()
+        };
+
+        store
+            .add_edit_event_with_attribution(
+                session.id,
+                EditSource::PostPasteAx,
+                "Lumen Asr",
+                "Lumen ASR",
+                &attribution,
+            )
+            .unwrap();
+
+        let edits = store.list_edit_events(session.id).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].before_text, "Lumen Asr");
+        assert_eq!(edits[0].after_text, "Lumen ASR");
+        assert_eq!(edits[0].attribution, attribution);
+        let recent = store.list_recent_edit_events(1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].attribution, attribution);
     }
 
     #[test]

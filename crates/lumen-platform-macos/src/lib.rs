@@ -1,9 +1,11 @@
 //! macOS platform adapters: permissions, text injection, frontmost app, hotkeys.
 
+mod focused_field;
 mod hotkey_tap;
 mod inject;
 mod permissions;
 
+pub use focused_field::{focused_text_field_snapshot, FocusedTextFieldSnapshot};
 pub use hotkey_tap::{
     start_monitor, start_multi_monitor, stop_monitor, HotkeyBinding, HotkeyEdge, HotkeyMode,
     HotkeySpec,

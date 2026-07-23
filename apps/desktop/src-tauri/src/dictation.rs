@@ -497,6 +497,8 @@ pub struct TranscribeOutcome {
     /// When true, UI/backend should start post-paste edit watch.
     pub watch_post_paste: bool,
     pub post_paste_seconds: u64,
+    #[serde(skip)]
+    pub post_insert_watch: Option<crate::learning::PostInsertWatchRequest>,
 }
 
 #[tauri::command]
@@ -506,13 +508,8 @@ pub async fn stop_and_transcribe(
     save: Option<bool>,
 ) -> Result<TranscribeOutcome, String> {
     let outcome = stop_and_transcribe_inner(&state, save.unwrap_or(true), Some(&app)).await?;
-    if outcome.watch_post_paste {
-        crate::learning::spawn_post_paste_watch(
-            app,
-            outcome.session.id,
-            outcome.corrected_text.clone(),
-            outcome.post_paste_seconds,
-        );
+    if let Some(request) = outcome.post_insert_watch.clone() {
+        crate::learning::spawn_post_insert_watch(app, request, outcome.post_paste_seconds);
     }
     Ok(outcome)
 }
@@ -928,7 +925,21 @@ pub async fn stop_and_transcribe_inner(
             notes,
         },
     );
+    let attempt_id = attempt.id;
     persist_attempt(state, save, &rec, attempt)?;
+    let post_insert_watch = if did_insert && cfg.learning.post_paste_capture {
+        target
+            .clone()
+            .map(|target| crate::learning::PostInsertWatchRequest {
+                session_id: rec.id,
+                attempt_id,
+                inserted_text: corrected_text.clone(),
+                target,
+            })
+    } else {
+        None
+    };
+    let watch_post_paste = post_insert_watch.is_some();
 
     Ok(TranscribeOutcome {
         text: corrected_text.clone(),
@@ -941,8 +952,9 @@ pub async fn stop_and_transcribe_inner(
         num_samples,
         duration_ms,
         session: rec,
-        watch_post_paste: did_insert && cfg.learning.post_paste_capture,
+        watch_post_paste,
         post_paste_seconds: cfg.learning.post_paste_seconds,
+        post_insert_watch,
     })
 }
 
@@ -1633,11 +1645,10 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
     clear_ui_intent();
     match result {
         Ok(outcome) => {
-            if outcome.watch_post_paste {
-                crate::learning::spawn_post_paste_watch(
+            if let Some(request) = outcome.post_insert_watch.clone() {
+                crate::learning::spawn_post_insert_watch(
                     app.clone(),
-                    outcome.session.id,
-                    outcome.corrected_text.clone(),
+                    request,
                     outcome.post_paste_seconds,
                 );
             }
