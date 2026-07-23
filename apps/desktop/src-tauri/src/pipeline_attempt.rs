@@ -1,4 +1,3 @@
-use crate::AppState;
 use crate::config::{AppConfig, AsrServiceConfig};
 use crate::context_capture::{CorrectorContextProjection, StageUsageInput};
 use crate::corrector_svc::{
@@ -7,7 +6,8 @@ use crate::corrector_svc::{
 };
 use crate::dictation::{canonical_asr_provider, engine_kind_for_provider};
 use crate::session_debug::{self, SessionDebugMeta};
-use lumen_asr::{AsrResult, EngineKind, QwenShadowStatus, model_identity_from_path};
+use crate::AppState;
+use lumen_asr::{model_identity_from_path, AsrResult, EngineKind, QwenShadowStatus};
 use lumen_core::SessionRecord;
 use lumen_corrector::CorrectorFallbackReason;
 use lumen_platform_macos::FrontmostTarget;

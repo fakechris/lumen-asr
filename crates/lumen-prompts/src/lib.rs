@@ -238,29 +238,35 @@ pub const CORRECTOR_SYSTEM_ZH: &str = CORRECTOR_BASE_ZH;
 fn cleanup_clause(level: CleanupLevel) -> &'static str {
     match level {
         CleanupLevel::None => "",
-        CleanupLevel::Light => r#"
+        CleanupLevel::Light => {
+            r#"
 # 整理强度：轻
 - 修正识别错误、同音字、错别字和基本标点
 - 去掉不承载语义的口头禅（嗯、啊、那个、就是）
 - 保持原句结构与用词，不改写语气，不压缩信息
 - 不合并用户本意分开的句子
-"#,
-        CleanupLevel::Medium => r#"
+"#
+        }
+        CleanupLevel::Medium => {
+            r#"
 # 整理强度：中（默认）
 - 修正识别错误、同音字、错别字和标点
 - 去掉填充词与明显口误重说
 - 在不增删事实的前提下理顺语序，合并明显的半截重复
 - 可轻度删减冗余，使句子清晰可读
 - 保持原意与关键措辞，不做文学化扩写
-"#,
-        CleanupLevel::Strong => r#"
+"#
+        }
+        CleanupLevel::Strong => {
+            r#"
 # 整理强度：强
 - 修正识别错误与标点
 - 大幅清理口语填充与重复
 - 在不发明信息的前提下重写为更顺畅、更简洁的书面表达
 - 可合并短句、调整顺序以提高可读性
 - 仍禁止回答问题、禁止添加原文没有的事实或建议
-"#,
+"#
+        }
     }
 }
 
@@ -281,9 +287,7 @@ fn style_clause(style: Style, casing: Casing, punct: PunctPolicy) -> String {
         PunctPolicy::Standard => "使用完整规范标点。",
         PunctPolicy::Light => "标点从简，可用较少逗号/句号，偏消息风格。",
     };
-    format!(
-        "\n# 语气与书写\n- {tone}\n- {case}\n- {p}\n"
-    )
+    format!("\n# 语气与书写\n- {tone}\n- {case}\n- {p}\n")
 }
 
 fn polish_clause(rules: &[PolishRule]) -> String {
