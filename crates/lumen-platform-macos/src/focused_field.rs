@@ -14,6 +14,8 @@ const FOCUSED_FIELD_SCRIPT_TIMEOUT: Duration = Duration::from_millis(750);
 /// Accessibility value and stable identity material for the focused text control.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedTextFieldSnapshot {
+    pub owner_name: String,
+    pub owner_bundle_id: String,
     pub value: String,
     pub role: String,
     pub subrole: String,
@@ -28,6 +30,7 @@ impl FocusedTextFieldSnapshot {
     /// Returns metadata suitable for hashing without including the field's text.
     pub fn fingerprint_material(&self) -> String {
         [
+            self.owner_bundle_id.as_str(),
             self.role.as_str(),
             self.subrole.as_str(),
             self.identifier.as_str(),
@@ -48,6 +51,14 @@ set fieldSeparator to ASCII character 30
 tell application "System Events"
   try
     set frontProc to first application process whose frontmost is true
+    set ownerName to ""
+    set ownerBundleId to ""
+    try
+      set ownerName to name of frontProc as text
+    end try
+    try
+      set ownerBundleId to bundle identifier of frontProc as text
+    end try
     set focusedElement to value of attribute "AXFocusedUIElement" of frontProc
     set fieldRole to ""
     set fieldSubrole to ""
@@ -87,7 +98,7 @@ tell application "System Events"
         end try
       end try
     end try
-    return fieldRole & fieldSeparator & fieldSubrole & fieldSeparator & fieldIdentifier & fieldSeparator & fieldX & fieldSeparator & fieldY & fieldSeparator & fieldWidth & fieldSeparator & fieldHeight & fieldSeparator & fieldValue
+    return ownerName & fieldSeparator & ownerBundleId & fieldSeparator & fieldRole & fieldSeparator & fieldSubrole & fieldSeparator & fieldIdentifier & fieldSeparator & fieldX & fieldSeparator & fieldY & fieldSeparator & fieldWidth & fieldSeparator & fieldHeight & fieldSeparator & fieldValue
   end try
 end tell
 return ""
@@ -136,7 +147,9 @@ fn run_osascript_with_timeout(script: &str, timeout: Duration) -> Option<Vec<u8>
 
 fn parse_snapshot(output: &str) -> Option<FocusedTextFieldSnapshot> {
     let output = output.strip_suffix('\n').unwrap_or(output);
-    let mut parts = output.splitn(8, FIELD_SEPARATOR);
+    let mut parts = output.splitn(10, FIELD_SEPARATOR);
+    let owner_name = parts.next()?.to_owned();
+    let owner_bundle_id = parts.next()?.to_owned();
     let role = parts.next()?.to_owned();
     let subrole = parts.next()?.to_owned();
     let identifier = parts.next()?.to_owned();
@@ -149,6 +162,8 @@ fn parse_snapshot(output: &str) -> Option<FocusedTextFieldSnapshot> {
         return None;
     }
     Some(FocusedTextFieldSnapshot {
+        owner_name,
+        owner_bundle_id,
         value,
         role,
         subrole,
@@ -167,11 +182,14 @@ mod tests {
     #[test]
     fn parser_preserves_multiline_unicode_field_values() {
         let separator = FIELD_SEPARATOR;
-        let raw =
-            format!("AXTextArea{separator}{separator}editor{separator}10{separator}20{separator}300{separator}80{separator}第一行\n第二行\n");
+        let raw = format!(
+            "TextEdit{separator}com.apple.TextEdit{separator}AXTextArea{separator}{separator}editor{separator}10{separator}20{separator}300{separator}80{separator}第一行\n第二行\n"
+        );
 
         let snapshot = parse_snapshot(&raw).unwrap();
 
+        assert_eq!(snapshot.owner_name, "TextEdit");
+        assert_eq!(snapshot.owner_bundle_id, "com.apple.TextEdit");
         assert_eq!(snapshot.role, "AXTextArea");
         assert_eq!(snapshot.value, "第一行\n第二行");
         assert!(!snapshot.fingerprint_material().contains("第一行"));
