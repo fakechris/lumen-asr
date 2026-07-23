@@ -11,8 +11,8 @@
 
 use async_trait::async_trait;
 use lumen_inject::{InjectError, TextInjectorBackend};
-use std::io::Write;
-use std::process::{Command, Stdio};
+use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+use objc2_foundation::NSString;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -68,37 +68,26 @@ fn paste_with_restore_sync(text: &str, preserve: bool) -> Result<(), InjectError
 }
 
 fn set_clipboard(text: &str) -> Result<(), InjectError> {
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| InjectError::Other(format!("pbcopy: {e}")))?;
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| InjectError::Other("pbcopy stdin missing".into()))?;
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| InjectError::Other(format!("pbcopy write: {e}")))?;
-    }
-    let status = child
-        .wait()
-        .map_err(|e| InjectError::Other(format!("pbcopy wait: {e}")))?;
-    if status.success() {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    let value = NSString::from_str(text);
+    let string_type = unsafe { NSPasteboardTypeString };
+    if pasteboard.setString_forType(&value, string_type) {
         Ok(())
     } else {
-        Err(InjectError::Other("pbcopy failed".into()))
+        Err(InjectError::Other(
+            "failed to write Unicode text to pasteboard".into(),
+        ))
     }
 }
 
 fn get_clipboard() -> Result<String, InjectError> {
-    let output = Command::new("pbpaste")
-        .output()
-        .map_err(|e| InjectError::Other(format!("pbpaste: {e}")))?;
-    if !output.status.success() {
-        return Err(InjectError::Other("pbpaste failed".into()));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let string_type = unsafe { NSPasteboardTypeString };
+    pasteboard
+        .stringForType(string_type)
+        .map(|value| value.to_string())
+        .ok_or_else(|| InjectError::Other("pasteboard does not contain text".into()))
 }
 
 const FLAG_SHIFT: u64 = 0x0002_0000;
@@ -224,4 +213,33 @@ fn post_unicode_chunk(
     event.set_flags(CGEventFlags::empty());
     event.post(CGEventTapLocation::HID);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::set_clipboard;
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::NSString;
+
+    #[test]
+    fn clipboard_copy_preserves_unicode_for_native_consumers() {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let string_type = unsafe { NSPasteboardTypeString };
+        let previous = pasteboard
+            .stringForType(string_type)
+            .map(|value| value.to_string());
+        let expected = "中文剪贴板测试：你好，世界。🚀";
+
+        set_clipboard(expected).expect("copy Unicode fixture");
+        let actual = pasteboard
+            .stringForType(string_type)
+            .map(|value| value.to_string());
+
+        pasteboard.clearContents();
+        if let Some(previous) = previous {
+            assert!(pasteboard.setString_forType(&NSString::from_str(&previous), string_type));
+        }
+
+        assert_eq!(actual.as_deref(), Some(expected));
+    }
 }
