@@ -4,7 +4,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "fonts": "node scripts/fetch-plex-fonts.mjs",
+    "predev": "node scripts/fetch-plex-fonts.mjs",
     "dev": "vite",
+    "prebuild": "node scripts/fetch-plex-fonts.mjs",
     "build": "tsc -b && vite build",
     "test": "node --test tests/*.test.ts",
     "preview": "vite preview",

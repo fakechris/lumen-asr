@@ -8,10 +8,30 @@
    rules adopt the new palette with no renaming.
    ============================================================ */
 
-/* Type: IBM Plex is used when installed, otherwise the stack falls back to
-   the system UI font (SF / PingFang SC for 简体中文). The woff2 files are not
-   bundled — the public repo forbids committing binaries, and a build step can
-   fetch/vendor them if pixel-exact Plex is required. See --font-sans below. */
+/* ── IBM Plex (fetched at build time, SIL OFL 1.1) ─────────────
+   The woff2 are pulled into public/fonts/ by scripts/fetch-plex-fonts.mjs
+   (predev/prebuild) — the public repo forbids committing binaries. These
+   src urls are root-relative /fonts/… so a missing file (offline build)
+   does NOT fail the bundle: the --font-sans stack falls back to the system
+   UI font (SF / PingFang SC for 简体中文). */
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 400; font-display: swap;
+  src: url('/fonts/IBMPlexSans-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 500; font-display: swap;
+  src: url('/fonts/IBMPlexSans-Medium.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 600; font-display: swap;
+  src: url('/fonts/IBMPlexSans-SemiBold.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 700; font-display: swap;
+  src: url('/fonts/IBMPlexSans-Bold.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans SC'; font-style: normal; font-weight: 400; font-display: swap;
+  src: url('/fonts/IBMPlexSansSC-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans SC'; font-style: normal; font-weight: 600; font-display: swap;
+  src: url('/fonts/IBMPlexSansSC-SemiBold.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 400; font-display: swap;
+  src: url('/fonts/IBMPlexMono-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 500; font-display: swap;
+  src: url('/fonts/IBMPlexMono-Medium.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 600; font-display: swap;
+  src: url('/fonts/IBMPlexMono-SemiBold.woff2') format('woff2'); }
 
 /* ===== LIGHT (default) — "Atelier" ===== */
 :root,
