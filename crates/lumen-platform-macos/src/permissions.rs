@@ -22,11 +22,25 @@ impl Permissions for MacPermissions {
     async fn request_microphone(&self) -> Result<PermissionState, PlatformError> {
         #[cfg(target_os = "macos")]
         {
-            let st = mic_status();
-            if st == PermissionState::Denied || st == PermissionState::Restricted {
-                let _ = self.open_microphone_settings().await;
+            match mic_status() {
+                // First run for this signing identity: fire the real system
+                // prompt. requestAccess is async — status stays NotDetermined
+                // until the user answers, and the settings/wizard poll picks up
+                // the result.
+                PermissionState::NotDetermined => {
+                    av_audio::request_access();
+                    Ok(mic_status())
+                }
+                // Already decided against us: macOS will not re-prompt, so open
+                // the exact settings pane for the user to flip it.
+                st @ (PermissionState::Denied | PermissionState::Restricted) => {
+                    if let Err(e) = self.open_microphone_settings().await {
+                        tracing::warn!(error = %e, "failed to open microphone settings pane");
+                    }
+                    Ok(st)
+                }
+                st => Ok(st),
             }
-            Ok(st)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -118,15 +132,22 @@ fn open_accessibility_settings_urls() -> Result<(), PlatformError> {
     {
         return Ok(());
     }
-    Err(last_err.unwrap_or_else(|| PlatformError::Message("open Accessibility settings failed".into())))
+    Err(last_err
+        .unwrap_or_else(|| PlatformError::Message("open Accessibility settings failed".into())))
 }
 
 fn mic_status() -> PermissionState {
     #[cfg(target_os = "macos")]
     {
-        match cpal_default_input_ok() {
-            true => PermissionState::Granted,
-            false => PermissionState::NotDetermined,
+        // Real TCC authorization via AVCaptureDevice — NOT device enumeration.
+        // A microphone can be listed (cpal sees it) while capture is still
+        // blocked, which previously reported a false "granted" and made the
+        // request button flash green without ever prompting.
+        match av_audio::authorization_status() {
+            3 => PermissionState::Granted,
+            2 => PermissionState::Denied,
+            1 => PermissionState::Restricted,
+            _ => PermissionState::NotDetermined,
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -135,13 +156,53 @@ fn mic_status() -> PermissionState {
     }
 }
 
+/// AVFoundation microphone authorization: the real TCC state and the system
+/// prompt. Uses raw objc2 messaging so no extra framework wrapper crate is
+/// pulled in.
 #[cfg(target_os = "macos")]
-fn cpal_default_input_ok() -> bool {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let host = cpal::default_host();
-    host.default_input_device()
-        .and_then(|d| d.default_input_config().ok())
-        .is_some()
+mod av_audio {
+    use block2::RcBlock;
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, Bool};
+    use objc2_foundation::NSString;
+
+    // Force-link AVFoundation so the AVCaptureDevice class is registered.
+    #[link(name = "AVFoundation", kind = "framework")]
+    extern "C" {}
+
+    fn capture_device_class() -> Option<&'static AnyClass> {
+        AnyClass::get(c"AVCaptureDevice")
+    }
+
+    // AVMediaTypeAudio is the constant NSString @"soun"; an equal-valued string
+    // is accepted by the media-type selectors, so we skip the extern symbol.
+    fn audio_media_type() -> Retained<NSString> {
+        NSString::from_str("soun")
+    }
+
+    /// AVAuthorizationStatus: 0 NotDetermined · 1 Restricted · 2 Denied · 3 Authorized.
+    pub fn authorization_status() -> i64 {
+        let Some(cls) = capture_device_class() else {
+            return 0;
+        };
+        let media = audio_media_type();
+        let status: isize = unsafe { msg_send![cls, authorizationStatusForMediaType: &*media] };
+        status as i64
+    }
+
+    /// Fire the system microphone prompt (only meaningful when NotDetermined).
+    /// The completion handler is required by the API; we just need the prompt.
+    pub fn request_access() {
+        let Some(cls) = capture_device_class() else {
+            return;
+        };
+        let media = audio_media_type();
+        let handler = RcBlock::new(|_granted: Bool| {});
+        let _: () = unsafe {
+            msg_send![cls, requestAccessForMediaType: &*media, completionHandler: &*handler]
+        };
+    }
 }
 
 #[cfg(target_os = "macos")]

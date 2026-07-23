@@ -92,8 +92,10 @@ fn process_path() -> String {
 /// System Settings usually shows CFBundleDisplayName for .app, basename for bare binaries.
 fn settings_list_name(path: &str) -> String {
     if let Some(app_root) = app_bundle_root(path) {
-        if let Some(name) = read_plist_string(&app_root.join("Contents/Info.plist"), "CFBundleDisplayName")
-            .or_else(|| read_plist_string(&app_root.join("Contents/Info.plist"), "CFBundleName"))
+        if let Some(name) =
+            read_plist_string(&app_root.join("Contents/Info.plist"), "CFBundleDisplayName").or_else(
+                || read_plist_string(&app_root.join("Contents/Info.plist"), "CFBundleName"),
+            )
         {
             return name;
         }
@@ -156,6 +158,7 @@ fn codesign_info(path: &str) -> (String, String, bool) {
     let mut identifier = String::new();
     let mut signature = String::new();
     let mut team = String::new();
+    let mut authority = String::new();
     for line in text.lines() {
         if let Some(v) = line.strip_prefix("Identifier=") {
             identifier = v.trim().into();
@@ -163,14 +166,26 @@ fn codesign_info(path: &str) -> (String, String, bool) {
             signature = v.trim().into();
         } else if let Some(v) = line.strip_prefix("TeamIdentifier=") {
             team = v.trim().into();
+        } else if authority.is_empty() {
+            // First Authority= is the leaf signer (e.g. "Lumen Local Codesign"
+            // or "Apple Development: …"). codesign prints the chain top-down.
+            if let Some(v) = line.strip_prefix("Authority=") {
+                authority = v.trim().into();
+            }
         }
     }
+    // codesign prints the flag label literally, e.g. `flags=0x2(adhoc)` vs
+    // `flags=0x0(none)` — match that rather than a fragile `0x2` substring
+    // (which would also hit 0x20000 etc.). No leaf Authority + no team is the
+    // other adhoc tell.
     let adhoc = signature.eq_ignore_ascii_case("adhoc")
-        || identifier.contains('-') && team == "not set"
-        || text.contains("flags=0x2")
-        || text.contains("adhoc");
+        || text.contains("(adhoc)")
+        || (authority.is_empty() && team == "not set");
     let kind = if adhoc {
         "adhoc".into()
+    } else if !authority.is_empty() {
+        // Show the signer name — the thing that actually keeps TCC stable.
+        authority
     } else if !team.is_empty() && team != "not set" {
         format!("signed:{team}")
     } else if !signature.is_empty() {
@@ -232,7 +247,9 @@ pub async fn request_accessibility_access() -> Result<PermissionDto, String> {
 }
 
 #[tauri::command]
-pub async fn request_microphone_access(state: State<'_, AppState>) -> Result<PermissionDto, String> {
+pub async fn request_microphone_access(
+    state: State<'_, AppState>,
+) -> Result<PermissionDto, String> {
     if !state.audio.is_recording() {
         match state.audio.start() {
             Ok(()) => {

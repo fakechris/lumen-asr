@@ -206,7 +206,7 @@ export function HotkeyRecorder({
         默认热键 <span className="kbd">⌥Space</span>。
       </p>
 
-      <div className="form-row" style={{ marginBottom: 12 }}>
+      <div className="form-row">
         <label className="muted-text">
           <input
             type="checkbox"
@@ -237,8 +237,8 @@ export function HotkeyRecorder({
         </label>
       </div>
 
-      <div className="form-row" style={{ marginBottom: 12 }}>
-        <label className="muted-text" style={{ minWidth: 72 }}>
+      <div className="form-row">
+        <label className="form-label">
           触发方式
         </label>
         <select
@@ -271,7 +271,7 @@ export function HotkeyRecorder({
         </select>
       </div>
 
-      <div className="form-row" style={{ marginBottom: 12 }}>
+      <div className="form-row">
         <label className="muted-text">
           <input
             type="checkbox"

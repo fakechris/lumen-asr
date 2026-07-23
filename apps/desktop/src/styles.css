@@ -1,71 +1,150 @@
-/* Lumen ASR — design system (macOS + Lumen warm light) */
-/* Tokens from 设计系统: system blue, warm glow accent, SF linear icons */
+/* ============================================================
+   Lumen ASR — Lumen Design System
+   Warm quiet-utility language shared across the Lumen family.
+   Dual theme: Atelier (warm light, default) + Vault (dark),
+   switched by data-theme on <html>. IBM Plex type, 1px borders
+   over shadows, DS radius/spacing scale, restrained motion.
+   Variable names kept from the previous macOS skin so component
+   rules adopt the new palette with no renaming.
+   ============================================================ */
 
-:root {
-  color-scheme: light dark;
-  --bg: #f2f2f7;
-  --sidebar: #e8e8ed;
-  --sidebar-hover: rgba(0, 0, 0, 0.045);
-  --sidebar-active: rgba(0, 122, 255, 0.12);
-  --card: #ffffff;
-  --card-soft: #fbfbfd;
-  --text: #1d1d1f;
-  --muted: #6e6e73;
-  --muted-2: #8a8a8e;
-  --accent: #007aff;
-  --accent-hover: #0a63d1;
-  --accent-dim: rgba(0, 122, 255, 0.12);
-  --lumen-warm: #ff9f0a;
-  --lumen-warm-soft: #ffc24b;
-  --lumen-warm-dim: rgba(255, 159, 10, 0.16);
-  --error: #ff3b30;
-  --ok: #34c759;
-  --border: rgba(0, 0, 0, 0.07);
-  --border-strong: rgba(0, 0, 0, 0.12);
-  --danger: #ff3b30;
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.035), 0 6px 20px rgba(0, 0, 0, 0.045);
-  --shadow-lift: 0 1px 2px rgba(0, 0, 0, 0.04), 0 12px 32px rgba(0, 0, 0, 0.08);
+/* Type: IBM Plex is used when installed, otherwise the stack falls back to
+   the system UI font (SF / PingFang SC for 简体中文). The woff2 files are not
+   bundled — the public repo forbids committing binaries, and a build step can
+   fetch/vendor them if pixel-exact Plex is required. See --font-sans below. */
+
+/* ===== LIGHT (default) — "Atelier" ===== */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f7f6f2;
+  --bg-deep: #efece5;
+  --sidebar: #efece5;
+  --sidebar-hover: #f2ede4;
+  --sidebar-active: #f4dfd2;
+  --card: #fffdfa;
+  --card-soft: #fbf7f0;
+  --text: #1f1a17;
+  --text-soft: #443a32;
+  --muted: #71675d;
+  --muted-2: #938a7f;
+
+  --accent: #9f4f24;
+  --accent-hover: #843c15;
+  --accent-strong: #843c15;
+  --accent-soft: #f4dfd2;
+  --accent-dim: #f4dfd2;
+  --accent-2: #2563bb;
+  --on-accent: #fffdfa;
+
+  --lumen-warm: #e08a4f;
+  --lumen-warm-soft: #edb488;
+  --lumen-warm-dim: color-mix(in srgb, #e08a4f 18%, transparent);
+
+  --error: #b04545;
+  --ok: #2f7d52;
+  --danger: #b04545;
+  --success: #2f7d52;
+  --success-soft: #e4f0e8;
+  --warn: #a85e10;
+  --warn-soft: #fff8ec;
+  --danger-soft: #fbe9e7;
+  --durable: #2f7d52;
+  --caveated: #b8862e;
+  --blocked: #b04545;
+
+  --border: #e7e1d8;
+  --border-strong: #cdc4b6;
+  --code-bg: #f4f1ea;
+
+  /* Elevation — only two, used only on the outer shell + popovers */
+  --shadow: 0 12px 36px rgba(31, 26, 23, 0.06);
+  --shadow-lift: 0 16px 48px rgba(31, 26, 23, 0.12);
+
+  /* fonts */
+  --font-sans: 'IBM Plex Sans', 'IBM Plex Sans SC', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'Roboto', sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', 'Menlo', 'Consolas', monospace;
+  --font-serif: 'Iowan Old Style', 'Songti SC', 'Source Han Serif SC', 'Georgia', serif;
+
+  /* spacing — 4px grid */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-5: 20px; --space-6: 24px; --space-8: 32px; --space-10: 40px;
+  --space-12: 48px; --space-16: 64px;
+
+  /* shape — DS radius scale */
   --titlebar-h: 52px;
   --sidebar-w: 176px;
   --status-h: 30px;
-  --radius: 11px;
-  --radius-sm: 8px;
-  --radius-lg: 14px;
+  --radius: 16px;       /* cards */
+  --radius-sm: 10px;    /* buttons, inputs, small controls */
+  --radius-lg: 20px;    /* outer shell / modal */
+  --radius-input: 10px;
+  --radius-md: 12px;    /* nested panels */
+  --radius-card: 16px;
+  --radius-shell: 20px;
+  --radius-pill: 999px;
   --control-h: 32px;
-  --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
-    system-ui, sans-serif;
-  font-size: 13px;
-  line-height: 1.45;
-  letter-spacing: -0.01em;
+
+  /* motion — restrained */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur-normal: 180ms;
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 32%, transparent);
+
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: 0;
   -webkit-font-smoothing: antialiased;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #1c1c1e;
-    --sidebar: #2c2c2e;
-    --sidebar-hover: rgba(255, 255, 255, 0.055);
-    --sidebar-active: rgba(10, 132, 255, 0.2);
-    --card: #2c2c2e;
-    --card-soft: #323234;
-    --text: #f5f5f7;
-    --muted: #98989d;
-    --muted-2: #8a8a8e;
-    --accent: #0a84ff;
-    --accent-hover: #409cff;
-    --accent-dim: rgba(10, 132, 255, 0.18);
-    --lumen-warm: #ff9f0a;
-    --lumen-warm-soft: #ffc24b;
-    --lumen-warm-dim: rgba(255, 159, 10, 0.18);
-    --error: #ff453a;
-    --ok: #30d158;
-    --border: rgba(255, 255, 255, 0.08);
-    --border-strong: rgba(255, 255, 255, 0.14);
-    --danger: #ff453a;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.28), 0 8px 24px rgba(0, 0, 0, 0.22);
-    --shadow-lift: 0 2px 8px rgba(0, 0, 0, 0.35), 0 16px 40px rgba(0, 0, 0, 0.28);
-  }
+/* ===== DARK — "Vault" ===== */
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0a0e16;
+  --bg-deep: #05080d;
+  --sidebar: #0c1119;
+  --sidebar-hover: #1c2432;
+  --sidebar-active: rgba(59, 130, 246, 0.16);
+  --card: #11161f;
+  --card-soft: #161c27;
+  --text: #e6edf5;
+  --text-soft: #c2cfde;
+  --muted: #7d8aa0;
+  --muted-2: #64728a;
+
+  --accent: #3b82f6;
+  --accent-hover: #5b98f8;
+  --accent-strong: #5b98f8;
+  --accent-soft: rgba(59, 130, 246, 0.16);
+  --accent-dim: rgba(59, 130, 246, 0.16);
+  --accent-2: #06b6d4;
+  --on-accent: #081120;
+
+  --lumen-warm: #eab308;
+  --lumen-warm-soft: #facc48;
+  --lumen-warm-dim: color-mix(in srgb, #eab308 22%, transparent);
+
+  --error: #f87171;
+  --ok: #22c55e;
+  --danger: #f87171;
+  --success: #22c55e;
+  --success-soft: rgba(34, 197, 94, 0.15);
+  --warn: #fbbf24;
+  --warn-soft: rgba(245, 158, 11, 0.12);
+  --danger-soft: rgba(244, 114, 182, 0.14);
+  --durable: #22c55e;
+  --caveated: #eab308;
+  --blocked: #f87171;
+
+  --border: #1f2937;
+  --border-strong: #2c3a4f;
+  --code-bg: #0e1420;
+
+  --shadow: 0 12px 36px rgba(0, 0, 0, 0.55);
+  --shadow-lift: 0 18px 52px rgba(0, 0, 0, 0.7);
 }
 
 .icon {
@@ -75,6 +154,17 @@
 
 * {
   box-sizing: border-box;
+}
+
+/* Accent focus ring — DS :focus-visible (3px accent outline, 2px offset) */
+:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--text);
 }
 
 html,
@@ -128,26 +218,13 @@ body {
   margin-bottom: 4px;
 }
 
+/* Product mark: the unified Lumen ASR tile (espresso + amber waveform SVG). */
 .sidebar-brand-mark {
-  width: 26px;
-  height: 26px;
-  border-radius: 7px;
-  background: linear-gradient(180deg, #3b86ff 0%, #0e4ecb 55%, #082c82 100%);
-  box-shadow: 0 4px 12px rgba(14, 78, 203, 0.28);
-  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
   flex-shrink: 0;
-}
-
-.sidebar-brand-mark::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  margin: auto;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #fffdf5;
-  box-shadow: 0 0 10px rgba(255, 178, 32, 0.85);
+  display: block;
 }
 
 .sidebar-brand-text {
@@ -216,6 +293,13 @@ body {
 
 .sidebar-spacer {
   flex: 1;
+}
+
+.sidebar-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 6px 2px;
 }
 
 .sidebar-meta {
@@ -311,7 +395,7 @@ body {
 
 .statusbar .kbd,
 .kbd {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   padding: 1px 6px;
   border-radius: 4px;
@@ -426,12 +510,12 @@ body {
 
 /* ── Cards & chrome ────────────────────────────────────── */
 
+/* Borders do the structural work — no shadow on inline cards (DS ethos). */
 .card {
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 16px 18px;
-  box-shadow: var(--shadow);
 }
 
 .card h2 {
@@ -474,7 +558,7 @@ body {
 }
 
 code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 0.9em;
   background: color-mix(in srgb, var(--text) 6%, transparent);
   padding: 0.1em 0.35em;
@@ -541,7 +625,7 @@ code {
 .btn {
   border: 1px solid transparent;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   padding: 0 14px;
   min-height: var(--control-h);
   border-radius: var(--radius-sm);
@@ -637,10 +721,6 @@ code {
   background: var(--accent-dim);
   border-color: color-mix(in srgb, var(--accent) 28%, transparent);
   color: var(--accent);
-}
-
-.btn:hover:not(:disabled) {
-  filter: brightness(1.05);
 }
 
 .btn:disabled {
@@ -1110,6 +1190,110 @@ code {
   margin-bottom: 6px;
 }
 
+/* ── Permission status rows ────────────────────────────── */
+/* At-a-glance state: granted = green, not granted = red. The action
+   button stays clickable in both states (force a re-check) but drops to
+   ghost once granted so the card reads "done" rather than "act now". */
+
+.perm-list {
+  display: grid;
+  gap: 8px;
+  margin: 2px 0 14px;
+}
+
+.perm-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--card-soft);
+}
+
+.perm-row.ok {
+  border-color: color-mix(in srgb, var(--ok) 42%, var(--border));
+  background: color-mix(in srgb, var(--ok) 8%, var(--card-soft));
+}
+
+.perm-row.bad {
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--border));
+  background: color-mix(in srgb, var(--danger) 8%, var(--card-soft));
+}
+
+.perm-status {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+
+.perm-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: var(--radius-pill);
+  flex-shrink: 0;
+  background: var(--muted);
+}
+
+.perm-dot.ok {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent);
+}
+
+.perm-dot.bad {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 22%, transparent);
+}
+
+.perm-status-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.perm-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.perm-badge {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+}
+
+.perm-row.ok .perm-badge {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+}
+
+.perm-row.bad .perm-badge {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+}
+
+.perm-state {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.perm-row .btn {
+  flex-shrink: 0;
+}
+
+.perm-details {
+  margin-top: 4px;
+}
+
 .chip {
   display: inline-block;
   font-size: 0.72rem;
@@ -1138,7 +1322,7 @@ code {
   border: 1px solid var(--border);
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 0.88rem;
   line-height: 1.45;
 }
@@ -1175,6 +1359,11 @@ select.input:focus {
   flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+  margin-bottom: var(--space-3);
+}
+
+.form-row:last-child {
+  margin-bottom: 0;
 }
 
 .form-row .input {
@@ -1186,6 +1375,16 @@ select.input:focus {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+/* Fixed-width inline field label — replaces repeated inline minWidth styles. */
+.form-label {
+  min-width: 72px;
+  color: var(--muted);
+}
+
+.form-label.wide {
+  min-width: 120px;
 }
 
 .arrow {
@@ -1260,7 +1459,7 @@ select.input:focus {
 }
 
 /* ── Onboarding wizard ─────────────────────────────────── */
-/* Pattern: dim + blur the app behind; solid opaque modal on top (not inverted). */
+/* Quiet-utility modal: solid dark scrim (no frosted glass) + bordered card. */
 
 .onboard-overlay {
   position: fixed;
@@ -1270,10 +1469,8 @@ select.input:focus {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  /* Dark scrim dims the page; blur softens content behind. Card stays solid. */
-  background: rgba(0, 0, 0, 0.42);
-  -webkit-backdrop-filter: blur(14px) saturate(1.15);
-  backdrop-filter: blur(14px) saturate(1.15);
+  /* Solid scrim dims the page — no backdrop blur (DS: no frosted glass). */
+  background: color-mix(in srgb, #05080d 62%, transparent);
 }
 
 .onboard-card {
@@ -1281,15 +1478,12 @@ select.input:focus {
   width: min(640px, 100%);
   max-height: min(90vh, 820px);
   overflow: auto;
-  border-radius: 16px;
+  border-radius: var(--radius-shell);
   padding: 24px 28px 22px;
-  /* Must use solid --card (light/dark), never a missing --surface fallback to pure dark. */
   background: var(--card);
   color: var(--text);
   border: 1px solid var(--border-strong);
-  box-shadow:
-    0 1px 2px rgba(0, 0, 0, 0.06),
-    0 24px 64px rgba(0, 0, 0, 0.28);
+  box-shadow: var(--shadow-lift);
 }
 
 .onboard-card-wide {
@@ -1372,7 +1566,7 @@ select.input:focus {
   justify-content: space-between;
   gap: 10px;
   padding: 8px 0;
-  border-bottom: 1px solid color-mix(in srgb, var(--border, #48484a) 50%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
   font-size: 0.88rem;
 }
 
@@ -1481,13 +1675,11 @@ select.input:focus {
 
 .onboard-feature-icon.warm {
   background: var(--lumen-warm-dim);
-  color: #c47600;
+  color: color-mix(in srgb, var(--lumen-warm) 78%, var(--text));
 }
 
-@media (prefers-color-scheme: dark) {
-  .onboard-feature-icon.warm {
-    color: var(--lumen-warm-soft);
-  }
+[data-theme="dark"] .onboard-feature-icon.warm {
+  color: var(--lumen-warm-soft);
 }
 
 .onboard-actions {
@@ -1522,7 +1714,7 @@ select.input:focus {
 }
 
 .onboard-perm-card.ok {
-  border-color: color-mix(in srgb, var(--ok, #30d158) 55%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 55%, transparent);
 }
 
 .onboard-perm-title {
@@ -1538,12 +1730,12 @@ select.input:focus {
   font-weight: 600;
   padding: 2px 8px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--muted, #98989d) 22%, transparent);
+  background: color-mix(in srgb, var(--muted) 22%, transparent);
 }
 
 .onboard-perm-card.ok .onboard-pill {
-  background: color-mix(in srgb, var(--ok, #30d158) 28%, transparent);
-  color: var(--ok, #30d158);
+  background: color-mix(in srgb, var(--ok) 28%, transparent);
+  color: var(--ok);
 }
 
 .onboard-path-meta {
@@ -1555,7 +1747,7 @@ select.input:focus {
 }
 
 .onboard-path-meta dt {
-  color: var(--muted, #98989d);
+  color: var(--muted);
 }
 
 .onboard-path code {
@@ -1580,7 +1772,7 @@ select.input:focus {
 .onboard-meter {
   height: 14px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--border, #48484a) 70%, transparent);
+  background: color-mix(in srgb, var(--border) 70%, transparent);
   overflow: hidden;
 }
 
@@ -1588,12 +1780,12 @@ select.input:focus {
   height: 100%;
   width: 0;
   border-radius: 999px;
-  background: var(--accent, #0a84ff);
+  background: var(--accent);
   transition: width 60ms linear;
 }
 
 .onboard-meter-fill.ok {
-  background: var(--ok, #30d158);
+  background: var(--ok);
 }
 
 .onboard-meter-nums {
@@ -1622,72 +1814,71 @@ html:has(.capsule-root) body {
   color-scheme: only dark;
 }
 
+/* Floating recording HUD — a gap component the DS doesn't ship, drawn in
+   the family language: solid warm-espresso pill (no glass/blur), 1px
+   accent border, pill radius, one pop shadow. Stays dark in both themes
+   so it reads over any focused app; phase colour follows the ASR mark
+   (amber) with red for capture and gold for translate. */
 .capsule-root {
   display: flex;
   align-items: center;
   gap: 10px;
-  /* No outer margin — margin sits on transparent webview and still “looks” like a frame on some OS builds */
   margin: 0;
   box-sizing: border-box;
   width: 100%;
   height: 100%;
   padding: 0 14px;
-  border-radius: 999px;
-  background: rgba(28, 28, 32, 0.92);
-  border: 1.5px solid rgba(10, 132, 255, 0.55);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  border-radius: var(--radius-pill);
+  background: #17120d;
+  border: 1.5px solid rgba(224, 138, 79, 0.55);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
   -webkit-app-region: drag;
   user-select: none;
+  font-family: var(--font-sans);
   font-size: 0.9rem;
   font-weight: 550;
-  color: #f5f5f7;
-  /* Avoid backdrop-filter on the full window chrome — can paint a frosted white rect */
+  color: #f3ece2;
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
 
 .capsule-root.phase-listening {
-  border-color: rgba(255, 69, 58, 0.7);
+  border-color: rgba(224, 98, 92, 0.85);
 }
 
 .capsule-root.phase-processing {
-  border-color: rgba(255, 159, 10, 0.7);
+  border-color: rgba(224, 138, 79, 0.9);
 }
 
-/* Translate — warm amber, not the same blue/red as normal record */
+/* Translate — gold, distinct from the red/amber record path */
 .capsule-root.intent-translate {
-  background: linear-gradient(
-    135deg,
-    rgba(48, 36, 12, 0.96) 0%,
-    rgba(36, 28, 14, 0.96) 100%
-  );
-  border-color: rgba(255, 178, 32, 0.9);
-  box-shadow: 0 6px 22px rgba(255, 159, 10, 0.22);
-  color: #fff8e8;
+  background: #191309;
+  border-color: rgba(230, 184, 79, 0.9);
+  color: #fff6e2;
 }
 
 .capsule-root.intent-translate.phase-processing {
-  border-color: rgba(255, 204, 80, 0.95);
+  border-color: rgba(240, 205, 120, 0.95);
 }
 
 .capsule-root.intent-raw {
-  border-color: rgba(152, 152, 157, 0.75);
-  background: rgba(40, 40, 44, 0.94);
+  border-color: rgba(148, 163, 184, 0.7);
+  background: #16130f;
 }
 
 .capsule-badge {
   flex-shrink: 0;
   width: 26px;
   height: 26px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   display: grid;
   place-items: center;
   font-size: 0.72rem;
   font-weight: 700;
   letter-spacing: 0;
-  background: rgba(10, 132, 255, 0.28);
-  color: #7ec8ff;
-  border: 1px solid rgba(10, 132, 255, 0.45);
+  background: rgba(224, 138, 79, 0.26);
+  color: #edb488;
+  border: 1px solid rgba(224, 138, 79, 0.5);
 }
 
 .phase-listening .capsule-badge {
