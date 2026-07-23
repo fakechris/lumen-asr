@@ -52,6 +52,8 @@ function editObservationReasonLabel(reason: string): string {
     next_dictation_started: "开始了下一次听写",
     edit_not_stable_before_timeout: "修改尚未稳定时观察结束",
     edit_event_persistence_failed: "修改已观察到，但数据库保存失败",
+    target_metadata_unavailable: "插入时无法读取目标应用信息",
+    session_persistence_timeout: "听写记录保存超时，无法写入修改观察结果",
   };
   return labels[reason] || reason;
 }
