@@ -498,7 +498,7 @@ export function OnboardingWizard({ onDone }: Props) {
             <h1>选择麦克风</h1>
             <p className="muted-text">选择输入设备，然后说一句话。</p>
             <div className="form-row" style={{ marginBottom: 16 }}>
-              <label className="muted-text" style={{ minWidth: 72 }}>
+              <label className="form-label">
                 设备
               </label>
               <select
@@ -550,7 +550,7 @@ export function OnboardingWizard({ onDone }: Props) {
             <h1>本地 ASR 模型</h1>
             <p className="muted-text">默认 SenseVoice。可使用本机已有模型，或下载官方 sherpa 包。</p>
             <div className="form-row" style={{ marginBottom: 10 }}>
-              <label className="muted-text" style={{ minWidth: 72 }}>
+              <label className="form-label">
                 引擎
               </label>
               <select
@@ -735,7 +735,7 @@ export function OnboardingWizard({ onDone }: Props) {
             )}
             {probe?.ollamaRunning && (
               <div className="form-row" style={{ margin: "12px 0" }}>
-                <label className="muted-text" style={{ minWidth: 72 }}>
+                <label className="form-label">
                   模型
                 </label>
                 <select

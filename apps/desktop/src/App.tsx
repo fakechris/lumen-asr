@@ -6,7 +6,9 @@ import { OnboardingWizard } from "./OnboardingWizard";
 import { formatHotkeyLabel } from "./hotkeyFormat";
 import { chooseAudioDevice } from "./audioDeviceSelection";
 import { Icon, type IconName } from "./Icons";
+import { ThemeToggle } from "./ThemeToggle";
 import { ChordCaptureChip } from "./ChordCaptureChip";
+import lumenMark from "./assets/product-icons/lumen-asr.svg";
 import type {
   AsrStatus,
   AudioDevice,
@@ -301,7 +303,7 @@ export default function App() {
       <div className="app-body">
         <nav className="sidebar" aria-label="主导航">
           <div className="sidebar-brand">
-            <div className="sidebar-brand-mark" aria-hidden />
+            <img className="sidebar-brand-mark" src={lumenMark} alt="" aria-hidden />
             <div className="sidebar-brand-text">
               <span className="sidebar-brand-name">Lumen</span>
               <span className="sidebar-brand-sub">ASR</span>
@@ -321,6 +323,9 @@ export default function App() {
             </button>
           ))}
           <div className="sidebar-spacer" />
+          <div className="sidebar-foot">
+            <ThemeToggle />
+          </div>
           <div className="sidebar-meta">
             {onboardingIncomplete && (
               <>
@@ -890,8 +895,8 @@ function RecordPanel({
           在任意 App 按住说话。当前：
           <strong> {status?.providerLabel || provider}</strong>
         </p>
-        <div className="form-row" style={{ marginBottom: 12 }}>
-          <label className="muted-text" style={{ minWidth: 64 }}>
+        <div className="form-row">
+          <label className="form-label">
             设备
           </label>
           <select
@@ -908,8 +913,8 @@ function RecordPanel({
             ))}
           </select>
         </div>
-        <div className="form-row" style={{ marginBottom: 12 }}>
-          <label className="muted-text" style={{ minWidth: 64 }}>
+        <div className="form-row">
+          <label className="form-label">
             ASR
           </label>
           <select
@@ -1357,43 +1362,128 @@ function SettingsPanel({
     <>
       <section className="card settings-section">
         <h2>权限</h2>
-        <p className="muted-text">
-          麦克风：系统弹窗授权。辅助功能：系统<strong>不会</strong>弹授权窗，必须在「系统设置 →
-          隐私与安全性 → 辅助功能」里打开<strong>当前进程</strong>的开关。检测用的是系统 API
-          <code>AXIsProcessTrusted</code>，不是猜的。
-        </p>
-        {perm && (
+        {perm ? (
           <>
-            <dl className="meta">
-              <dt>麦克风</dt>
-              <dd>{perm.microphone}</dd>
-              <dt>辅助功能</dt>
-              <dd>
-                {perm.accessibilityTrusted ? "已开启" : "需要开启"}
-                {perm.accessibilityTrusted ? "" : "（未开启时只能复制到剪贴板）"}
-              </dd>
-              <dt>系统列表中的名称</dt>
-              <dd>
-                <code>{perm.settingsListName || perm.processHint}</code>
-                {perm.processHint && perm.settingsListName !== perm.processHint ? (
-                  <span className="muted-text"> （可执行文件名 {perm.processHint}）</span>
-                ) : null}
-              </dd>
-              <dt>完整路径</dt>
-              <dd style={{ wordBreak: "break-all" }}>
-                <code>{perm.processPath}</code>
-              </dd>
-              <dt>代码签名</dt>
-              <dd>
-                <code>{perm.codesignKind || "unknown"}</code>
-                {perm.codesignIdentifier ? (
-                  <>
-                    {" · "}
-                    <code style={{ wordBreak: "break-all" }}>{perm.codesignIdentifier}</code>
-                  </>
-                ) : null}
-              </dd>
-            </dl>
+            <div className="perm-list">
+              <div className={`perm-row ${perm.microphone === "granted" ? "ok" : "bad"}`}>
+                <span className="perm-status">
+                  <span
+                    className={`perm-dot ${perm.microphone === "granted" ? "ok" : "bad"}`}
+                    aria-hidden
+                  />
+                  <span className="perm-status-text">
+                    <span className="perm-name">
+                      麦克风
+                      <span className="perm-badge">
+                        {perm.microphone === "granted" ? "已授权" : "未授权"}
+                      </span>
+                    </span>
+                    <span className="perm-state">
+                      {perm.microphone === "granted"
+                        ? "可以录音"
+                        : perm.microphone === "denied"
+                          ? "已被拒绝 — 到系统设置里打开"
+                          : perm.microphone === "restricted"
+                            ? "被系统策略限制"
+                            : "尚未授权 — 点右侧请求，会弹系统授权窗"}
+                    </span>
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  className={`btn small ${perm.microphone === "granted" ? "ghost" : ""}`}
+                  disabled={busy}
+                  onClick={() =>
+                    void (async () => {
+                      onBusy(true);
+                      try {
+                        setPerm(await api.requestMicrophoneAccess());
+                      } catch (e) {
+                        onError(String(e));
+                      } finally {
+                        onBusy(false);
+                      }
+                    })()
+                  }
+                >
+                  {perm.microphone === "granted" ? "重新检查" : "请求麦克风"}
+                </button>
+              </div>
+
+              <div className={`perm-row ${perm.accessibilityTrusted ? "ok" : "bad"}`}>
+                <span className="perm-status">
+                  <span
+                    className={`perm-dot ${perm.accessibilityTrusted ? "ok" : "bad"}`}
+                    aria-hidden
+                  />
+                  <span className="perm-status-text">
+                    <span className="perm-name">
+                      辅助功能
+                      <span className="perm-badge">
+                        {perm.accessibilityTrusted ? "已开启" : "未开启"}
+                      </span>
+                    </span>
+                    <span className="perm-state">
+                      {perm.accessibilityTrusted
+                        ? "可直接把文本插入到其它应用"
+                        : "未开启只能复制到剪贴板 — 在系统设置里打开当前进程的开关"}
+                    </span>
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  className={`btn small ${perm.accessibilityTrusted ? "ghost" : ""}`}
+                  disabled={busy}
+                  onClick={() =>
+                    void (async () => {
+                      onBusy(true);
+                      try {
+                        setPerm(await api.requestAccessibilityAccess());
+                        onSaved();
+                      } catch (e) {
+                        onError(String(e));
+                      } finally {
+                        onBusy(false);
+                      }
+                    })()
+                  }
+                >
+                  {perm.accessibilityTrusted ? "重新检查" : "打开辅助功能设置"}
+                </button>
+              </div>
+            </div>
+
+            <details className="settings-help perm-details">
+              <summary>权限如何检测 · 技术细节</summary>
+              <p className="muted-text" style={{ margin: "10px 0" }}>
+                麦克风走系统弹窗授权。辅助功能系统<strong>不会</strong>弹窗，必须在「系统设置 →
+                隐私与安全性 → 辅助功能」里打开<strong>当前进程</strong>的开关；检测用的是系统 API
+                <code>AXIsProcessTrusted</code>，不是猜的。
+              </p>
+              <dl className="meta" style={{ margin: 0 }}>
+                <dt>系统列表中的名称</dt>
+                <dd>
+                  <code>{perm.settingsListName || perm.processHint}</code>
+                  {perm.processHint && perm.settingsListName !== perm.processHint ? (
+                    <span className="muted-text"> （可执行文件名 {perm.processHint}）</span>
+                  ) : null}
+                </dd>
+                <dt>完整路径</dt>
+                <dd style={{ wordBreak: "break-all" }}>
+                  <code>{perm.processPath}</code>
+                </dd>
+                <dt>代码签名</dt>
+                <dd>
+                  <code>{perm.codesignKind || "unknown"}</code>
+                  {perm.codesignIdentifier ? (
+                    <>
+                      {" · "}
+                      <code style={{ wordBreak: "break-all" }}>{perm.codesignIdentifier}</code>
+                    </>
+                  ) : null}
+                </dd>
+              </dl>
+            </details>
             {!perm.accessibilityTrusted && (
               <div className="ax-recovery" style={{ marginTop: 12 }}>
                 <p className="muted-text" style={{ marginBottom: 8 }}>
@@ -1427,27 +1517,10 @@ function SettingsPanel({
               </div>
             )}
           </>
+        ) : (
+          <p className="muted-text">正在读取权限状态…</p>
         )}
         <div className="actions">
-          <button
-            type="button"
-            className="btn"
-            disabled={busy}
-            onClick={() =>
-              void (async () => {
-                onBusy(true);
-                try {
-                  setPerm(await api.requestMicrophoneAccess());
-                } catch (e) {
-                  onError(String(e));
-                } finally {
-                  onBusy(false);
-                }
-              })()
-            }
-          >
-            请求麦克风
-          </button>
           <button
             type="button"
             className="btn ghost"
@@ -1455,26 +1528,6 @@ function SettingsPanel({
             onClick={() => void api.openMicrophoneSettings()}
           >
             打开麦克风设置
-          </button>
-          <button
-            type="button"
-            className="btn"
-            disabled={busy}
-            onClick={() =>
-              void (async () => {
-                onBusy(true);
-                try {
-                  setPerm(await api.requestAccessibilityAccess());
-                  onSaved();
-                } catch (e) {
-                  onError(String(e));
-                } finally {
-                  onBusy(false);
-                }
-              })()
-            }
-          >
-            打开辅助功能设置
           </button>
           <button
             type="button"
@@ -1527,8 +1580,8 @@ function SettingsPanel({
           SenseVoice 与 Qwen 是两条独立的本地识别前端；Qwen
           优先准确率，SenseVoice 优先较低资源占用。识别后共用当前的文本整理、插入与学习流程。
         </p>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             Provider
           </label>
           <select
@@ -1646,8 +1699,8 @@ function SettingsPanel({
         )}
         {asrProvider === "local_qwen" && (
           <>
-            <div className="form-row" style={{ marginBottom: 10 }}>
-              <label className="muted-text" style={{ minWidth: 120 }}>
+            <div className="form-row">
+              <label className="form-label wide">
                 Qwen Python
               </label>
               <input
@@ -1658,7 +1711,7 @@ function SettingsPanel({
                 placeholder="包含 mlx_qwen3_asr 的 Python 可执行文件"
               />
             </div>
-            <div className="form-row" style={{ marginBottom: 10 }}>
+            <div className="form-row">
               <label className="muted-text">
                 <input
                   type="checkbox"
@@ -1675,8 +1728,8 @@ function SettingsPanel({
         )}
         {!asrProvider.startsWith("local") && (
           <>
-            <div className="form-row" style={{ marginBottom: 10 }}>
-              <label className="muted-text" style={{ minWidth: 72 }}>
+            <div className="form-row">
+              <label className="form-label">
                 Base URL
               </label>
               <input
@@ -1686,8 +1739,8 @@ function SettingsPanel({
                 onChange={(e) => setAsrBaseUrl(e.target.value)}
               />
             </div>
-            <div className="form-row" style={{ marginBottom: 10 }}>
-              <label className="muted-text" style={{ minWidth: 72 }}>
+            <div className="form-row">
+              <label className="form-label">
                 Model
               </label>
               <input
@@ -1703,8 +1756,8 @@ function SettingsPanel({
                 ))}
               </datalist>
             </div>
-            <div className="form-row" style={{ marginBottom: 10 }}>
-              <label className="muted-text" style={{ minWidth: 72 }}>
+            <div className="form-row">
+              <label className="form-label">
                 API Key
               </label>
               <input
@@ -1716,8 +1769,8 @@ function SettingsPanel({
                 placeholder={asrHasKey ? "已保存（留空不改）" : "必填"}
               />
             </div>
-            <div className="form-row" style={{ marginBottom: 10 }}>
-              <label className="muted-text" style={{ minWidth: 72 }}>
+            <div className="form-row">
+              <label className="form-label">
                 语言
               </label>
               <input
@@ -1966,7 +2019,7 @@ function SettingsPanel({
 
       <section className="card settings-section">
         <h2>插入策略</h2>
-        <div className="form-row" style={{ marginBottom: 10 }}>
+        <div className="form-row">
           <label className="muted-text">
             <input
               type="checkbox"
@@ -1977,7 +2030,7 @@ function SettingsPanel({
             停止转写后自动插入
           </label>
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
+        <div className="form-row">
           <label className="muted-text">
             <input
               type="checkbox"
@@ -1988,8 +2041,8 @@ function SettingsPanel({
             保留并恢复原剪贴板
           </label>
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             模式
           </label>
           <select
@@ -2041,7 +2094,7 @@ function SettingsPanel({
             </li>
           </ul>
         </details>
-        <div className="form-row" style={{ marginBottom: 10 }}>
+        <div className="form-row">
           <label className="muted-text">
             <input
               type="checkbox"
@@ -2091,8 +2144,8 @@ function SettingsPanel({
             <br />→ 轻：去「嗯/那个」+ 标点 · 中：更顺 · 强：压成更短几句
           </div>
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             语气
           </label>
           <select
@@ -2107,8 +2160,8 @@ function SettingsPanel({
             <option value="very_casual">很随意</option>
           </select>
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             英文大小写
           </label>
           <select
@@ -2122,8 +2175,8 @@ function SettingsPanel({
             <option value="lower">尽量小写</option>
           </select>
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             标点
           </label>
           <select
@@ -2185,7 +2238,7 @@ function SettingsPanel({
           />
         )}
         <div className="form-row" style={{ marginBottom: 10, marginTop: 12 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+          <label className="form-label">
             Provider
           </label>
           <select
@@ -2221,8 +2274,8 @@ function SettingsPanel({
             {llmPresets.find((p) => p.id === provider)?.notes}
           </p>
         )}
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             Base URL
           </label>
           <input
@@ -2233,8 +2286,8 @@ function SettingsPanel({
             placeholder="http://127.0.0.1:11434/v1"
           />
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             Model
           </label>
           <input
@@ -2251,8 +2304,8 @@ function SettingsPanel({
             ))}
           </datalist>
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             API Key
           </label>
           <input
@@ -2264,8 +2317,8 @@ function SettingsPanel({
             placeholder={cfg?.hasApiKey ? "已保存（留空不改）" : "可选"}
           />
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             Timeout
           </label>
           <input
@@ -2303,7 +2356,7 @@ function SettingsPanel({
         <p className="muted-text">
           转写结果改字、或粘贴后在目标 App 再改，可生成词典候选。默认需手动确认。
         </p>
-        <div className="form-row" style={{ marginBottom: 10 }}>
+        <div className="form-row">
           <label className="muted-text">
             <input
               type="checkbox"
@@ -2314,8 +2367,8 @@ function SettingsPanel({
             自动晋升（同一替换累计达到阈值）
           </label>
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             阈值 N
           </label>
           <input
@@ -2327,7 +2380,7 @@ function SettingsPanel({
             onChange={(e) => setPromoteN(Number(e.target.value) || 3)}
           />
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
+        <div className="form-row">
           <label className="muted-text">
             <input
               type="checkbox"
@@ -2338,8 +2391,8 @@ function SettingsPanel({
             粘贴后监听目标输入框改动（需辅助功能）
           </label>
         </div>
-        <div className="form-row" style={{ marginBottom: 10 }}>
-          <label className="muted-text" style={{ minWidth: 72 }}>
+        <div className="form-row">
+          <label className="form-label">
             监听秒数
           </label>
           <input
