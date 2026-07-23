@@ -174,10 +174,13 @@ fn codesign_info(path: &str) -> (String, String, bool) {
             }
         }
     }
+    // codesign prints the flag label literally, e.g. `flags=0x2(adhoc)` vs
+    // `flags=0x0(none)` — match that rather than a fragile `0x2` substring
+    // (which would also hit 0x20000 etc.). No leaf Authority + no team is the
+    // other adhoc tell.
     let adhoc = signature.eq_ignore_ascii_case("adhoc")
-        || (authority.is_empty() && team == "not set" && !text.contains("flags=0x0"))
-        || text.contains("flags=0x2")
-        || text.contains("adhoc");
+        || text.contains("(adhoc)")
+        || (authority.is_empty() && team == "not set");
     let kind = if adhoc {
         "adhoc".into()
     } else if !authority.is_empty() {

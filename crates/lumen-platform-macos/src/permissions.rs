@@ -34,7 +34,9 @@ impl Permissions for MacPermissions {
                 // Already decided against us: macOS will not re-prompt, so open
                 // the exact settings pane for the user to flip it.
                 st @ (PermissionState::Denied | PermissionState::Restricted) => {
-                    let _ = self.open_microphone_settings().await;
+                    if let Err(e) = self.open_microphone_settings().await {
+                        tracing::warn!(error = %e, "failed to open microphone settings pane");
+                    }
                     Ok(st)
                 }
                 st => Ok(st),

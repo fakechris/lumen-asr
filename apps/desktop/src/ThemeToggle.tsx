@@ -20,9 +20,17 @@ function currentTheme(): Theme {
 export function ThemeToggle() {
   const [theme, setTheme] = useState<Theme>(() => currentTheme());
 
-  // Reflect an external change (e.g. another window) if the attribute moves.
+  // Reflect a theme change made in another window (localStorage fires
+  // `storage` in other documents of the same origin).
   useEffect(() => {
-    setTheme(currentTheme());
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== STORAGE_KEY || !e.newValue) return;
+      const next: Theme = e.newValue === "dark" ? "dark" : "light";
+      document.documentElement.setAttribute("data-theme", next);
+      setTheme(next);
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
 
   const toggle = useCallback(() => {

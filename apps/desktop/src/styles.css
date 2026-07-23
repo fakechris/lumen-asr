@@ -63,9 +63,9 @@
   --shadow-lift: 0 16px 48px rgba(31, 26, 23, 0.12);
 
   /* fonts */
-  --font-sans: 'IBM Plex Sans', 'IBM Plex Sans SC', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --font-serif: 'Iowan Old Style', 'Songti SC', 'Source Han Serif SC', Georgia, serif;
+  --font-sans: 'IBM Plex Sans', 'IBM Plex Sans SC', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'Roboto', sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', 'Menlo', 'Consolas', monospace;
+  --font-serif: 'Iowan Old Style', 'Songti SC', 'Source Han Serif SC', 'Georgia', serif;
 
   /* spacing — 4px grid */
   --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
