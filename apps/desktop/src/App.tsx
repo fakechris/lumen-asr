@@ -12,6 +12,7 @@ import type {
   AudioDevice,
   CorrectorStatus,
   DictionaryEntry,
+  EditEvent,
   Health,
   LearnCandidate,
   LearningConfig,
@@ -101,6 +102,8 @@ export default function App() {
   const [tab, setTab] = useState<TabId>("record");
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [editFeedbackRevision, setEditFeedbackRevision] = useState(0);
   const [busy, setBusy] = useState(false);
   const [hotkeyLabel, setHotkeyLabel] = useState("⌥Space");
   const [hotkeyEnabled, setHotkeyEnabledUi] = useState(true);
@@ -148,16 +151,19 @@ export default function App() {
     }
   }, []);
 
-  // Post-paste learn suggestions from native watch
+  // Persisted post-insert feedback. Keep it visible without stealing the
+  // user's current tab; candidates remain ready if they later open Learning.
   useEffect(() => {
     let un: (() => void) | undefined;
     listen<{
+      editEventId?: string | null;
       sessionId: string;
       beforeText: string;
       afterText: string;
       candidates: LearnCandidate[];
+      autoPromoted: DictionaryEntry[];
       message: string;
-    }>("learn-suggestion", (e) => {
+    }>("edit-feedback-captured", (e) => {
       const p = e.payload;
       setLearnBefore(p.beforeText);
       setLearnAfter(p.afterText);
@@ -167,13 +173,19 @@ export default function App() {
         baseline: p.beforeText,
         candidates: p.candidates || [],
       });
-      setTab("learn");
+      setEditFeedbackRevision((value) => value + 1);
+      setNotice(
+        p.candidates?.length
+          ? `已记录你对听写结果的修改，并发现 ${p.candidates.length} 个可学习候选。`
+          : "已记录你对听写结果的修改。"
+      );
       setError(null);
+      if (p.autoPromoted?.length) void refreshDict();
     }).then((fn) => {
       un = fn;
     });
     return () => un?.();
-  }, []);
+  }, [refreshDict]);
 
   // Global hotkey / capsule events
   useEffect(() => {
@@ -352,6 +364,14 @@ export default function App() {
               </button>
             </div>
           )}
+          {notice && (
+            <div className="banner success" role="status">
+              {notice}
+              <button type="button" className="linkish" onClick={() => setNotice(null)}>
+                关闭
+              </button>
+            </div>
+          )}
 
           <div className="content-scroll">
             <div className="content-header">
@@ -407,6 +427,7 @@ export default function App() {
               <HistoryPanel
                 sessions={sessions}
                 selected={selected}
+                editFeedbackRevision={editFeedbackRevision}
                 busy={busy}
                 onSelect={setSelectedId}
                 onRefresh={() => void refreshSessions()}
@@ -2502,6 +2523,7 @@ function sessionMainText(s: SessionRecord): string {
 function HistoryPanel({
   sessions,
   selected,
+  editFeedbackRevision,
   busy,
   onSelect,
   onRefresh,
@@ -2512,6 +2534,7 @@ function HistoryPanel({
 }: {
   sessions: SessionRecord[];
   selected: SessionRecord | null;
+  editFeedbackRevision: number;
   busy: boolean;
   onSelect: (id: string | null) => void;
   onRefresh: () => void;
@@ -2524,6 +2547,7 @@ function HistoryPanel({
   const [copied, setCopied] = useState(false);
   const [showPipeline, setShowPipeline] = useState(false);
   const [retryNote, setRetryNote] = useState<string | null>(null);
+  const [editEvents, setEditEvents] = useState<EditEvent[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
 
@@ -2545,6 +2569,25 @@ function HistoryPanel({
     setShowPipeline(false);
     setRetryNote(null);
   }, [selected?.id, stopAudio]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selected) {
+      setEditEvents([]);
+      return;
+    }
+    void api
+      .listEditEvents(selected.id)
+      .then((events) => {
+        if (!cancelled) setEditEvents(events);
+      })
+      .catch((error) => {
+        if (!cancelled) onError(`读取编辑反馈失败: ${String(error)}`);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editFeedbackRevision, onError, selected]);
 
   useEffect(() => () => stopAudio(), [stopAudio]);
 
@@ -2799,6 +2842,39 @@ function HistoryPanel({
                 </span>
               )}
             </div>
+
+            {editEvents.length > 0 && (
+              <section className="history-edits" aria-label="插入后的用户编辑">
+                <div className="history-edits-head">
+                  <h3>插入后的编辑</h3>
+                  <span className="chip">{editEvents.length}</span>
+                </div>
+                <p className="muted-text history-edits-note">
+                  这里只显示已确认发生在本次插入文本范围内的修改。
+                </p>
+                <ol className="history-edit-list">
+                  {editEvents.map((edit) => (
+                    <li key={edit.id} className="history-edit-item">
+                      <div className="history-edit-meta">
+                        <span>{formatTime(edit.created_at)}</span>
+                        <span>
+                          {edit.source === "post_paste_ax"
+                            ? "目标输入框"
+                            : edit.source === "pre_insert_ui"
+                              ? "插入前编辑"
+                              : "手动记录"}
+                        </span>
+                      </div>
+                      <div className="history-edit-change">
+                        <pre>{edit.before_text || "（空）"}</pre>
+                        <span aria-hidden="true">→</span>
+                        <pre>{edit.after_text || "（已删除）"}</pre>
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              </section>
+            )}
 
             {/* Recovery path: emphasized only when quality is bad */}
             {needsRecovery && hasAudio && (

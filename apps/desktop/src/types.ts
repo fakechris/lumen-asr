@@ -352,6 +352,17 @@ export type EditEvent = {
   before_text: string;
   after_text: string;
   created_at: string;
+  attribution: {
+    schema_version: number;
+    attempt_id?: string | null;
+    target_app_name?: string | null;
+    target_bundle_id?: string | null;
+    observer?: string | null;
+    target_fingerprint_hash?: string | null;
+    field_before_hash?: string | null;
+    field_after_hash?: string | null;
+    status: string;
+  };
 };
 
 export type DictionaryEntry = {
