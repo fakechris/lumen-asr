@@ -2321,9 +2321,9 @@ name = "lumen-platform-macos"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "block2",
  "core-foundation",
  "core-graphics 0.24.0",
- "cpal",
  "lumen-core",
  "lumen-inject",
  "lumen-platform",
