@@ -265,6 +265,7 @@ pub fn run() {
             commands::save_session,
             commands::seed_demo_session,
             commands::list_edit_events,
+            commands::list_edit_observations,
             commands::record_edit_event,
             commands::suggest_from_edit,
             commands::confirm_learn,

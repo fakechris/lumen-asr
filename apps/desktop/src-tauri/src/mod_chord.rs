@@ -17,10 +17,7 @@ pub struct ModChord {
 
 impl ModChord {
     pub fn count(self) -> u8 {
-        (self.alt as u8)
-            + (self.shift as u8)
-            + (self.control as u8)
-            + (self.meta as u8)
+        (self.alt as u8) + (self.shift as u8) + (self.control as u8) + (self.meta as u8)
     }
 
     pub fn parse_modifier_only(s: &str) -> Option<Self> {
@@ -122,18 +119,15 @@ where
     F: Fn() + Send + 'static,
     G: Fn() + Send + 'static,
 {
-    start_multi_watcher(
-        vec![("default".into(), chord)],
-        move |id, press| {
-            if id == "default" {
-                if press {
-                    on_press();
-                } else {
-                    on_release();
-                }
+    start_multi_watcher(vec![("default".into(), chord)], move |id, press| {
+        if id == "default" {
+            if press {
+                on_press();
+            } else {
+                on_release();
             }
-        },
-    );
+        }
+    });
 }
 
 /// Multiple pure-mod chords. `on_edge(id, is_press)`.

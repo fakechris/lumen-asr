@@ -1,7 +1,7 @@
 //! Recording + local ASR + model corrector IPC (M2–M5).
 
 use crate::config::AsrServiceConfig;
-use crate::context_capture::{ActiveContextCapture, StageUsageInput};
+use crate::context_capture::{ActiveContextCapture, CorrectorContextProjection, StageUsageInput};
 use crate::pipeline_attempt::{
     apply_asr_result, build_pipeline_identity, elapsed_ms, mark_attempt_failed, persist_attempt,
     run_corrector_stage, write_attempt_debug, AttemptDebug,
@@ -478,7 +478,9 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     state.audio.start().map_err(|error| {
         state.context.clear_active();
         error.to_string()
-    })
+    })?;
+    crate::learning::cancel_post_insert_watches();
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -513,7 +515,7 @@ async fn attach_frozen_context(
     active: Option<&ActiveContextCapture>,
     attempt: &mut DictationAttemptRecord,
     app: Option<&AppHandle>,
-) {
+) -> Option<CorrectorContextProjection> {
     let Some(active) = active else {
         attempt
             .pipeline_inputs
@@ -525,11 +527,12 @@ async fn attach_frozen_context(
                 not_used_reason: Some("capture_session_missing".into()),
                 ..ContextStageUsage::default()
             });
-        return;
+        return None;
     };
 
     match active.freeze(&state.store).await {
-        Ok(input_ref) => {
+        Ok(frozen) => {
+            let input_ref = frozen.input_ref;
             let captured = input_ref.source_presence_bitmap != 0;
             let should_archive = input_ref.source_status_summary == "partial";
             attempt.pipeline_inputs.context = Some(input_ref);
@@ -560,6 +563,7 @@ async fn attach_frozen_context(
                     });
                 }
             }
+            frozen.corrector_projection
         }
         Err(error) => {
             attempt
@@ -581,6 +585,7 @@ async fn attach_frozen_context(
                     ..ContextStageUsage::default()
                 });
             tracing::warn!(error = %error, "failed to freeze context input");
+            None
         }
     }
 }
@@ -632,7 +637,8 @@ pub async fn stop_and_transcribe_inner(
     );
 
     let capture_result = state.audio.stop();
-    attach_frozen_context(state, active_context.as_ref(), &mut attempt, app).await;
+    let captured_context =
+        attach_frozen_context(state, active_context.as_ref(), &mut attempt, app).await;
     let capture = match capture_result {
         Ok(capture) => capture,
         Err(error) => {
@@ -775,8 +781,15 @@ pub async fn stop_and_transcribe_inner(
     );
 
     tracing::info!(?intent, "running corrector with session intent");
-    let correction =
-        run_corrector_stage(state, &cfg, &enhanced_text, intent.clone(), &mut attempt).await?;
+    let correction = run_corrector_stage(
+        state,
+        &cfg,
+        &enhanced_text,
+        intent.clone(),
+        captured_context.as_ref(),
+        &mut attempt,
+    )
+    .await?;
     let corrected_text = correction.text;
     let corrector_engine = correction.engine;
     if !correction.model_applied && matches!(intent, IntentSpec::Translate { .. }) {
@@ -912,6 +925,16 @@ pub async fn stop_and_transcribe_inner(
                 )
                 .await
             }
+            (Some(app), None) => {
+                crate::learning::schedule_unavailable_post_insert_observation(
+                    app.clone(),
+                    rec.id,
+                    attempt.id,
+                    corrected_text.clone(),
+                    "target_metadata_unavailable",
+                );
+                false
+            }
             _ => false,
         }
     } else {
@@ -1043,19 +1066,68 @@ pub async fn retry_session_transcription(
         "not_run",
         IntentSpec::Default,
     );
-    attempt.pipeline_inputs.context = state.store.lock().ok().and_then(|guard| {
-        guard.as_ref().and_then(|store| {
-            store
-                .list_dictation_attempts(rec.id, 1, None)
-                .ok()
-                .and_then(|attempts| {
-                    attempts
-                        .into_iter()
-                        .next()
-                        .and_then(|prior| prior.pipeline_inputs.context)
-                })
+    let prior_attempts = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|store| store.list_dictation_attempts(rec.id, 100, None).ok())
         })
-    });
+        .unwrap_or_default();
+    let mut retry_context_projection = None;
+    for prior in &prior_attempts {
+        let Some(context_ref) = prior.pipeline_inputs.context.as_ref() else {
+            continue;
+        };
+        let Some(usage) = prior.pipeline_inputs.stage_usages.iter().find(|usage| {
+            usage.stage == PipelineStage::Corrector
+                && usage.sent
+                && usage.projection_path.is_some()
+                && !usage
+                    .sources
+                    .iter()
+                    .any(|source| source == "personal_dictionary")
+        }) else {
+            continue;
+        };
+        match state
+            .context
+            .load_stage_projection(Some(context_ref.capture_id), prior.id, usage)
+        {
+            Ok(projection) => {
+                match serde_json::from_slice::<crate::context_capture::CorrectorContextProjection>(
+                    &projection,
+                ) {
+                    Ok(projection) => {
+                        attempt.pipeline_inputs.context = Some(context_ref.clone());
+                        retry_context_projection = Some(projection);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            prior_attempt_id = %prior.id,
+                            error = %error,
+                            "historical context projection could not be decoded"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    prior_attempt_id = %prior.id,
+                    %error,
+                    "historical context projection could not be opened"
+                );
+            }
+        }
+    }
+    if attempt.pipeline_inputs.context.is_none() {
+        attempt.pipeline_inputs.context = prior_attempts
+            .iter()
+            .find_map(|prior| prior.pipeline_inputs.context.clone());
+    }
     attempt
         .pipeline_inputs
         .stage_usages
@@ -1155,6 +1227,7 @@ pub async fn retry_session_transcription(
         &cfg,
         &enhanced_text,
         IntentSpec::Default,
+        retry_context_projection.as_ref(),
         &mut attempt,
     )
     .await?;

@@ -981,6 +981,50 @@ code {
   font-size: 0.78rem;
 }
 
+.history-observations {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card-soft);
+}
+
+.history-observations.has-failure {
+  border-color: color-mix(in srgb, var(--danger) 34%, var(--border));
+  background: color-mix(in srgb, var(--danger) 5%, var(--card-soft));
+}
+
+.history-observations > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.history-observations.has-failure > summary {
+  color: var(--danger);
+}
+
+.history-observations[open] > summary {
+  margin-bottom: 8px;
+}
+
+.history-edit-item.observation-failed {
+  border-left: 3px solid var(--danger);
+}
+
+.history-edit-item.observation-completed_no_edit {
+  border-left: 3px solid var(--border-strong);
+}
+
+.history-edit-item.observation-completed_with_edit {
+  border-left: 3px solid var(--ok);
+}
+
 .history-edit-list {
   list-style: none;
   display: grid;

@@ -1,8 +1,8 @@
 use crate::config::{AppConfig, AsrServiceConfig};
-use crate::context_capture::StageUsageInput;
+use crate::context_capture::{CorrectorContextProjection, StageUsageInput};
 use crate::corrector_svc::{
     corrector_outcome_identity, dictionary_context, dictionary_run_identity,
-    run_correct_with_intent, run_identity,
+    run_correct_with_intent_and_context, run_identity,
 };
 use crate::dictation::{canonical_asr_provider, engine_kind_for_provider};
 use crate::session_debug::{self, SessionDebugMeta};
@@ -154,11 +154,52 @@ pub(crate) struct CorrectionStageOutput {
     pub model_applied: bool,
 }
 
+fn select_corrector_context(
+    use_captured_context: bool,
+    intent_allows_context: bool,
+    provider: &str,
+    captured_context: Option<&CorrectorContextProjection>,
+) -> Result<(Option<String>, bool), String> {
+    let projection = captured_context
+        .map(CorrectorContextProjection::to_model_json)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let selected =
+        use_captured_context && intent_allows_context && provider != "none" && projection.is_some();
+    Ok((projection, selected))
+}
+
+fn corrector_context_not_used_reason(
+    captured: bool,
+    has_projection: bool,
+    use_captured_context: bool,
+    intent_allows_context: bool,
+    provider: &str,
+    model_attempted: bool,
+) -> Option<String> {
+    if !captured {
+        Some("captured_context_unavailable".into())
+    } else if !has_projection {
+        Some("no_projectable_captured_context".into())
+    } else if !use_captured_context {
+        Some("captured_context_disabled_for_corrector".into())
+    } else if !intent_allows_context {
+        Some("captured_context_disabled_for_translate".into())
+    } else if provider == "none" {
+        Some("corrector_model_disabled".into())
+    } else if !model_attempted {
+        Some("corrector_model_not_invoked".into())
+    } else {
+        None
+    }
+}
+
 pub(crate) async fn run_corrector_stage(
     state: &AppState,
     config: &AppConfig,
     enhanced_text: &str,
     intent: IntentSpec,
+    captured_context: Option<&CorrectorContextProjection>,
     attempt: &mut DictationAttemptRecord,
 ) -> Result<CorrectionStageOutput, String> {
     let (entries, dictionary_error) = match state.store.lock() {
@@ -177,17 +218,11 @@ pub(crate) async fn run_corrector_stage(
             (Vec::new(), Some("dictionary unavailable".to_string()))
         }
     };
-    let dictionary = dictionary_run_identity(&entries);
     let projected_dictionary = dictionary_context(&entries);
-    let dictionary_selected =
+    let dictionary_requested =
         !projected_dictionary.terms.is_empty() || !projected_dictionary.replacements.is_empty();
-    let projection =
+    let dictionary_projection =
         serde_json::to_vec(&projected_dictionary).map_err(|error| error.to_string())?;
-    attempt.pipeline_identity.dictionary_context_hash = Some(dictionary.hash);
-    attempt.pipeline_identity.dictionary_context_hash_algorithm =
-        Some(dictionary.hash_algorithm.into());
-    attempt.pipeline_identity.dictionary_term_count = dictionary.term_count;
-    attempt.pipeline_identity.dictionary_replacement_count = dictionary.replacement_count;
     let dictionary_captured = dictionary_error.is_none();
     if let Some(message) = dictionary_error {
         attempt
@@ -201,10 +236,13 @@ pub(crate) async fn run_corrector_stage(
     }
 
     let run = run_identity(config, intent.clone());
-    let corrector_started = Instant::now();
-    let result = run_correct_with_intent(config, enhanced_text, &entries, intent).await;
-    attempt.pipeline_metrics.corrector_ms = elapsed_ms(corrector_started);
-    let text = result.text.trim().to_string();
+    let intent_allows_context = !matches!(intent, IntentSpec::Translate { .. });
+    let (context_projection, context_requested) = select_corrector_context(
+        config.corrector.use_captured_context,
+        intent_allows_context,
+        &run.provider,
+        captured_context,
+    )?;
     let capture_id = attempt
         .pipeline_inputs
         .context
@@ -215,46 +253,86 @@ pub(crate) async fn run_corrector_stage(
         .context
         .as_ref()
         .is_some_and(|input| input.source_presence_bitmap != 0);
-    // `sent` means the model adapter was invoked with this projection. A
-    // timeout or provider rejection still counts as sent; local preprocessing
-    // and model-construction failures do not.
-    let model_attempted = run.provider != "none"
-        && !matches!(
-            result.fallback_reason.as_ref(),
-            Some(CorrectorFallbackReason::BuildFailed)
-        );
-    let not_used_reason = if !dictionary_selected {
-        Some("no_personal_dictionary_context".to_owned())
-    } else if !model_attempted {
-        Some("corrector_model_not_invoked".to_owned())
-    } else {
-        None
+    let context_sources = captured_context
+        .map(CorrectorContextProjection::source_names)
+        .filter(|sources| !sources.is_empty())
+        .unwrap_or_else(|| vec!["captured_context".into()]);
+
+    // Persist every exact payload before a provider can receive it. If this
+    // preflight fails, continue correction without that input rather than
+    // creating an unauditable disclosure.
+    let mut context_selected = context_requested;
+    let mut context_provenance_failed = false;
+    let mut context_usage = match state.context.record_stage_usage(StageUsageInput {
+        capture_id,
+        attempt_id: attempt.id,
+        stage: PipelineStage::Corrector,
+        sources: context_sources.clone(),
+        projection: context_selected
+            .then_some(context_projection.as_deref())
+            .flatten()
+            .map(str::as_bytes),
+        captured: captured_context_available,
+        selected: context_selected,
+        consumed: false,
+        sent: false,
+        not_used_reason: corrector_context_not_used_reason(
+            captured_context_available,
+            context_projection.is_some(),
+            config.corrector.use_captured_context,
+            intent_allows_context,
+            &run.provider,
+            true,
+        ),
+    }) {
+        Ok(usage) => usage,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to persist captured-context provenance");
+            context_selected = false;
+            context_provenance_failed = true;
+            attempt
+                .pipeline_metrics
+                .stage_issues
+                .push(PipelineStageIssue {
+                    stage: PipelineStage::Corrector,
+                    kind: PipelineIssueKind::InputUnavailable,
+                    message: "captured-context provenance unavailable".into(),
+                });
+            ContextStageUsage {
+                stage: PipelineStage::Corrector,
+                sources: context_sources,
+                captured: captured_context_available,
+                not_used_reason: Some("captured_context_provenance_persistence_failed".into()),
+                ..ContextStageUsage::default()
+            }
+        }
     };
-    attempt
-        .pipeline_inputs
-        .stage_usages
-        .push(ContextStageUsage {
-            stage: PipelineStage::Corrector,
-            sources: vec!["captured_context".into()],
-            captured: captured_context_available,
-            not_used_reason: Some("captured_context_not_projected_to_corrector".into()),
-            ..ContextStageUsage::default()
-        });
-    match state.context.record_stage_usage(StageUsageInput {
+
+    let mut dictionary_selected = dictionary_requested;
+    let mut dictionary_provenance_failed = false;
+    let mut dictionary_usage = match state.context.record_stage_usage(StageUsageInput {
         capture_id,
         attempt_id: attempt.id,
         stage: PipelineStage::Corrector,
         sources: vec!["personal_dictionary".into()],
-        projection: Some(&projection),
+        projection: dictionary_selected.then_some(dictionary_projection.as_slice()),
         captured: dictionary_captured,
         selected: dictionary_selected,
-        consumed: dictionary_selected,
-        sent: dictionary_selected && model_attempted,
-        not_used_reason,
+        consumed: false,
+        sent: false,
+        not_used_reason: if !dictionary_captured {
+            Some("personal_dictionary_unavailable".into())
+        } else if !dictionary_selected {
+            Some("no_personal_dictionary_context".into())
+        } else {
+            None
+        },
     }) {
-        Ok(usage) => attempt.pipeline_inputs.stage_usages.push(usage),
+        Ok(usage) => usage,
         Err(error) => {
             tracing::warn!(error = %error, "failed to persist corrector input provenance");
+            dictionary_selected = false;
+            dictionary_provenance_failed = true;
             attempt
                 .pipeline_metrics
                 .stage_issues
@@ -263,8 +341,81 @@ pub(crate) async fn run_corrector_stage(
                     kind: PipelineIssueKind::InputUnavailable,
                     message: "corrector input provenance unavailable".into(),
                 });
+            ContextStageUsage {
+                stage: PipelineStage::Corrector,
+                sources: vec!["personal_dictionary".into()],
+                captured: dictionary_captured,
+                not_used_reason: Some("dictionary_provenance_persistence_failed".into()),
+                ..ContextStageUsage::default()
+            }
         }
+    };
+
+    let effective_entries = if dictionary_selected {
+        entries.as_slice()
+    } else {
+        &[]
+    };
+    let dictionary = dictionary_run_identity(effective_entries);
+    attempt.pipeline_identity.dictionary_context_hash = Some(dictionary.hash);
+    attempt.pipeline_identity.dictionary_context_hash_algorithm =
+        Some(dictionary.hash_algorithm.into());
+    attempt.pipeline_identity.dictionary_term_count = dictionary.term_count;
+    attempt.pipeline_identity.dictionary_replacement_count = dictionary.replacement_count;
+
+    let corrector_started = Instant::now();
+    let result = run_correct_with_intent_and_context(
+        config,
+        enhanced_text,
+        effective_entries,
+        intent,
+        context_selected
+            .then_some(context_projection.as_deref())
+            .flatten(),
+    )
+    .await;
+    attempt.pipeline_metrics.corrector_ms = elapsed_ms(corrector_started);
+    let text = result.text.trim().to_string();
+    // `sent` means the model adapter was invoked with this projection. A
+    // timeout or provider rejection still counts as sent; local preprocessing
+    // and model-construction failures do not.
+    let model_attempted = run.provider != "none"
+        && !matches!(
+            result.fallback_reason.as_ref(),
+            Some(CorrectorFallbackReason::BuildFailed)
+        );
+    context_usage.selected = context_selected;
+    context_usage.consumed = context_selected && model_attempted;
+    context_usage.sent = context_selected && model_attempted;
+    if !context_provenance_failed {
+        context_usage.not_used_reason = corrector_context_not_used_reason(
+            captured_context_available,
+            context_projection.is_some(),
+            config.corrector.use_captured_context,
+            intent_allows_context,
+            &run.provider,
+            model_attempted,
+        );
     }
+    attempt.pipeline_inputs.stage_usages.push(context_usage);
+
+    dictionary_usage.selected = dictionary_selected;
+    // Replacement rules are applied locally during preprocess even when no
+    // provider runs or model construction fails.
+    dictionary_usage.consumed = dictionary_selected;
+    dictionary_usage.sent = dictionary_selected && model_attempted;
+    if !dictionary_provenance_failed {
+        dictionary_usage.not_used_reason = if !dictionary_captured {
+            Some("personal_dictionary_unavailable".into())
+        } else if !dictionary_selected {
+            Some("no_personal_dictionary_context".into())
+        } else if !model_attempted {
+            Some("corrector_model_not_invoked".into())
+        } else {
+            None
+        };
+    }
+    attempt.pipeline_inputs.stage_usages.push(dictionary_usage);
     let outcome_identity = corrector_outcome_identity(&run, result.model_applied);
     let engine = outcome_identity.engine;
     attempt.corrected = Some(text.clone());
@@ -374,7 +525,11 @@ pub(crate) fn write_attempt_debug(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_asr_result, mark_attempt_failed};
+    use super::{
+        apply_asr_result, corrector_context_not_used_reason, mark_attempt_failed,
+        select_corrector_context,
+    };
+    use crate::context_capture::{CorrectorContextProjection, CorrectorTargetProjection};
     use lumen_asr::{AsrResult, AsrRuntimeDiagnostics, QwenShadowDiagnostics, QwenShadowStatus};
     use lumen_core::AsrEngineId;
     use lumen_store::{
@@ -382,6 +537,75 @@ mod tests {
     };
     use std::time::Instant;
     use uuid::Uuid;
+
+    fn captured_projection() -> CorrectorContextProjection {
+        CorrectorContextProjection {
+            schema_version: 1,
+            target: Some(CorrectorTargetProjection {
+                app_name: Some("TextEdit".into()),
+                ..CorrectorTargetProjection::default()
+            }),
+            ..CorrectorContextProjection::default()
+        }
+    }
+
+    #[test]
+    fn captured_context_upload_requires_both_opt_in_and_a_model_provider() {
+        let projection = captured_projection();
+        for (enabled, intent_allows_context, provider, present, expected_selected) in [
+            (false, true, "minimax", true, false),
+            (true, true, "none", true, false),
+            (true, true, "minimax", false, false),
+            (true, true, "minimax", true, true),
+            (true, false, "minimax", true, false),
+        ] {
+            let (json, selected) = select_corrector_context(
+                enabled,
+                intent_allows_context,
+                provider,
+                present.then_some(&projection),
+            )
+            .unwrap();
+            assert_eq!(json.is_some(), present);
+            assert_eq!(
+                selected, expected_selected,
+                "enabled={enabled} intent_allows_context={intent_allows_context} \
+                 provider={provider} present={present}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_provenance_reasons_distinguish_every_non_sent_path() {
+        assert_eq!(
+            corrector_context_not_used_reason(false, false, true, true, "minimax", true).as_deref(),
+            Some("captured_context_unavailable")
+        );
+        assert_eq!(
+            corrector_context_not_used_reason(true, false, true, true, "minimax", true).as_deref(),
+            Some("no_projectable_captured_context")
+        );
+        assert_eq!(
+            corrector_context_not_used_reason(true, true, false, true, "minimax", true).as_deref(),
+            Some("captured_context_disabled_for_corrector")
+        );
+        assert_eq!(
+            corrector_context_not_used_reason(true, true, true, true, "none", false).as_deref(),
+            Some("corrector_model_disabled")
+        );
+        assert_eq!(
+            corrector_context_not_used_reason(true, true, true, true, "minimax", false).as_deref(),
+            Some("corrector_model_not_invoked")
+        );
+        assert_eq!(
+            corrector_context_not_used_reason(true, true, true, true, "minimax", true),
+            None
+        );
+        assert_eq!(
+            corrector_context_not_used_reason(true, true, true, false, "minimax", true).as_deref(),
+            Some("captured_context_disabled_for_translate")
+        );
+    }
 
     #[test]
     fn apply_asr_result_records_identity_enhancement_and_runtime_evidence() {

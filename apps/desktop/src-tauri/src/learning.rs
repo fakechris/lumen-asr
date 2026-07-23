@@ -4,15 +4,20 @@
 use crate::config::LearningConfig;
 use crate::edit_attribution::{EditProjection, InsertionAnchor};
 use crate::AppState;
+use chrono::{DateTime, Utc};
 use lumen_core::{DictEntryKind, DictEntrySource, EditSource};
 use lumen_dictionary::{candidates_from_edit, DictionaryEntry, LearnCandidate};
 use lumen_platform_macos::{
     focused_text_field_snapshot, FocusedTextFieldSnapshot, FrontmostTarget,
 };
-use lumen_store::EditAttribution;
+use lumen_store::{EditAttribution, EditObservationRecord};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
+
+static EDIT_WATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
+const EDIT_OBSERVER_ID: &str = "focused_field_poll_v3";
 
 #[derive(Debug, Clone)]
 pub struct PostInsertWatchRequest {
@@ -136,6 +141,19 @@ struct PreparedEditWatch {
 }
 
 #[derive(Debug)]
+enum EditObservationOutcome {
+    Edited(ObservedEdit),
+    NoEdit {
+        reason: &'static str,
+        field_final_hash: Option<String>,
+    },
+    Failed {
+        reason: &'static str,
+        field_final_hash: Option<String>,
+    },
+}
+
+#[derive(Debug)]
 enum PinnedFieldProjection {
     FieldChanged,
     Current {
@@ -153,6 +171,9 @@ pub async fn spawn_post_insert_watch(
     if request.inserted_text.is_empty() {
         return false;
     }
+    let observation_id = Uuid::new_v4();
+    let started_at = Utc::now();
+    let watch_generation = EDIT_WATCH_GENERATION.load(Ordering::SeqCst);
     // Capture the original inserted span before debug/audio persistence can delay observation
     // and before a fast user correction removes the original text.
     let request_for_prepare = request.clone();
@@ -167,6 +188,13 @@ pub async fn spawn_post_insert_watch(
                     %reason,
                     "edit watch could not anchor immediately after insertion"
                 );
+                schedule_failed_observation(
+                    app,
+                    request,
+                    observation_id,
+                    started_at,
+                    anchor_failure_reason(&reason),
+                );
                 return false;
             }
             Err(error) => {
@@ -177,6 +205,13 @@ pub async fn spawn_post_insert_watch(
                     target_bundle_id = ?request.target.bundle_id,
                     %reason,
                     "edit watch could not anchor immediately after insertion"
+                );
+                schedule_failed_observation(
+                    app,
+                    request,
+                    observation_id,
+                    started_at,
+                    "anchor_task_failed".into(),
                 );
                 return false;
             }
@@ -189,25 +224,89 @@ pub async fn spawn_post_insert_watch(
         "edit watch started"
     );
     tauri::async_runtime::spawn(async move {
-        let Some(observed) = observe_prepared_edit(&request, seconds, prepared).await else {
-            tracing::info!(
-                session_id = %request.session_id,
-                attempt_id = %request.attempt_id,
-                "edit watch finished without a confirmed same-span edit"
-            );
-            return;
-        };
+        let target_fingerprint_hash = prepared.target_fingerprint_hash.clone();
+        let field_initial_hash = prepared.field_before_hash.clone();
+        let outcome = observe_prepared_edit(&request, seconds, prepared, watch_generation).await;
         if !wait_for_session_persistence(&app, request.session_id, seconds).await {
             tracing::warn!(
                 session_id = %request.session_id,
                 attempt_id = %request.attempt_id,
-                "edit watch observed a correction but its session was not persisted in time"
+                "edit watch ended but its session was not persisted in time"
             );
+            let record = EditObservationRecord {
+                id: observation_id,
+                session_id: request.session_id,
+                attempt_id: request.attempt_id,
+                source: EDIT_OBSERVER_ID.into(),
+                status: "failed".into(),
+                end_reason: "session_persistence_timeout".into(),
+                target_app_name: request.target.name.clone(),
+                target_bundle_id: request.target.bundle_id.clone(),
+                target_fingerprint_hash: Some(target_fingerprint_hash),
+                inserted_text_hash: text_hash(&request.inserted_text),
+                field_initial_hash: Some(field_initial_hash),
+                field_final_hash: None,
+                normalized_edit_distance: None,
+                started_at,
+                completed_at: Utc::now(),
+                edit_event_id: None,
+            };
+            let _ = app.emit("edit-observation-completed", &record);
             return;
         }
-        persist_and_emit_edit(&app, &request, &observed);
+        persist_observation_outcome(
+            &app,
+            &request,
+            observation_id,
+            started_at,
+            Some(target_fingerprint_hash),
+            Some(field_initial_hash),
+            outcome,
+        );
     });
     true
+}
+
+/// Preserve a terminal audit record when insertion succeeded but the target
+/// identity needed for field pinning was unavailable.
+pub fn schedule_unavailable_post_insert_observation(
+    app: AppHandle,
+    session_id: Uuid,
+    attempt_id: Uuid,
+    inserted_text: String,
+    reason: &'static str,
+) {
+    schedule_failed_observation(
+        app,
+        PostInsertWatchRequest {
+            session_id,
+            attempt_id,
+            inserted_text,
+            target: FrontmostTarget {
+                name: None,
+                bundle_id: None,
+            },
+        },
+        Uuid::new_v4(),
+        Utc::now(),
+        reason.into(),
+    );
+}
+
+/// Starting another dictation gives every previous observer an explicit terminal
+/// reason instead of letting it silently time out against a changed field.
+pub fn cancel_post_insert_watches() {
+    EDIT_WATCH_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+fn anchor_failure_reason(reason: &str) -> String {
+    match reason {
+        "inserted_text_not_found_in_field" => "inserted_text_not_found",
+        "inserted_text_not_unique_in_field" => "inserted_text_not_unique",
+        "pinned_target_field_unavailable" => "target_field_unavailable",
+        _ => "anchor_unavailable",
+    }
+    .into()
 }
 
 fn prepare_edit_watch(request: &PostInsertWatchRequest) -> Result<PreparedEditWatch, String> {
@@ -246,15 +345,27 @@ async fn observe_post_insert(
         return None;
     };
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    observe_prepared_edit(request, remaining.as_secs().max(1), prepared).await
+    match observe_prepared_edit(
+        request,
+        remaining.as_secs().max(1),
+        prepared,
+        EDIT_WATCH_GENERATION.load(Ordering::SeqCst),
+    )
+    .await
+    {
+        EditObservationOutcome::Edited(observed) => Some(observed),
+        EditObservationOutcome::NoEdit { .. } | EditObservationOutcome::Failed { .. } => None,
+    }
 }
 
 async fn observe_prepared_edit(
     request: &PostInsertWatchRequest,
     seconds: u64,
     prepared: PreparedEditWatch,
-) -> Option<ObservedEdit> {
+    watch_generation: u64,
+) -> EditObservationOutcome {
     const STABLE_EDIT_DURATION: std::time::Duration = std::time::Duration::from_millis(1_200);
+    const MAX_CONSECUTIVE_UNAVAILABLE: u8 = 4;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let PreparedEditWatch {
         anchor,
@@ -262,9 +373,17 @@ async fn observe_prepared_edit(
         field_before_hash,
     } = prepared;
     let mut pending: Option<PendingProjection> = None;
+    let mut last_field_hash = Some(field_before_hash.clone());
+    let mut unavailable_count = 0_u8;
 
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if EDIT_WATCH_GENERATION.load(Ordering::SeqCst) != watch_generation {
+            return EditObservationOutcome::Failed {
+                reason: "next_dictation_started",
+                field_final_hash: last_field_hash,
+            };
+        }
         let target = request.target.clone();
         let anchor_for_probe = anchor.clone();
         let expected_fingerprint = target_fingerprint_hash.clone();
@@ -282,8 +401,16 @@ async fn observe_prepared_edit(
         .ok()
         .flatten();
         let Some(observation) = observation else {
+            unavailable_count = unavailable_count.saturating_add(1);
+            if unavailable_count >= MAX_CONSECUTIVE_UNAVAILABLE {
+                return EditObservationOutcome::Failed {
+                    reason: "target_field_unavailable",
+                    field_final_hash: last_field_hash,
+                };
+            }
             continue;
         };
+        unavailable_count = 0;
         let PinnedFieldProjection::Current {
             projection,
             field_hash,
@@ -294,8 +421,12 @@ async fn observe_prepared_edit(
                 attempt_id = %request.attempt_id,
                 "edit watch stopped because the focused field changed"
             );
-            return None;
+            return EditObservationOutcome::Failed {
+                reason: "focused_field_changed",
+                field_final_hash: last_field_hash,
+            };
         };
+        last_field_hash = Some(field_hash.clone());
         match projection {
             EditProjection::Unchanged => pending = None,
             EditProjection::Unrelated => {
@@ -304,13 +435,16 @@ async fn observe_prepared_edit(
                     attempt_id = %request.attempt_id,
                     "edit watch stopped because text outside the inserted span changed"
                 );
-                return None;
+                return EditObservationOutcome::Failed {
+                    reason: "anchor_mismatch",
+                    field_final_hash: Some(field_hash),
+                };
             }
             EditProjection::Edited { after_text } => match pending.as_mut() {
                 Some(value) if value.after_text == after_text => {
                     value.field_after_hash = field_hash;
                     if value.stable_since.elapsed() >= STABLE_EDIT_DURATION {
-                        return Some(ObservedEdit {
+                        return EditObservationOutcome::Edited(ObservedEdit {
                             after_text: value.after_text.clone(),
                             target_fingerprint_hash,
                             field_before_hash,
@@ -328,14 +462,24 @@ async fn observe_prepared_edit(
             },
         }
     }
-    pending
-        .filter(|pending| pending.stable_since.elapsed() >= STABLE_EDIT_DURATION)
-        .map(|pending| ObservedEdit {
-            after_text: pending.after_text,
-            target_fingerprint_hash,
-            field_before_hash,
-            field_after_hash: pending.field_after_hash,
-        })
+    match pending {
+        Some(pending) if pending.stable_since.elapsed() >= STABLE_EDIT_DURATION => {
+            EditObservationOutcome::Edited(ObservedEdit {
+                after_text: pending.after_text,
+                target_fingerprint_hash,
+                field_before_hash,
+                field_after_hash: pending.field_after_hash,
+            })
+        }
+        Some(_) => EditObservationOutcome::Failed {
+            reason: "edit_not_stable_before_timeout",
+            field_final_hash: last_field_hash,
+        },
+        None => EditObservationOutcome::NoEdit {
+            reason: "observation_window_elapsed",
+            field_final_hash: last_field_hash,
+        },
+    }
 }
 
 fn project_for_target(
@@ -415,16 +559,216 @@ fn text_hash(text: &str) -> String {
     blake3::hash(text.as_bytes()).to_hex().to_string()
 }
 
+fn schedule_failed_observation(
+    app: AppHandle,
+    request: PostInsertWatchRequest,
+    observation_id: Uuid,
+    started_at: DateTime<Utc>,
+    reason: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        if !wait_for_session_persistence(&app, request.session_id, 10).await {
+            tracing::warn!(
+                session_id = %request.session_id,
+                attempt_id = %request.attempt_id,
+                %reason,
+                "failed edit observation could not be attached to its session"
+            );
+            let record = EditObservationRecord {
+                id: observation_id,
+                session_id: request.session_id,
+                attempt_id: request.attempt_id,
+                source: EDIT_OBSERVER_ID.into(),
+                status: "failed".into(),
+                end_reason: "session_persistence_timeout".into(),
+                target_app_name: request.target.name,
+                target_bundle_id: request.target.bundle_id,
+                target_fingerprint_hash: None,
+                inserted_text_hash: text_hash(&request.inserted_text),
+                field_initial_hash: None,
+                field_final_hash: None,
+                normalized_edit_distance: None,
+                started_at,
+                completed_at: Utc::now(),
+                edit_event_id: None,
+            };
+            let _ = app.emit("edit-observation-completed", &record);
+            return;
+        }
+        save_observation(
+            &app,
+            EditObservationRecord {
+                id: observation_id,
+                session_id: request.session_id,
+                attempt_id: request.attempt_id,
+                source: EDIT_OBSERVER_ID.into(),
+                status: "failed".into(),
+                end_reason: reason,
+                target_app_name: request.target.name,
+                target_bundle_id: request.target.bundle_id,
+                target_fingerprint_hash: None,
+                inserted_text_hash: text_hash(&request.inserted_text),
+                field_initial_hash: None,
+                field_final_hash: None,
+                normalized_edit_distance: None,
+                started_at,
+                completed_at: Utc::now(),
+                edit_event_id: None,
+            },
+        );
+    });
+}
+
+fn persist_observation_outcome(
+    app: &AppHandle,
+    request: &PostInsertWatchRequest,
+    observation_id: Uuid,
+    started_at: DateTime<Utc>,
+    prepared_target_fingerprint_hash: Option<String>,
+    prepared_field_initial_hash: Option<String>,
+    outcome: EditObservationOutcome,
+) {
+    match outcome {
+        EditObservationOutcome::Edited(observed) => {
+            let observation = EditObservationRecord {
+                id: observation_id,
+                session_id: request.session_id,
+                attempt_id: request.attempt_id,
+                source: EDIT_OBSERVER_ID.into(),
+                status: "completed_with_edit".into(),
+                end_reason: "stable_edit_captured".into(),
+                target_app_name: request.target.name.clone(),
+                target_bundle_id: request.target.bundle_id.clone(),
+                target_fingerprint_hash: Some(observed.target_fingerprint_hash.clone()),
+                inserted_text_hash: text_hash(&request.inserted_text),
+                field_initial_hash: Some(observed.field_before_hash.clone()),
+                field_final_hash: Some(observed.field_after_hash.clone()),
+                normalized_edit_distance: Some(normalized_edit_distance(
+                    &request.inserted_text,
+                    &observed.after_text,
+                )),
+                started_at,
+                completed_at: Utc::now(),
+                edit_event_id: None,
+            };
+            persist_and_emit_edit(app, request, &observed, observation);
+        }
+        EditObservationOutcome::NoEdit {
+            reason,
+            field_final_hash,
+        } => save_observation(
+            app,
+            EditObservationRecord {
+                id: observation_id,
+                session_id: request.session_id,
+                attempt_id: request.attempt_id,
+                source: EDIT_OBSERVER_ID.into(),
+                status: "completed_no_edit".into(),
+                end_reason: reason.into(),
+                target_app_name: request.target.name.clone(),
+                target_bundle_id: request.target.bundle_id.clone(),
+                target_fingerprint_hash: prepared_target_fingerprint_hash,
+                inserted_text_hash: text_hash(&request.inserted_text),
+                field_initial_hash: prepared_field_initial_hash,
+                field_final_hash,
+                normalized_edit_distance: Some(0.0),
+                started_at,
+                completed_at: Utc::now(),
+                edit_event_id: None,
+            },
+        ),
+        EditObservationOutcome::Failed {
+            reason,
+            field_final_hash,
+        } => save_observation(
+            app,
+            EditObservationRecord {
+                id: observation_id,
+                session_id: request.session_id,
+                attempt_id: request.attempt_id,
+                source: EDIT_OBSERVER_ID.into(),
+                status: "failed".into(),
+                end_reason: reason.into(),
+                target_app_name: request.target.name.clone(),
+                target_bundle_id: request.target.bundle_id.clone(),
+                target_fingerprint_hash: prepared_target_fingerprint_hash,
+                inserted_text_hash: text_hash(&request.inserted_text),
+                field_initial_hash: prepared_field_initial_hash,
+                field_final_hash,
+                normalized_edit_distance: None,
+                started_at,
+                completed_at: Utc::now(),
+                edit_event_id: None,
+            },
+        ),
+    }
+}
+
+fn save_observation(app: &AppHandle, record: EditObservationRecord) {
+    let state = app.state::<AppState>();
+    let result = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_owned())
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .ok_or_else(|| "database unavailable".to_owned())
+                .and_then(|store| {
+                    store
+                        .save_edit_observation(&record)
+                        .map_err(|error| error.to_string())
+                })
+        });
+    match result {
+        Ok(()) => {
+            let _ = app.emit("edit-observation-completed", &record);
+        }
+        Err(error) => {
+            tracing::warn!(
+                session_id = %record.session_id,
+                attempt_id = %record.attempt_id,
+                status = %record.status,
+                reason = %record.end_reason,
+                %error,
+                "failed to persist edit observation terminal state"
+            );
+        }
+    }
+}
+
+fn normalized_edit_distance(before: &str, after: &str) -> f64 {
+    let before: Vec<char> = before.chars().collect();
+    let after: Vec<char> = after.chars().collect();
+    let denominator = before.len().max(after.len());
+    if denominator == 0 {
+        return 0.0;
+    }
+    let mut previous: Vec<usize> = (0..=after.len()).collect();
+    let mut current = vec![0; after.len() + 1];
+    for (row, left) in before.iter().enumerate() {
+        current[0] = row + 1;
+        for (column, right) in after.iter().enumerate() {
+            current[column + 1] = (previous[column + 1] + 1)
+                .min(current[column] + 1)
+                .min(previous[column] + usize::from(left != right));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[after.len()] as f64 / denominator as f64
+}
+
 fn persist_and_emit_edit(
     app: &AppHandle,
     request: &PostInsertWatchRequest,
     observed: &ObservedEdit,
+    observation: EditObservationRecord,
 ) {
     let attribution = EditAttribution {
         attempt_id: Some(request.attempt_id),
         target_app_name: request.target.name.clone(),
         target_bundle_id: request.target.bundle_id.clone(),
-        observer: Some("focused_field_poll_v2".into()),
+        observer: Some(EDIT_OBSERVER_ID.into()),
         target_fingerprint_hash: Some(observed.target_fingerprint_hash.clone()),
         field_before_hash: Some(observed.field_before_hash.clone()),
         field_after_hash: Some(observed.field_after_hash.clone()),
@@ -432,46 +776,86 @@ fn persist_and_emit_edit(
         ..EditAttribution::default()
     };
     let state = app.state::<AppState>();
-    match process_edit_from_state(
-        &state,
-        ProcessEditInput {
-            before_text: request.inserted_text.clone(),
-            after_text: observed.after_text.clone(),
-            session_id: Some(request.session_id.to_string()),
-            source: Some("post_paste_ax".into()),
-            record_event: Some(true),
-        },
-        Some(attribution),
-    ) {
-        Ok(result) => {
-            if result.edit_event_id.is_none() {
-                tracing::warn!(
-                    session_id = %request.session_id,
-                    attempt_id = %request.attempt_id,
-                    "attributed edit was observed but could not be attached to its session"
-                );
-                return;
-            }
+    let persisted = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_owned())
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .ok_or_else(|| "database unavailable".to_owned())
+                .and_then(|store| {
+                    store
+                        .add_edit_event_with_observation(
+                            request.session_id,
+                            EditSource::PostPasteAx,
+                            &request.inserted_text,
+                            &observed.after_text,
+                            &attribution,
+                            &observation,
+                        )
+                        .map_err(|error| error.to_string())
+                })
+        });
+    match persisted {
+        Ok(edit_event_id) => {
+            let mut linked_observation = observation;
+            linked_observation.edit_event_id = Some(edit_event_id);
+            let _ = app.emit("edit-observation-completed", &linked_observation);
+            let learning_result = process_edit_from_state(
+                &state,
+                ProcessEditInput {
+                    before_text: request.inserted_text.clone(),
+                    after_text: observed.after_text.clone(),
+                    session_id: Some(request.session_id.to_string()),
+                    source: Some("post_paste_ax".into()),
+                    record_event: Some(false),
+                },
+                None,
+            );
+            let (candidates, auto_promoted, message) = match learning_result {
+                Ok(result) => (result.candidates, result.auto_promoted, result.message),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %request.session_id,
+                        attempt_id = %request.attempt_id,
+                        %error,
+                        "edit persisted but dictionary learning failed"
+                    );
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        "edit captured; dictionary learning failed".into(),
+                    )
+                }
+            };
             let _ = app.emit(
                 "edit-feedback-captured",
                 EditFeedbackEvent {
-                    edit_event_id: result.edit_event_id,
+                    edit_event_id: Some(edit_event_id.to_string()),
                     session_id: request.session_id.to_string(),
                     before_text: request.inserted_text.clone(),
                     after_text: observed.after_text.clone(),
                     source: "post_paste_ax".into(),
-                    candidates: result.candidates,
-                    auto_promoted: result.auto_promoted,
-                    message: result.message,
+                    candidates,
+                    auto_promoted,
+                    message,
                 },
             );
         }
         Err(error) => {
             tracing::warn!(
                 session_id = %request.session_id,
+                attempt_id = %request.attempt_id,
                 error = %error,
                 "failed to persist attributed edit feedback"
             );
+            let mut failed_observation = observation;
+            failed_observation.status = "failed".into();
+            failed_observation.end_reason = "edit_event_persistence_failed".into();
+            failed_observation.normalized_edit_distance = None;
+            failed_observation.edit_event_id = None;
+            save_observation(app, failed_observation);
         }
     }
 }
@@ -617,6 +1001,70 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use std::time::Duration;
+
+    #[test]
+    fn normalized_distance_has_clear_zero_and_full_scale_meaning() {
+        assert_eq!(normalized_edit_distance("Codex", "Codex"), 0.0);
+        assert_eq!(normalized_edit_distance("", ""), 0.0);
+        assert_eq!(normalized_edit_distance("abc", "xyz"), 1.0);
+        assert!((normalized_edit_distance("Cortex", "Codex") - (2.0 / 6.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn starting_a_new_dictation_advances_the_observer_generation() {
+        let before = EDIT_WATCH_GENERATION.load(Ordering::SeqCst);
+        cancel_post_insert_watches();
+        let after = EDIT_WATCH_GENERATION.load(Ordering::SeqCst);
+
+        assert!(after > before);
+    }
+
+    #[tokio::test]
+    async fn a_running_observer_reports_next_dictation_cancellation() {
+        let inserted = "Codex";
+        let request = PostInsertWatchRequest {
+            session_id: Uuid::new_v4(),
+            attempt_id: Uuid::new_v4(),
+            inserted_text: inserted.into(),
+            target: FrontmostTarget {
+                name: Some("TextEdit".into()),
+                bundle_id: Some("com.apple.TextEdit".into()),
+            },
+        };
+        let prepared = PreparedEditWatch {
+            anchor: InsertionAnchor::from_post_insert("prefix Codex suffix", inserted).unwrap(),
+            target_fingerprint_hash: "target".into(),
+            field_before_hash: "field".into(),
+        };
+        let generation = EDIT_WATCH_GENERATION.load(Ordering::SeqCst);
+        cancel_post_insert_watches();
+
+        let outcome = observe_prepared_edit(&request, 1, prepared, generation).await;
+
+        assert!(matches!(
+            outcome,
+            EditObservationOutcome::Failed {
+                reason: "next_dictation_started",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn anchor_failures_keep_actionable_terminal_reasons() {
+        assert_eq!(
+            anchor_failure_reason("inserted_text_not_found_in_field"),
+            "inserted_text_not_found"
+        );
+        assert_eq!(
+            anchor_failure_reason("inserted_text_not_unique_in_field"),
+            "inserted_text_not_unique"
+        );
+        assert_eq!(
+            anchor_failure_reason("pinned_target_field_unavailable"),
+            "target_field_unavailable"
+        );
+    }
 
     fn ghostty_window_count() -> usize {
         let output = Command::new("osascript")
