@@ -60,6 +60,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
           inserted TEXT,
           pipeline_identity_json TEXT NOT NULL,
           pipeline_metrics_json TEXT NOT NULL,
+          pipeline_inputs_json TEXT NOT NULL DEFAULT '{"schema_version":1,"context":null,"stage_usages":[]}',
           status TEXT NOT NULL,
           failed_stage TEXT,
           failure_message TEXT,
@@ -73,6 +74,28 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_dictation_attempts_supersedes
           ON dictation_attempts(supersedes_attempt_id);
+
+        CREATE TABLE IF NOT EXISTS context_snapshots (
+          capture_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          revision INTEGER NOT NULL,
+          schema_version INTEGER NOT NULL,
+          profile TEXT NOT NULL,
+          target_generation INTEGER NOT NULL,
+          started_at TEXT NOT NULL,
+          frozen_at TEXT NOT NULL,
+          completed_at TEXT,
+          manifest_path TEXT NOT NULL,
+          source_presence_bitmap INTEGER NOT NULL,
+          source_status_json TEXT NOT NULL,
+          sanitized_hash TEXT NOT NULL,
+          encryption TEXT NOT NULL DEFAULT 'none',
+          status TEXT NOT NULL,
+          PRIMARY KEY(capture_id, revision)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_snapshots_session
+          ON context_snapshots(session_id, revision);
         "#,
     )?;
 
@@ -85,6 +108,26 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)",
         [],
     )?;
+    let has_pipeline_inputs = {
+        let mut statement = conn.prepare("PRAGMA table_info(dictation_attempts)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "pipeline_inputs_json")
+    };
+    if !has_pipeline_inputs {
+        conn.execute(
+            r#"ALTER TABLE dictation_attempts
+               ADD COLUMN pipeline_inputs_json TEXT NOT NULL
+               DEFAULT '{"schema_version":1,"context":null,"stage_usages":[]}'"#,
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -93,7 +136,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_two_is_additive_and_preserves_legacy_sessions() {
+    fn migrations_remain_additive_and_preserve_legacy_sessions() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
@@ -143,6 +186,79 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn version_three_adds_context_storage_without_changing_existing_attempts() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (2);
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  focused_app TEXT,
+                  focused_bundle_id TEXT,
+                  asr_raw TEXT,
+                  corrected TEXT,
+                  pasted TEXT,
+                  asr_engine TEXT,
+                  corrector_engine TEXT,
+                  insert_strategy TEXT NOT NULL DEFAULT 'none',
+                  audio_path TEXT,
+                  status TEXT NOT NULL DEFAULT 'in_progress'
+                );
+                CREATE TABLE dictation_attempts (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  session_id TEXT NOT NULL,
+                  attempt_ordinal INTEGER NOT NULL,
+                  created_at TEXT NOT NULL,
+                  asr_raw TEXT,
+                  asr_enhanced TEXT,
+                  corrected TEXT,
+                  inserted TEXT,
+                  pipeline_identity_json TEXT NOT NULL,
+                  pipeline_metrics_json TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  failed_stage TEXT,
+                  failure_message TEXT,
+                  supersedes_attempt_id TEXT,
+                  UNIQUE(session_id, attempt_ordinal)
+                );
+                INSERT INTO dictation_attempts (
+                  id, session_id, attempt_ordinal, created_at,
+                  pipeline_identity_json, pipeline_metrics_json, status
+                ) VALUES (
+                  'attempt', 'session', 1, '2026-07-23T00:00:00Z',
+                  '{}', '{}', 'completed'
+                );
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let inputs: String = connection
+            .query_row(
+                "SELECT pipeline_inputs_json FROM dictation_attempts WHERE id='attempt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            inputs,
+            r#"{"schema_version":1,"context":null,"stage_usages":[]}"#
+        );
+        let context_table: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='context_snapshots'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(context_table, 1);
     }
 }

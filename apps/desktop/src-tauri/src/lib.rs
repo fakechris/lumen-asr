@@ -2,6 +2,7 @@ mod asr_models;
 mod capsule;
 mod commands;
 mod config;
+mod context_capture;
 mod corrector_cmd;
 mod corrector_probe;
 mod corrector_svc;
@@ -51,6 +52,7 @@ pub struct AppState {
     pub qwen_runtime: Mutex<QwenRuntimeStatus>,
     pub whisper: Mutex<WhisperAsr>,
     pub config: Mutex<AppConfig>,
+    pub context: context_capture::ContextRecorder,
 }
 
 fn qwen_engine_from_config(config: &config::AsrServiceConfig) -> QwenAsr {
@@ -189,6 +191,7 @@ pub fn run() {
     );
 
     let audio = AudioCapture::new();
+    let context = context_capture::ContextRecorder::new(&app_config.context, &data_dir);
     if let Some(ref name) = app_config.audio.device_name {
         if !name.is_empty() {
             audio.set_device(Some(name.clone()));
@@ -246,12 +249,14 @@ pub fn run() {
             qwen_runtime: Mutex::new(qwen_runtime),
             whisper: Mutex::new(WhisperAsr::new(wh_dir)),
             config: Mutex::new(app_config),
+            context,
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_health,
             commands::list_sessions,
             commands::get_session,
             commands::list_session_attempts,
+            commands::list_context_snapshots,
             commands::delete_session,
             commands::save_session,
             commands::seed_demo_session,

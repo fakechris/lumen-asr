@@ -53,6 +53,8 @@ lumen-inject = { path = "crates/lumen-inject" }
 lumen-platform = { path = "crates/lumen-platform" }
 lumen-platform-macos = { path = "crates/lumen-platform-macos" }
 lumen-prompts = { path = "crates/lumen-prompts" }
+# Versioned capture contracts shared with Lumen's local macOS context collector.
+lumen-context = { git = "https://github.com/fakechris/lumen-navi.git", rev = "67d7cfa8114bbd9f38105494ad5574fd51634cc7" }
 parking_lot = "0.12"
 cpal = "0.15"
 fs2 = "0.4"

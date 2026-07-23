@@ -184,6 +184,89 @@ pub struct PipelineStageIssue {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextSnapshotRecord {
+    pub capture_id: Uuid,
+    pub session_id: Uuid,
+    pub revision: u64,
+    pub schema_version: u32,
+    pub profile: String,
+    pub target_generation: u64,
+    pub started_at: DateTime<Utc>,
+    pub frozen_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub manifest_path: String,
+    pub source_presence_bitmap: u64,
+    pub source_status_json: String,
+    pub sanitized_hash: String,
+    pub encryption: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextInputRef {
+    pub capture_id: Uuid,
+    pub revision: u64,
+    pub snapshot_hash: String,
+    pub context_schema_version: u32,
+    pub capture_profile: String,
+    pub source_presence_bitmap: u64,
+    pub source_status_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextStageUsage {
+    pub stage: PipelineStage,
+    pub sources: Vec<String>,
+    pub projection_schema_version: u32,
+    pub projection_path: Option<String>,
+    pub projection_hash: Option<String>,
+    pub projection_chars: u32,
+    pub captured: bool,
+    pub selected: bool,
+    pub consumed: bool,
+    pub sent: bool,
+    pub not_used_reason: Option<String>,
+}
+
+impl Default for ContextStageUsage {
+    fn default() -> Self {
+        Self {
+            stage: PipelineStage::Unknown,
+            sources: Vec::new(),
+            projection_schema_version: 1,
+            projection_path: None,
+            projection_hash: None,
+            projection_chars: 0,
+            captured: false,
+            selected: false,
+            consumed: false,
+            sent: false,
+            not_used_reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PipelineInputs {
+    pub schema_version: u32,
+    pub context: Option<ContextInputRef>,
+    pub stage_usages: Vec<ContextStageUsage>,
+}
+
+impl Default for PipelineInputs {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            context: None,
+            stage_usages: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PipelineMetrics {
     pub schema_version: u32,
@@ -326,6 +409,7 @@ pub struct DictationAttemptRecord {
     pub inserted: Option<String>,
     pub pipeline_identity: PipelineIdentity,
     pub pipeline_metrics: PipelineMetrics,
+    pub pipeline_inputs: PipelineInputs,
     pub status: AttemptStatus,
     pub failed_stage: Option<PipelineStage>,
     pub failure_message: Option<String>,
@@ -345,6 +429,7 @@ impl DictationAttemptRecord {
             inserted: None,
             pipeline_identity: PipelineIdentity::default(),
             pipeline_metrics: PipelineMetrics::default(),
+            pipeline_inputs: PipelineInputs::default(),
             status: AttemptStatus::InProgress,
             failed_stage: None,
             failure_message: None,
@@ -423,7 +508,7 @@ impl Store {
             r#"
             SELECT id, session_id, attempt_ordinal, created_at,
                    asr_raw, asr_enhanced, corrected, inserted,
-                   pipeline_identity_json, pipeline_metrics_json,
+                   pipeline_identity_json, pipeline_metrics_json, pipeline_inputs_json,
                    status, failed_stage, failure_message, supersedes_attempt_id
             FROM dictation_attempts
             WHERE session_id=?1
@@ -440,6 +525,55 @@ impl Store {
             ],
             map_attempt,
         )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn save_context_snapshot(&self, record: &ContextSnapshotRecord) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO context_snapshots (
+              capture_id, session_id, revision, schema_version, profile,
+              target_generation, started_at, frozen_at, completed_at,
+              manifest_path, source_presence_bitmap, source_status_json,
+              sanitized_hash, encryption, status
+            ) VALUES (
+              ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15
+            )
+            "#,
+            params![
+                record.capture_id.to_string(),
+                record.session_id.to_string(),
+                i64::try_from(record.revision)?,
+                i64::from(record.schema_version),
+                record.profile,
+                i64::try_from(record.target_generation)?,
+                record.started_at.to_rfc3339(),
+                record.frozen_at.to_rfc3339(),
+                record.completed_at.map(|value| value.to_rfc3339()),
+                record.manifest_path,
+                i64::try_from(record.source_presence_bitmap)?,
+                record.source_status_json,
+                record.sanitized_hash,
+                record.encryption,
+                record.status,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_context_snapshots(&self, session_id: Uuid) -> Result<Vec<ContextSnapshotRecord>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT capture_id, session_id, revision, schema_version, profile,
+                   target_generation, started_at, frozen_at, completed_at,
+                   manifest_path, source_presence_bitmap, source_status_json,
+                   sanitized_hash, encryption, status
+            FROM context_snapshots
+            WHERE session_id=?1
+            ORDER BY revision ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![session_id.to_string()], map_context_snapshot)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -669,19 +803,23 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 fn map_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<DictationAttemptRecord> {
     let identity_json: String = row.get(8)?;
     let metrics_json: String = row.get(9)?;
+    let inputs_json: String = row.get(10)?;
     let pipeline_identity = serde_json::from_str(&identity_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(error))
     })?;
     let pipeline_metrics = serde_json::from_str(&metrics_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(error))
     })?;
+    let pipeline_inputs = serde_json::from_str(&inputs_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     let id = parse_uuid_column(row, 0)?;
     let session_id = parse_uuid_column(row, 1)?;
     let attempt_ordinal = parse_u32_column(row, 2)?;
-    let supersedes_attempt_id = match row.get::<_, Option<String>>(13)? {
+    let supersedes_attempt_id = match row.get::<_, Option<String>>(14)? {
         Some(value) => Some(Uuid::parse_str(&value).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                13,
+                14,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
@@ -699,12 +837,35 @@ fn map_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<DictationAttemptReco
         inserted: row.get(7)?,
         pipeline_identity,
         pipeline_metrics,
-        status: parse_attempt_status(&row.get::<_, String>(10)?),
+        pipeline_inputs,
+        status: parse_attempt_status(&row.get::<_, String>(11)?),
         failed_stage: row
-            .get::<_, Option<String>>(11)?
+            .get::<_, Option<String>>(12)?
             .and_then(|value| parse_pipeline_stage(&value)),
-        failure_message: row.get(12)?,
+        failure_message: row.get(13)?,
         supersedes_attempt_id,
+    })
+}
+
+fn map_context_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextSnapshotRecord> {
+    Ok(ContextSnapshotRecord {
+        capture_id: parse_uuid_column(row, 0)?,
+        session_id: parse_uuid_column(row, 1)?,
+        revision: parse_u64_column(row, 2)?,
+        schema_version: parse_u32_column(row, 3)?,
+        profile: row.get(4)?,
+        target_generation: parse_u64_column(row, 5)?,
+        started_at: parse_dt(&row.get::<_, String>(6)?),
+        frozen_at: parse_dt(&row.get::<_, String>(7)?),
+        completed_at: row
+            .get::<_, Option<String>>(8)?
+            .map(|value| parse_dt(&value)),
+        manifest_path: row.get(9)?,
+        source_presence_bitmap: parse_u64_column(row, 10)?,
+        source_status_json: row.get(11)?,
+        sanitized_hash: row.get(12)?,
+        encryption: row.get(13)?,
+        status: row.get(14)?,
     })
 }
 
@@ -722,6 +883,17 @@ fn parse_uuid_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<
 fn parse_u32_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u32> {
     let value: i64 = row.get(index)?;
     u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+fn parse_u64_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             index,
             rusqlite::types::Type::Integer,
@@ -790,15 +962,16 @@ fn append_dictation_attempt_on(
     record.supersedes_attempt_id = latest.map(|(id, _)| id);
     let identity_json = serde_json::to_string(&record.pipeline_identity)?;
     let metrics_json = serde_json::to_string(&record.pipeline_metrics)?;
+    let inputs_json = serde_json::to_string(&record.pipeline_inputs)?;
     transaction.execute(
         r#"
         INSERT INTO dictation_attempts (
           id, session_id, attempt_ordinal, created_at,
           asr_raw, asr_enhanced, corrected, inserted,
-          pipeline_identity_json, pipeline_metrics_json,
+          pipeline_identity_json, pipeline_metrics_json, pipeline_inputs_json,
           status, failed_stage, failure_message, supersedes_attempt_id
         ) VALUES (
-          ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14
+          ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15
         )
         "#,
         params![
@@ -812,6 +985,7 @@ fn append_dictation_attempt_on(
             record.inserted,
             identity_json,
             metrics_json,
+            inputs_json,
             record.status.as_str(),
             record.failed_stage.map(PipelineStage::as_str),
             record.failure_message,
@@ -1358,5 +1532,144 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 2]
         );
+    }
+
+    #[test]
+    fn context_snapshot_and_exact_stage_usage_round_trip_with_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("context-round-trip.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+
+        let capture_id = Uuid::new_v4();
+        let frozen_at = Utc::now();
+        let snapshot = ContextSnapshotRecord {
+            capture_id,
+            session_id: session.id,
+            revision: 1,
+            schema_version: 1,
+            profile: "visible".into(),
+            target_generation: 7,
+            started_at: frozen_at,
+            frozen_at,
+            completed_at: Some(frozen_at),
+            manifest_path: "context/example/revision-1.envelope.json".into(),
+            source_presence_bitmap: 0b111,
+            source_status_json: r#"{"target":"succeeded","editor_ax":"succeeded"}"#.into(),
+            sanitized_hash: "snapshot-hash".into(),
+            encryption: "xchacha20poly1305".into(),
+            status: "complete".into(),
+        };
+        store.save_context_snapshot(&snapshot).unwrap();
+
+        let mut attempt = DictationAttemptRecord::new(session.id);
+        attempt.pipeline_inputs = PipelineInputs {
+            schema_version: 1,
+            context: Some(ContextInputRef {
+                capture_id,
+                revision: 1,
+                snapshot_hash: "snapshot-hash".into(),
+                context_schema_version: 1,
+                capture_profile: "visible".into(),
+                source_presence_bitmap: 0b111,
+                source_status_summary: "complete".into(),
+            }),
+            stage_usages: vec![
+                ContextStageUsage {
+                    stage: PipelineStage::Asr,
+                    sources: vec!["captured_context".into()],
+                    projection_schema_version: 1,
+                    projection_path: None,
+                    projection_hash: None,
+                    projection_chars: 0,
+                    captured: true,
+                    selected: false,
+                    consumed: false,
+                    sent: false,
+                    not_used_reason: Some("engine_context_disabled".into()),
+                },
+                ContextStageUsage {
+                    stage: PipelineStage::Corrector,
+                    sources: vec!["personal_dictionary".into()],
+                    projection_schema_version: 1,
+                    projection_path: Some("context/example/attempt/corrector.envelope.json".into()),
+                    projection_hash: Some("corrector-input-hash".into()),
+                    projection_chars: 42,
+                    captured: true,
+                    selected: true,
+                    consumed: true,
+                    sent: true,
+                    not_used_reason: None,
+                },
+            ],
+        };
+        attempt.status = AttemptStatus::Completed;
+        let saved = store.append_dictation_attempt(attempt).unwrap();
+
+        let snapshots = store.list_context_snapshots(session.id).unwrap();
+        assert_eq!(snapshots, vec![snapshot]);
+        let attempts = store.list_dictation_attempts(session.id, 10, None).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].id, saved.id);
+        assert_eq!(
+            attempts[0]
+                .pipeline_inputs
+                .context
+                .as_ref()
+                .unwrap()
+                .capture_id,
+            capture_id
+        );
+        assert_eq!(attempts[0].pipeline_inputs.stage_usages.len(), 2);
+        assert!(!attempts[0].pipeline_inputs.stage_usages[0].sent);
+        assert_eq!(
+            attempts[0].pipeline_inputs.stage_usages[1]
+                .projection_hash
+                .as_deref(),
+            Some("corrector-input-hash")
+        );
+    }
+
+    #[test]
+    fn context_snapshot_revisions_are_append_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("context-revisions.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+        let capture_id = Uuid::new_v4();
+        let frozen_at = Utc::now();
+        let snapshot = ContextSnapshotRecord {
+            capture_id,
+            session_id: session.id,
+            revision: 1,
+            schema_version: 1,
+            profile: "visible".into(),
+            target_generation: 1,
+            started_at: frozen_at,
+            frozen_at,
+            completed_at: None,
+            manifest_path: "context/revision-1.envelope.json".into(),
+            source_presence_bitmap: 1,
+            source_status_json: "{}".into(),
+            sanitized_hash: "first".into(),
+            encryption: "xchacha20poly1305".into(),
+            status: "partial".into(),
+        };
+        store.save_context_snapshot(&snapshot).unwrap();
+
+        let mut conflicting = snapshot.clone();
+        conflicting.sanitized_hash = "mutated".into();
+        assert!(store.save_context_snapshot(&conflicting).is_err());
+
+        let mut revision_two = snapshot;
+        revision_two.revision = 2;
+        revision_two.sanitized_hash = "second".into();
+        revision_two.status = "complete".into();
+        store.save_context_snapshot(&revision_two).unwrap();
+
+        let snapshots = store.list_context_snapshots(session.id).unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].sanitized_hash, "first");
+        assert_eq!(snapshots[1].sanitized_hash, "second");
     }
 }

@@ -1,17 +1,20 @@
 use crate::config::{AppConfig, AsrServiceConfig};
+use crate::context_capture::StageUsageInput;
 use crate::corrector_svc::{
-    corrector_outcome_identity, dictionary_run_identity, run_correct_with_intent, run_identity,
+    corrector_outcome_identity, dictionary_context, dictionary_run_identity,
+    run_correct_with_intent, run_identity,
 };
 use crate::dictation::{canonical_asr_provider, engine_kind_for_provider};
 use crate::session_debug::{self, SessionDebugMeta};
 use crate::AppState;
 use lumen_asr::{model_identity_from_path, AsrResult, EngineKind, QwenShadowStatus};
 use lumen_core::SessionRecord;
+use lumen_corrector::CorrectorFallbackReason;
 use lumen_platform_macos::FrontmostTarget;
 use lumen_prompts::IntentSpec;
 use lumen_store::{
-    AttemptStatus, DictationAttemptRecord, EnhancementMode, PipelineIdentity, PipelineIssueKind,
-    PipelineStage, PipelineStageIssue,
+    AttemptStatus, ContextStageUsage, DictationAttemptRecord, EnhancementMode, PipelineIdentity,
+    PipelineIssueKind, PipelineStage, PipelineStageIssue,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -167,7 +170,7 @@ pub(crate) async fn run_corrector_stage(
                     (Vec::new(), Some("dictionary unavailable".to_string()))
                 }
             },
-            None => (vec![], None),
+            None => (vec![], Some("dictionary store unavailable".to_string())),
         },
         Err(_) => {
             tracing::warn!("dictionary store lock poisoned; continuing without dictionary");
@@ -175,11 +178,17 @@ pub(crate) async fn run_corrector_stage(
         }
     };
     let dictionary = dictionary_run_identity(&entries);
+    let projected_dictionary = dictionary_context(&entries);
+    let dictionary_selected =
+        !projected_dictionary.terms.is_empty() || !projected_dictionary.replacements.is_empty();
+    let projection =
+        serde_json::to_vec(&projected_dictionary).map_err(|error| error.to_string())?;
     attempt.pipeline_identity.dictionary_context_hash = Some(dictionary.hash);
     attempt.pipeline_identity.dictionary_context_hash_algorithm =
         Some(dictionary.hash_algorithm.into());
     attempt.pipeline_identity.dictionary_term_count = dictionary.term_count;
     attempt.pipeline_identity.dictionary_replacement_count = dictionary.replacement_count;
+    let dictionary_captured = dictionary_error.is_none();
     if let Some(message) = dictionary_error {
         attempt
             .pipeline_metrics
@@ -196,6 +205,66 @@ pub(crate) async fn run_corrector_stage(
     let result = run_correct_with_intent(config, enhanced_text, &entries, intent).await;
     attempt.pipeline_metrics.corrector_ms = elapsed_ms(corrector_started);
     let text = result.text.trim().to_string();
+    let capture_id = attempt
+        .pipeline_inputs
+        .context
+        .as_ref()
+        .map(|input| input.capture_id);
+    let captured_context_available = attempt
+        .pipeline_inputs
+        .context
+        .as_ref()
+        .is_some_and(|input| input.source_presence_bitmap != 0);
+    // `sent` means the model adapter was invoked with this projection. A
+    // timeout or provider rejection still counts as sent; local preprocessing
+    // and model-construction failures do not.
+    let model_attempted = run.provider != "none"
+        && !matches!(
+            result.fallback_reason.as_ref(),
+            Some(CorrectorFallbackReason::BuildFailed)
+        );
+    let not_used_reason = if !dictionary_selected {
+        Some("no_personal_dictionary_context".to_owned())
+    } else if !model_attempted {
+        Some("corrector_model_not_invoked".to_owned())
+    } else {
+        None
+    };
+    attempt
+        .pipeline_inputs
+        .stage_usages
+        .push(ContextStageUsage {
+            stage: PipelineStage::Corrector,
+            sources: vec!["captured_context".into()],
+            captured: captured_context_available,
+            not_used_reason: Some("captured_context_not_projected_to_corrector".into()),
+            ..ContextStageUsage::default()
+        });
+    match state.context.record_stage_usage(StageUsageInput {
+        capture_id,
+        attempt_id: attempt.id,
+        stage: PipelineStage::Corrector,
+        sources: vec!["personal_dictionary".into()],
+        projection: Some(&projection),
+        captured: dictionary_captured,
+        selected: dictionary_selected,
+        consumed: dictionary_selected,
+        sent: dictionary_selected && model_attempted,
+        not_used_reason,
+    }) {
+        Ok(usage) => attempt.pipeline_inputs.stage_usages.push(usage),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to persist corrector input provenance");
+            attempt
+                .pipeline_metrics
+                .stage_issues
+                .push(PipelineStageIssue {
+                    stage: PipelineStage::Corrector,
+                    kind: PipelineIssueKind::InputUnavailable,
+                    message: "corrector input provenance unavailable".into(),
+                });
+        }
+    }
     let outcome_identity = corrector_outcome_identity(&run, result.model_applied);
     let engine = outcome_identity.engine;
     attempt.corrected = Some(text.clone());
