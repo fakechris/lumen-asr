@@ -77,6 +77,7 @@ static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Only discard as bounce if shorter than this *and* almost no audio.
 const BOUNCE_MS: u128 = 80;
+const MIN_AUDIBLE_PEAK: f32 = 0.005;
 
 /// Snapshot frontmost app into process-local cache (sync, preferred at press).
 fn remember_target_app() -> Option<FrontmostTarget> {
@@ -182,6 +183,15 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 }
 
 #[tauri::command]
+pub fn get_audio_device(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    state
+        .config
+        .lock()
+        .map(|cfg| cfg.audio.device_name.clone())
+        .map_err(|_| "config lock poisoned".to_string())
+}
+
+#[tauri::command]
 pub fn set_audio_device(state: State<'_, AppState>, name: Option<String>) -> Result<(), String> {
     state.audio.set_device(name.clone());
     // Persist preferred device for onboarding + next launch.
@@ -190,6 +200,14 @@ pub fn set_audio_device(state: State<'_, AppState>, name: Option<String>) -> Res
         let _ = cfg.save();
     }
     Ok(())
+}
+
+fn ensure_audible_capture(peak: f32) -> Result<(), &'static str> {
+    if peak.is_finite() && peak >= MIN_AUDIBLE_PEAK {
+        Ok(())
+    } else {
+        Err("未检测到有效声音。请在录音页选择正确的麦克风设备后重试。")
+    }
 }
 
 pub(crate) fn canonical_asr_provider(provider: &str) -> String {
@@ -598,8 +616,34 @@ pub async fn stop_and_transcribe_inner(
     let samples_16k = prepare_for_asr(&capture);
     attempt.pipeline_metrics.preprocess_ms = elapsed_ms(preprocess_started);
     let (rms, peak) = session_debug::audio_stats(&samples_16k);
-    if peak < 0.005 {
-        tracing::warn!(peak, rms, "audio nearly silent — ASR likely empty");
+    if let Err(error) = ensure_audible_capture(peak) {
+        tracing::error!(peak, rms, "audio capture rejected before ASR");
+        mark_attempt_failed(
+            &mut attempt,
+            PipelineStage::Capture,
+            error,
+            pipeline_started,
+        );
+        rec.status = SessionStatus::Failed;
+        rec.asr_engine = Some(engine_kind.as_str().into());
+        write_attempt_debug(
+            &mut rec,
+            &attempt,
+            AttemptDebug {
+                target: target.as_ref(),
+                frontmost_before_insert: None,
+                sample_rate_capture: sample_rate,
+                num_samples_capture: num_samples,
+                samples_asr: &samples_16k,
+                rms,
+                peak,
+                notes: vec!["near-silent capture rejected before ASR".into()],
+            },
+        );
+        if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
+            tracing::warn!(error = %persist_error, "failed to persist silent capture failure");
+        }
+        return Err(error.to_string());
     }
 
     // Clone samples for debug dump (after ASR we still have this).
@@ -655,9 +699,6 @@ pub async fn stop_and_transcribe_inner(
     }
 
     let mut notes: Vec<String> = Vec::new();
-    if peak < 0.005 {
-        notes.push("near-silent audio".into());
-    }
     if asr_text.is_empty() || asr_text == "." {
         notes.push("empty/dot ASR".into());
     }
@@ -1461,6 +1502,14 @@ mod attempt_metric_tests {
             insertion_outcome_for_strategy(InsertStrategy::None),
             InsertionOutcome::Failed
         );
+    }
+
+    #[test]
+    fn near_silent_capture_is_rejected_before_asr_or_clipboard_fallback() {
+        assert!(ensure_audible_capture(0.0).is_err());
+        assert!(ensure_audible_capture(f32::NAN).is_err());
+        assert!(ensure_audible_capture(0.0049).is_err());
+        assert!(ensure_audible_capture(0.005).is_ok());
     }
 
     #[test]

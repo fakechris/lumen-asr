@@ -4,6 +4,7 @@ import { api, type AsrModelStatus } from "./api";
 import { HotkeyRecorder } from "./HotkeyRecorder";
 import { OnboardingWizard } from "./OnboardingWizard";
 import { formatHotkeyLabel } from "./hotkeyFormat";
+import { chooseAudioDevice } from "./audioDeviceSelection";
 import { Icon, type IconName } from "./Icons";
 import { ChordCaptureChip } from "./ChordCaptureChip";
 import type {
@@ -627,12 +628,17 @@ function RecordPanel({
   useEffect(() => {
     void (async () => {
       try {
-        const list = await api.listAudioDevices();
+        const [list, preferred] = await Promise.all([
+          api.listAudioDevices(),
+          api.getAudioDevice(),
+        ]);
         setDevices(list);
-        const def = list.find((d) => d.is_default) ?? list[0];
-        if (def) {
-          setDevice(def.name);
-          await api.setAudioDevice(def.name);
+        const selected = chooseAudioDevice(list, preferred);
+        if (selected) {
+          setDevice(selected);
+          if (selected !== preferred) {
+            await api.setAudioDevice(selected);
+          }
         }
       } catch (e) {
         onError(String(e));

@@ -264,6 +264,7 @@ pub fn run() {
             commands::add_dictionary_replacement,
             commands::delete_dictionary_entry,
             dictation::list_audio_devices,
+            dictation::get_audio_device,
             dictation::set_audio_device,
             dictation::set_asr_engine,
             dictation::get_asr_status,
