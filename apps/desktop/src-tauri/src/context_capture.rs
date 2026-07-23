@@ -739,6 +739,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a logged-in macOS session and Accessibility permission"]
     async fn live_textedit_capture_round_trips_visible_context() {
+        let _live_test_guard = crate::MACOS_LIVE_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let document = directory.path().join("lumen-context-e2e.txt");
         let marker = format!("LUMEN_CONTEXT_E2E_{}", Uuid::new_v4());
