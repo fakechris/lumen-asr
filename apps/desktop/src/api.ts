@@ -95,6 +95,7 @@ export const api = {
   health: () => invoke<Health>("app_health"),
 
   listAudioDevices: () => invoke<AudioDevice[]>("list_audio_devices"),
+  getAudioDevice: () => invoke<string | null>("get_audio_device"),
   setAudioDevice: (name: string | null) =>
     invoke<void>("set_audio_device", { name }),
   setAsrEngine: (engine: string) =>

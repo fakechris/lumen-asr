@@ -79,10 +79,7 @@ fn set_register_status(tap: bool, note: impl Into<String>) {
 fn register_status() -> (bool, String) {
     (
         EVENT_TAP_ACTIVE.load(std::sync::atomic::Ordering::SeqCst),
-        REGISTER_NOTE
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default(),
+        REGISTER_NOTE.lock().map(|g| g.clone()).unwrap_or_default(),
     )
 }
 
@@ -176,10 +173,6 @@ fn spawn_start(app: AppHandle, intent: IntentSpec) {
         tracing::info!(?intent, "hotkey → start");
         if let Err(e) = dictation::dictation_start_with_intent(app.clone(), intent).await {
             tracing::warn!(error = %e, "dictation start failed");
-            dictation::emit_dictation(
-                &app,
-                dictation::DictationUiEvent::Error { message: e },
-            );
         }
     });
 }
@@ -189,10 +182,6 @@ fn spawn_stop(app: AppHandle) {
         tracing::info!("hotkey → stop");
         if let Err(e) = dictation::dictation_stop(app.clone()).await {
             tracing::warn!(error = %e, "dictation stop failed");
-            dictation::emit_dictation(
-                &app,
-                dictation::DictationUiEvent::Error { message: e },
-            );
         }
     });
 }
@@ -202,10 +191,6 @@ fn spawn_toggle(app: AppHandle) {
         tracing::info!("hotkey → toggle");
         if let Err(e) = dictation::toggle_dictation(app.clone()).await {
             tracing::warn!(error = %e, "dictation toggle failed");
-            dictation::emit_dictation(
-                &app,
-                dictation::DictationUiEvent::Error { message: e },
-            );
         }
     });
 }
@@ -301,10 +286,7 @@ pub fn reregister_with(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
                         intents = n,
                         "event-tap multi hotkeys registered"
                     );
-                    set_register_status(
-                        true,
-                        format!("EventTap 已注册主热键 + {n} 个意图键"),
-                    );
+                    set_register_status(true, format!("EventTap 已注册主热键 + {n} 个意图键"));
                     return Ok(());
                 }
                 Err(e) => {
@@ -416,25 +398,27 @@ fn register_fallback(
         let intent_spec = intent.to_intent_spec();
         let hold_mode = hold;
         let id = intent.id.clone();
-        match app.global_shortcut().on_shortcut(shortcut, move |_app, _s, event| {
-            let handle = handle.clone();
-            let intent_spec = intent_spec.clone();
-            match event.state {
-                ShortcutState::Pressed => {
-                    if hold_mode {
-                        spawn_start(handle, intent_spec);
-                    } else {
-                        dictation::set_session_intent(intent_spec);
-                        spawn_toggle(handle);
+        match app
+            .global_shortcut()
+            .on_shortcut(shortcut, move |_app, _s, event| {
+                let handle = handle.clone();
+                let intent_spec = intent_spec.clone();
+                match event.state {
+                    ShortcutState::Pressed => {
+                        if hold_mode {
+                            spawn_start(handle, intent_spec);
+                        } else {
+                            dictation::set_session_intent(intent_spec);
+                            spawn_toggle(handle);
+                        }
+                    }
+                    ShortcutState::Released => {
+                        if hold_mode {
+                            spawn_stop(handle);
+                        }
                     }
                 }
-                ShortcutState::Released => {
-                    if hold_mode {
-                        spawn_stop(handle);
-                    }
-                }
-            }
-        }) {
+            }) {
             Ok(()) => {
                 key_chord_count += 1;
                 tracing::info!(%id, chord, "intent global_shortcut registered (fallback)");
@@ -453,10 +437,7 @@ fn register_fallback(
     let note = if notes.is_empty() {
         format!("回退注册成功（修饰键组 + {key_chord_count} 个含字母键）")
     } else {
-        format!(
-            "回退注册（EventTap 需辅助功能）。{}",
-            notes.join("；")
-        )
+        format!("回退注册（EventTap 需辅助功能）。{}", notes.join("；"))
     };
     set_register_status(false, note);
     Ok(())

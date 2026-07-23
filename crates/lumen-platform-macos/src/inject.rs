@@ -11,8 +11,10 @@
 
 use async_trait::async_trait;
 use lumen_inject::{InjectError, TextInjectorBackend};
-use std::io::Write;
-use std::process::{Command, Stdio};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+#[cfg(target_os = "macos")]
+use objc2_foundation::NSString;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -67,38 +69,50 @@ fn paste_with_restore_sync(text: &str, preserve: bool) -> Result<(), InjectError
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn set_clipboard(text: &str) -> Result<(), InjectError> {
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| InjectError::Other(format!("pbcopy: {e}")))?;
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| InjectError::Other("pbcopy stdin missing".into()))?;
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| InjectError::Other(format!("pbcopy write: {e}")))?;
-    }
-    let status = child
-        .wait()
-        .map_err(|e| InjectError::Other(format!("pbcopy wait: {e}")))?;
-    if status.success() {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    set_pasteboard_text(&pasteboard, text)
+}
+
+#[cfg(target_os = "macos")]
+fn set_pasteboard_text(pasteboard: &NSPasteboard, text: &str) -> Result<(), InjectError> {
+    pasteboard.clearContents();
+    let value = NSString::from_str(text);
+    let string_type = unsafe { NSPasteboardTypeString };
+    if pasteboard.setString_forType(&value, string_type) {
         Ok(())
     } else {
-        Err(InjectError::Other("pbcopy failed".into()))
+        Err(InjectError::Other(
+            "failed to write Unicode text to pasteboard".into(),
+        ))
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn set_clipboard(text: &str) -> Result<(), InjectError> {
+    let _ = text;
+    Err(InjectError::NotSupported("not macOS".into()))
+}
+
+#[cfg(target_os = "macos")]
 fn get_clipboard() -> Result<String, InjectError> {
-    let output = Command::new("pbpaste")
-        .output()
-        .map_err(|e| InjectError::Other(format!("pbpaste: {e}")))?;
-    if !output.status.success() {
-        return Err(InjectError::Other("pbpaste failed".into()));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let pasteboard = NSPasteboard::generalPasteboard();
+    get_pasteboard_text(&pasteboard)
+}
+
+#[cfg(target_os = "macos")]
+fn get_pasteboard_text(pasteboard: &NSPasteboard) -> Result<String, InjectError> {
+    let string_type = unsafe { NSPasteboardTypeString };
+    pasteboard
+        .stringForType(string_type)
+        .map(|value| value.to_string())
+        .ok_or_else(|| InjectError::Other("pasteboard does not contain text".into()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn get_clipboard() -> Result<String, InjectError> {
+    Err(InjectError::NotSupported("not macOS".into()))
 }
 
 const FLAG_SHIFT: u64 = 0x0002_0000;
@@ -224,4 +238,21 @@ fn post_unicode_chunk(
     event.set_flags(CGEventFlags::empty());
     event.post(CGEventTapLocation::HID);
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{get_pasteboard_text, set_pasteboard_text};
+    use objc2_app_kit::NSPasteboard;
+
+    #[test]
+    fn clipboard_copy_preserves_unicode_for_native_consumers() {
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        let expected = "中文剪贴板测试：你好，世界。🚀";
+
+        set_pasteboard_text(&pasteboard, expected).expect("copy Unicode fixture");
+        let actual = get_pasteboard_text(&pasteboard).expect("read Unicode fixture");
+
+        assert_eq!(actual, expected);
+    }
 }
