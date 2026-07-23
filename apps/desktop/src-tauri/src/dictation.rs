@@ -74,6 +74,7 @@ const PHASE_RECORDING: u8 = 1;
 const PHASE_PROCESSING: u8 = 2;
 static PHASE: AtomicU8 = AtomicU8::new(PHASE_IDLE);
 static UI_NOTICE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static UI_TRANSITION: Mutex<()> = Mutex::new(());
 static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Only discard as bounce if shorter than this *and* almost no audio.
@@ -1280,6 +1281,26 @@ pub fn emit_dictation(app: &AppHandle, event: DictationUiEvent) {
     let _ = app.emit("dictation", &event);
 }
 
+fn show_transient_error(app: &AppHandle, message: String) {
+    let notice_epoch = UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    crate::capsule::set_capsule_visible(app, true, "error");
+    emit_dictation(app, DictationUiEvent::Error { message });
+
+    let app_for_notice = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let _transition = UI_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if UI_NOTICE_EPOCH.load(Ordering::SeqCst) == notice_epoch
+            && PHASE.load(Ordering::SeqCst) == PHASE_IDLE
+        {
+            emit_dictation(&app_for_notice, DictationUiEvent::Idle);
+            crate::capsule::set_capsule_visible(&app_for_notice, false, "idle");
+        }
+    });
+}
+
 /// Start recording if idle (push-to-talk press / toggle start).
 pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
     dictation_start_with_intent(app, IntentSpec::Default).await
@@ -1287,15 +1308,18 @@ pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
 
 pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> Result<(), String> {
     // Only one session at a time.
-    if PHASE
-        .compare_exchange(
+    let phase_transition = {
+        let _transition = UI_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        PHASE.compare_exchange(
             PHASE_IDLE,
             PHASE_RECORDING,
             Ordering::SeqCst,
             Ordering::SeqCst,
         )
-        .is_err()
-    {
+    };
+    if phase_transition.is_err() {
         tracing::info!(
             phase = PHASE.load(Ordering::SeqCst),
             "dictation_start ignored (not idle)"
@@ -1351,6 +1375,7 @@ pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> 
                 *g = None;
             }
             PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+            show_transient_error(&app, e.clone());
             Err(e)
         }
     }
@@ -1449,20 +1474,8 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
             Ok(())
         }
         Err(e) => {
-            let notice_epoch = UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-            crate::capsule::set_capsule_visible(&app, true, "error");
-            emit_dictation(&app, DictationUiEvent::Error { message: e.clone() });
             PHASE.store(PHASE_IDLE, Ordering::SeqCst);
-            let app_for_notice = app.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(4)).await;
-                if UI_NOTICE_EPOCH.load(Ordering::SeqCst) == notice_epoch
-                    && PHASE.load(Ordering::SeqCst) == PHASE_IDLE
-                {
-                    emit_dictation(&app_for_notice, DictationUiEvent::Idle);
-                    crate::capsule::set_capsule_visible(&app_for_notice, false, "idle");
-                }
-            });
+            show_transient_error(&app, e.clone());
             Err(e)
         }
     }
