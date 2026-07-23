@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub audio: AudioConfig,
     /// Speech recognition backend (local or cloud).
     pub asr: AsrServiceConfig,
+    /// Local, encrypted context capture used for replay and pipeline provenance.
+    pub context: ContextCaptureConfig,
 }
 
 impl Default for AppConfig {
@@ -30,6 +32,30 @@ impl Default for AppConfig {
             onboarding: OnboardingConfig::default(),
             audio: AudioConfig::default(),
             asr: AsrServiceConfig::default(),
+            context: ContextCaptureConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextCaptureConfig {
+    pub enabled: bool,
+    /// metadata | editor | visible. Vision sources are intentionally excluded.
+    pub profile: String,
+    pub max_chars: usize,
+    pub freeze_deadline_ms: u64,
+    pub late_deadline_ms: u64,
+}
+
+impl Default for ContextCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            profile: "visible".into(),
+            max_chars: 200_000,
+            freeze_deadline_ms: 500,
+            late_deadline_ms: 5_000,
         }
     }
 }
@@ -839,5 +865,28 @@ provider = "local_qwen"
             output.cleanup_level_for_asr_provider("local_qwen"),
             lumen_prompts::CleanupLevel::Strong
         );
+    }
+
+    #[test]
+    fn context_capture_defaults_to_bounded_text_without_vision_sources() {
+        let context = ContextCaptureConfig::default();
+
+        assert!(context.enabled);
+        assert_eq!(context.profile, "visible");
+        assert_eq!(context.max_chars, 200_000);
+    }
+
+    #[test]
+    fn existing_config_without_context_section_enables_auditable_capture() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[asr]
+provider = "local_qwen"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.context.enabled);
+        assert_eq!(config.context.profile, "visible");
     }
 }

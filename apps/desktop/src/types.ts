@@ -279,6 +279,54 @@ export type PipelineStageIssue = {
   message: string;
 };
 
+export type ContextInputRef = {
+  capture_id: string;
+  revision: number;
+  snapshot_hash: string;
+  context_schema_version: number;
+  capture_profile: string;
+  source_presence_bitmap: number;
+  source_status_summary: string;
+};
+
+export type ContextStageUsage = {
+  stage: PipelineStage;
+  sources: string[];
+  projection_schema_version: number;
+  projection_path?: string | null;
+  projection_hash?: string | null;
+  projection_chars: number;
+  captured: boolean;
+  selected: boolean;
+  consumed: boolean;
+  sent: boolean;
+  not_used_reason?: string | null;
+};
+
+export type PipelineInputs = {
+  schema_version: number;
+  context?: ContextInputRef | null;
+  stage_usages: ContextStageUsage[];
+};
+
+export type ContextSnapshotRecord = {
+  capture_id: string;
+  session_id: string;
+  revision: number;
+  schema_version: number;
+  profile: string;
+  target_generation: number;
+  started_at: string;
+  frozen_at: string;
+  completed_at?: string | null;
+  manifest_path: string;
+  source_presence_bitmap: number;
+  source_status_json: string;
+  sanitized_hash: string;
+  encryption: string;
+  status: string;
+};
+
 export type DictationAttemptRecord = {
   id: string;
   session_id: string;
@@ -290,6 +338,7 @@ export type DictationAttemptRecord = {
   inserted?: string | null;
   pipeline_identity: PipelineIdentity;
   pipeline_metrics: PipelineMetrics;
+  pipeline_inputs: PipelineInputs;
   status: AttemptStatus;
   failed_stage?: PipelineStage | null;
   failure_message?: string | null;

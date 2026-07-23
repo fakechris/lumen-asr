@@ -4,6 +4,7 @@ import type {
   AudioDevice,
   CorrectorStatus,
   CorrectTextOutcome,
+  ContextSnapshotRecord,
   DictationAttemptRecord,
   DictionaryEntry,
   EditEvent,
@@ -309,6 +310,9 @@ export const api = {
       limit,
       beforeOrdinal,
     }),
+
+  listContextSnapshots: (sessionId: string) =>
+    invoke<ContextSnapshotRecord[]>("list_context_snapshots", { sessionId }),
 
   deleteSession: (id: string) => invoke<boolean>("delete_session", { id }),
 

@@ -1,6 +1,7 @@
 //! Recording + local ASR + model corrector IPC (M2–M5).
 
 use crate::config::AsrServiceConfig;
+use crate::context_capture::{ActiveContextCapture, StageUsageInput};
 use crate::pipeline_attempt::{
     apply_asr_result, build_pipeline_identity, elapsed_ms, mark_attempt_failed, persist_attempt,
     run_corrector_stage, write_attempt_debug, AttemptDebug,
@@ -12,6 +13,7 @@ use lumen_asr::{
     AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig,
     QwenShadowRequest, QwenShadowTerm,
 };
+use lumen_context::TargetHint;
 use lumen_core::{DictEntryKind, FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use lumen_dictionary::DictionaryEntry;
 use lumen_platform_macos::{
@@ -20,8 +22,8 @@ use lumen_platform_macos::{
 };
 use lumen_prompts::IntentSpec;
 use lumen_store::{
-    AttemptStatus, DictationAttemptRecord, InsertionOutcome, PipelineIssueKind, PipelineStage,
-    PipelineStageIssue,
+    AttemptStatus, ContextStageUsage, DictationAttemptRecord, InsertionOutcome, PipelineIssueKind,
+    PipelineStage, PipelineStageIssue,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -466,8 +468,17 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
         status.active_ready,
         status.qwen_runtime_checking,
     )?;
-    remember_target_app();
-    state.audio.start().map_err(|e| e.to_string())
+    let target = remember_target_app();
+    let hint = target.as_ref().map(|target| TargetHint {
+        app_name: target.name.clone(),
+        bundle_id: target.bundle_id.clone(),
+        ..TargetHint::default()
+    });
+    state.context.begin(hint);
+    state.audio.start().map_err(|error| {
+        state.context.clear_active();
+        error.to_string()
+    })
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -506,14 +517,95 @@ pub async fn stop_and_transcribe(
     Ok(outcome)
 }
 
+async fn attach_frozen_context(
+    state: &AppState,
+    active: Option<&ActiveContextCapture>,
+    attempt: &mut DictationAttemptRecord,
+    app: Option<&AppHandle>,
+) {
+    let Some(active) = active else {
+        attempt
+            .pipeline_inputs
+            .stage_usages
+            .push(ContextStageUsage {
+                stage: PipelineStage::Asr,
+                sources: vec!["captured_context".into()],
+                captured: false,
+                not_used_reason: Some("capture_session_missing".into()),
+                ..ContextStageUsage::default()
+            });
+        return;
+    };
+
+    match active.freeze(&state.store).await {
+        Ok(input_ref) => {
+            let captured = input_ref.source_presence_bitmap != 0;
+            let should_archive = input_ref.source_status_summary == "partial";
+            attempt.pipeline_inputs.context = Some(input_ref);
+            match state.context.record_stage_usage(StageUsageInput {
+                capture_id: Some(active.capture_id.0),
+                attempt_id: attempt.id,
+                stage: PipelineStage::Asr,
+                sources: vec!["captured_context".into()],
+                projection: None,
+                captured,
+                selected: false,
+                consumed: false,
+                sent: false,
+                not_used_reason: Some("captured_context_not_projected_to_asr".into()),
+            }) {
+                Ok(usage) => attempt.pipeline_inputs.stage_usages.push(usage),
+                Err(error) => tracing::warn!(error = %error, "failed to record ASR context usage"),
+            }
+            if should_archive {
+                if let Some(app) = app {
+                    let active = active.clone();
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app.state::<AppState>();
+                        if let Err(error) = active.archive(&state.store).await {
+                            tracing::warn!(error = %error, "late context archive failed");
+                        }
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            attempt
+                .pipeline_metrics
+                .stage_issues
+                .push(PipelineStageIssue {
+                    stage: PipelineStage::Capture,
+                    kind: PipelineIssueKind::InputUnavailable,
+                    message: error.clone(),
+                });
+            attempt
+                .pipeline_inputs
+                .stage_usages
+                .push(ContextStageUsage {
+                    stage: PipelineStage::Asr,
+                    sources: vec!["captured_context".into()],
+                    captured: false,
+                    not_used_reason: Some("context_persistence_failed".into()),
+                    ..ContextStageUsage::default()
+                });
+            tracing::warn!(error = %error, "failed to freeze context input");
+        }
+    }
+}
+
 pub async fn stop_and_transcribe_inner(
     state: &AppState,
     save: bool,
     app: Option<&AppHandle>,
 ) -> Result<TranscribeOutcome, String> {
     let pipeline_started = Instant::now();
+    let active_context = state.context.take_active();
     let target = TARGET.lock().ok().and_then(|guard| guard.clone());
     let mut rec = SessionRecord::new();
+    if let Some(active) = active_context.as_ref() {
+        rec.id = active.session_id;
+    }
     rec.focus = FocusInfo {
         app_name: target.as_ref().and_then(|value| value.name.clone()),
         bundle_id: target.as_ref().and_then(|value| value.bundle_id.clone()),
@@ -548,7 +640,9 @@ pub async fn stop_and_transcribe_inner(
         intent.clone(),
     );
 
-    let capture = match state.audio.stop() {
+    let capture_result = state.audio.stop();
+    attach_frozen_context(state, active_context.as_ref(), &mut attempt, app).await;
+    let capture = match capture_result {
         Ok(capture) => capture,
         Err(error) => {
             let error = error.to_string();
@@ -653,7 +747,7 @@ pub async fn stop_and_transcribe_inner(
     let samples_for_debug = samples_16k.clone();
 
     let asr_started = Instant::now();
-    let result = match run_asr(state, engine_kind, &asr_cfg, samples_16k).await {
+    let result = match run_asr(state, engine_kind, &asr_cfg, samples_16k, &mut attempt).await {
         Ok(result) => result,
         Err(error) => {
             attempt.pipeline_metrics.asr_ms = elapsed_ms(asr_started);
@@ -935,6 +1029,33 @@ pub async fn retry_session_transcription(
         "not_run",
         IntentSpec::Default,
     );
+    attempt.pipeline_inputs.context = state.store.lock().ok().and_then(|guard| {
+        guard.as_ref().and_then(|store| {
+            store
+                .list_dictation_attempts(rec.id, 1, None)
+                .ok()
+                .and_then(|attempts| {
+                    attempts
+                        .into_iter()
+                        .next()
+                        .and_then(|prior| prior.pipeline_inputs.context)
+                })
+        })
+    });
+    attempt
+        .pipeline_inputs
+        .stage_usages
+        .push(ContextStageUsage {
+            stage: PipelineStage::Asr,
+            sources: vec!["captured_context".into()],
+            captured: attempt
+                .pipeline_inputs
+                .context
+                .as_ref()
+                .is_some_and(|input| input.source_presence_bitmap != 0),
+            not_used_reason: Some("captured_context_not_projected_to_asr".into()),
+            ..ContextStageUsage::default()
+        });
 
     let preprocess_started = Instant::now();
     let path = match rec.audio_path.clone() {
@@ -1002,7 +1123,7 @@ pub async fn retry_session_transcription(
     );
 
     let asr_started = Instant::now();
-    let result = match run_asr(&state, engine_kind, &cfg.asr, samples_16k).await {
+    let result = match run_asr(&state, engine_kind, &cfg.asr, samples_16k, &mut attempt).await {
         Ok(result) => result,
         Err(error) => {
             attempt.pipeline_metrics.asr_ms = elapsed_ms(asr_started);
@@ -1061,6 +1182,7 @@ pub fn cancel_recording(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
+    state.context.clear_active();
     if state.audio.is_recording() {
         let _ = state.audio.stop();
     }
@@ -1072,6 +1194,7 @@ async fn run_asr(
     engine_kind: EngineKind,
     asr_cfg: &AsrServiceConfig,
     samples_16k: Vec<f32>,
+    attempt: &mut DictationAttemptRecord,
 ) -> Result<AsrResult, String> {
     let provider = canonical_asr_provider(&asr_cfg.provider);
     let provider = provider.as_str();
@@ -1141,7 +1264,49 @@ async fn run_asr(
             .lock()
             .map_err(|_| "asr lock poisoned".to_string())?
             .clone();
-        let shadow = qwen_shadow_request_from_store(state, asr_cfg.qwen_shadow_enabled);
+        let (shadow, dictionary_captured) =
+            qwen_shadow_request_from_store(state, asr_cfg.qwen_shadow_enabled);
+        let selected = shadow.enabled && !shadow.terms.is_empty();
+        let projection = serde_json::to_vec(&shadow).map_err(|error| error.to_string())?;
+        let capture_id = attempt
+            .pipeline_inputs
+            .context
+            .as_ref()
+            .map(|input| input.capture_id);
+        let not_used_reason = if !shadow.enabled {
+            Some("qwen_shadow_disabled".to_owned())
+        } else if !dictionary_captured {
+            Some("personal_dictionary_unavailable".to_owned())
+        } else if shadow.terms.is_empty() {
+            Some("no_confirmed_personal_terms".to_owned())
+        } else {
+            None
+        };
+        match state.context.record_stage_usage(StageUsageInput {
+            capture_id,
+            attempt_id: attempt.id,
+            stage: PipelineStage::Enhancement,
+            sources: vec!["personal_dictionary".into()],
+            projection: Some(&projection),
+            captured: dictionary_captured,
+            selected,
+            consumed: selected,
+            sent: selected,
+            not_used_reason,
+        }) {
+            Ok(usage) => attempt.pipeline_inputs.stage_usages.push(usage),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to persist Qwen shadow input provenance");
+                attempt
+                    .pipeline_metrics
+                    .stage_issues
+                    .push(PipelineStageIssue {
+                        stage: PipelineStage::Enhancement,
+                        kind: PipelineIssueKind::InputUnavailable,
+                        message: "qwen shadow input provenance unavailable".into(),
+                    });
+            }
+        }
         return eng
             .transcribe_with_shadow(
                 AsrRequest {
@@ -1169,34 +1334,37 @@ async fn run_asr(
     .map_err(|e| e.to_string())
 }
 
-fn qwen_shadow_request_from_store(state: &AppState, enabled: bool) -> QwenShadowRequest {
+fn qwen_shadow_request_from_store(state: &AppState, enabled: bool) -> (QwenShadowRequest, bool) {
     if !enabled {
-        return QwenShadowRequest {
-            enabled: false,
-            ..QwenShadowRequest::default()
-        }
-        .bounded();
+        return (
+            QwenShadowRequest {
+                enabled: false,
+                ..QwenShadowRequest::default()
+            }
+            .bounded(),
+            false,
+        );
     }
-    let entries = match state.store.lock() {
+    let (entries, captured) = match state.store.lock() {
         Ok(store) => match store.as_ref().map(|store| store.list_dictionary()) {
-            Some(Ok(entries)) => entries,
+            Some(Ok(entries)) => (entries, true),
             Some(Err(error)) => {
                 tracing::warn!(
                     error = %error,
                     "dictionary unavailable; Qwen shadow will run without personal terms"
                 );
-                Vec::new()
+                (Vec::new(), false)
             }
-            None => Vec::new(),
+            None => (Vec::new(), false),
         },
         Err(_) => {
             tracing::warn!(
                 "dictionary store lock poisoned; Qwen shadow will run without personal terms"
             );
-            Vec::new()
+            (Vec::new(), false)
         }
     };
-    build_qwen_shadow_request(&entries, enabled)
+    (build_qwen_shadow_request(&entries, enabled), captured)
 }
 
 fn build_qwen_shadow_request(entries: &[DictionaryEntry], enabled: bool) -> QwenShadowRequest {
@@ -1585,6 +1753,7 @@ mod attempt_metric_tests {
     async fn capture_stop_runs_and_failure_is_persisted_after_snapshot_lock_poisoning() {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig::default();
+        let context = crate::context_capture::ContextRecorder::new(&config.context, dir.path());
         let qwen = crate::qwen_engine_from_config(&config.asr);
         let qwen_executable = qwen.python_executable().to_path_buf();
         let state = AppState {
@@ -1603,6 +1772,7 @@ mod attempt_metric_tests {
             }),
             whisper: Mutex::new(WhisperAsr::new(dir.path().join("whisper"))),
             config: Mutex::new(config),
+            context,
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = state.engine.lock().unwrap();

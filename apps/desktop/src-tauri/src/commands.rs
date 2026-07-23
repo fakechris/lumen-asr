@@ -4,7 +4,9 @@ use crate::AppState;
 use lumen_core::{EditSource, FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use lumen_dictionary::{candidates_from_edit, DictionaryEntry, LearnCandidate};
 use lumen_platform::{default_data_dir, default_db_path};
-use lumen_store::{DictationAttemptRecord, EditEventRecord, DEFAULT_ATTEMPT_PAGE_SIZE};
+use lumen_store::{
+    ContextSnapshotRecord, DictationAttemptRecord, EditEventRecord, DEFAULT_ATTEMPT_PAGE_SIZE,
+};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -118,6 +120,19 @@ pub fn list_session_attempts(
                 limit.unwrap_or(DEFAULT_ATTEMPT_PAGE_SIZE),
                 before_ordinal,
             )
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+pub fn list_context_snapshots(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<ContextSnapshotRecord>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(|error| error.to_string())?;
+    with_store(&state, |store| {
+        store
+            .list_context_snapshots(id)
             .map_err(|error| error.to_string())
     })
 }
