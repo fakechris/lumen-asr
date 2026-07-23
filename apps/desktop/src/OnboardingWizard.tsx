@@ -9,6 +9,7 @@ import {
 import { HotkeyRecorder } from "./HotkeyRecorder";
 import { formatHotkeyLabel } from "./hotkeyFormat";
 import { Icon } from "./Icons";
+import { chooseAudioDevice } from "./audioDeviceSelection";
 import type { AudioDevice } from "./types";
 
 type Props = {
@@ -85,10 +86,12 @@ export function OnboardingWizard({ onDone }: Props) {
       try {
         const s = await api.getOnboardingState();
         setStep(Math.min(s.step, 6));
-        const list = await api.listAudioDevices();
+        const [list, preferred] = await Promise.all([
+          api.listAudioDevices(),
+          api.getAudioDevice(),
+        ]);
         setDevices(list);
-        const def = list.find((d) => d.is_default) ?? list[0];
-        if (def) setDevice(def.name);
+        setDevice(chooseAudioDevice(list, preferred));
         try {
           const hk = await api.getHotkeyConfig();
           setHkEnabled(hk.enabled);

@@ -11,7 +11,9 @@
 
 use async_trait::async_trait;
 use lumen_inject::{InjectError, TextInjectorBackend};
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+#[cfg(target_os = "macos")]
 use objc2_foundation::NSString;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -67,8 +69,14 @@ fn paste_with_restore_sync(text: &str, preserve: bool) -> Result<(), InjectError
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn set_clipboard(text: &str) -> Result<(), InjectError> {
     let pasteboard = NSPasteboard::generalPasteboard();
+    set_pasteboard_text(&pasteboard, text)
+}
+
+#[cfg(target_os = "macos")]
+fn set_pasteboard_text(pasteboard: &NSPasteboard, text: &str) -> Result<(), InjectError> {
     pasteboard.clearContents();
     let value = NSString::from_str(text);
     let string_type = unsafe { NSPasteboardTypeString };
@@ -81,13 +89,30 @@ fn set_clipboard(text: &str) -> Result<(), InjectError> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn set_clipboard(text: &str) -> Result<(), InjectError> {
+    let _ = text;
+    Err(InjectError::NotSupported("not macOS".into()))
+}
+
+#[cfg(target_os = "macos")]
 fn get_clipboard() -> Result<String, InjectError> {
     let pasteboard = NSPasteboard::generalPasteboard();
+    get_pasteboard_text(&pasteboard)
+}
+
+#[cfg(target_os = "macos")]
+fn get_pasteboard_text(pasteboard: &NSPasteboard) -> Result<String, InjectError> {
     let string_type = unsafe { NSPasteboardTypeString };
     pasteboard
         .stringForType(string_type)
         .map(|value| value.to_string())
         .ok_or_else(|| InjectError::Other("pasteboard does not contain text".into()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn get_clipboard() -> Result<String, InjectError> {
+    Err(InjectError::NotSupported("not macOS".into()))
 }
 
 const FLAG_SHIFT: u64 = 0x0002_0000;
@@ -215,31 +240,19 @@ fn post_unicode_chunk(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::set_clipboard;
-    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-    use objc2_foundation::NSString;
+    use super::{get_pasteboard_text, set_pasteboard_text};
+    use objc2_app_kit::NSPasteboard;
 
     #[test]
     fn clipboard_copy_preserves_unicode_for_native_consumers() {
-        let pasteboard = NSPasteboard::generalPasteboard();
-        let string_type = unsafe { NSPasteboardTypeString };
-        let previous = pasteboard
-            .stringForType(string_type)
-            .map(|value| value.to_string());
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
         let expected = "中文剪贴板测试：你好，世界。🚀";
 
-        set_clipboard(expected).expect("copy Unicode fixture");
-        let actual = pasteboard
-            .stringForType(string_type)
-            .map(|value| value.to_string());
+        set_pasteboard_text(&pasteboard, expected).expect("copy Unicode fixture");
+        let actual = get_pasteboard_text(&pasteboard).expect("read Unicode fixture");
 
-        pasteboard.clearContents();
-        if let Some(previous) = previous {
-            assert!(pasteboard.setString_forType(&NSString::from_str(&previous), string_type));
-        }
-
-        assert_eq!(actual.as_deref(), Some(expected));
+        assert_eq!(actual, expected);
     }
 }

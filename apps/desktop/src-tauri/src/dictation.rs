@@ -24,9 +24,9 @@ use lumen_store::{
     PipelineStageIssue,
 };
 use serde::Serialize;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Frontmost app captured when hotkey dictation starts — restored before paste.
@@ -73,11 +73,13 @@ const PHASE_IDLE: u8 = 0;
 const PHASE_RECORDING: u8 = 1;
 const PHASE_PROCESSING: u8 = 2;
 static PHASE: AtomicU8 = AtomicU8::new(PHASE_IDLE);
+static UI_NOTICE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Only discard as bounce if shorter than this *and* almost no audio.
 const BOUNCE_MS: u128 = 80;
-const MIN_AUDIBLE_PEAK: f32 = 0.005;
+/// Reject only a missing/invalid signal; low-gain speech must still reach ASR.
+const ABSOLUTE_SILENCE_PEAK: f32 = 1.0e-6;
 
 /// Snapshot frontmost app into process-local cache (sync, preferred at press).
 fn remember_target_app() -> Option<FrontmostTarget> {
@@ -203,10 +205,10 @@ pub fn set_audio_device(state: State<'_, AppState>, name: Option<String>) -> Res
 }
 
 fn ensure_audible_capture(peak: f32) -> Result<(), &'static str> {
-    if peak.is_finite() && peak >= MIN_AUDIBLE_PEAK {
+    if peak.is_finite() && peak > ABSOLUTE_SILENCE_PEAK {
         Ok(())
     } else {
-        Err("未检测到有效声音。请在录音页选择正确的麦克风设备后重试。")
+        Err("未检测到麦克风信号。请检查麦克风权限、输入设备或静音状态后重试。")
     }
 }
 
@@ -1300,6 +1302,7 @@ pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> 
         );
         return Ok(());
     }
+    UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst);
 
     set_session_intent(intent.clone());
     let (intent_kind, target_lang, intent_label) = intent_ui_label(&intent);
@@ -1446,10 +1449,20 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
             Ok(())
         }
         Err(e) => {
-            crate::capsule::set_capsule_visible(&app, false, "idle");
+            let notice_epoch = UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+            crate::capsule::set_capsule_visible(&app, true, "error");
             emit_dictation(&app, DictationUiEvent::Error { message: e.clone() });
-            emit_dictation(&app, DictationUiEvent::Idle);
             PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+            let app_for_notice = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                if UI_NOTICE_EPOCH.load(Ordering::SeqCst) == notice_epoch
+                    && PHASE.load(Ordering::SeqCst) == PHASE_IDLE
+                {
+                    emit_dictation(&app_for_notice, DictationUiEvent::Idle);
+                    crate::capsule::set_capsule_visible(&app_for_notice, false, "idle");
+                }
+            });
             Err(e)
         }
     }
@@ -1505,10 +1518,11 @@ mod attempt_metric_tests {
     }
 
     #[test]
-    fn near_silent_capture_is_rejected_before_asr_or_clipboard_fallback() {
+    fn near_silent_capture_threshold_rejects_invalid_or_inaudible_peaks() {
         assert!(ensure_audible_capture(0.0).is_err());
         assert!(ensure_audible_capture(f32::NAN).is_err());
-        assert!(ensure_audible_capture(0.0049).is_err());
+        assert!(ensure_audible_capture(1.0e-7).is_err());
+        assert!(ensure_audible_capture(1.0e-5).is_ok());
         assert!(ensure_audible_capture(0.005).is_ok());
     }
 
