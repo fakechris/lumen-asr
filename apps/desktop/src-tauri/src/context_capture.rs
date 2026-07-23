@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -28,6 +28,14 @@ const EDITOR_CONTEXT_LIMIT: usize = 1_500;
 const EDITOR_FIELD_LIMIT: usize = 3_500;
 const VISIBLE_BLOCK_LIMIT: usize = 10;
 const VISIBLE_TEXT_LIMIT: usize = 2_000;
+const KEYCHAIN_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(8);
+const KEYCHAIN_SERVICE: &str = "com.lumenopen.asr.context";
+const KEYCHAIN_ACCOUNT: &str = "capture-key-v1";
+
+enum ExistingKeychainKey {
+    Found(ContextSealer),
+    Missing,
+}
 
 #[derive(Debug, Clone)]
 pub struct FrozenContextInput {
@@ -185,6 +193,13 @@ impl ContextRecorder {
         let root = data_dir.join("context");
         let _ = fs::create_dir_all(&root);
         let (sealer, encryption, key_error) = initialize_sealer(&root);
+        if let Some(error) = key_error.as_deref() {
+            tracing::warn!(
+                error,
+                encryption,
+                "context encryption initialization degraded"
+            );
+        }
         Self::new_with_components(config, data_dir, sealer, encryption, key_error)
     }
 
@@ -1001,26 +1016,166 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn initialize_sealer(root: &Path) -> (Option<Arc<ContextSealer>>, String, Option<String>) {
-    match ContextSealer::from_macos_keychain("com.lumenopen.asr.context", "capture-key-v1") {
-        Ok(sealer) => (
-            Some(Arc::new(sealer)),
-            "chacha20_poly1305:macos_keychain".to_owned(),
-            None,
-        ),
-        Err(keychain_error) => match load_or_create_local_key(root) {
-            Ok(key) => (
-                Some(Arc::new(ContextSealer::from_key(key))),
-                "chacha20_poly1305:local_key_file".to_owned(),
-                Some(format!("keychain fallback: {keychain_error}")),
-            ),
-            Err(file_error) => (
-                None,
-                "none".to_owned(),
-                Some(format!(
-                    "keychain error: {keychain_error}; local key error: {file_error}"
-                )),
-            ),
+    initialize_sealer_with_timeout(
+        root,
+        KEYCHAIN_INITIALIZATION_TIMEOUT,
+        read_existing_macos_keychain,
+        || {
+            ContextSealer::from_macos_keychain(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                .map_err(|error| error.to_string())
         },
+    )
+}
+
+fn initialize_sealer_with_timeout<L, C>(
+    root: &Path,
+    timeout: Duration,
+    lookup_existing: L,
+    create_keychain: C,
+) -> (Option<Arc<ContextSealer>>, String, Option<String>)
+where
+    L: FnOnce() -> Result<ExistingKeychainKey, String> + Send + 'static,
+    C: FnOnce() -> Result<ContextSealer, String> + Send + 'static,
+{
+    match run_keychain_worker(timeout, lookup_existing, "lookup") {
+        Ok(ExistingKeychainKey::Found(sealer)) => {
+            return keychain_initialization_success(sealer);
+        }
+        Ok(ExistingKeychainKey::Missing) => {}
+        Err(KeychainWorkerError::Operation(error)) => {
+            return fallback_to_local_key(root, error);
+        }
+        Err(KeychainWorkerError::Timeout) => {
+            return keychain_initialization_timeout(timeout, "lookup");
+        }
+        Err(KeychainWorkerError::Unavailable(error)) => {
+            return fallback_to_local_key(root, error);
+        }
+    }
+
+    // The lookup worker is deliberately read-only. If it times out, it may
+    // remain blocked in SecurityServer, but it cannot create or rotate a key.
+    // A prior explicit Keychain failure may have created this fallback key.
+    // Reuse it instead of introducing a second key and orphaning local history.
+    if root.join(".capture-key").exists() {
+        return fallback_to_local_key(
+            root,
+            "keychain item missing; preserving existing local key".to_owned(),
+        );
+    }
+
+    // Creation only runs after Keychain definitively reported "not found" and
+    // no local key exists. A timed-out first-time creation disables capture for
+    // this run; a late-created key can only be adopted on a future restart, so
+    // no context is ever sealed with a competing key.
+    match run_keychain_worker(timeout, create_keychain, "create") {
+        Ok(sealer) => keychain_initialization_success(sealer),
+        Err(KeychainWorkerError::Operation(error)) => fallback_to_local_key(root, error),
+        Err(KeychainWorkerError::Timeout) => keychain_initialization_timeout(timeout, "create"),
+        Err(KeychainWorkerError::Unavailable(error)) => fallback_to_local_key(root, error),
+    }
+}
+
+enum KeychainWorkerError {
+    Operation(String),
+    Timeout,
+    Unavailable(String),
+}
+
+fn run_keychain_worker<T, F>(
+    timeout: Duration,
+    operation: F,
+    operation_name: &str,
+) -> Result<T, KeychainWorkerError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("lumen-context-keychain-{operation_name}"))
+        .spawn(move || {
+            let _ = sender.send(operation());
+        });
+    if let Err(error) = spawn_result {
+        return Err(KeychainWorkerError::Unavailable(format!(
+            "keychain {operation_name} worker unavailable: {error}"
+        )));
+    }
+
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(KeychainWorkerError::Operation(error)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(KeychainWorkerError::Timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(KeychainWorkerError::Unavailable(
+            format!("keychain {operation_name} worker disconnected before returning"),
+        )),
+    }
+}
+
+fn keychain_initialization_success(
+    sealer: ContextSealer,
+) -> (Option<Arc<ContextSealer>>, String, Option<String>) {
+    (
+        Some(Arc::new(sealer)),
+        "chacha20_poly1305:macos_keychain".to_owned(),
+        None,
+    )
+}
+
+fn keychain_initialization_timeout(
+    timeout: Duration,
+    operation_name: &str,
+) -> (Option<Arc<ContextSealer>>, String, Option<String>) {
+    (
+        None,
+        "none".to_owned(),
+        Some(format!(
+            "keychain {operation_name} timed out after {} ms; context capture disabled for this run",
+            timeout.as_millis()
+        )),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn read_existing_macos_keychain() -> Result<ExistingKeychainKey, String> {
+    use security_framework::passwords::get_generic_password;
+    use security_framework_sys::base::errSecItemNotFound;
+
+    match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        Ok(key) => {
+            let key: [u8; 32] = key
+                .try_into()
+                .map_err(|_| "keychain context key has invalid length".to_owned())?;
+            Ok(ExistingKeychainKey::Found(ContextSealer::from_key(key)))
+        }
+        Err(error) if error.code() == errSecItemNotFound => Ok(ExistingKeychainKey::Missing),
+        Err(error) => Err(format!("keychain lookup failed: {error}")),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_existing_macos_keychain() -> Result<ExistingKeychainKey, String> {
+    Err("macOS Keychain is unavailable on this platform".to_owned())
+}
+
+fn fallback_to_local_key(
+    root: &Path,
+    keychain_error: String,
+) -> (Option<Arc<ContextSealer>>, String, Option<String>) {
+    match load_or_create_local_key(root) {
+        Ok(key) => (
+            Some(Arc::new(ContextSealer::from_key(key))),
+            "chacha20_poly1305:local_key_file".to_owned(),
+            Some(format!("keychain fallback: {keychain_error}")),
+        ),
+        Err(file_error) => (
+            None,
+            "none".to_owned(),
+            Some(format!(
+                "keychain error: {keychain_error}; local key error: {file_error}"
+            )),
+        ),
     }
 }
 
@@ -1141,6 +1296,118 @@ mod tests {
             "chacha20_poly1305:test".to_owned(),
             None,
         )
+    }
+
+    #[test]
+    fn keychain_timeout_does_not_block_startup_or_rotate_the_context_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_path = directory.path().join(".capture-key");
+        let existing_key = [41_u8; 32];
+        fs::write(&key_path, existing_key).unwrap();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let create_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let create_called_by_worker = Arc::clone(&create_called);
+        let (sealer, encryption, error) = initialize_sealer_with_timeout(
+            directory.path(),
+            Duration::ZERO,
+            move || {
+                let _ = release_receiver.recv();
+                Ok(ExistingKeychainKey::Found(ContextSealer::from_key(
+                    [23_u8; 32],
+                )))
+            },
+            move || {
+                create_called_by_worker.store(true, Ordering::SeqCst);
+                Ok(ContextSealer::from_key([29_u8; 32]))
+            },
+        );
+
+        assert!(sealer.is_none());
+        assert_eq!(encryption, "none");
+        assert!(error.unwrap().contains("lookup timed out"));
+        assert_eq!(fs::read(&key_path).unwrap(), existing_key);
+        assert!(!create_called.load(Ordering::SeqCst));
+        release_sender.send(()).unwrap();
+    }
+
+    #[test]
+    fn successful_keychain_initialization_does_not_create_a_local_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let (sealer, encryption, error) = initialize_sealer_with_timeout(
+            directory.path(),
+            Duration::from_secs(30),
+            || {
+                Ok(ExistingKeychainKey::Found(ContextSealer::from_key(
+                    [23_u8; 32],
+                )))
+            },
+            || panic!("create must not run when the existing key was found"),
+        );
+
+        assert!(sealer.is_some());
+        assert_eq!(encryption, "chacha20_poly1305:macos_keychain");
+        assert!(error.is_none());
+        assert!(!directory.path().join(".capture-key").exists());
+    }
+
+    #[test]
+    fn explicit_keychain_failure_preserves_the_existing_local_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let (sealer, encryption, error) = initialize_sealer_with_timeout(
+            directory.path(),
+            Duration::from_secs(30),
+            || Err("interaction unavailable".to_owned()),
+            || panic!("create must not run after an explicit lookup failure"),
+        );
+
+        assert!(sealer.is_some());
+        assert_eq!(encryption, "chacha20_poly1305:local_key_file");
+        assert!(error
+            .unwrap()
+            .contains("keychain fallback: interaction unavailable"));
+        assert_eq!(
+            fs::read(directory.path().join(".capture-key"))
+                .unwrap()
+                .len(),
+            32
+        );
+    }
+
+    #[test]
+    fn missing_keychain_item_preserves_an_existing_local_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_path = directory.path().join(".capture-key");
+        let existing_key = [43_u8; 32];
+        fs::write(&key_path, existing_key).unwrap();
+
+        let (sealer, encryption, error) = initialize_sealer_with_timeout(
+            directory.path(),
+            Duration::from_secs(30),
+            || Ok(ExistingKeychainKey::Missing),
+            || panic!("create must not replace an existing local key"),
+        );
+
+        assert!(sealer.is_some());
+        assert_eq!(encryption, "chacha20_poly1305:local_key_file");
+        assert!(error.unwrap().contains("preserving existing local key"));
+        assert_eq!(fs::read(key_path).unwrap(), existing_key);
+    }
+
+    #[test]
+    fn missing_keychain_item_creates_a_new_keychain_key_on_a_fresh_install() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let (sealer, encryption, error) = initialize_sealer_with_timeout(
+            directory.path(),
+            Duration::from_secs(30),
+            || Ok(ExistingKeychainKey::Missing),
+            || Ok(ContextSealer::from_key([47_u8; 32])),
+        );
+
+        assert!(sealer.is_some());
+        assert_eq!(encryption, "chacha20_poly1305:macos_keychain");
+        assert!(error.is_none());
+        assert!(!directory.path().join(".capture-key").exists());
     }
 
     fn projection_manifest() -> ContextManifest {
