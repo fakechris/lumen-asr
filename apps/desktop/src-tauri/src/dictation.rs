@@ -26,13 +26,36 @@ use lumen_store::{
     PipelineStage, PipelineStageIssue,
 };
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Frontmost app captured when hotkey dictation starts — restored before paste.
 static TARGET: Mutex<Option<FrontmostTarget>> = Mutex::new(None);
+static PANE_TARGET: Mutex<PaneTargetState> = Mutex::new(PaneTargetState {
+    generation: 0,
+    completed: true,
+    deadline: None,
+    cancellation: None,
+    pane: None,
+});
+static PANE_TARGET_READY: Condvar = Condvar::new();
+const PANE_DISCOVERY_BUDGET: Duration = Duration::from_secs(2);
+
+struct PaneTargetState {
+    generation: u64,
+    completed: bool,
+    deadline: Option<Instant>,
+    cancellation: Option<Arc<AtomicBool>>,
+    pane: Option<crate::pane_observer::LockedPane>,
+}
+
+struct PaneDiscoveryStart {
+    generation: u64,
+    deadline: Instant,
+    cancellation: Arc<AtomicBool>,
+}
 
 /// Intent bound to the current dictation session (default / translate / raw).
 static SESSION_INTENT: Mutex<IntentSpec> = Mutex::new(IntentSpec::Default);
@@ -85,7 +108,7 @@ const BOUNCE_MS: u128 = 80;
 const ABSOLUTE_SILENCE_PEAK: f32 = 1.0e-6;
 
 /// Snapshot frontmost app into process-local cache (sync, preferred at press).
-fn remember_target_app() -> Option<FrontmostTarget> {
+fn remember_target_app() -> (Option<FrontmostTarget>, PaneDiscoveryStart) {
     let t = frontmost_target();
     let target = match &t {
         Some(t) if !is_self_target(t) => {
@@ -105,7 +128,96 @@ fn remember_target_app() -> Option<FrontmostTarget> {
     if let Ok(mut current) = TARGET.lock() {
         *current = target.clone();
     }
-    target
+    let deadline = Instant::now() + PANE_DISCOVERY_BUDGET;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let generation = PANE_TARGET
+        .lock()
+        .map(|mut state| {
+            if let Some(previous) = state.cancellation.take() {
+                previous.store(true, Ordering::Release);
+            }
+            state.generation = state.generation.wrapping_add(1);
+            state.completed = false;
+            state.deadline = Some(deadline);
+            state.cancellation = Some(cancellation.clone());
+            state.pane = None;
+            state.generation
+        })
+        .unwrap_or_default();
+    (
+        target,
+        PaneDiscoveryStart {
+            generation,
+            deadline,
+            cancellation,
+        },
+    )
+}
+
+fn discover_pane_target(
+    target: Option<crate::pane_observer::PaneDiscoveryTarget>,
+    generation: u64,
+) {
+    std::thread::spawn(move || {
+        let pane = target.and_then(crate::pane_observer::identify_pane);
+        if let Some(pane) = pane.as_ref() {
+            tracing::info!(
+                observer = pane.observer_id(),
+                "terminal pane target remembered"
+            );
+        }
+        if let Ok(mut state) = PANE_TARGET.lock() {
+            if state.generation != generation {
+                return;
+            }
+            state.pane = pane;
+            state.completed = true;
+            state.deadline = None;
+            PANE_TARGET_READY.notify_all();
+        }
+    });
+}
+
+fn take_discovered_pane_target() -> Option<crate::pane_observer::LockedPane> {
+    let mut state = PANE_TARGET.lock().ok()?;
+    while !state.completed {
+        let Some(remaining) = state
+            .deadline
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+        else {
+            break;
+        };
+        let waited = PANE_TARGET_READY.wait_timeout(state, remaining);
+        let (next_state, timeout) = match waited {
+            Ok(result) => result,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state = next_state;
+        if timeout.timed_out() {
+            break;
+        }
+    }
+    let pane = state.pane.clone();
+    if let Some(cancellation) = state.cancellation.take() {
+        cancellation.store(true, Ordering::Release);
+    }
+    state.generation = state.generation.wrapping_add(1);
+    state.completed = true;
+    state.deadline = None;
+    pane
+}
+
+fn cancel_pane_target_discovery() {
+    if let Ok(mut state) = PANE_TARGET.lock() {
+        if let Some(cancellation) = state.cancellation.take() {
+            cancellation.store(true, Ordering::Release);
+        }
+        state.generation = state.generation.wrapping_add(1);
+        state.completed = true;
+        state.deadline = None;
+        state.pane = None;
+        PANE_TARGET_READY.notify_all();
+    }
 }
 
 /// Prepare for insert:
@@ -468,7 +580,7 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
         status.active_ready,
         status.qwen_runtime_checking,
     )?;
-    let target = remember_target_app();
+    let (target, pane_discovery) = remember_target_app();
     let hint = target.as_ref().map(|target| TargetHint {
         app_name: target.name.clone(),
         bundle_id: target.bundle_id.clone(),
@@ -476,10 +588,32 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     });
     state.context.begin(hint);
     state.audio.start().map_err(|error| {
+        cancel_pane_target_discovery();
         state.context.clear_active();
         error.to_string()
     })?;
     crate::learning::cancel_post_insert_watches();
+    let pane_observation_enabled = state
+        .config
+        .lock()
+        .map(|config| config.inject.auto_insert && config.learning.post_paste_capture)
+        .unwrap_or(false);
+    if pane_observation_enabled {
+        // Recording is already live while we synchronously lock the exact outer
+        // surface; provider-specific probing then continues in the background.
+        let pane_target = target.as_ref().and_then(|target| {
+            crate::pane_observer::capture_pane_target(
+                target,
+                pane_discovery.deadline,
+                pane_discovery.cancellation,
+            )
+        });
+        // A generation guard discards any result that arrives after this
+        // dictation has moved on.
+        discover_pane_target(pane_target, pane_discovery.generation);
+    } else {
+        cancel_pane_target_discovery();
+    }
     Ok(())
 }
 
@@ -810,6 +944,18 @@ pub async fn stop_and_transcribe_inner(
         ));
     }
 
+    // Discovery started with recording. Join it before insertion so the
+    // post-insert anchor itself is never delayed by provider probing.
+    let pane_target = if cfg.inject.auto_insert
+        && !corrected_text.is_empty()
+        && cfg.learning.post_paste_capture
+    {
+        take_discovered_pane_target()
+    } else {
+        cancel_pane_target_discovery();
+        None
+    };
+
     let mut insert_strategy = InsertStrategy::None;
     let mut did_insert = false;
     let mut insertion_outcome = InsertionOutcome::NotRequested;
@@ -920,6 +1066,7 @@ pub async fn stop_and_transcribe_inner(
                         attempt_id: attempt.id,
                         inserted_text: corrected_text.clone(),
                         target,
+                        pane_target,
                     },
                     cfg.learning.post_paste_seconds,
                 )
@@ -1613,6 +1760,16 @@ pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> 
 
     match start_recording_inner(&state) {
         Ok(()) => {
+            // Serialize the final state check and UI publication with stop's
+            // RECORDING -> PROCESSING transition. A quick release can finish
+            // while pane discovery is still returning from start_recording_inner.
+            let _transition = UI_TRANSITION
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if PHASE.load(Ordering::SeqCst) != PHASE_RECORDING || !state.audio.is_recording() {
+                tracing::debug!("recording ended before start feedback was published");
+                return Ok(());
+            }
             tracing::info!(%intent_kind, ?target_lang, "dictation recording live");
             // Force-show capsule on hotkey start so user always sees feedback.
             crate::capsule::set_capsule_visible(&app, true, "listening");
@@ -1645,15 +1802,18 @@ pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> 
 /// Stop recording + ASR + correct + paste into target (push-to-talk release / toggle stop).
 pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
     // Only stop if we are actively recording.
-    if PHASE
-        .compare_exchange(
+    let phase_transition = {
+        let _transition = UI_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        PHASE.compare_exchange(
             PHASE_RECORDING,
             PHASE_PROCESSING,
             Ordering::SeqCst,
             Ordering::SeqCst,
         )
-        .is_err()
-    {
+    };
+    if phase_transition.is_err() {
         tracing::info!(
             phase = PHASE.load(Ordering::SeqCst),
             "dictation_stop ignored (not recording)"

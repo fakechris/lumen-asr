@@ -49,6 +49,11 @@ pub fn open_url(url: &str) -> Result<(), PlatformError> {
 pub struct FrontmostTarget {
     pub name: Option<String>,
     pub bundle_id: Option<String>,
+    /// Native process identifier captured with the frontmost application.
+    ///
+    /// Terminal pane adapters use this only to prove that a multiplexer client
+    /// belongs to the selected outer terminal. It is never persisted.
+    pub process_id: Option<u32>,
 }
 
 /// Best-effort frontmost process name + bundle id.
@@ -87,10 +92,17 @@ fn frontmost_target_native() -> Option<FrontmostTarget> {
         .bundleIdentifier()
         .map(|s: objc2::rc::Retained<NSString>| s.to_string())
         .filter(|s| !s.is_empty());
+    let process_id = u32::try_from(app.processIdentifier())
+        .ok()
+        .filter(|process_id| *process_id > 0);
     if name.is_none() && bundle_id.is_none() {
         return None;
     }
-    Some(FrontmostTarget { name, bundle_id })
+    Some(FrontmostTarget {
+        name,
+        bundle_id,
+        process_id,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -109,7 +121,11 @@ tell application "System Events"
   try
     set b to bundle identifier of p
   end try
-  return n & linefeed & b
+  set processId to ""
+  try
+    set processId to unix id of p as text
+  end try
+  return n & linefeed & b & linefeed & processId
 end tell
 "#;
         let output = std::process::Command::new("osascript")
@@ -128,9 +144,16 @@ end tell
             .map(str::trim)
             .filter(|x| !x.is_empty())
             .map(|x| x.to_string());
+        let process_id = lines
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok())
+            .filter(|process_id| *process_id > 0);
         Some(FrontmostTarget {
             name: Some(name.to_string()),
             bundle_id: bundle,
+            process_id,
         })
     }
     #[cfg(not(target_os = "macos"))]
@@ -209,6 +232,7 @@ pub fn activate_app_by_name(name: &str) -> bool {
     activate_target(&FrontmostTarget {
         name: Some(name.to_string()),
         bundle_id: None,
+        process_id: None,
     })
 }
 

@@ -14,6 +14,99 @@ pub struct InsertionAnchor {
     right_context: String,
 }
 
+/// Pins one uniquely rendered terminal row without requiring the rest of the
+/// pane to remain unchanged while a TUI redraws status/header/footer content.
+#[derive(Debug, Clone)]
+pub struct TerminalInsertionAnchor {
+    inserted_text: String,
+    left_context: String,
+    right_context: String,
+}
+
+impl TerminalInsertionAnchor {
+    pub fn from_snapshot(snapshot: &str, inserted_text: &str) -> Result<Self, String> {
+        if inserted_text.is_empty() {
+            return Err("inserted_text_empty".into());
+        }
+        if inserted_text.contains('\n') || inserted_text.contains('\r') {
+            return Err("pane_multiline_insert_unsupported".into());
+        }
+        let mut matches = snapshot.match_indices(inserted_text);
+        let Some((start, _)) = matches.next() else {
+            return Err("inserted_text_not_found_in_pane".into());
+        };
+        if matches.next().is_some() {
+            return Err("inserted_text_not_unique_in_pane".into());
+        }
+        let end = start + inserted_text.len();
+        let line_start = snapshot[..start]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or_default();
+        let line_end = snapshot[end..]
+            .find('\n')
+            .map(|offset| end + offset)
+            .unwrap_or(snapshot.len());
+        let left_context = snapshot[line_start..start].to_owned();
+        let right_context = snapshot[end..line_end].to_owned();
+        if left_context.is_empty() && right_context.is_empty() {
+            return Err("pane_line_context_unavailable".into());
+        }
+        Ok(Self {
+            inserted_text: inserted_text.to_owned(),
+            left_context,
+            right_context,
+        })
+    }
+
+    pub fn project(&self, snapshot: &str) -> EditProjection {
+        let lines = snapshot.split('\n').collect::<Vec<_>>();
+        let mut candidates = lines
+            .iter()
+            .copied()
+            .filter(|line| self.project_line(line).is_some());
+        if let Some(line) = candidates.next() {
+            if candidates.next().is_none() {
+                return self.projection_for_line(line);
+            }
+        }
+        EditProjection::Unrelated
+    }
+
+    fn projection_for_line(&self, line: &str) -> EditProjection {
+        let Some(after_text) = self.project_line(line) else {
+            return EditProjection::Unrelated;
+        };
+        if after_text == self.inserted_text {
+            EditProjection::Unchanged
+        } else {
+            EditProjection::Edited { after_text }
+        }
+    }
+
+    fn project_line(&self, line: &str) -> Option<String> {
+        if !line.starts_with(&self.left_context)
+            || !line.ends_with(&self.right_context)
+            || line.len() < self.left_context.len() + self.right_context.len()
+        {
+            return None;
+        }
+        let end = line.len() - self.right_context.len();
+        let value = &line[self.left_context.len()..end];
+        if value.chars().count()
+            > self
+                .inserted_text
+                .chars()
+                .count()
+                .saturating_mul(4)
+                .saturating_add(256)
+        {
+            return None;
+        }
+        Some(value.to_owned())
+    }
+}
+
 impl InsertionAnchor {
     pub fn from_post_insert(field_value: &str, inserted_text: &str) -> Result<Self, String> {
         if inserted_text.is_empty() {
@@ -183,6 +276,61 @@ fn closest_terminal_suffix(field_tail: &[char], inserted_text: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_pane_anchor_ignores_unrelated_screen_repaints() {
+        let anchor = TerminalInsertionAnchor::from_snapshot(
+            "status: listening\nproject $ HERDR\nfooter: old",
+            "HERDR",
+        )
+        .unwrap();
+
+        assert_eq!(
+            anchor.project("status: ready\nproject $ Herdr\nfooter: new"),
+            EditProjection::Edited {
+                after_text: "Herdr".into()
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_pane_anchor_rejects_a_context_free_rendered_row() {
+        let error =
+            TerminalInsertionAnchor::from_snapshot("header\nHERDR\nfooter", "HERDR").unwrap_err();
+
+        assert_eq!(error, "pane_line_context_unavailable");
+    }
+
+    #[test]
+    fn terminal_pane_anchor_rejects_multiple_later_context_matches() {
+        let anchor =
+            TerminalInsertionAnchor::from_snapshot("header\nproject $ HERDR\nfooter", "HERDR")
+                .unwrap();
+
+        assert_eq!(
+            anchor.project("project $ Herdr\nproject $ Other"),
+            EditProjection::Unrelated
+        );
+    }
+
+    #[test]
+    fn terminal_pane_anchor_rejects_an_ambiguous_initial_screen() {
+        let error =
+            TerminalInsertionAnchor::from_snapshot("HERDR\nother HERDR", "HERDR").unwrap_err();
+
+        assert_eq!(error, "inserted_text_not_unique_in_pane");
+    }
+
+    #[test]
+    fn terminal_pane_anchor_rejects_multiline_insertions_for_ax_fallback() {
+        let error = TerminalInsertionAnchor::from_snapshot(
+            "project $ first line\nsecond line",
+            "first line\nsecond line",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "pane_multiline_insert_unsupported");
+    }
 
     #[test]
     fn extracts_an_edit_to_the_inserted_span_without_storing_surrounding_document_text() {
