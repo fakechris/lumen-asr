@@ -17,7 +17,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 static EDIT_WATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
-const EDIT_OBSERVER_ID: &str = "focused_field_poll_v3";
+const EDIT_OBSERVER_ID: &str = "focused_field_poll_v4";
 
 #[derive(Debug, Clone)]
 pub struct PostInsertWatchRequest {
@@ -160,6 +160,165 @@ enum PinnedFieldProjection {
         projection: EditProjection,
         field_hash: String,
     },
+}
+
+#[derive(Debug)]
+enum EditWatchDecision {
+    Continue,
+    Complete(EditObservationOutcome),
+}
+
+#[derive(Debug)]
+struct EditWatchTracker {
+    target_fingerprint_hash: String,
+    field_before_hash: String,
+    last_field_hash: Option<String>,
+    pending: Option<PendingProjection>,
+    consecutive_unavailable: u8,
+    consecutive_field_mismatches: u8,
+    consecutive_anchor_mismatches: u8,
+    stable_edit_duration: std::time::Duration,
+}
+
+impl EditWatchTracker {
+    const MAX_CONSECUTIVE_MISMATCHES: u8 = 8;
+
+    fn new(
+        target_fingerprint_hash: String,
+        field_before_hash: String,
+        stable_edit_duration: std::time::Duration,
+    ) -> Self {
+        Self {
+            target_fingerprint_hash,
+            last_field_hash: Some(field_before_hash.clone()),
+            field_before_hash,
+            pending: None,
+            consecutive_unavailable: 0,
+            consecutive_field_mismatches: 0,
+            consecutive_anchor_mismatches: 0,
+            stable_edit_duration,
+        }
+    }
+
+    fn last_field_hash(&self) -> Option<String> {
+        self.last_field_hash.clone()
+    }
+
+    fn observe_unavailable(&mut self) -> EditWatchDecision {
+        self.consecutive_unavailable = self.consecutive_unavailable.saturating_add(1);
+        self.consecutive_field_mismatches = 0;
+        self.consecutive_anchor_mismatches = 0;
+        self.pending = None;
+        if self.consecutive_unavailable >= Self::MAX_CONSECUTIVE_MISMATCHES {
+            EditWatchDecision::Complete(EditObservationOutcome::Failed {
+                reason: "target_field_unavailable",
+                field_final_hash: self.last_field_hash(),
+            })
+        } else {
+            EditWatchDecision::Continue
+        }
+    }
+
+    fn observe(
+        &mut self,
+        observation: PinnedFieldProjection,
+        observed_at: std::time::Instant,
+    ) -> EditWatchDecision {
+        self.consecutive_unavailable = 0;
+        let PinnedFieldProjection::Current {
+            projection,
+            field_hash,
+        } = observation
+        else {
+            self.consecutive_field_mismatches = self.consecutive_field_mismatches.saturating_add(1);
+            self.consecutive_anchor_mismatches = 0;
+            self.pending = None;
+            return if self.consecutive_field_mismatches >= Self::MAX_CONSECUTIVE_MISMATCHES {
+                EditWatchDecision::Complete(EditObservationOutcome::Failed {
+                    reason: "focused_field_changed",
+                    field_final_hash: self.last_field_hash(),
+                })
+            } else {
+                EditWatchDecision::Continue
+            };
+        };
+
+        self.consecutive_field_mismatches = 0;
+        self.last_field_hash = Some(field_hash.clone());
+        match projection {
+            EditProjection::Unchanged => {
+                self.consecutive_anchor_mismatches = 0;
+                self.pending = None;
+                EditWatchDecision::Continue
+            }
+            EditProjection::Unrelated => {
+                self.consecutive_anchor_mismatches =
+                    self.consecutive_anchor_mismatches.saturating_add(1);
+                self.pending = None;
+                if self.consecutive_anchor_mismatches >= Self::MAX_CONSECUTIVE_MISMATCHES {
+                    EditWatchDecision::Complete(EditObservationOutcome::Failed {
+                        reason: "anchor_mismatch",
+                        field_final_hash: Some(field_hash),
+                    })
+                } else {
+                    EditWatchDecision::Continue
+                }
+            }
+            EditProjection::Edited { after_text } => {
+                self.consecutive_anchor_mismatches = 0;
+                match self.pending.as_mut() {
+                    Some(value) if value.after_text == after_text => {
+                        value.field_after_hash = field_hash;
+                        if observed_at.saturating_duration_since(value.stable_since)
+                            >= self.stable_edit_duration
+                        {
+                            return EditWatchDecision::Complete(EditObservationOutcome::Edited(
+                                ObservedEdit {
+                                    after_text: value.after_text.clone(),
+                                    target_fingerprint_hash: self.target_fingerprint_hash.clone(),
+                                    field_before_hash: self.field_before_hash.clone(),
+                                    field_after_hash: value.field_after_hash.clone(),
+                                },
+                            ));
+                        }
+                    }
+                    _ => {
+                        self.pending = Some(PendingProjection {
+                            after_text,
+                            field_after_hash: field_hash,
+                            stable_since: observed_at,
+                        });
+                    }
+                }
+                EditWatchDecision::Continue
+            }
+        }
+    }
+
+    fn finish(self) -> EditObservationOutcome {
+        match self.pending {
+            Some(_) => EditObservationOutcome::Failed {
+                reason: "edit_not_stable_before_timeout",
+                field_final_hash: self.last_field_hash,
+            },
+            None if self.consecutive_unavailable > 0 => EditObservationOutcome::Failed {
+                reason: "target_field_unrecovered_before_timeout",
+                field_final_hash: self.last_field_hash,
+            },
+            None if self.consecutive_anchor_mismatches > 0 => EditObservationOutcome::Failed {
+                reason: "anchor_mismatch_before_timeout",
+                field_final_hash: self.last_field_hash,
+            },
+            None if self.consecutive_field_mismatches > 0 => EditObservationOutcome::Failed {
+                reason: "focused_field_unrecovered_before_timeout",
+                field_final_hash: self.last_field_hash,
+            },
+            None => EditObservationOutcome::NoEdit {
+                reason: "observation_window_elapsed",
+                field_final_hash: self.last_field_hash,
+            },
+        }
+    }
 }
 
 /// Watch only the target field and only the span inserted by this attempt.
@@ -365,28 +524,29 @@ async fn observe_prepared_edit(
     watch_generation: u64,
 ) -> EditObservationOutcome {
     const STABLE_EDIT_DURATION: std::time::Duration = std::time::Duration::from_millis(1_200);
-    const MAX_CONSECUTIVE_UNAVAILABLE: u8 = 4;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let PreparedEditWatch {
         anchor,
         target_fingerprint_hash,
         field_before_hash,
     } = prepared;
-    let mut pending: Option<PendingProjection> = None;
-    let mut last_field_hash = Some(field_before_hash.clone());
-    let mut unavailable_count = 0_u8;
-
+    let expected_fingerprint = target_fingerprint_hash.clone();
+    let mut tracker = EditWatchTracker::new(
+        target_fingerprint_hash,
+        field_before_hash,
+        STABLE_EDIT_DURATION,
+    );
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if EDIT_WATCH_GENERATION.load(Ordering::SeqCst) != watch_generation {
             return EditObservationOutcome::Failed {
                 reason: "next_dictation_started",
-                field_final_hash: last_field_hash,
+                field_final_hash: tracker.last_field_hash(),
             };
         }
         let target = request.target.clone();
         let anchor_for_probe = anchor.clone();
-        let expected_fingerprint = target_fingerprint_hash.clone();
+        let expected_fingerprint = expected_fingerprint.clone();
         let observation = tokio::task::spawn_blocking(move || {
             let current = read_pinned_field(&target)?;
             if field_fingerprint(&target, &current) != expected_fingerprint {
@@ -401,85 +561,17 @@ async fn observe_prepared_edit(
         .ok()
         .flatten();
         let Some(observation) = observation else {
-            unavailable_count = unavailable_count.saturating_add(1);
-            if unavailable_count >= MAX_CONSECUTIVE_UNAVAILABLE {
-                return EditObservationOutcome::Failed {
-                    reason: "target_field_unavailable",
-                    field_final_hash: last_field_hash,
-                };
+            match tracker.observe_unavailable() {
+                EditWatchDecision::Continue => continue,
+                EditWatchDecision::Complete(outcome) => return outcome,
             }
-            continue;
         };
-        unavailable_count = 0;
-        let PinnedFieldProjection::Current {
-            projection,
-            field_hash,
-        } = observation
-        else {
-            tracing::info!(
-                session_id = %request.session_id,
-                attempt_id = %request.attempt_id,
-                "edit watch stopped because the focused field changed"
-            );
-            return EditObservationOutcome::Failed {
-                reason: "focused_field_changed",
-                field_final_hash: last_field_hash,
-            };
-        };
-        last_field_hash = Some(field_hash.clone());
-        match projection {
-            EditProjection::Unchanged => pending = None,
-            EditProjection::Unrelated => {
-                tracing::info!(
-                    session_id = %request.session_id,
-                    attempt_id = %request.attempt_id,
-                    "edit watch stopped because text outside the inserted span changed"
-                );
-                return EditObservationOutcome::Failed {
-                    reason: "anchor_mismatch",
-                    field_final_hash: Some(field_hash),
-                };
-            }
-            EditProjection::Edited { after_text } => match pending.as_mut() {
-                Some(value) if value.after_text == after_text => {
-                    value.field_after_hash = field_hash;
-                    if value.stable_since.elapsed() >= STABLE_EDIT_DURATION {
-                        return EditObservationOutcome::Edited(ObservedEdit {
-                            after_text: value.after_text.clone(),
-                            target_fingerprint_hash,
-                            field_before_hash,
-                            field_after_hash: value.field_after_hash.clone(),
-                        });
-                    }
-                }
-                _ => {
-                    pending = Some(PendingProjection {
-                        after_text,
-                        field_after_hash: field_hash,
-                        stable_since: std::time::Instant::now(),
-                    });
-                }
-            },
+        match tracker.observe(observation, std::time::Instant::now()) {
+            EditWatchDecision::Continue => {}
+            EditWatchDecision::Complete(outcome) => return outcome,
         }
     }
-    match pending {
-        Some(pending) if pending.stable_since.elapsed() >= STABLE_EDIT_DURATION => {
-            EditObservationOutcome::Edited(ObservedEdit {
-                after_text: pending.after_text,
-                target_fingerprint_hash,
-                field_before_hash,
-                field_after_hash: pending.field_after_hash,
-            })
-        }
-        Some(_) => EditObservationOutcome::Failed {
-            reason: "edit_not_stable_before_timeout",
-            field_final_hash: last_field_hash,
-        },
-        None => EditObservationOutcome::NoEdit {
-            reason: "observation_window_elapsed",
-            field_final_hash: last_field_hash,
-        },
-    }
+    tracker.finish()
 }
 
 fn project_for_target(
@@ -1051,6 +1143,223 @@ mod tests {
     }
 
     #[test]
+    fn transient_field_mismatch_does_not_terminate_the_observation() {
+        let now = std::time::Instant::now();
+        let mut tracker = EditWatchTracker::new(
+            "target".into(),
+            "field-before".into(),
+            std::time::Duration::from_millis(100),
+        );
+
+        assert!(matches!(
+            tracker.observe(PinnedFieldProjection::FieldChanged, now),
+            EditWatchDecision::Continue
+        ));
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "Codex".into(),
+                    },
+                    field_hash: "field-after".into(),
+                },
+                now + std::time::Duration::from_millis(10),
+            ),
+            EditWatchDecision::Continue
+        ));
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "Codex".into(),
+                    },
+                    field_hash: "field-after".into(),
+                },
+                now + std::time::Duration::from_millis(150),
+            ),
+            EditWatchDecision::Complete(EditObservationOutcome::Edited(ObservedEdit {
+                after_text,
+                ..
+            })) if after_text == "Codex"
+        ));
+    }
+
+    #[test]
+    fn persistent_field_mismatch_has_an_explicit_terminal_reason() {
+        let now = std::time::Instant::now();
+        let mut tracker = EditWatchTracker::new(
+            "target".into(),
+            "field-before".into(),
+            std::time::Duration::from_millis(100),
+        );
+        for offset in 0..(EditWatchTracker::MAX_CONSECUTIVE_MISMATCHES - 1) {
+            assert!(matches!(
+                tracker.observe(
+                    PinnedFieldProjection::FieldChanged,
+                    now + std::time::Duration::from_millis(u64::from(offset) * 10),
+                ),
+                EditWatchDecision::Continue
+            ));
+        }
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::FieldChanged,
+                now + std::time::Duration::from_millis(
+                    u64::from(EditWatchTracker::MAX_CONSECUTIVE_MISMATCHES) * 10,
+                ),
+            ),
+            EditWatchDecision::Complete(EditObservationOutcome::Failed {
+                reason: "focused_field_changed",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn transient_unavailability_preserves_the_original_text_anchor() {
+        let now = std::time::Instant::now();
+        let mut tracker = EditWatchTracker::new(
+            "target".into(),
+            "field-before".into(),
+            std::time::Duration::from_millis(100),
+        );
+
+        assert!(matches!(
+            tracker.observe_unavailable(),
+            EditWatchDecision::Continue
+        ));
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "Qdrant".into(),
+                    },
+                    field_hash: "field-after".into(),
+                },
+                now,
+            ),
+            EditWatchDecision::Continue
+        ));
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "Qdrant".into(),
+                    },
+                    field_hash: "field-after".into(),
+                },
+                now + std::time::Duration::from_millis(120),
+            ),
+            EditWatchDecision::Complete(EditObservationOutcome::Edited(ObservedEdit {
+                after_text,
+                ..
+            })) if after_text == "Qdrant"
+        ));
+    }
+
+    #[test]
+    fn transient_anchor_mismatch_can_recover_to_the_original_field() {
+        let now = std::time::Instant::now();
+        let mut tracker = EditWatchTracker::new(
+            "target".into(),
+            "field-before".into(),
+            std::time::Duration::from_millis(100),
+        );
+
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Unrelated,
+                    field_hash: "other-field".into(),
+                },
+                now,
+            ),
+            EditWatchDecision::Continue
+        ));
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "Railway".into(),
+                    },
+                    field_hash: "field-after".into(),
+                },
+                now + std::time::Duration::from_millis(10),
+            ),
+            EditWatchDecision::Continue
+        ));
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "Railway".into(),
+                    },
+                    field_hash: "field-after".into(),
+                },
+                now + std::time::Duration::from_millis(120),
+            ),
+            EditWatchDecision::Complete(EditObservationOutcome::Edited(ObservedEdit {
+                after_text,
+                ..
+            })) if after_text == "Railway"
+        ));
+    }
+
+    #[test]
+    fn elapsed_time_while_unavailable_does_not_confirm_a_single_edit_sample() {
+        let now = std::time::Instant::now();
+        let mut tracker = EditWatchTracker::new(
+            "target".into(),
+            "field-before".into(),
+            std::time::Duration::from_millis(100),
+        );
+
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "Codex".into(),
+                    },
+                    field_hash: "field-after".into(),
+                },
+                now,
+            ),
+            EditWatchDecision::Continue
+        ));
+        assert!(matches!(
+            tracker.observe_unavailable(),
+            EditWatchDecision::Continue
+        ));
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "Codex".into(),
+                    },
+                    field_hash: "field-after".into(),
+                },
+                now + std::time::Duration::from_secs(1),
+            ),
+            EditWatchDecision::Continue
+        ));
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "Codex".into(),
+                    },
+                    field_hash: "field-after".into(),
+                },
+                now + std::time::Duration::from_millis(1_120),
+            ),
+            EditWatchDecision::Complete(EditObservationOutcome::Edited(ObservedEdit {
+                after_text,
+                ..
+            })) if after_text == "Codex"
+        ));
+    }
+
+    #[test]
     fn anchor_failures_keep_actionable_terminal_reasons() {
         assert_eq!(
             anchor_failure_reason("inserted_text_not_found_in_field"),
@@ -1292,7 +1601,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a logged-in macOS session and Accessibility permission"]
-    async fn live_textedit_edit_is_attributed_to_the_inserted_span() {
+    async fn live_textedit_edit_survives_geometry_and_focus_churn() {
         let _live_test_guard = crate::MACOS_LIVE_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let document = directory.path().join("lumen-edit-feedback-e2e.txt");
@@ -1335,11 +1644,38 @@ mod tests {
             inserted_text: inserted,
             target,
         };
+        let prepared = prepare_edit_watch(&request).expect("anchor the live TextEdit field");
+        let watch_generation = EDIT_WATCH_GENERATION.load(Ordering::SeqCst);
         let replacement = actual_field
             .value
             .replacen(&request.inserted_text, &edited, 1);
         let editor = async move {
-            tokio::time::sleep(Duration::from_millis(900)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let churn_status = Command::new("osascript")
+                .args([
+                    "-e",
+                    "tell application \"System Events\"",
+                    "-e",
+                    "tell process \"TextEdit\"",
+                    "-e",
+                    "set position of front window to {180, 140}",
+                    "-e",
+                    "set size of front window to {720, 520}",
+                    "-e",
+                    "end tell",
+                    "-e",
+                    "end tell",
+                    "-e",
+                    "tell application \"Finder\" to activate",
+                    "-e",
+                    "delay 0.7",
+                    "-e",
+                    "tell application \"TextEdit\" to activate",
+                ])
+                .status()
+                .expect("move TextEdit and temporarily change focus");
+            assert!(churn_status.success());
+            tokio::time::sleep(Duration::from_millis(400)).await;
             let script = format!(
                 "tell application \"TextEdit\" to set text of front document to \"{}\"",
                 replacement.replace('\\', "\\\\").replace('"', "\\\"")
@@ -1350,7 +1686,10 @@ mod tests {
                 .unwrap()
         };
 
-        let (observed, edit_status) = tokio::join!(observe_post_insert(&request, 6), editor);
+        let (outcome, edit_status) = tokio::join!(
+            observe_prepared_edit(&request, 6, prepared, watch_generation),
+            editor
+        );
         let _ = Command::new("osascript")
             .args([
                 "-e",
@@ -1359,41 +1698,15 @@ mod tests {
             .status();
 
         assert!(edit_status.success());
-        let observed = observed.unwrap_or_else(|| {
-            let current_target = lumen_platform_macos::frontmost_target();
-            let current_field = focused_text_field_snapshot();
-            let projection = match InsertionAnchor::from_post_insert(
-                &actual_field.value,
-                &request.inserted_text,
-            )
-            .ok()
-            .and_then(|anchor| {
-                current_field
-                    .as_ref()
-                    .map(|field| anchor.project(&field.value))
-            }) {
-                Some(EditProjection::Unchanged) => "unchanged",
-                Some(EditProjection::Edited { .. }) => "edited",
-                Some(EditProjection::Unrelated) => "unrelated",
-                None => "unavailable",
-            };
-            let current_evidence = current_field.as_ref().map(|field| {
-                (
-                    field.role.as_str(),
-                    field_fingerprint(&request.target, field),
-                    text_hash(&field.value),
-                    field.value.len(),
-                )
-            });
+        let EditObservationOutcome::Edited(observed) = outcome else {
             panic!(
-                "same-field edit was not observed; target={current_target:?}; \
-                 initial_fingerprint={}; initial_value_hash={}; initial_value_len={}; \
-                 current_evidence={current_evidence:?}; projection={projection}",
+                "same-field edit was not observed; outcome={outcome:?}; \
+                 initial_fingerprint={}; initial_value_hash={}; initial_value_len={}",
                 field_fingerprint(&request.target, &actual_field),
                 text_hash(&actual_field.value),
                 actual_field.value.len(),
             );
-        });
+        };
         assert_eq!(observed.after_text, edited);
         assert!(!observed.target_fingerprint_hash.is_empty());
         assert_ne!(observed.field_before_hash, observed.field_after_hash);
