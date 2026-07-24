@@ -29,17 +29,24 @@ pub struct FocusedTextFieldSnapshot {
 impl FocusedTextFieldSnapshot {
     /// Returns metadata suitable for hashing without including the field's text.
     pub fn fingerprint_material(&self) -> String {
-        [
+        let mut material = vec![
             self.owner_bundle_id.as_str(),
             self.role.as_str(),
             self.subrole.as_str(),
             self.identifier.as_str(),
-            self.x.as_str(),
-            self.y.as_str(),
-            self.width.as_str(),
-            self.height.as_str(),
-        ]
-        .join("\u{001f}")
+        ];
+        // A non-empty AXIdentifier is stable when its window moves or resizes.
+        // Anonymous controls need geometry as a fail-safe so two same-role fields
+        // in one app are not silently treated as the same editing target.
+        if self.identifier.is_empty() {
+            material.extend([
+                self.x.as_str(),
+                self.y.as_str(),
+                self.width.as_str(),
+                self.height.as_str(),
+            ]);
+        }
+        material.join("\u{001f}")
     }
 }
 
@@ -193,6 +200,36 @@ mod tests {
         assert_eq!(snapshot.role, "AXTextArea");
         assert_eq!(snapshot.value, "第一行\n第二行");
         assert!(!snapshot.fingerprint_material().contains("第一行"));
+    }
+
+    #[test]
+    fn field_identity_does_not_change_when_only_geometry_changes() {
+        let separator = FIELD_SEPARATOR;
+        let first = parse_snapshot(&format!(
+            "TextEdit{separator}com.apple.TextEdit{separator}AXTextArea{separator}{separator}First Text View{separator}10{separator}20{separator}300{separator}80{separator}同一段文字"
+        ))
+        .unwrap();
+        let moved = parse_snapshot(&format!(
+            "TextEdit{separator}com.apple.TextEdit{separator}AXTextArea{separator}{separator}First Text View{separator}80{separator}120{separator}640{separator}400{separator}同一段文字"
+        ))
+        .unwrap();
+
+        assert_eq!(first.fingerprint_material(), moved.fingerprint_material());
+    }
+
+    #[test]
+    fn anonymous_fields_keep_geometry_in_their_identity() {
+        let separator = FIELD_SEPARATOR;
+        let first = parse_snapshot(&format!(
+            "Browser{separator}com.example.browser{separator}AXTextField{separator}{separator}{separator}10{separator}20{separator}300{separator}80{separator}同一段文字"
+        ))
+        .unwrap();
+        let second = parse_snapshot(&format!(
+            "Browser{separator}com.example.browser{separator}AXTextField{separator}{separator}{separator}10{separator}120{separator}300{separator}80{separator}同一段文字"
+        ))
+        .unwrap();
+
+        assert_ne!(first.fingerprint_material(), second.fingerprint_material());
     }
 
     #[cfg(target_os = "macos")]
