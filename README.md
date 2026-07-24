@@ -29,11 +29,14 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 4. Text is **pasted into the focused field** (editor, chat, browser, IDE…)  
 5. Sessions stay in **History**; you can replay audio, edit, and grow a personal dictionary  
 
-**Local by default.** Recognition runs on your Mac (SenseVoice). Cleanup can stay on-device (e.g. Ollama). When local rewrite/translate quality isn’t enough, switch the corrector to a cloud OpenAI-compatible API — same UI, better models.
+**Local by default.** Recognition can run on your Mac with SenseVoice, Qwen3-ASR, or Whisper. Cleanup can stay on-device (e.g. Ollama). When local recognition or rewrite quality isn’t enough, switch ASR to OpenAI Audio or the corrector to a cloud OpenAI-compatible API.
 
 | You want… | Use |
 |-----------|-----|
-| Privacy + offline ASR | Local SenseVoice (default) |
+| Privacy + lightweight offline ASR | Local SenseVoice (default) |
+| Higher-accuracy local ASR on Apple Silicon | Local Qwen3-ASR 0.6B 8-bit |
+| Another fully local ASR path | Local Whisper |
+| Cloud transcription | OpenAI Audio-compatible API |
 | Light cleanup, no cloud | Local LLM (Ollama / LM Studio) |
 | Stronger rewrite / translation | Cloud corrector (e.g. MiniMax-M3, other OpenAI-compatible APIs) |
 | Just the raw transcript | Cleanup level **None** / raw intent |
@@ -44,8 +47,11 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 - **Intent hotkeys** — e.g. default cleanup vs **translate** to another language  
 - **Floating capsule** while you speak (doesn’t steal focus from the typing target)  
 - **Cleanup strength** — none / light / medium / strong  
-- **Personal dictionary** — terms & replacements; learn from post-paste edits  
-- **Session history** with audio playback when saved  
+- **Context-aware cleanup** — optionally use bounded text near the cursor; full captured context stays encrypted locally
+- **Personal dictionary** — terms & replacements; learn from attributed post-insert edits
+- **Terminal pane observation** — follow edits in Herdr, tmux, and Zellij instead of depending only on Accessibility text
+- **Auditable pipeline records** — immutable attempts, context provenance, and edit-observation outcomes alongside session history
+- **Independent local model selections** — switch SenseVoice, Qwen3-ASR, and Whisper without overwriting each other’s paths or cleanup profile
 - **First-run onboarding** for Microphone + Accessibility  
 
 ### Requirements
@@ -114,21 +120,27 @@ You can re-open onboarding later from Settings if permissions were skipped.
 
 Quit Lumen fully and reopen after toggling Accessibility.
 
-#### 4. Put a local speech model in place
+#### 4. Choose a speech recognition engine
 
-Default engine: **SenseVoice** (via sherpa-onnx).
+The default remains **SenseVoice** via sherpa-onnx. Lumen keeps a separate model path for each local engine, so switching engines does not overwrite the previous selection.
 
-Put model files here (first match wins):
+| Engine | Best for | What it needs |
+|--------|----------|---------------|
+| **SenseVoice** | Lower resource use, fast local dictation | `model.int8.onnx` (or `model.onnx`) + `tokens.txt` |
+| **Qwen3-ASR 0.6B 8-bit** | Higher local accuracy on Apple Silicon | MLX model directory + a Python environment containing `mlx_qwen3_asr` 0.3.5 |
+| **Whisper** | Alternative local ONNX pipeline | Encoder ONNX + decoder ONNX + tokens text file |
+| **OpenAI Audio** | Cloud transcription | Compatible endpoint, model, and API key |
 
-1. `LUMEN_SENSEVOICE_DIR` (env override)  
-2. `~/Library/Application Support/LumenAsr/models/sensevoice/`  
+Shared local model root:
 
-Expected files:
+1. `LUMEN_MODELS_DIR` (environment override)
+2. `~/Library/Application Support/Lumen/models/`
 
-- `model.int8.onnx` (or `model.onnx`)  
-- `tokens.txt`  
+Engine-specific overrides such as `LUMEN_SENSEVOICE_DIR` and `LUMEN_WHISPER_DIR` take priority. Lumen also discovers ready models in older Lumen/Navi and coli locations without moving them.
 
-In the app: **Settings → Speech recognition** should show the engine as ready.
+In the app, open **Settings → Speech recognition** to select an engine, choose a discovered model, or validate a custom directory.
+
+For Qwen3-ASR, Settings validates the Python runtime before activation. An optional local terminology-candidate analysis can inspect uncertain spans without changing the transcript delivered to the user.
 
 #### 5. Choose AI cleanup (recommended path)
 
@@ -142,6 +154,8 @@ In the app: **Settings → Speech recognition** should show the engine as ready.
 
 Config file (advanced):  
 `~/Library/Application Support/LumenAsr/config.toml`
+
+> **Context privacy:** Lumen can keep a bounded, encrypted local snapshot for audit and provenance. Cursor-near text is included in a corrector request only when **Use current app and nearby text** is enabled. With a cloud corrector, that bounded projection leaves the Mac; the full captured snapshot does not.
 
 #### 6. Learn the hotkeys
 
@@ -163,6 +177,19 @@ Config file (advanced):
 - **Cleanup level** — Medium is a good default (clear, light cleanup).  
 - **Dictionary** — add product names / jargon so ASR + cleanup keep them.  
 - **History → edit** — improve a line and save learn candidates when offered.  
+
+### Terminal pane edit learning
+
+After inserting dictated text, Lumen can observe a correction through the terminal tool’s pane API. It pins the outer terminal surface and the inner client/session/pane identity, then attributes only a unique edit to the inserted line. This avoids screen selection tricks and survives unrelated TUI redraws.
+
+| Environment | Read path | Support |
+|-------------|-----------|---------|
+| **Herdr** | Locked Herdr pane ID + unwrapped recent render buffer | Direct pane observation |
+| **tmux** | Locked client/session/pane + `capture-pane -J` | Direct pane observation |
+| **Zellij** | Locked client/pane + targeted `dump-screen --pane-id` | Direct on **Zellij 0.44+**; older versions fall back to Accessibility |
+| **Ghostty** | Stable outer terminal identity | Hosts the inner Herdr/tmux/Zellij adapter; Ghostty itself is not read as a screen source |
+
+Pane attribution is intentionally limited to a uniquely rendered single line. Multiline or ambiguous renders fall back to Accessibility rather than guessing. If Lumen cannot prove that the same pane is still active, it also fails closed to the Accessibility observer. Raw pane snapshots are not logged or stored; only hashes and the attributed edited span enter the learning/audit records. Enable post-insert observation under **Settings → Edit learning**.
 
 ### Day-to-day tips
 
@@ -200,11 +227,14 @@ Private / TBD.
 
 Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 自动粘贴到当前 App，并保留历史与个人词库。
 
-**默认本地。** 识别用本机 SenseVoice；整理可用本机大模型（如 Ollama）。本地改写/翻译效果不够时，再在设置里换成在线 OpenAI 兼容接口——同一套界面，更强模型。
+**默认本地。** 识别可使用本机 SenseVoice、Qwen3-ASR 或 Whisper；整理可使用本机大模型（如 Ollama）。本地识别或改写效果不够时，可以把 ASR 切到 OpenAI Audio，或把修正器切到在线 OpenAI 兼容接口。
 
 | 需求 | 建议 |
 |------|------|
-| 隐私、离线识别 | 本地 SenseVoice（默认） |
+| 隐私、轻量离线识别 | 本地 SenseVoice（默认） |
+| Apple Silicon 上更高精度的本地识别 | 本地 Qwen3-ASR 0.6B 8-bit |
+| 另一条全本地识别路径 | 本地 Whisper |
+| 在线语音转写 | OpenAI Audio 兼容接口 |
 | 轻度整理、不上云 | 本地 LLM（Ollama / LM Studio） |
 | 更强改写 / 翻译 | 在线修正（如 MiniMax-M3 等兼容接口） |
 | 只要原始转写 | 整理强度选「无」 |
@@ -215,8 +245,11 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 - **意图快捷键**（如默认整理 vs **翻译**）  
 - 说话时 **悬浮胶囊**（不抢当前输入焦点）  
 - 整理强度：无 / 轻 / 中 / 强  
-- **个人词库**；粘贴后可从编辑中学习  
-- **历史记录**与录音回放  
+- **上下文辅助整理**：可选择发送光标附近的有界文本，完整上下文只在本机加密保存
+- **个人词库**：从已归因的插入后修改中生成术语与替换候选
+- **终端 pane 观察**：直接跟踪 Herdr、tmux、Zellij 中的修改，不只依赖辅助功能文本
+- **可审计流水线记录**：在会话历史之外保存不可变尝试、上下文来源与编辑观察结果
+- **本地模型独立配置**：切换 SenseVoice、Qwen3-ASR、Whisper 时保留各自路径与整理配置
 - 首次启动 **引导**：麦克风 + 辅助功能  
 
 ### 环境要求
@@ -282,21 +315,27 @@ npm run tauri dev
 
 修改辅助功能后请完全退出再打开 Lumen。
 
-#### 4. 准备本地语音模型
+#### 4. 选择语音识别引擎
 
-默认引擎：**SenseVoice**（sherpa-onnx）。
+默认仍是 sherpa-onnx 驱动的 **SenseVoice**。每个本地引擎都有独立的模型路径，来回切换不会覆盖之前的选择。
 
-模型目录（按优先级）：
+| 引擎 | 适用场景 | 所需内容 |
+|------|----------|----------|
+| **SenseVoice** | 资源占用较低、快速本地听写 | `model.int8.onnx`（或 `model.onnx`）+ `tokens.txt` |
+| **Qwen3-ASR 0.6B 8-bit** | Apple Silicon 上更高精度的本地识别 | MLX 模型目录 + 安装了 `mlx_qwen3_asr` 0.3.5 的 Python 环境 |
+| **Whisper** | 另一条本地 ONNX 路线 | encoder ONNX + decoder ONNX + tokens 文本 |
+| **OpenAI Audio** | 在线转写 | 兼容接口、模型与 API Key |
 
-1. 环境变量 `LUMEN_SENSEVOICE_DIR`  
-2. `~/Library/Application Support/LumenAsr/models/sensevoice/`  
+本地模型共享根目录：
 
-需要文件：
+1. 环境变量 `LUMEN_MODELS_DIR`
+2. `~/Library/Application Support/Lumen/models/`
 
-- `model.int8.onnx`（或 `model.onnx`）  
-- `tokens.txt`  
+`LUMEN_SENSEVOICE_DIR`、`LUMEN_WHISPER_DIR` 等引擎变量优先。Lumen 也会发现旧版 Lumen/Navi 与 coli 目录中的可用模型，但不会自动移动它们。
 
-在应用内 **设置 → 语音识别** 确认引擎就绪。
+在应用内打开 **设置 → 语音识别**，可以切换引擎、选择已发现模型，或验证自定义目录。
+
+选择 Qwen3-ASR 时，设置页会先验证 Python runtime。还可选择运行本地术语候选分析，对不确定片段做诊断，但不会改动最终交给用户的转写文本。
 
 #### 5. 配置 AI 整理（推荐策略）
 
@@ -309,6 +348,8 @@ npm run tauri dev
 | **关闭** | 整理强度「无」或关闭修正 | 只要 ASR 原文 |
 
 高级配置：`~/Library/Application Support/LumenAsr/config.toml`
+
+> **上下文隐私：** Lumen 可以把有长度上限的上下文加密保存在本机，用于审计与来源记录。只有开启“用当前应用和光标附近文字辅助纠错”后，才会把光标附近的有界投影加入修正请求；使用云端修正器时，这份投影会离开本机，完整快照不会上传。
 
 #### 6. 快捷键与使用流程
 
@@ -330,6 +371,19 @@ npm run tauri dev
 - 整理强度默认 **中** 即可  
 - 在 **词库** 加入专有名词  
 - 在历史中改稿，有学习建议时按需入库  
+
+### 终端 pane 编辑学习
+
+听写文本插入后，Lumen 可以通过终端工具自身的 pane API 观察用户修改。它会锁定外层终端界面和内层 client/session/pane 身份，只在插入行能够唯一归因时记录修改，不需要通过后台选中文字来读取屏幕，也不会被无关的 TUI 重绘误导。
+
+| 环境 | 读取路径 | 支持状态 |
+|------|----------|----------|
+| **Herdr** | 锁定 Herdr pane ID，读取未软换行的近期渲染缓冲区 | 直接 pane 观察 |
+| **tmux** | 锁定 client/session/pane，使用 `capture-pane -J` | 直接 pane 观察 |
+| **Zellij** | 锁定 client/pane，定向调用 `dump-screen --pane-id` | **Zellij 0.44+** 直接观察；旧版本回退辅助功能 |
+| **Ghostty** | 锁定稳定的外层 terminal 身份 | 读取内层 Herdr/tmux/Zellij；不把 Ghostty 自身当作 screen 数据源 |
+
+pane 归因目前只处理能够唯一定位的单行文本。遇到多行或画面歧义时会回退辅助功能，不会猜测。如果无法证明当前仍是同一个 pane，同样会安全回退。pane 原始快照不会写入日志或数据库，只保存哈希与归因后的修改片段。可在 **设置 → 编辑学习 → 粘贴后监听目标输入框改动** 中启用。
 
 ### 日常提示
 
