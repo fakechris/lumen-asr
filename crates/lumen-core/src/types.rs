@@ -26,6 +26,7 @@ pub enum InsertStrategy {
 pub enum EditSource {
     PreInsertUi,
     PostPasteAx,
+    PostPastePane,
     Manual,
 }
 

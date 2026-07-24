@@ -588,7 +588,7 @@ pub struct LearningConfig {
     /// When true, promote a replacement after it appears `auto_promote_threshold` times.
     pub auto_promote: bool,
     pub auto_promote_threshold: u32,
-    /// After successful paste, poll frontmost field for user edits (best-effort AX/osascript).
+    /// After successful insert, observe a pinned pane API or Accessibility field for user edits.
     pub post_paste_capture: bool,
     /// Seconds to watch after paste before giving up.
     pub post_paste_seconds: u64,

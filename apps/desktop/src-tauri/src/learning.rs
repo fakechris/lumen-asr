@@ -2,7 +2,8 @@
 //! optional post-paste capture of user corrections in the target app.
 
 use crate::config::LearningConfig;
-use crate::edit_attribution::{EditProjection, InsertionAnchor};
+use crate::edit_attribution::{EditProjection, InsertionAnchor, TerminalInsertionAnchor};
+use crate::pane_observer::LockedPane;
 use crate::AppState;
 use chrono::{DateTime, Utc};
 use lumen_core::{DictEntryKind, DictEntrySource, EditSource};
@@ -17,7 +18,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 static EDIT_WATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
-const EDIT_OBSERVER_ID: &str = "focused_field_poll_v4";
+const AX_EDIT_OBSERVER_ID: &str = "focused_field_poll_v4";
 
 #[derive(Debug, Clone)]
 pub struct PostInsertWatchRequest {
@@ -25,6 +26,7 @@ pub struct PostInsertWatchRequest {
     pub attempt_id: Uuid,
     pub inserted_text: String,
     pub target: FrontmostTarget,
+    pub pane_target: Option<LockedPane>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +62,7 @@ pub struct ProcessEditInput {
     pub before_text: String,
     pub after_text: String,
     pub session_id: Option<String>,
-    /// pre_insert_ui | post_paste_ax | manual
+    /// pre_insert_ui | post_paste_ax | post_paste_pane | manual
     pub source: Option<String>,
     /// When false, only suggest (no edit_event write). Default true.
     pub record_event: Option<bool>,
@@ -123,11 +125,22 @@ struct PendingProjection {
     after_text: String,
     field_after_hash: String,
     stable_since: std::time::Instant,
+    identity: ObservationIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservationIdentity {
+    observer_id: String,
+    edit_source: EditSource,
+    target_fingerprint_hash: String,
+    field_before_hash: String,
 }
 
 #[derive(Debug)]
 struct ObservedEdit {
     after_text: String,
+    observer_id: String,
+    edit_source: EditSource,
     target_fingerprint_hash: String,
     field_before_hash: String,
     field_after_hash: String,
@@ -135,9 +148,36 @@ struct ObservedEdit {
 
 #[derive(Debug)]
 struct PreparedEditWatch {
-    anchor: InsertionAnchor,
+    surface: PreparedEditSurface,
+    observer_id: String,
+    edit_source: EditSource,
     target_fingerprint_hash: String,
     field_before_hash: String,
+}
+
+#[derive(Debug)]
+struct PreparedObservationMetadata {
+    observer_id: String,
+    target_fingerprint_hash: String,
+    field_initial_hash: String,
+}
+
+#[derive(Debug, Clone)]
+enum PreparedEditSurface {
+    Accessibility(AccessibilityEditSurface),
+    Pane {
+        target: LockedPane,
+        anchor: TerminalInsertionAnchor,
+        accessibility_fallback: Option<AccessibilityEditSurface>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct AccessibilityEditSurface {
+    target: FrontmostTarget,
+    anchor: InsertionAnchor,
+    expected_fingerprint: String,
+    identity: ObservationIdentity,
 }
 
 #[derive(Debug)]
@@ -159,6 +199,7 @@ enum PinnedFieldProjection {
     Current {
         projection: EditProjection,
         field_hash: String,
+        identity: Option<ObservationIdentity>,
     },
 }
 
@@ -170,6 +211,8 @@ enum EditWatchDecision {
 
 #[derive(Debug)]
 struct EditWatchTracker {
+    observer_id: String,
+    edit_source: EditSource,
     target_fingerprint_hash: String,
     field_before_hash: String,
     last_field_hash: Option<String>,
@@ -184,11 +227,15 @@ impl EditWatchTracker {
     const MAX_CONSECUTIVE_MISMATCHES: u8 = 8;
 
     fn new(
+        observer_id: String,
+        edit_source: EditSource,
         target_fingerprint_hash: String,
         field_before_hash: String,
         stable_edit_duration: std::time::Duration,
     ) -> Self {
         Self {
+            observer_id,
+            edit_source,
             target_fingerprint_hash,
             last_field_hash: Some(field_before_hash.clone()),
             field_before_hash,
@@ -228,6 +275,7 @@ impl EditWatchTracker {
         let PinnedFieldProjection::Current {
             projection,
             field_hash,
+            identity,
         } = observation
         else {
             self.consecutive_field_mismatches = self.consecutive_field_mismatches.saturating_add(1);
@@ -266,8 +314,14 @@ impl EditWatchTracker {
             }
             EditProjection::Edited { after_text } => {
                 self.consecutive_anchor_mismatches = 0;
+                let identity = identity.unwrap_or_else(|| ObservationIdentity {
+                    observer_id: self.observer_id.clone(),
+                    edit_source: self.edit_source,
+                    target_fingerprint_hash: self.target_fingerprint_hash.clone(),
+                    field_before_hash: self.field_before_hash.clone(),
+                });
                 match self.pending.as_mut() {
-                    Some(value) if value.after_text == after_text => {
+                    Some(value) if value.after_text == after_text && value.identity == identity => {
                         value.field_after_hash = field_hash;
                         if observed_at.saturating_duration_since(value.stable_since)
                             >= self.stable_edit_duration
@@ -275,8 +329,13 @@ impl EditWatchTracker {
                             return EditWatchDecision::Complete(EditObservationOutcome::Edited(
                                 ObservedEdit {
                                     after_text: value.after_text.clone(),
-                                    target_fingerprint_hash: self.target_fingerprint_hash.clone(),
-                                    field_before_hash: self.field_before_hash.clone(),
+                                    observer_id: value.identity.observer_id.clone(),
+                                    edit_source: value.identity.edit_source,
+                                    target_fingerprint_hash: value
+                                        .identity
+                                        .target_fingerprint_hash
+                                        .clone(),
+                                    field_before_hash: value.identity.field_before_hash.clone(),
                                     field_after_hash: value.field_after_hash.clone(),
                                 },
                             ));
@@ -287,6 +346,7 @@ impl EditWatchTracker {
                             after_text,
                             field_after_hash: field_hash,
                             stable_since: observed_at,
+                            identity,
                         });
                     }
                 }
@@ -383,8 +443,11 @@ pub async fn spawn_post_insert_watch(
         "edit watch started"
     );
     tauri::async_runtime::spawn(async move {
-        let target_fingerprint_hash = prepared.target_fingerprint_hash.clone();
-        let field_initial_hash = prepared.field_before_hash.clone();
+        let metadata = PreparedObservationMetadata {
+            observer_id: prepared.observer_id.clone(),
+            target_fingerprint_hash: prepared.target_fingerprint_hash.clone(),
+            field_initial_hash: prepared.field_before_hash.clone(),
+        };
         let outcome = observe_prepared_edit(&request, seconds, prepared, watch_generation).await;
         if !wait_for_session_persistence(&app, request.session_id, seconds).await {
             tracing::warn!(
@@ -396,14 +459,14 @@ pub async fn spawn_post_insert_watch(
                 id: observation_id,
                 session_id: request.session_id,
                 attempt_id: request.attempt_id,
-                source: EDIT_OBSERVER_ID.into(),
+                source: metadata.observer_id,
                 status: "failed".into(),
                 end_reason: "session_persistence_timeout".into(),
                 target_app_name: request.target.name.clone(),
                 target_bundle_id: request.target.bundle_id.clone(),
-                target_fingerprint_hash: Some(target_fingerprint_hash),
+                target_fingerprint_hash: Some(metadata.target_fingerprint_hash),
                 inserted_text_hash: text_hash(&request.inserted_text),
-                field_initial_hash: Some(field_initial_hash),
+                field_initial_hash: Some(metadata.field_initial_hash),
                 field_final_hash: None,
                 normalized_edit_distance: None,
                 started_at,
@@ -418,8 +481,7 @@ pub async fn spawn_post_insert_watch(
             &request,
             observation_id,
             started_at,
-            Some(target_fingerprint_hash),
-            Some(field_initial_hash),
+            metadata,
             outcome,
         );
     });
@@ -444,7 +506,9 @@ pub fn schedule_unavailable_post_insert_observation(
             target: FrontmostTarget {
                 name: None,
                 bundle_id: None,
+                process_id: None,
             },
+            pane_target: None,
         },
         Uuid::new_v4(),
         Utc::now(),
@@ -460,8 +524,12 @@ pub fn cancel_post_insert_watches() {
 
 fn anchor_failure_reason(reason: &str) -> String {
     match reason {
-        "inserted_text_not_found_in_field" => "inserted_text_not_found",
-        "inserted_text_not_unique_in_field" => "inserted_text_not_unique",
+        "inserted_text_not_found_in_field" | "inserted_text_not_found_in_pane" => {
+            "inserted_text_not_found"
+        }
+        "inserted_text_not_unique_in_field" | "inserted_text_not_unique_in_pane" => {
+            "inserted_text_not_unique"
+        }
         "pinned_target_field_unavailable" => "target_field_unavailable",
         _ => "anchor_unavailable",
     }
@@ -469,13 +537,74 @@ fn anchor_failure_reason(reason: &str) -> String {
 }
 
 fn prepare_edit_watch(request: &PostInsertWatchRequest) -> Result<PreparedEditWatch, String> {
+    let mut pane_failure = None;
+    if let Some(pane) = request.pane_target.as_ref() {
+        match pane.snapshot() {
+            Ok(snapshot) => {
+                let value = normalize_pane_text(&snapshot.text);
+                match TerminalInsertionAnchor::from_snapshot(&value, &request.inserted_text) {
+                    Ok(anchor) => {
+                        let accessibility_fallback = prepare_accessibility_surface(request).ok();
+                        return Ok(PreparedEditWatch {
+                            surface: PreparedEditSurface::Pane {
+                                target: pane.clone(),
+                                anchor,
+                                accessibility_fallback,
+                            },
+                            observer_id: pane.observer_id().into(),
+                            edit_source: EditSource::PostPastePane,
+                            target_fingerprint_hash: text_hash(&pane.fingerprint_material()),
+                            field_before_hash: text_hash(&value),
+                        });
+                    }
+                    Err(reason) => {
+                        tracing::debug!(
+                            observer = pane.observer_id(),
+                            %reason,
+                            "pane snapshot could not anchor inserted span; trying accessibility"
+                        );
+                        pane_failure = Some(reason);
+                    }
+                }
+            }
+            Err(reason) => {
+                tracing::debug!(
+                    observer = pane.observer_id(),
+                    %reason,
+                    "pane snapshot unavailable after insertion; trying accessibility"
+                );
+                pane_failure = Some("pane_snapshot_unavailable".to_owned());
+            }
+        }
+    }
+    let accessibility =
+        prepare_accessibility_surface(request).map_err(|reason| pane_failure.unwrap_or(reason))?;
+    Ok(PreparedEditWatch {
+        observer_id: accessibility.identity.observer_id.clone(),
+        edit_source: accessibility.identity.edit_source,
+        target_fingerprint_hash: accessibility.identity.target_fingerprint_hash.clone(),
+        field_before_hash: accessibility.identity.field_before_hash.clone(),
+        surface: PreparedEditSurface::Accessibility(accessibility),
+    })
+}
+
+fn prepare_accessibility_surface(
+    request: &PostInsertWatchRequest,
+) -> Result<AccessibilityEditSurface, String> {
     let initial = read_pinned_field(&request.target)
         .ok_or_else(|| "pinned_target_field_unavailable".to_owned())?;
     let anchor = InsertionAnchor::from_post_insert(&initial.value, &request.inserted_text)?;
-    Ok(PreparedEditWatch {
+    let expected_fingerprint = field_fingerprint(&request.target, &initial);
+    Ok(AccessibilityEditSurface {
+        target: request.target.clone(),
         anchor,
-        target_fingerprint_hash: field_fingerprint(&request.target, &initial),
-        field_before_hash: text_hash(&initial.value),
+        expected_fingerprint: expected_fingerprint.clone(),
+        identity: ObservationIdentity {
+            observer_id: AX_EDIT_OBSERVER_ID.into(),
+            edit_source: EditSource::PostPasteAx,
+            target_fingerprint_hash: expected_fingerprint,
+            field_before_hash: text_hash(&initial.value),
+        },
     })
 }
 
@@ -518,7 +647,7 @@ async fn observe_post_insert(
 }
 
 async fn observe_prepared_edit(
-    request: &PostInsertWatchRequest,
+    _request: &PostInsertWatchRequest,
     seconds: u64,
     prepared: PreparedEditWatch,
     watch_generation: u64,
@@ -526,12 +655,15 @@ async fn observe_prepared_edit(
     const STABLE_EDIT_DURATION: std::time::Duration = std::time::Duration::from_millis(1_200);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let PreparedEditWatch {
-        anchor,
+        surface,
+        observer_id,
+        edit_source,
         target_fingerprint_hash,
         field_before_hash,
     } = prepared;
-    let expected_fingerprint = target_fingerprint_hash.clone();
     let mut tracker = EditWatchTracker::new(
+        observer_id,
+        edit_source,
         target_fingerprint_hash,
         field_before_hash,
         STABLE_EDIT_DURATION,
@@ -544,22 +676,11 @@ async fn observe_prepared_edit(
                 field_final_hash: tracker.last_field_hash(),
             };
         }
-        let target = request.target.clone();
-        let anchor_for_probe = anchor.clone();
-        let expected_fingerprint = expected_fingerprint.clone();
-        let observation = tokio::task::spawn_blocking(move || {
-            let current = read_pinned_field(&target)?;
-            if field_fingerprint(&target, &current) != expected_fingerprint {
-                return Some(PinnedFieldProjection::FieldChanged);
-            }
-            Some(PinnedFieldProjection::Current {
-                projection: project_for_target(&target, &anchor_for_probe, &current.value),
-                field_hash: text_hash(&current.value),
-            })
-        })
-        .await
-        .ok()
-        .flatten();
+        let surface = surface.clone();
+        let observation = tokio::task::spawn_blocking(move || read_surface_projection(&surface))
+            .await
+            .ok()
+            .flatten();
         let Some(observation) = observation else {
             match tracker.observe_unavailable() {
                 EditWatchDecision::Continue => continue,
@@ -572,6 +693,71 @@ async fn observe_prepared_edit(
         }
     }
     tracker.finish()
+}
+
+fn read_surface_projection(surface: &PreparedEditSurface) -> Option<PinnedFieldProjection> {
+    match surface {
+        PreparedEditSurface::Accessibility(accessibility) => {
+            read_accessibility_projection(accessibility, None)
+        }
+        PreparedEditSurface::Pane {
+            target,
+            anchor,
+            accessibility_fallback,
+        } => {
+            let Some(snapshot) = target.snapshot().ok() else {
+                return accessibility_fallback.as_ref().and_then(|accessibility| {
+                    read_accessibility_projection(
+                        accessibility,
+                        Some(accessibility.identity.clone()),
+                    )
+                });
+            };
+            let value = normalize_pane_text(&snapshot.text);
+            let projection = anchor.project(&value);
+            if projection == EditProjection::Unrelated {
+                if let Some(fallback) = accessibility_fallback.as_ref().and_then(|accessibility| {
+                    read_accessibility_projection(
+                        accessibility,
+                        Some(accessibility.identity.clone()),
+                    )
+                }) {
+                    return Some(fallback);
+                }
+            }
+            Some(PinnedFieldProjection::Current {
+                projection,
+                field_hash: text_hash(&value),
+                identity: None,
+            })
+        }
+    }
+}
+
+fn read_accessibility_projection(
+    accessibility: &AccessibilityEditSurface,
+    identity: Option<ObservationIdentity>,
+) -> Option<PinnedFieldProjection> {
+    let current = read_pinned_field(&accessibility.target)?;
+    if field_fingerprint(&accessibility.target, &current) != accessibility.expected_fingerprint {
+        return Some(PinnedFieldProjection::FieldChanged);
+    }
+    Some(PinnedFieldProjection::Current {
+        projection: project_for_target(
+            &accessibility.target,
+            &accessibility.anchor,
+            &current.value,
+        ),
+        field_hash: text_hash(&current.value),
+        identity,
+    })
+}
+
+fn normalize_pane_text(text: &str) -> String {
+    text.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn project_for_target(
@@ -600,6 +786,7 @@ fn read_pinned_field(target: &FrontmostTarget) -> Option<FocusedTextFieldSnapsho
     let owner = FrontmostTarget {
         name: (!field.owner_name.is_empty()).then(|| field.owner_name.clone()),
         bundle_id: (!field.owner_bundle_id.is_empty()).then(|| field.owner_bundle_id.clone()),
+        process_id: None,
     };
     same_target(target, &owner).then_some(field)
 }
@@ -658,6 +845,12 @@ fn schedule_failed_observation(
     started_at: DateTime<Utc>,
     reason: String,
 ) {
+    let observer_id = request
+        .pane_target
+        .as_ref()
+        .map(|pane| pane.observer_id())
+        .unwrap_or(AX_EDIT_OBSERVER_ID)
+        .to_owned();
     tauri::async_runtime::spawn(async move {
         if !wait_for_session_persistence(&app, request.session_id, 10).await {
             tracing::warn!(
@@ -670,7 +863,7 @@ fn schedule_failed_observation(
                 id: observation_id,
                 session_id: request.session_id,
                 attempt_id: request.attempt_id,
-                source: EDIT_OBSERVER_ID.into(),
+                source: observer_id.clone(),
                 status: "failed".into(),
                 end_reason: "session_persistence_timeout".into(),
                 target_app_name: request.target.name,
@@ -693,7 +886,7 @@ fn schedule_failed_observation(
                 id: observation_id,
                 session_id: request.session_id,
                 attempt_id: request.attempt_id,
-                source: EDIT_OBSERVER_ID.into(),
+                source: observer_id,
                 status: "failed".into(),
                 end_reason: reason,
                 target_app_name: request.target.name,
@@ -716,8 +909,7 @@ fn persist_observation_outcome(
     request: &PostInsertWatchRequest,
     observation_id: Uuid,
     started_at: DateTime<Utc>,
-    prepared_target_fingerprint_hash: Option<String>,
-    prepared_field_initial_hash: Option<String>,
+    metadata: PreparedObservationMetadata,
     outcome: EditObservationOutcome,
 ) {
     match outcome {
@@ -726,7 +918,7 @@ fn persist_observation_outcome(
                 id: observation_id,
                 session_id: request.session_id,
                 attempt_id: request.attempt_id,
-                source: EDIT_OBSERVER_ID.into(),
+                source: observed.observer_id.clone(),
                 status: "completed_with_edit".into(),
                 end_reason: "stable_edit_captured".into(),
                 target_app_name: request.target.name.clone(),
@@ -754,14 +946,14 @@ fn persist_observation_outcome(
                 id: observation_id,
                 session_id: request.session_id,
                 attempt_id: request.attempt_id,
-                source: EDIT_OBSERVER_ID.into(),
+                source: metadata.observer_id.clone(),
                 status: "completed_no_edit".into(),
                 end_reason: reason.into(),
                 target_app_name: request.target.name.clone(),
                 target_bundle_id: request.target.bundle_id.clone(),
-                target_fingerprint_hash: prepared_target_fingerprint_hash,
+                target_fingerprint_hash: Some(metadata.target_fingerprint_hash.clone()),
                 inserted_text_hash: text_hash(&request.inserted_text),
-                field_initial_hash: prepared_field_initial_hash,
+                field_initial_hash: Some(metadata.field_initial_hash.clone()),
                 field_final_hash,
                 normalized_edit_distance: Some(0.0),
                 started_at,
@@ -778,14 +970,14 @@ fn persist_observation_outcome(
                 id: observation_id,
                 session_id: request.session_id,
                 attempt_id: request.attempt_id,
-                source: EDIT_OBSERVER_ID.into(),
+                source: metadata.observer_id,
                 status: "failed".into(),
                 end_reason: reason.into(),
                 target_app_name: request.target.name.clone(),
                 target_bundle_id: request.target.bundle_id.clone(),
-                target_fingerprint_hash: prepared_target_fingerprint_hash,
+                target_fingerprint_hash: Some(metadata.target_fingerprint_hash),
                 inserted_text_hash: text_hash(&request.inserted_text),
-                field_initial_hash: prepared_field_initial_hash,
+                field_initial_hash: Some(metadata.field_initial_hash),
                 field_final_hash,
                 normalized_edit_distance: None,
                 started_at,
@@ -850,6 +1042,15 @@ fn normalized_edit_distance(before: &str, after: &str) -> f64 {
     previous[after.len()] as f64 / denominator as f64
 }
 
+fn edit_source_name(source: EditSource) -> &'static str {
+    match source {
+        EditSource::PreInsertUi => "pre_insert_ui",
+        EditSource::PostPasteAx => "post_paste_ax",
+        EditSource::PostPastePane => "post_paste_pane",
+        EditSource::Manual => "manual",
+    }
+}
+
 fn persist_and_emit_edit(
     app: &AppHandle,
     request: &PostInsertWatchRequest,
@@ -860,7 +1061,7 @@ fn persist_and_emit_edit(
         attempt_id: Some(request.attempt_id),
         target_app_name: request.target.name.clone(),
         target_bundle_id: request.target.bundle_id.clone(),
-        observer: Some(EDIT_OBSERVER_ID.into()),
+        observer: Some(observed.observer_id.clone()),
         target_fingerprint_hash: Some(observed.target_fingerprint_hash.clone()),
         field_before_hash: Some(observed.field_before_hash.clone()),
         field_after_hash: Some(observed.field_after_hash.clone()),
@@ -880,7 +1081,7 @@ fn persist_and_emit_edit(
                     store
                         .add_edit_event_with_observation(
                             request.session_id,
-                            EditSource::PostPasteAx,
+                            observed.edit_source,
                             &request.inserted_text,
                             &observed.after_text,
                             &attribution,
@@ -900,7 +1101,7 @@ fn persist_and_emit_edit(
                     before_text: request.inserted_text.clone(),
                     after_text: observed.after_text.clone(),
                     session_id: Some(request.session_id.to_string()),
-                    source: Some("post_paste_ax".into()),
+                    source: Some(edit_source_name(observed.edit_source).into()),
                     record_event: Some(false),
                 },
                 None,
@@ -928,7 +1129,7 @@ fn persist_and_emit_edit(
                     session_id: request.session_id.to_string(),
                     before_text: request.inserted_text.clone(),
                     after_text: observed.after_text.clone(),
-                    source: "post_paste_ax".into(),
+                    source: edit_source_name(observed.edit_source).into(),
                     candidates,
                     auto_promoted,
                     message,
@@ -969,6 +1170,7 @@ fn process_edit_from_state(
     }
 
     let source = match input.source.as_deref() {
+        Some("post_paste_pane") => EditSource::PostPastePane,
         Some("post_paste_ax") => EditSource::PostPasteAx,
         Some("manual") => EditSource::Manual,
         _ => EditSource::PreInsertUi,
@@ -1111,6 +1313,121 @@ mod tests {
         assert!(after > before);
     }
 
+    #[test]
+    fn pinned_pane_surface_is_preferred_when_accessibility_has_no_field() {
+        let request = PostInsertWatchRequest {
+            session_id: Uuid::new_v4(),
+            attempt_id: Uuid::new_v4(),
+            inserted_text: "HERDR".into(),
+            target: FrontmostTarget {
+                name: Some("Ghostty".into()),
+                bundle_id: Some("com.mitchellh.ghostty".into()),
+                process_id: Some(659),
+            },
+            pane_target: Some(LockedPane::test_snapshot(
+                "herdr_pane_v1",
+                "herdr:w7:p2",
+                "header\nproject $ HERDR\nfooter",
+            )),
+        };
+
+        let prepared = prepare_edit_watch(&request).unwrap();
+
+        assert_eq!(prepared.observer_id, "herdr_pane_v1");
+        assert_eq!(prepared.edit_source, EditSource::PostPastePane);
+        assert!(matches!(prepared.surface, PreparedEditSurface::Pane { .. }));
+    }
+
+    #[test]
+    fn captured_edit_keeps_the_provider_observer_identity() {
+        let now = std::time::Instant::now();
+        let mut tracker = EditWatchTracker::new(
+            "tmux_pane_v1".into(),
+            EditSource::PostPastePane,
+            "target".into(),
+            "field-before".into(),
+            std::time::Duration::from_millis(100),
+        );
+
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "tmux".into(),
+                    },
+                    field_hash: "field-after".into(),
+                    identity: None,
+                },
+                now,
+            ),
+            EditWatchDecision::Continue
+        ));
+        assert!(matches!(
+            tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "tmux".into(),
+                    },
+                    field_hash: "field-after".into(),
+                    identity: None,
+                },
+                now + std::time::Duration::from_millis(120),
+            ),
+            EditWatchDecision::Complete(EditObservationOutcome::Edited(ObservedEdit {
+                observer_id,
+                edit_source: EditSource::PostPastePane,
+                ..
+            })) if observer_id == "tmux_pane_v1"
+        ));
+    }
+
+    #[test]
+    fn pane_loss_can_complete_with_the_accessibility_fallback_identity() {
+        let now = std::time::Instant::now();
+        let mut tracker = EditWatchTracker::new(
+            "tmux_pane_v1".into(),
+            EditSource::PostPastePane,
+            "pane-target".into(),
+            "pane-before".into(),
+            std::time::Duration::from_millis(100),
+        );
+        let fallback = ObservationIdentity {
+            observer_id: AX_EDIT_OBSERVER_ID.into(),
+            edit_source: EditSource::PostPasteAx,
+            target_fingerprint_hash: "ax-target".into(),
+            field_before_hash: "ax-before".into(),
+        };
+
+        for observed_at in [now, now + std::time::Duration::from_millis(120)] {
+            let decision = tracker.observe(
+                PinnedFieldProjection::Current {
+                    projection: EditProjection::Edited {
+                        after_text: "Codex".into(),
+                    },
+                    field_hash: "ax-after".into(),
+                    identity: Some(fallback.clone()),
+                },
+                observed_at,
+            );
+            if observed_at == now {
+                assert!(matches!(decision, EditWatchDecision::Continue));
+            } else {
+                assert!(matches!(
+                    decision,
+                    EditWatchDecision::Complete(EditObservationOutcome::Edited(ObservedEdit {
+                        observer_id,
+                        edit_source: EditSource::PostPasteAx,
+                        target_fingerprint_hash,
+                        field_before_hash,
+                        ..
+                    })) if observer_id == AX_EDIT_OBSERVER_ID
+                        && target_fingerprint_hash == "ax-target"
+                        && field_before_hash == "ax-before"
+                ));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_running_observer_reports_next_dictation_cancellation() {
         let inserted = "Codex";
@@ -1121,10 +1438,25 @@ mod tests {
             target: FrontmostTarget {
                 name: Some("TextEdit".into()),
                 bundle_id: Some("com.apple.TextEdit".into()),
+                process_id: None,
             },
+            pane_target: None,
         };
+        let anchor = InsertionAnchor::from_post_insert("prefix Codex suffix", inserted).unwrap();
         let prepared = PreparedEditWatch {
-            anchor: InsertionAnchor::from_post_insert("prefix Codex suffix", inserted).unwrap(),
+            surface: PreparedEditSurface::Accessibility(AccessibilityEditSurface {
+                target: request.target.clone(),
+                anchor,
+                expected_fingerprint: "target".into(),
+                identity: ObservationIdentity {
+                    observer_id: AX_EDIT_OBSERVER_ID.into(),
+                    edit_source: EditSource::PostPasteAx,
+                    target_fingerprint_hash: "target".into(),
+                    field_before_hash: "field".into(),
+                },
+            }),
+            observer_id: AX_EDIT_OBSERVER_ID.into(),
+            edit_source: EditSource::PostPasteAx,
             target_fingerprint_hash: "target".into(),
             field_before_hash: "field".into(),
         };
@@ -1146,6 +1478,8 @@ mod tests {
     fn transient_field_mismatch_does_not_terminate_the_observation() {
         let now = std::time::Instant::now();
         let mut tracker = EditWatchTracker::new(
+            AX_EDIT_OBSERVER_ID.into(),
+            EditSource::PostPasteAx,
             "target".into(),
             "field-before".into(),
             std::time::Duration::from_millis(100),
@@ -1162,6 +1496,7 @@ mod tests {
                         after_text: "Codex".into(),
                     },
                     field_hash: "field-after".into(),
+                    identity: None,
                 },
                 now + std::time::Duration::from_millis(10),
             ),
@@ -1174,6 +1509,7 @@ mod tests {
                         after_text: "Codex".into(),
                     },
                     field_hash: "field-after".into(),
+                    identity: None,
                 },
                 now + std::time::Duration::from_millis(150),
             ),
@@ -1188,6 +1524,8 @@ mod tests {
     fn persistent_field_mismatch_has_an_explicit_terminal_reason() {
         let now = std::time::Instant::now();
         let mut tracker = EditWatchTracker::new(
+            AX_EDIT_OBSERVER_ID.into(),
+            EditSource::PostPasteAx,
             "target".into(),
             "field-before".into(),
             std::time::Duration::from_millis(100),
@@ -1219,6 +1557,8 @@ mod tests {
     fn transient_unavailability_preserves_the_original_text_anchor() {
         let now = std::time::Instant::now();
         let mut tracker = EditWatchTracker::new(
+            AX_EDIT_OBSERVER_ID.into(),
+            EditSource::PostPasteAx,
             "target".into(),
             "field-before".into(),
             std::time::Duration::from_millis(100),
@@ -1235,6 +1575,7 @@ mod tests {
                         after_text: "Qdrant".into(),
                     },
                     field_hash: "field-after".into(),
+                    identity: None,
                 },
                 now,
             ),
@@ -1247,6 +1588,7 @@ mod tests {
                         after_text: "Qdrant".into(),
                     },
                     field_hash: "field-after".into(),
+                    identity: None,
                 },
                 now + std::time::Duration::from_millis(120),
             ),
@@ -1261,6 +1603,8 @@ mod tests {
     fn transient_anchor_mismatch_can_recover_to_the_original_field() {
         let now = std::time::Instant::now();
         let mut tracker = EditWatchTracker::new(
+            AX_EDIT_OBSERVER_ID.into(),
+            EditSource::PostPasteAx,
             "target".into(),
             "field-before".into(),
             std::time::Duration::from_millis(100),
@@ -1271,6 +1615,7 @@ mod tests {
                 PinnedFieldProjection::Current {
                     projection: EditProjection::Unrelated,
                     field_hash: "other-field".into(),
+                    identity: None,
                 },
                 now,
             ),
@@ -1283,6 +1628,7 @@ mod tests {
                         after_text: "Railway".into(),
                     },
                     field_hash: "field-after".into(),
+                    identity: None,
                 },
                 now + std::time::Duration::from_millis(10),
             ),
@@ -1295,6 +1641,7 @@ mod tests {
                         after_text: "Railway".into(),
                     },
                     field_hash: "field-after".into(),
+                    identity: None,
                 },
                 now + std::time::Duration::from_millis(120),
             ),
@@ -1309,6 +1656,8 @@ mod tests {
     fn elapsed_time_while_unavailable_does_not_confirm_a_single_edit_sample() {
         let now = std::time::Instant::now();
         let mut tracker = EditWatchTracker::new(
+            AX_EDIT_OBSERVER_ID.into(),
+            EditSource::PostPasteAx,
             "target".into(),
             "field-before".into(),
             std::time::Duration::from_millis(100),
@@ -1321,6 +1670,7 @@ mod tests {
                         after_text: "Codex".into(),
                     },
                     field_hash: "field-after".into(),
+                    identity: None,
                 },
                 now,
             ),
@@ -1337,6 +1687,7 @@ mod tests {
                         after_text: "Codex".into(),
                     },
                     field_hash: "field-after".into(),
+                    identity: None,
                 },
                 now + std::time::Duration::from_secs(1),
             ),
@@ -1349,6 +1700,7 @@ mod tests {
                         after_text: "Codex".into(),
                     },
                     field_hash: "field-after".into(),
+                    identity: None,
                 },
                 now + std::time::Duration::from_millis(1_120),
             ),
@@ -1515,7 +1867,9 @@ mod tests {
             target: FrontmostTarget {
                 name: Some("Ghostty".into()),
                 bundle_id: Some("com.mitchellh.ghostty".into()),
+                process_id: None,
             },
+            pane_target: None,
         };
         let edited_for_script = edited.clone();
         let editor = async move {
@@ -1620,6 +1974,7 @@ mod tests {
         let target = FrontmostTarget {
             name: Some("TextEdit".into()),
             bundle_id: Some("com.apple.TextEdit".into()),
+            process_id: None,
         };
         let field_deadline = std::time::Instant::now() + Duration::from_secs(5);
         let actual_field = loop {
@@ -1643,6 +1998,7 @@ mod tests {
             attempt_id: Uuid::new_v4(),
             inserted_text: inserted,
             target,
+            pane_target: None,
         };
         let prepared = prepare_edit_watch(&request).expect("anchor the live TextEdit field");
         let watch_generation = EDIT_WATCH_GENERATION.load(Ordering::SeqCst);

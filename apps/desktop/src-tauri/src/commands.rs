@@ -245,7 +245,7 @@ pub struct RecordEditInput {
     pub session_id: String,
     pub before_text: String,
     pub after_text: String,
-    /// pre_insert_ui | post_paste_ax | manual
+    /// pre_insert_ui | post_paste_ax | post_paste_pane | manual
     pub source: Option<String>,
 }
 
@@ -257,6 +257,7 @@ pub fn record_edit_event(
     let session_id = Uuid::parse_str(&input.session_id).map_err(|e| e.to_string())?;
     let source = match input.source.as_deref() {
         Some("post_paste_ax") => EditSource::PostPasteAx,
+        Some("post_paste_pane") => EditSource::PostPastePane,
         Some("manual") => EditSource::Manual,
         _ => EditSource::PreInsertUi,
     };

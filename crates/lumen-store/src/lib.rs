@@ -1258,6 +1258,7 @@ fn map_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EditEventRecord> {
 fn parse_edit_source(s: &str) -> EditSource {
     match s {
         "post_paste_ax" => EditSource::PostPasteAx,
+        "post_paste_pane" => EditSource::PostPastePane,
         "manual" => EditSource::Manual,
         _ => EditSource::PreInsertUi,
     }
@@ -1311,6 +1312,7 @@ fn edit_source_str(s: EditSource) -> &'static str {
     match s {
         EditSource::PreInsertUi => "pre_insert_ui",
         EditSource::PostPasteAx => "post_paste_ax",
+        EditSource::PostPastePane => "post_paste_pane",
         EditSource::Manual => "manual",
     }
 }
@@ -1424,6 +1426,27 @@ mod tests {
         let recent = store.list_recent_edit_events(1).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].attribution, attribution);
+    }
+
+    #[test]
+    fn pane_edit_source_round_trips_without_collapsing_to_ax() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("pane-edit.sqlite")).unwrap();
+        let session = SessionRecord::new();
+        store.save_session(&session).unwrap();
+
+        store
+            .add_edit_event(
+                session.id,
+                EditSource::PostPastePane,
+                "Lumen Asr",
+                "Lumen ASR",
+            )
+            .unwrap();
+
+        let edits = store.list_edit_events(session.id).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].source, EditSource::PostPastePane);
     }
 
     #[test]

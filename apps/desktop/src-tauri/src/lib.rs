@@ -14,6 +14,7 @@ mod inject_cmd;
 mod learning;
 mod mod_chord;
 mod onboard;
+mod pane_observer;
 mod permissions_cmd;
 mod pipeline_attempt;
 mod provider_presets;
