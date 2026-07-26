@@ -147,6 +147,9 @@ impl AsrServiceConfig {
             lumen_asr::EngineKind::SenseVoice => self.sensevoice_model_dir.trim(),
             lumen_asr::EngineKind::Qwen => self.qwen_model_dir.trim(),
             lumen_asr::EngineKind::Whisper => self.whisper_model_dir.trim(),
+            // Speech / OpenAiAudio (shared EngineKind superset) have no local
+            // model directory in this app.
+            _ => "",
         };
         PathBuf::from(if engine_specific.is_empty() {
             self.model_dir.trim()
@@ -162,6 +165,8 @@ impl AsrServiceConfig {
             lumen_asr::EngineKind::SenseVoice => self.sensevoice_model_dir = value.clone(),
             lumen_asr::EngineKind::Qwen => self.qwen_model_dir = value.clone(),
             lumen_asr::EngineKind::Whisper => self.whisper_model_dir = value.clone(),
+            // Non-local engines (Speech / OpenAiAudio) carry no model dir.
+            _ => return,
         }
         // Older builds still read this field, so keep it pointed at the active engine.
         self.model_dir = value;

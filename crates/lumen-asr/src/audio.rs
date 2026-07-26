@@ -81,8 +81,7 @@ impl AudioCapture {
         let (tx, rx) = mpsc::channel::<AudioCmd>();
         let rec_flag = Arc::clone(&recording);
         // Shared only as a pointer slot; each Start installs a fresh buffer.
-        let samples_slot: Arc<Mutex<Option<Arc<Mutex<Vec<f32>>>>>> =
-            Arc::new(Mutex::new(None));
+        let samples_slot: Arc<Mutex<Option<Arc<Mutex<Vec<f32>>>>>> = Arc::new(Mutex::new(None));
         let sample_rate = Arc::new(AtomicU32::new(0));
         let epoch = Arc::new(AtomicU64::new(0));
         let rate_flag = Arc::clone(&sample_rate);
@@ -408,42 +407,5 @@ where
         .map_err(|e| AudioError::Stream(e.to_string()))
 }
 
-/// Linear resample mono f32 to `target_hz`.
-pub fn resample_linear(samples: &[f32], from_hz: u32, target_hz: u32) -> Vec<f32> {
-    if samples.is_empty() || from_hz == 0 {
-        return Vec::new();
-    }
-    if from_hz == target_hz {
-        return samples.to_vec();
-    }
-    let ratio = from_hz as f64 / target_hz as f64;
-    let out_len = ((samples.len() as f64) / ratio).floor() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src = i as f64 * ratio;
-        let i0 = src.floor() as usize;
-        let i1 = (i0 + 1).min(samples.len() - 1);
-        let t = (src - i0 as f64) as f32;
-        let v = samples[i0] * (1.0 - t) + samples[i1] * t;
-        out.push(v);
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resample_identity() {
-        let s = vec![0.0, 0.5, 1.0];
-        assert_eq!(resample_linear(&s, 16000, 16000), s);
-    }
-
-    #[test]
-    fn resample_down() {
-        let s = vec![0.0, 1.0, 0.0, -1.0];
-        let out = resample_linear(&s, 32000, 16000);
-        assert!(out.len() >= 2);
-    }
-}
+// Resampling and WAV helpers moved to `lumen_asr_engine::audio`
+// (re-exported from this crate's root).

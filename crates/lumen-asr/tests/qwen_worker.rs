@@ -111,6 +111,7 @@ for line in sys.stdin:
         samples: vec![0.0; 1_600],
         sample_rate: 16_000,
         hotwords: vec![],
+        language_hint: None,
     };
 
     let first = engine.transcribe(request()).await.unwrap();
@@ -200,6 +201,7 @@ for line in sys.stdin:
             samples: vec![0.0; 1_600],
             sample_rate: 16_000,
             hotwords: vec![],
+            language_hint: None,
         })
         .await
         .unwrap();
@@ -302,6 +304,7 @@ for line in sys.stdin:
                 samples: vec![0.0; 1_600],
                 sample_rate: 16_000,
                 hotwords: vec![],
+                language_hint: None,
             },
             Some(QwenShadowRequest {
                 terms: vec![QwenShadowTerm {
@@ -373,6 +376,7 @@ for line in sys.stdin:
             samples: vec![0.0; 1_600],
             sample_rate: 16_000,
             hotwords: vec![],
+            language_hint: None,
         })
         .await
         .unwrap();
@@ -411,6 +415,7 @@ async fn qwen_rejects_empty_audio_without_starting_worker() {
             samples: vec![],
             sample_rate: 16_000,
             hotwords: vec![],
+            language_hint: None,
         })
         .await
         .unwrap_err();
@@ -463,6 +468,7 @@ for line in sys.stdin:
         samples: vec![0.0; 1_600],
         sample_rate: 16_000,
         hotwords: vec![],
+        language_hint: None,
     };
 
     assert!(engine.transcribe(request()).await.is_err());
@@ -516,6 +522,7 @@ for line in sys.stdin:
         samples: vec![0.0; 1_600],
         sample_rate: 16_000,
         hotwords: vec![],
+        language_hint: None,
     };
 
     engine.transcribe(request()).await.unwrap();
@@ -573,6 +580,7 @@ for line in sys.stdin:
         samples: vec![0.0; 1_600],
         sample_rate: 16_000,
         hotwords: vec![],
+        language_hint: None,
     };
 
     let in_flight_engine = engine.clone();
@@ -638,6 +646,7 @@ for line in sys.stdin:
         samples: vec![0.0; 1_600],
         sample_rate: 16_000,
         hotwords: vec![],
+        language_hint: None,
     };
 
     let first_engine = engine.clone();
@@ -711,6 +720,7 @@ for line in sys.stdin:
         samples: vec![0.0; 1_600],
         sample_rate: 16_000,
         hotwords: vec![],
+        language_hint: None,
     };
 
     assert!(engine.transcribe(request()).await.is_err());
@@ -771,6 +781,7 @@ for line in sys.stdin:
         samples: vec![0.0; 1_600],
         sample_rate: 16_000,
         hotwords: vec![],
+        language_hint: None,
     };
 
     let error = engine.transcribe(request()).await.unwrap_err();
@@ -832,6 +843,7 @@ for line in sys.stdin:
             samples: vec![0.0; 1_600],
             sample_rate: 16_000,
             hotwords: vec![],
+            language_hint: None,
         }))
         .unwrap();
     drop(runtime);

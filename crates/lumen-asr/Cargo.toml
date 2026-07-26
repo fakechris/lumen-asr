@@ -3,28 +3,24 @@ name = "lumen-asr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ASR engine ports (SenseVoice, Qwen3-ASR, Whisper) + mic capture"
+description = "Mic capture + product glue over the shared lumen-suite ASR crates"
 
 [dependencies]
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-lumen-core = { workspace = true }
+# Shared cluster crates (engines + model management). `cloud` enables the
+# OpenAI-compatible HTTP engine that this product always offered.
+lumen-asr-engine = { workspace = true, features = ["cloud"] }
+lumen-models = { workspace = true }
+cpal = { workspace = true }
+parking_lot = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-parking_lot = { workspace = true }
-cpal = { workspace = true }
-fs2 = { workspace = true }
-tokio = { workspace = true }
-reqwest = { workspace = true }
-serde_json = { workspace = true }
-tempfile = "3"
-# Offline SenseVoice / Whisper via official bindings (downloads prebuilt static lib on first build)
-sherpa-onnx = { version = "1.13.4", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 
 [features]
 default = ["sherpa"]
-sherpa = ["dep:sherpa-onnx"]
+# Offline SenseVoice / Whisper via sherpa-onnx (downloads a prebuilt static
+# lib on first build). Forwarded to the shared engine crate.
+sherpa = ["lumen-asr-engine/sherpa"]

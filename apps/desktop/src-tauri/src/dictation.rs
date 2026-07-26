@@ -9,9 +9,8 @@ use crate::pipeline_attempt::{
 use crate::session_debug;
 use crate::AppState;
 use lumen_asr::{
-    prepare_for_asr, qwen_ready, sensevoice_ready, whisper_ready, AsrEngine, AsrRequest, AsrResult,
-    AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig,
-    QwenShadowRequest, QwenShadowTerm,
+    prepare_for_asr, probe_status, AsrEngine, AsrRequest, AsrResult, AudioDeviceInfo, EngineKind,
+    EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig, QwenShadowRequest, QwenShadowTerm,
 };
 use lumen_context::TargetHint;
 use lumen_core::{DictEntryKind, FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
@@ -442,9 +441,10 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         .unwrap_or_default();
     let provider = if asr_cfg.provider.is_empty() {
         match engine {
-            EngineKind::SenseVoice => "local_sensevoice".into(),
             EngineKind::Qwen => "local_qwen".into(),
             EngineKind::Whisper => "local_whisper".into(),
+            // The runtime engine slot only ever holds a local engine.
+            _ => "local_sensevoice".into(),
         }
     } else {
         canonical_asr_provider(&asr_cfg.provider)
@@ -452,38 +452,19 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
     let sv = state
         .sensevoice
         .lock()
-        .map(|engine| {
-            let path = engine.model_dir();
-            EngineStatus {
-                kind: EngineKind::SenseVoice,
-                ready: sensevoice_ready(path),
-                model_dir: path.display().to_string(),
-            }
-        })
+        .map(|engine| probe_status(EngineKind::SenseVoice, Some(&engine.model_dir())))
         .unwrap_or_else(|_| lumen_asr::sensevoice_status());
     let wh = state
         .whisper
         .lock()
-        .map(|engine| {
-            let path = engine.model_dir();
-            EngineStatus {
-                kind: EngineKind::Whisper,
-                ready: whisper_ready(path),
-                model_dir: path.display().to_string(),
-            }
-        })
+        .map(|engine| probe_status(EngineKind::Whisper, Some(&engine.model_dir())))
         .unwrap_or_else(|_| lumen_asr::whisper_status());
     let (qwen, qwen_runtime_path) = state
         .qwen
         .lock()
         .map(|engine| {
-            let model_dir = engine.model_dir();
             (
-                EngineStatus {
-                    kind: EngineKind::Qwen,
-                    ready: qwen_ready(model_dir),
-                    model_dir: model_dir.display().to_string(),
-                },
+                probe_status(EngineKind::Qwen, Some(engine.model_dir())),
                 engine.python_executable().display().to_string(),
             )
         })
@@ -841,7 +822,7 @@ pub async fn stop_and_transcribe_inner(
     }
 
     let preprocess_started = Instant::now();
-    let samples_16k = prepare_for_asr(&capture);
+    let samples_16k = prepare_for_asr(&capture.samples, capture.sample_rate);
     attempt.pipeline_metrics.preprocess_ms = elapsed_ms(preprocess_started);
     let (rms, peak) = session_debug::audio_stats(&samples_16k);
     if let Err(error) = ensure_audible_capture(peak) {
@@ -1463,14 +1444,13 @@ async fn run_asr(
             } else {
                 Some(asr_cfg.language.clone())
             },
+            // Keep the shared engine's defaults for the new knobs
+            // (8 MiB request cap, "openai_audio" transcript label).
+            ..OpenAiAudioConfig::default()
         })
         .map_err(|e| e.to_string())?;
         return eng
-            .transcribe(AsrRequest {
-                samples: samples_16k,
-                sample_rate: 16_000,
-                hotwords: vec![],
-            })
+            .transcribe(AsrRequest::new(samples_16k, 16_000))
             .await
             .map_err(|e| e.to_string());
     }
@@ -1483,11 +1463,7 @@ async fn run_asr(
             .map_err(|_| "asr lock poisoned".to_string())?
             .clone();
         return eng
-            .transcribe(AsrRequest {
-                samples: samples_16k,
-                sample_rate: 16_000,
-                hotwords: vec![],
-            })
+            .transcribe(AsrRequest::new(samples_16k, 16_000))
             .await
             .map_err(|e| e.to_string());
     }
@@ -1542,14 +1518,7 @@ async fn run_asr(
             }
         }
         return eng
-            .transcribe_with_shadow(
-                AsrRequest {
-                    samples: samples_16k,
-                    sample_rate: 16_000,
-                    hotwords: vec![],
-                },
-                Some(shadow),
-            )
+            .transcribe_with_shadow(AsrRequest::new(samples_16k, 16_000), Some(shadow))
             .await
             .map_err(|e| e.to_string());
     }
@@ -1559,13 +1528,9 @@ async fn run_asr(
         .lock()
         .map_err(|_| "asr lock poisoned".to_string())?
         .clone();
-    eng.transcribe(AsrRequest {
-        samples: samples_16k,
-        sample_rate: 16_000,
-        hotwords: vec![],
-    })
-    .await
-    .map_err(|e| e.to_string())
+    eng.transcribe(AsrRequest::new(samples_16k, 16_000))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn qwen_shadow_request_from_store(state: &AppState, enabled: bool) -> (QwenShadowRequest, bool) {

@@ -6,6 +6,9 @@ license.workspace = true
 description = "Session state machine and orchestration types for Lumen ASR"
 
 [dependencies]
+# Types-only re-export source for AsrEngineId + ASR runtime diagnostics
+# (no sherpa/cloud features; the engine implementations are not pulled in).
+lumen-asr-engine = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

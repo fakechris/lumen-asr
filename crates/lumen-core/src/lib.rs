@@ -7,8 +7,14 @@ mod types;
 
 pub use session::{Session, SessionCommand, SessionEvent, SessionState};
 pub use types::{
-    AsrEngineId, AsrRuntimeDiagnostics, AsrTokenEvidence, CorrectorEngineId, DictEntryKind,
-    DictEntrySource, EditSource, FocusInfo, InsertStrategy, QwenDecodeMode, QwenRuntimeMetrics,
-    QwenShadowCandidate, QwenShadowDiagnostics, QwenShadowScore, QwenShadowSpan, QwenShadowStatus,
+    CorrectorEngineId, DictEntryKind, DictEntrySource, EditSource, FocusInfo, InsertStrategy,
     SessionRecord, SessionStatus,
+};
+
+// ASR engine identity and runtime diagnostics moved to the shared
+// `lumen-asr-engine` crate (lumen-suite). Re-exported here so existing
+// `lumen_core::…` imports and the persisted serde shapes stay unchanged.
+pub use lumen_asr_engine::{
+    AsrEngineId, AsrRuntimeDiagnostics, AsrTokenEvidence, QwenDecodeMode, QwenRuntimeMetrics,
+    QwenShadowCandidate, QwenShadowDiagnostics, QwenShadowScore, QwenShadowSpan, QwenShadowStatus,
 };
