@@ -48,12 +48,11 @@ jobs:
         run: |
           while IFS= read -r -d '' file; do
             rustfmt --edition 2021 --config skip_children=true --check "$file"
-          done < <(git diff -z --name-only "$BASE_SHA" HEAD -- '*.rs')
+          done < <(git diff -z --name-only --diff-filter=d "$BASE_SHA" HEAD -- '*.rs')
 
-      - name: Check Qwen worker
-        run: |
-          python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("crates/lumen-asr/src/qwen_worker.py").read_text())'
-          python3 crates/lumen-asr/tests/test_qwen_worker.py
+      # The Qwen MLX worker script and its Python tests moved to the shared
+      # lumen-asr-engine crate in fakechris/lumen-suite (validated by that
+      # repository's CI).
 
       - name: Install frontend dependencies
         run: npm ci

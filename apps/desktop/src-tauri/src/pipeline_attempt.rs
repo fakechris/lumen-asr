@@ -71,7 +71,7 @@ fn active_asr_model_identity(
         EngineKind::SenseVoice => state
             .sensevoice
             .lock()
-            .map(|engine| model_identity_from_path(engine.model_dir()))
+            .map(|engine| model_identity_from_path(&engine.model_dir()))
             .unwrap_or_default(),
         EngineKind::Qwen => state
             .qwen
@@ -81,8 +81,10 @@ fn active_asr_model_identity(
         EngineKind::Whisper => state
             .whisper
             .lock()
-            .map(|engine| model_identity_from_path(engine.model_dir()))
+            .map(|engine| model_identity_from_path(&engine.model_dir()))
             .unwrap_or_default(),
+        // Speech / OpenAiAudio never occupy the local runtime engine slot.
+        _ => (None, None),
     }
 }
 
@@ -611,22 +613,19 @@ mod tests {
     fn apply_asr_result_records_identity_enhancement_and_runtime_evidence() {
         let mut attempt = DictationAttemptRecord::new(Uuid::new_v4());
         attempt.pipeline_metrics.audio_duration_ms = 2_000;
-        let result = AsrResult {
-            text: "  原始听写  ".into(),
-            engine: AsrEngineId::Qwen3Asr,
-            language: Some("zh".into()),
-            diagnostics: AsrRuntimeDiagnostics {
-                worker_reused: Some(true),
-                model: Some("Qwen3-ASR-0.6B-8bit".into()),
-                model_revision: Some("revision-1".into()),
-                qwen_shadow: Some(QwenShadowDiagnostics {
-                    status: QwenShadowStatus::Completed,
-                    shadow_total_ms: Some(245.0),
-                    user_output_changed: false,
-                    ..QwenShadowDiagnostics::default()
-                }),
-                ..AsrRuntimeDiagnostics::default()
-            },
+        let mut result = AsrResult::new("  原始听写  ", AsrEngineId::Qwen3Asr);
+        result.language = Some("zh".into());
+        result.diagnostics = AsrRuntimeDiagnostics {
+            worker_reused: Some(true),
+            model: Some("Qwen3-ASR-0.6B-8bit".into()),
+            model_revision: Some("revision-1".into()),
+            qwen_shadow: Some(QwenShadowDiagnostics {
+                status: QwenShadowStatus::Completed,
+                shadow_total_ms: Some(245.0),
+                user_output_changed: false,
+                ..QwenShadowDiagnostics::default()
+            }),
+            ..AsrRuntimeDiagnostics::default()
         };
 
         let (raw, enhanced) = apply_asr_result(&mut attempt, &result, Instant::now());
@@ -663,17 +662,14 @@ mod tests {
     #[test]
     fn disabled_qwen_shadow_does_not_claim_an_enhancement_stage() {
         let mut attempt = DictationAttemptRecord::new(Uuid::new_v4());
-        let result = AsrResult {
-            text: "原始听写".into(),
-            engine: AsrEngineId::Qwen3Asr,
-            language: Some("zh".into()),
-            diagnostics: AsrRuntimeDiagnostics {
-                qwen_shadow: Some(QwenShadowDiagnostics {
-                    status: QwenShadowStatus::Disabled,
-                    ..QwenShadowDiagnostics::default()
-                }),
-                ..AsrRuntimeDiagnostics::default()
-            },
+        let mut result = AsrResult::new("原始听写", AsrEngineId::Qwen3Asr);
+        result.language = Some("zh".into());
+        result.diagnostics = AsrRuntimeDiagnostics {
+            qwen_shadow: Some(QwenShadowDiagnostics {
+                status: QwenShadowStatus::Disabled,
+                ..QwenShadowDiagnostics::default()
+            }),
+            ..AsrRuntimeDiagnostics::default()
         };
 
         apply_asr_result(&mut attempt, &result, Instant::now());
@@ -688,18 +684,15 @@ mod tests {
     #[test]
     fn failed_qwen_shadow_records_an_enhancement_fallback() {
         let mut attempt = DictationAttemptRecord::new(Uuid::new_v4());
-        let result = AsrResult {
-            text: "原始听写".into(),
-            engine: AsrEngineId::Qwen3Asr,
-            language: Some("zh".into()),
-            diagnostics: AsrRuntimeDiagnostics {
-                qwen_shadow: Some(QwenShadowDiagnostics {
-                    status: QwenShadowStatus::Failed,
-                    fallback_reason: Some("shadow_runtime_error".into()),
-                    ..QwenShadowDiagnostics::default()
-                }),
-                ..AsrRuntimeDiagnostics::default()
-            },
+        let mut result = AsrResult::new("原始听写", AsrEngineId::Qwen3Asr);
+        result.language = Some("zh".into());
+        result.diagnostics = AsrRuntimeDiagnostics {
+            qwen_shadow: Some(QwenShadowDiagnostics {
+                status: QwenShadowStatus::Failed,
+                fallback_reason: Some("shadow_runtime_error".into()),
+                ..QwenShadowDiagnostics::default()
+            }),
+            ..AsrRuntimeDiagnostics::default()
         };
 
         apply_asr_result(&mut attempt, &result, Instant::now());

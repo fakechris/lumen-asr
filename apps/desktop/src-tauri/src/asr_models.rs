@@ -2,21 +2,14 @@
 
 use crate::AppState;
 use lumen_asr::{
-    default_qwen_dir, default_sensevoice_dir, default_whisper_dir, lumen_models_dir, qwen_ready,
-    scan_model_candidates, sensevoice_ready, whisper_ready, EngineKind, ModelInstallLock,
-    SenseVoiceSherpaAsr, WhisperAsr,
+    default_qwen_dir, default_sensevoice_dir, default_whisper_dir, download_sensevoice_package,
+    lumen_models_dir, qwen_ready, scan_model_candidates, sensevoice_ready, whisper_ready,
+    EngineKind, SenseVoiceSherpaAsr, WhisperAsr, SENSEVOICE_ARCHIVE_URL,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
-
-const SENSEVOICE_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2";
-const SENSEVOICE_ARCHIVE_NAME: &str =
-    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2";
 
 static DOWNLOAD_CANCEL: AtomicBool = AtomicBool::new(false);
 static DOWNLOAD_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -238,9 +231,10 @@ fn persist_model_selection(
         .map_err(|_| "config lock poisoned".to_string())?;
     config.asr.set_model_dir_for(engine, path);
     config.asr.provider = match engine {
-        EngineKind::SenseVoice => "local_sensevoice",
         EngineKind::Qwen => "local_qwen",
         EngineKind::Whisper => "local_whisper",
+        // Only local engines reach this persistence path.
+        _ => "local_sensevoice",
     }
     .into();
     config.save()
@@ -307,172 +301,12 @@ fn emit_progress(app: &AppHandle, phase: &str, message: &str, bytes: u64, total:
 }
 
 fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
-    let dest_root = lumen_models_dir();
-    std::fs::create_dir_all(&dest_root).map_err(|e| e.to_string())?;
-    let final_dir = dest_root.join("sensevoice");
-
-    if sensevoice_ready(&final_dir) {
-        emit_progress(app, "done", "SenseVoice already installed", 0, None);
-        return Ok(final_dir);
-    }
-
-    let _install_lock = acquire_install_lock(app, &dest_root)?;
-    if sensevoice_ready(&final_dir) {
-        emit_progress(
-            app,
-            "done",
-            "SenseVoice installed by another Lumen app",
-            0,
-            None,
-        );
-        return Ok(final_dir);
-    }
-
-    if DOWNLOAD_CANCEL.load(Ordering::SeqCst) {
-        return Err("download cancelled".into());
-    }
-
-    let process_id = std::process::id();
-    let archive_path = dest_root.join(format!(".{SENSEVOICE_ARCHIVE_NAME}.{process_id}.part"));
-    let extract_tmp = dest_root.join(format!(".sensevoice-extract-{process_id}"));
-    let _scratch = DownloadScratch::new(archive_path.clone(), extract_tmp.clone());
-
-    emit_progress(app, "downloading", "Downloading SenseVoice model…", 0, None);
-
-    // Prefer curl for progress-friendly large downloads on macOS.
-    let mut child = Command::new("curl")
-        .args([
-            "-fL",
-            "--progress-bar",
-            "-o",
-            archive_path.to_str().ok_or("bad archive path")?,
-            SENSEVOICE_ARCHIVE_URL,
-        ])
-        .spawn()
-        .map_err(|e| format!("curl failed to start: {e}"))?;
-    let status = loop {
-        if DOWNLOAD_CANCEL.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("download cancelled".into());
-        }
-        match child.try_wait().map_err(|error| error.to_string())? {
-            Some(status) => break status,
-            None => thread::sleep(Duration::from_millis(100)),
-        }
-    };
-    if !status.success() {
-        return Err(format!(
-            "download failed (curl exit {:?}). Check network or place model under {}",
-            status.code(),
-            final_dir.display()
-        ));
-    }
-
-    let bytes = std::fs::metadata(&archive_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    emit_progress(app, "extracting", "Extracting archive…", bytes, Some(bytes));
-
-    std::fs::create_dir_all(&extract_tmp).map_err(|e| e.to_string())?;
-
-    let tar_status = Command::new("tar")
-        .args([
-            "-xjf",
-            archive_path.to_str().ok_or("bad archive path")?,
-            "-C",
-            extract_tmp.to_str().ok_or("bad extract path")?,
-        ])
-        .status()
-        .map_err(|e| format!("tar failed: {e}"))?;
-    if !tar_status.success() {
-        return Err("failed to extract model archive".into());
-    }
-
-    // Find directory containing model + tokens
-    let found = find_sensevoice_dir(&extract_tmp).ok_or_else(|| {
-        "extracted archive but could not find model.int8.onnx + tokens.txt".to_string()
-    })?;
-
-    if final_dir.exists() {
-        let _ = std::fs::remove_dir_all(&final_dir);
-    }
-    std::fs::rename(&found, &final_dir)
-        .map_err(|error| format!("publish model atomically: {error}"))?;
-
-    if !sensevoice_ready(&final_dir) {
-        return Err("model installed but validation failed".into());
-    }
-
-    emit_progress(app, "done", "SenseVoice ready", bytes, Some(bytes));
-    tracing::info!(dir = %final_dir.display(), "SenseVoice model installed");
-    Ok(final_dir)
-}
-
-fn acquire_install_lock(app: &AppHandle, models_root: &Path) -> Result<ModelInstallLock, String> {
-    let mut announced = false;
-    loop {
-        if DOWNLOAD_CANCEL.load(Ordering::SeqCst) {
-            return Err("download cancelled".into());
-        }
-        match ModelInstallLock::try_acquire(models_root).map_err(|error| error.to_string())? {
-            Some(lock) => return Ok(lock),
-            None => {
-                if !announced {
-                    emit_progress(
-                        app,
-                        "waiting",
-                        "Another Lumen app is installing SenseVoice…",
-                        0,
-                        None,
-                    );
-                    announced = true;
-                }
-                thread::sleep(Duration::from_millis(250));
-            }
-        }
-    }
-}
-
-struct DownloadScratch {
-    archive: PathBuf,
-    extract_dir: PathBuf,
-}
-
-impl DownloadScratch {
-    fn new(archive: PathBuf, extract_dir: PathBuf) -> Self {
-        let _ = std::fs::remove_file(&archive);
-        let _ = std::fs::remove_dir_all(&extract_dir);
-        Self {
-            archive,
-            extract_dir,
-        }
-    }
-}
-
-impl Drop for DownloadScratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.archive);
-        let _ = std::fs::remove_dir_all(&self.extract_dir);
-    }
-}
-
-fn find_sensevoice_dir(root: &Path) -> Option<PathBuf> {
-    if sensevoice_ready(root) {
-        return Some(root.to_path_buf());
-    }
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        if sensevoice_ready(&dir) {
-            return Some(dir);
-        }
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                if e.path().is_dir() {
-                    stack.push(e.path());
-                }
-            }
-        }
-    }
-    None
+    // The shared installer handles the cross-process install lock, cancel
+    // checks, curl download, extraction, and atomic publish.
+    let installed = download_sensevoice_package(&lumen_models_dir(), &DOWNLOAD_CANCEL, |p| {
+        emit_progress(app, &p.phase, &p.message, p.bytes, p.total)
+    })
+    .map_err(|error| error.to_string())?;
+    tracing::info!(dir = %installed.display(), "SenseVoice model installed");
+    Ok(installed)
 }
