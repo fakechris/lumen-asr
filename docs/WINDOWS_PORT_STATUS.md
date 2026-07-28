@@ -37,6 +37,15 @@ At this point, no intentional macOS behavior break has been introduced.
   packaged apps no longer require system `curl` or `tar`.
 - Windows CI definitions now exercise the shared crates, frontend, and desktop
   backend on GitHub-hosted `windows-latest` runners.
+- Windows CI creates an unsigned MSIX for Microsoft Store ingestion. The
+  manifest declares only `runFullTrust` (required for the Tauri Win32 process)
+  and `microphone`; Windows context capture and automatic insertion remain
+  disabled.
+- Store submission builds read the Partner Center identity from the
+  `WINDOWS_STORE_IDENTITY_NAME`, `WINDOWS_STORE_PUBLISHER`, and
+  `WINDOWS_STORE_PUBLISHER_DISPLAY_NAME` repository variables. Pull requests
+  use a development identity so MakeAppx validation does not depend on private
+  Partner Center configuration.
 
 ## Known Windows limitations
 
@@ -48,6 +57,9 @@ At this point, no intentional macOS behavior break has been introduced.
 - Context capture is not yet implemented with UI Automation, Windows Graphics
   Capture, DPAPI, or Named Pipes.
 - The installer is unsigned, so SmartScreen warnings are expected.
+- The CI-produced MSIX is also unsigned. Microsoft signs it after Store
+  certification; direct sideload distribution still requires a trusted
+  signature.
 - Qwen local inference uses the Apple MLX worker and is intentionally not
   offered as a Windows local engine. On Windows it falls back to SenseVoice;
   a future CUDA/DirectML/ONNX backend can replace this restriction.

@@ -6,6 +6,12 @@ on:
     branches:
       - main
       - port/windows
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: Four-part Microsoft Store package version
+        required: false
+        default: "0.1.0.0"
 
 permissions:
   contents: read
@@ -60,3 +66,53 @@ jobs:
       - name: Build Windows NSIS installer
         run: npm run tauri -- build --bundles nsis
         working-directory: apps/desktop
+
+      - name: Build Microsoft Store MSIX
+        shell: pwsh
+        env:
+          STORE_IDENTITY_NAME: ${{ vars.WINDOWS_STORE_IDENTITY_NAME }}
+          STORE_PUBLISHER: ${{ vars.WINDOWS_STORE_PUBLISHER }}
+          STORE_PUBLISHER_DISPLAY_NAME: ${{ vars.WINDOWS_STORE_PUBLISHER_DISPLAY_NAME }}
+          STORE_PACKAGE_VERSION: ${{ inputs.package_version }}
+        run: |
+          $storeValues = @(
+            $env:STORE_IDENTITY_NAME,
+            $env:STORE_PUBLISHER,
+            $env:STORE_PUBLISHER_DISPLAY_NAME
+          )
+          $hasStoreIdentity = ($storeValues | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+          }).Count -eq $storeValues.Count
+
+          if (-not $hasStoreIdentity -and '${{ github.event_name }}' -eq 'workflow_dispatch') {
+            throw "Set WINDOWS_STORE_IDENTITY_NAME, WINDOWS_STORE_PUBLISHER, and WINDOWS_STORE_PUBLISHER_DISPLAY_NAME as repository variables before building a Store submission package."
+          }
+
+          if (-not $hasStoreIdentity) {
+            $env:STORE_IDENTITY_NAME = 'LumenASR.Dev'
+            $env:STORE_PUBLISHER = 'CN=Lumen ASR Development, OID.2.25.269339209217466799157659632861705434293=1'
+            $env:STORE_PUBLISHER_DISPLAY_NAME = 'Lumen ASR Development'
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:STORE_PACKAGE_VERSION)) {
+            $tauri = Get-Content apps/desktop/src-tauri/tauri.conf.json | ConvertFrom-Json
+            $env:STORE_PACKAGE_VERSION = "$($tauri.version).0"
+          }
+
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          ./scripts/windows/build-msix.ps1 `
+            -ExecutablePath target/release/lumen-asr-desktop.exe `
+            -OutputPath "release-assets/Lumen-ASR-$($env:STORE_PACKAGE_VERSION)-windows-x64.msix" `
+            -Version $env:STORE_PACKAGE_VERSION `
+            -IdentityName $env:STORE_IDENTITY_NAME `
+            -Publisher $env:STORE_PUBLISHER `
+            -PublisherDisplayName $env:STORE_PUBLISHER_DISPLAY_NAME
+
+      - name: Upload Microsoft Store package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-store-msix-${{ github.sha }}
+          path: release-assets/*.msix
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
