@@ -211,7 +211,9 @@ More detail: [PRODUCT.md](./PRODUCT.md) · [ARCHITECTURE.md](./ARCHITECTURE.md)
 
 ### License
 
-Private / TBD.
+Lumen ASR is licensed under the [GNU General Public License v3.0
+only](./LICENSE). Release integrity and signing requirements are documented in
+the [Code signing policy](./CODE_SIGNING_POLICY.md).
 
 ---
 
@@ -405,4 +407,6 @@ docs/             设计与平台说明
 
 ### 许可证
 
-Private / TBD.
+Lumen ASR 使用 [GNU General Public License v3.0
+only](./LICENSE) 授权。发布完整性与签名要求见
+[代码签名政策](./CODE_SIGNING_POLICY.md)。
