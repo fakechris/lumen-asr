@@ -1,11 +1,9 @@
 fn main() {
-    #[cfg(target_os = "windows")]
     generate_windows_icon();
 
     tauri_build::build()
 }
 
-#[cfg(target_os = "windows")]
 fn generate_windows_icon() {
     use std::fs::File;
     use std::path::Path;
