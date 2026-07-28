@@ -133,18 +133,30 @@ pub async fn transcribe_meeting(
         duration,
     );
 
-    store
-        .create_meeting(&meeting)
-        .map_err(MeetingError::Store)?;
-    for speaker in &assembled.speakers {
-        store.upsert_speaker(speaker).map_err(MeetingError::Store)?;
+    // Everything above is assembled in memory before any write, so a diarize
+    // or ASR failure persists nothing. The remaining writes (create -> speakers
+    // -> segments -> Ready) are grouped so that if any one fails, the partial
+    // meeting is removed rather than left dangling in `Processing`.
+    let persist = (|| -> Result<(), MeetingError> {
+        store
+            .create_meeting(&meeting)
+            .map_err(MeetingError::Store)?;
+        for speaker in &assembled.speakers {
+            store.upsert_speaker(speaker).map_err(MeetingError::Store)?;
+        }
+        store
+            .add_segments(&assembled.segments)
+            .map_err(MeetingError::Store)?;
+        store
+            .update_meeting_status(meeting_id, MeetingStatus::Ready)
+            .map_err(MeetingError::Store)?;
+        Ok(())
+    })();
+    if let Err(error) = persist {
+        // Best-effort rollback; delete cascades to speakers/segments (schema v6).
+        let _ = store.delete_meeting(meeting_id);
+        return Err(error);
     }
-    store
-        .add_segments(&assembled.segments)
-        .map_err(MeetingError::Store)?;
-    store
-        .update_meeting_status(meeting_id, MeetingStatus::Ready)
-        .map_err(MeetingError::Store)?;
 
     Ok(meeting_id)
 }
