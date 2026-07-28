@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Speak. Polish. Paste.</strong><br />
-  Local-first voice dictation for macOS — hold a hotkey, talk, get clean text in the app you’re already using.
+  Local-first voice dictation for macOS and Windows — hold a hotkey, talk, get clean text for the app you’re already using.
 </p>
 
 <p align="center">
@@ -56,17 +56,27 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 
 ### Requirements
 
-- macOS 12+ (Apple Silicon recommended)  
-- **Microphone** — to record  
-- **Accessibility** — to paste into other apps (without it, Lumen copies to the clipboard)  
+- macOS 12+ (Apple Silicon recommended), or Windows 10/11 x64
+- **Microphone** — to record
+- **Accessibility on macOS** — to paste into other apps (without it, Lumen
+  copies to the clipboard)
+- Windows currently uses copy-only mode and does not capture application
+  context
 - Optional: [Ollama](https://ollama.com) or any OpenAI-compatible API key for AI cleanup  
 
 ### Install & run (from source)
 
 Prebuilt ad-hoc signed DMGs for Apple Silicon and Intel are published on
-[GitHub Releases](https://github.com/fakechris/lumen-asr/releases). macOS requires a one-time manual
-approval under **System Settings → Privacy & Security**. See
+[GitHub Releases](https://github.com/fakechris/lumen-asr/releases). Tagged
+releases also publish a Windows x64 NSIS installer. macOS requires a one-time
+manual approval under **System Settings → Privacy & Security**. See
 [docs/MACOS_GITHUB_RELEASE.md](./docs/MACOS_GITHUB_RELEASE.md) for verification and installation.
+
+The project is applying to SignPath Foundation for trusted direct Windows
+downloads. **Free code signing provided by
+[SignPath.io](https://signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/).** Until acceptance and workflow
+integration, Windows assets are clearly identified as unsigned.
 
 To build locally instead:
 
@@ -213,7 +223,9 @@ More detail: [PRODUCT.md](./PRODUCT.md) · [ARCHITECTURE.md](./ARCHITECTURE.md)
 
 Lumen ASR is licensed under the [GNU General Public License v3.0
 only](./LICENSE). Release integrity and signing requirements are documented in
-the [Code signing policy](./CODE_SIGNING_POLICY.md).
+the [Code signing policy](./CODE_SIGNING_POLICY.md). See the
+[Privacy policy](./PRIVACY.md) for local storage and optional network
+processing.
 
 ---
 
@@ -256,17 +268,24 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 
 ### 环境要求
 
-- macOS 12+（建议 Apple Silicon）  
-- **麦克风**：录音  
-- **辅助功能**：向其他 App 粘贴（未授权时仅复制到剪贴板）  
+- macOS 12+（建议 Apple Silicon），或 Windows 10/11 x64
+- **麦克风**：录音
+- **macOS 辅助功能**：向其他 App 粘贴（未授权时仅复制到剪贴板）
+- Windows 当前采用仅复制模式，不采集应用上下文
 - 可选：Ollama 或任意 OpenAI 兼容 API，用于 AI 整理  
 
 ### 安装与启动（源码）
 
 Apple Silicon 和 Intel 的 ad-hoc 签名 DMG 会发布在
-[GitHub Releases](https://github.com/fakechris/lumen-asr/releases)。首次启动需要前往
+[GitHub Releases](https://github.com/fakechris/lumen-asr/releases)，tag
+发布也会包含 Windows x64 NSIS 安装程序。macOS 首次启动需要前往
 **系统设置 → 隐私与安全性**手工放行。校验与安装方法见
 [docs/MACOS_GITHUB_RELEASE.md](./docs/MACOS_GITHUB_RELEASE.md)。
+
+项目正在申请 SignPath Foundation 的 Windows 可信签名。免费签名服务由
+[SignPath.io](https://signpath.io/) 提供，证书由
+[SignPath Foundation](https://signpath.org/) 提供。获批并接入流水线前，
+Windows 下载会明确标记为未签名。
 
 如需从源码构建：
 
@@ -409,4 +428,5 @@ docs/             设计与平台说明
 
 Lumen ASR 使用 [GNU General Public License v3.0
 only](./LICENSE) 授权。发布完整性与签名要求见
-[代码签名政策](./CODE_SIGNING_POLICY.md)。
+[代码签名政策](./CODE_SIGNING_POLICY.md)，本地存储与可选网络处理见
+[隐私政策](./PRIVACY.md)。

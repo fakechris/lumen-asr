@@ -18,8 +18,13 @@ and, where available, code signed.
 
 - Microsoft Store MSIX packages are submitted to Microsoft for certification
   and Store signing.
-- Directly distributed Windows artifacts may be signed through SignPath once
-  the project is accepted into the SignPath Foundation open-source program.
+- The project is applying to the SignPath Foundation open-source program for
+  directly distributed Windows artifacts.
+- **Free code signing provided by
+  [SignPath.io](https://signpath.io/), certificate by
+  [SignPath Foundation](https://signpath.org/).** This statement applies once
+  the application is accepted. Until then, release notes identify Windows
+  artifacts as unsigned.
 - macOS artifacts use an Apple-issued Developer ID certificate and Apple's
   notarization service when signed direct-distribution builds are published.
 - macOS prereleases may use ad-hoc signatures for bundle integrity. An ad-hoc
@@ -30,12 +35,13 @@ and, where available, code signed.
 
 ## Project roles and approval
 
-- **Authors** are repository maintainers with permission to modify source code
-  and release workflows.
-- **Reviewers** are maintainers who review contributions from people without
-  direct commit access before those changes are merged.
-- **Approvers** are maintainers authorized to approve release signing
-  requests.
+- **Author:** [Chris Song (`@fakechris`)](https://github.com/fakechris), the
+  repository owner and maintainer.
+- **Reviewer:** [Chris Song (`@fakechris`)](https://github.com/fakechris).
+  Contributions from people without direct commit access are reviewed before
+  merge.
+- **Approver:** [Chris Song (`@fakechris`)](https://github.com/fakechris), who
+  manually approves each release-signing request.
 - Maintainers must use multi-factor authentication for GitHub and signing
   provider access.
 - Signing requests are limited to official tagged releases produced by the
@@ -50,6 +56,10 @@ and, where available, code signed.
   security module, or protected CI secret store.
 - A release must not be signed when its source provenance, workflow result, or
   artifact integrity cannot be verified.
+
+The project's handling of microphone audio, transcripts, context, local
+storage, and optional network providers is documented in the
+[privacy policy](./PRIVACY.md).
 
 Security issues can be reported privately through the repository's
 [GitHub security advisory form](https://github.com/fakechris/lumen-asr/security/advisories/new).
