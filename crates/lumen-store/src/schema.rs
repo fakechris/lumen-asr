@@ -3,6 +3,68 @@ use rusqlite::Connection;
 
 pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"attempt_id":null,"target_app_name":null,"target_bundle_id":null,"observer":null,"target_fingerprint_hash":null,"field_before_hash":null,"field_after_hash":null,"status":"unattributed"}"#;
 
+/// Current storage schema version. Bumped to 6 for the meeting data model
+/// (`meetings`, `speakers`, `transcript_segments`, `meeting_summaries`).
+pub(crate) const SCHEMA_VERSION: i64 = 6;
+
+/// Additive v6 migration: the meeting-mode tables. These sit alongside the
+/// dictation tables and never touch them. `speakers` is created before
+/// `transcript_segments` so the segment→speaker foreign key resolves cleanly.
+const MEETING_SCHEMA_V6: &str = r#"
+        CREATE TABLE IF NOT EXISTS meetings (
+          id TEXT PRIMARY KEY NOT NULL,
+          created_at TEXT NOT NULL,
+          title TEXT,
+          audio_path TEXT,
+          duration_seconds REAL,
+          status TEXT NOT NULL DEFAULT 'recording',
+          language TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_meetings_created_at ON meetings(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS speakers (
+          id TEXT PRIMARY KEY NOT NULL,
+          meeting_id TEXT NOT NULL,
+          label TEXT NOT NULL,
+          display_name TEXT,
+          embedding_ref TEXT,
+          FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_speakers_meeting ON speakers(meeting_id);
+
+        CREATE TABLE IF NOT EXISTS transcript_segments (
+          id TEXT PRIMARY KEY NOT NULL,
+          meeting_id TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          start_seconds REAL NOT NULL,
+          end_seconds REAL NOT NULL,
+          text TEXT NOT NULL,
+          speaker_id TEXT,
+          confidence REAL,
+          words_json TEXT,
+          FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
+          FOREIGN KEY(speaker_id) REFERENCES speakers(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_transcript_segments_meeting_seq
+          ON transcript_segments(meeting_id, seq);
+
+        CREATE TABLE IF NOT EXISTS meeting_summaries (
+          id TEXT PRIMARY KEY NOT NULL,
+          meeting_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          content TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          model TEXT,
+          FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_meeting_summaries_meeting
+          ON meeting_summaries(meeting_id);
+    "#;
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     let base_schema = r#"
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -187,6 +249,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (5)",
         [],
     )?;
+    // v6: meeting-mode tables. Additive — the CREATE ... IF NOT EXISTS block
+    // leaves every existing table and row untouched.
+    conn.execute_batch(MEETING_SCHEMA_V6)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+        [SCHEMA_VERSION],
+    )?;
     Ok(())
 }
 
@@ -245,7 +314,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
@@ -375,7 +444,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
@@ -404,5 +473,95 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert!(indexes.contains(&"idx_edit_observations_edit_event".to_owned()));
+    }
+
+    #[test]
+    fn version_six_adds_meeting_tables_without_disturbing_existing_v5_data() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Stand up a realistic v5 database with one legacy dictation session.
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (1),(2),(3),(4),(5);
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  focused_app TEXT,
+                  focused_bundle_id TEXT,
+                  asr_raw TEXT,
+                  corrected TEXT,
+                  pasted TEXT,
+                  asr_engine TEXT,
+                  corrector_engine TEXT,
+                  insert_strategy TEXT NOT NULL DEFAULT 'none',
+                  audio_path TEXT,
+                  status TEXT NOT NULL DEFAULT 'in_progress'
+                );
+                INSERT INTO sessions (id, created_at, asr_raw, status)
+                VALUES ('legacy', '2026-07-18T00:00:00Z', '旧结果', 'completed');
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        // Existing v5 data survives untouched.
+        let raw: String = connection
+            .query_row(
+                "SELECT asr_raw FROM sessions WHERE id='legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, "旧结果");
+
+        // All four meeting tables now exist.
+        for table in [
+            "meetings",
+            "speakers",
+            "transcript_segments",
+            "meeting_summaries",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "table {table} should exist after v6");
+        }
+
+        // The segment ordering index is present.
+        let indexes: Vec<String> = connection
+            .prepare("PRAGMA index_list(transcript_segments)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(indexes.contains(&"idx_transcript_segments_meeting_seq".to_owned()));
+
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_is_idempotent_across_repeated_runs() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        // Running again must not fail (CREATE IF NOT EXISTS / INSERT OR IGNORE).
+        migrate(&connection).unwrap();
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 }

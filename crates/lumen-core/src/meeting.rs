@@ -1,0 +1,271 @@
+//! Meeting-mode domain types.
+//!
+//! A meeting is a long, multi-speaker recording — a parallel pipeline to the
+//! dictation `Session`, not an extension of it. These types are the persisted
+//! shape of a meeting and its transcript; the segment/speaker shapes are kept
+//! aligned with the `lumen-transcript.v1` interchange format so a finished
+//! meeting can be exported to that contract without a lossy remap
+//! (`start_seconds`/`end_seconds`/`text`/`speaker`/`confidence`/`words`).
+//!
+//! This is a data skeleton only. The runtime recording state machine
+//! (pause/resume, chunked capture) lives in a later stage; here `MeetingStatus`
+//! is just the coarse lifecycle a stored meeting can be in.
+
+use chrono::{DateTime, Utc};
+use lumen_transcript::Word;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Coarse lifecycle of a stored meeting.
+///
+/// This is intentionally minimal: the detailed runtime recording state
+/// (buffering, pause/resume) is modeled separately in a later stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingStatus {
+    /// Audio is being captured.
+    Recording,
+    /// Recording finished; diarization/transcription in flight.
+    Processing,
+    /// Transcript is available.
+    Ready,
+    /// Recording or processing failed terminally.
+    Failed,
+}
+
+impl MeetingStatus {
+    /// Stable lowercase token persisted in storage.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recording => "recording",
+            Self::Processing => "processing",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parse a persisted token, defaulting to [`MeetingStatus::Recording`] for
+    /// unknown values so a forward-written status never fails a read.
+    pub fn from_str_or_recording(value: &str) -> Self {
+        match value {
+            "processing" => Self::Processing,
+            "ready" => Self::Ready,
+            "failed" => Self::Failed,
+            _ => Self::Recording,
+        }
+    }
+}
+
+/// A meeting recording (maps to the `meetings` table).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Meeting {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    /// User-facing title; absent until named.
+    pub title: Option<String>,
+    /// Path to the recorded audio on disk; absent while still recording.
+    pub audio_path: Option<String>,
+    /// Total recording duration in seconds, once known.
+    pub duration_seconds: Option<f64>,
+    pub status: MeetingStatus,
+    /// Primary language as a BCP-47 tag, when detected.
+    pub language: Option<String>,
+}
+
+impl Meeting {
+    /// A fresh meeting with a new id, `created_at = now`, status `Recording`.
+    pub fn new() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            title: None,
+            audio_path: None,
+            duration_seconds: None,
+            status: MeetingStatus::Recording,
+            language: None,
+        }
+    }
+}
+
+impl Default for Meeting {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One transcript segment within a meeting (maps to `transcript_segments`).
+///
+/// Field shapes mirror `lumen_transcript::Segment`: `start_seconds`/
+/// `end_seconds` are seconds from media start, `words` is the optional
+/// word-level timing (same [`Word`] type as the interchange contract).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptSegment {
+    pub id: Uuid,
+    pub meeting_id: Uuid,
+    /// Zero-based order of this segment within the meeting.
+    pub seq: u32,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub text: String,
+    /// References [`Speaker::id`]; absent when the speaker is unassigned.
+    pub speaker_id: Option<Uuid>,
+    /// Engine confidence in `[0, 1]`, when the engine reports one.
+    pub confidence: Option<f64>,
+    /// Optional word-level timing, aligned with the interchange `Word` shape.
+    pub words: Option<Vec<Word>>,
+}
+
+impl TranscriptSegment {
+    /// A segment with the required fields set and everything optional absent.
+    pub fn new(
+        meeting_id: Uuid,
+        seq: u32,
+        start_seconds: f64,
+        end_seconds: f64,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            meeting_id,
+            seq,
+            start_seconds,
+            end_seconds,
+            text: text.into(),
+            speaker_id: None,
+            confidence: None,
+            words: None,
+        }
+    }
+}
+
+/// A speaker within one meeting (maps to the `speakers` table).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Speaker {
+    pub id: Uuid,
+    pub meeting_id: Uuid,
+    /// Engine-assigned label, e.g. `"S1"`. Stable within the meeting.
+    pub label: String,
+    /// User-assigned name, e.g. `"Chris"`; absent until labeled.
+    pub display_name: Option<String>,
+    /// Reference to a stored voiceprint embedding. Reserved for cross-meeting
+    /// speaker enrollment (M5); left empty in v1.
+    pub embedding_ref: Option<String>,
+}
+
+impl Speaker {
+    /// A speaker with the given engine label and everything else absent.
+    pub fn new(meeting_id: Uuid, label: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            meeting_id,
+            label: label.into(),
+            display_name: None,
+            embedding_ref: None,
+        }
+    }
+}
+
+/// Kind of generated meeting summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryKind {
+    /// Free-form narrative summary.
+    Summary,
+    /// Extracted action items.
+    ActionItems,
+    /// Extracted decisions.
+    Decisions,
+}
+
+impl SummaryKind {
+    /// Stable lowercase token persisted in storage.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::ActionItems => "action_items",
+            Self::Decisions => "decisions",
+        }
+    }
+
+    /// Parse a persisted token, defaulting to [`SummaryKind::Summary`].
+    pub fn from_str_or_summary(value: &str) -> Self {
+        match value {
+            "action_items" => Self::ActionItems,
+            "decisions" => Self::Decisions,
+            _ => Self::Summary,
+        }
+    }
+}
+
+/// A generated summary for a meeting (maps to `meeting_summaries`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeetingSummary {
+    pub id: Uuid,
+    pub meeting_id: Uuid,
+    pub kind: SummaryKind,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+    /// Model that produced the summary, e.g. `"qwen2.5"`; absent if unknown.
+    pub model: Option<String>,
+}
+
+impl MeetingSummary {
+    /// A summary with a new id and `created_at = now`.
+    pub fn new(meeting_id: Uuid, kind: SummaryKind, content: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            meeting_id,
+            kind,
+            content: content.into(),
+            created_at: Utc::now(),
+            model: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meeting_status_serde_uses_snake_case_tokens() {
+        assert_eq!(
+            serde_json::to_string(&MeetingStatus::Processing).unwrap(),
+            "\"processing\""
+        );
+        assert_eq!(
+            serde_json::from_str::<MeetingStatus>("\"ready\"").unwrap(),
+            MeetingStatus::Ready
+        );
+        for status in [
+            MeetingStatus::Recording,
+            MeetingStatus::Processing,
+            MeetingStatus::Ready,
+            MeetingStatus::Failed,
+        ] {
+            assert_eq!(
+                MeetingStatus::from_str_or_recording(status.as_str()),
+                status
+            );
+        }
+        assert_eq!(
+            MeetingStatus::from_str_or_recording("nonsense"),
+            MeetingStatus::Recording
+        );
+    }
+
+    #[test]
+    fn summary_kind_serde_uses_snake_case_tokens() {
+        assert_eq!(
+            serde_json::to_string(&SummaryKind::ActionItems).unwrap(),
+            "\"action_items\""
+        );
+        for kind in [
+            SummaryKind::Summary,
+            SummaryKind::ActionItems,
+            SummaryKind::Decisions,
+        ] {
+            assert_eq!(SummaryKind::from_str_or_summary(kind.as_str()), kind);
+        }
+    }
+}

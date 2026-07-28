@@ -1,5 +1,6 @@
 //! SQLite store for Lumen ASR.
 
+mod meeting;
 mod schema;
 
 use anyhow::{Context, Result};
