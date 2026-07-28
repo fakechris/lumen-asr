@@ -2225,7 +2225,7 @@ dependencies = [
 [[package]]
 name = "lumen-asr-engine"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=c22f24af02260bcfd64a5dbb641ea105079f0591#c22f24af02260bcfd64a5dbb641ea105079f0591"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=ef449465d18865d3d819309a64b1e723ae329817#ef449465d18865d3d819309a64b1e723ae329817"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2273,8 +2273,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "lumen-asr-engine",
+ "lumen-transcript",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "uuid",
@@ -2324,7 +2326,7 @@ dependencies = [
 [[package]]
 name = "lumen-models"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=c22f24af02260bcfd64a5dbb641ea105079f0591#c22f24af02260bcfd64a5dbb641ea105079f0591"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=ef449465d18865d3d819309a64b1e723ae329817#ef449465d18865d3d819309a64b1e723ae329817"
 dependencies = [
  "fs2",
  "serde",
@@ -2381,6 +2383,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "lumen-transcript"
+version = "0.1.0"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=ef449465d18865d3d819309a64b1e723ae329817#ef449465d18865d3d819309a64b1e723ae329817"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
