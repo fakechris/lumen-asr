@@ -22,8 +22,11 @@ and, where available, code signed.
   the project is accepted into the SignPath Foundation open-source program.
 - macOS artifacts use an Apple-issued Developer ID certificate and Apple's
   notarization service when signed direct-distribution builds are published.
-- Until a signing provider is configured for a platform, release notes must
-  clearly identify that platform's artifacts as unsigned.
+- macOS prereleases may use ad-hoc signatures for bundle integrity. An ad-hoc
+  signature does not establish a trusted publisher identity or qualify the
+  artifact for Apple notarization.
+- Release notes must clearly classify each platform's artifacts as
+  provider-signed and notarized where applicable, ad-hoc signed, or unsigned.
 
 ## Project roles and approval
 
