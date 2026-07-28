@@ -184,14 +184,21 @@ jobs:
             is_draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')"
             if [[ "$is_draft" != "true" ]]; then
               existing_assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"
+              release_complete="true"
               for asset in "${expected_assets[@]}"; do
                 if ! grep -Fxq "$asset" <<<"$existing_assets"; then
-                  echo "Published release $GITHUB_REF_NAME is missing $asset" >&2
-                  exit 1
+                  release_complete="false"
                 fi
               done
-              echo "Release $GITHUB_REF_NAME already contains all expected assets."
-              exit 0
+              if [[ "$release_complete" == "true" ]]; then
+                echo "Release $GITHUB_REF_NAME already contains all expected assets."
+                exit 0
+              fi
+              if [[ -n "$existing_assets" ]]; then
+                echo "Published release $GITHUB_REF_NAME has a partial asset set; refusing to replace it." >&2
+                exit 1
+              fi
+              echo "Completing empty release $GITHUB_REF_NAME created with its tag."
             fi
           else
             gh release create "$GITHUB_REF_NAME" \
@@ -203,14 +210,14 @@ jobs:
               --notes "$(cat docs/RELEASE_NOTES.md)"
           fi
 
-          # A rebuilt DMG is not byte-for-byte reproducible. Replace the complete draft
+          # A rebuilt DMG is not byte-for-byte reproducible. Replace the complete
           # asset set together so SHA256SUMS.txt always describes this workflow run.
           gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
 
           uploaded_assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"
           for asset in "${expected_assets[@]}"; do
             if ! grep -Fxq "$asset" <<<"$uploaded_assets"; then
-              echo "Draft release $GITHUB_REF_NAME is missing $asset" >&2
+              echo "Release $GITHUB_REF_NAME is missing $asset" >&2
               exit 1
             fi
           done
