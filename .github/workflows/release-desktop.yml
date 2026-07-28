@@ -18,19 +18,9 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "12.0"
 
 jobs:
-  build:
-    name: Build ${{ matrix.asset_arch }} DMG
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            asset_arch: arm64
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            asset_arch: x64
-    runs-on: ${{ matrix.runner }}
+  build-macos:
+    name: Build macOS arm64 DMG
+    runs-on: macos-15
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
@@ -52,28 +42,28 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: stable
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Install frontend dependencies
         run: npm ci
         working-directory: apps/desktop
 
       - name: Build ad-hoc signed DMG
-        run: npm run tauri -- build --target "${{ matrix.target }}" --bundles dmg
+        run: npm run tauri -- build --target aarch64-apple-darwin --bundles dmg
         working-directory: apps/desktop
 
       - name: Verify and name release asset
         run: >-
           scripts/macos/collect-release-asset.sh
-          "${{ matrix.target }}"
+          aarch64-apple-darwin
           "$GITHUB_REF_NAME"
-          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/bundle"
+          "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/bundle"
           release-assets
 
       - name: Upload DMG for release job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: macos-dmg-${{ matrix.asset_arch }}
+          name: macos-dmg-arm64
           path: release-assets/*.dmg
           if-no-files-found: error
           compression-level: 0
@@ -132,7 +122,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs:
-      - build
+      - build-macos
       - build-windows
     runs-on: ubuntu-24.04
     permissions:
@@ -142,12 +132,11 @@ jobs:
       - name: Check out release metadata
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      - name: Download both DMGs
+      - name: Download macOS DMG
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: macos-dmg-*
+          name: macos-dmg-arm64
           path: release-assets
-          merge-multiple: true
 
       - name: Download Windows installer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -159,7 +148,6 @@ jobs:
         run: |
           expected=(
             "Lumen-ASR-${GITHUB_REF_NAME}-arm64.dmg"
-            "Lumen-ASR-${GITHUB_REF_NAME}-x64.dmg"
             "Lumen-ASR-${GITHUB_REF_NAME}-windows-x64-setup.exe"
           )
           for asset in "${expected[@]}"; do
@@ -175,7 +163,6 @@ jobs:
         run: |
           expected_assets=(
             "Lumen-ASR-${GITHUB_REF_NAME}-arm64.dmg"
-            "Lumen-ASR-${GITHUB_REF_NAME}-x64.dmg"
             "Lumen-ASR-${GITHUB_REF_NAME}-windows-x64-setup.exe"
             "SHA256SUMS.txt"
           )

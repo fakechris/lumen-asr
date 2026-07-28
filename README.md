@@ -56,7 +56,7 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 
 ### Requirements
 
-- macOS 12+ (Apple Silicon recommended), or Windows 10/11 x64
+- macOS 12+ on Apple Silicon, or Windows 10/11 x64
 - **Microphone** — to record
 - **Accessibility on macOS** — to paste into other apps (without it, Lumen
   copies to the clipboard)
@@ -66,9 +66,10 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 
 ### Install & run (from source)
 
-Prebuilt ad-hoc signed DMGs for Apple Silicon and Intel are published on
+Prebuilt ad-hoc signed DMGs for Apple Silicon are published on
 [GitHub Releases](https://github.com/fakechris/lumen-asr/releases). Tagged
-releases also publish a Windows x64 NSIS installer. macOS requires a one-time
+releases also publish a Windows x64 NSIS installer. Intel Mac and Windows x86
+installers are not provided. macOS requires a one-time
 manual approval under **System Settings → Privacy & Security**. See
 [docs/MACOS_GITHUB_RELEASE.md](./docs/MACOS_GITHUB_RELEASE.md) for verification and installation.
 
@@ -268,7 +269,7 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 
 ### 环境要求
 
-- macOS 12+（建议 Apple Silicon），或 Windows 10/11 x64
+- Apple Silicon 上的 macOS 12+，或 Windows 10/11 x64
 - **麦克风**：录音
 - **macOS 辅助功能**：向其他 App 粘贴（未授权时仅复制到剪贴板）
 - Windows 当前采用仅复制模式，不采集应用上下文
@@ -276,9 +277,10 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 
 ### 安装与启动（源码）
 
-Apple Silicon 和 Intel 的 ad-hoc 签名 DMG 会发布在
+Apple Silicon 的 ad-hoc 签名 DMG 会发布在
 [GitHub Releases](https://github.com/fakechris/lumen-asr/releases)，tag
-发布也会包含 Windows x64 NSIS 安装程序。macOS 首次启动需要前往
+发布也会包含 Windows x64 NSIS 安装程序；不提供 Intel Mac 或 Windows
+x86 安装包。macOS 首次启动需要前往
 **系统设置 → 隐私与安全性**手工放行。校验与安装方法见
 [docs/MACOS_GITHUB_RELEASE.md](./docs/MACOS_GITHUB_RELEASE.md)。
 

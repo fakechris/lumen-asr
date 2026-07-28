@@ -121,13 +121,15 @@ Capsule 需要专门验证无焦点显示、透明、always-on-top、任务栏�
 
 ### 8. Release pipeline 不能简单再加一个互相竞争的 workflow
 
-当前 `.github/workflows/release-macos.yml` 在 tag `v*` 上构建 arm64/x64 两个 DMG，聚合校验后创建并发布 Release。它只接受 macOS 资产，发布后还会认为“两个 DMG + SHA256SUMS”就是完整 Release。
+当前 `.github/workflows/release-desktop.yml` 在 tag `v*` 上构建 macOS
+arm64 DMG 和 Windows x64 NSIS 安装包，聚合校验后创建并发布 Release。
+正式发布不包含 Intel Mac 或 Windows x86。
 
 如果另外加一个独立的 Windows tag workflow，两边可能同时创建/修改同一 Release，Windows 资产可能在 macOS job 发布后才到达，`SHA256SUMS.txt` 也可能互相覆盖。
 
-推荐改成一个 tag 驱动的 `release.yml`：
+当前采用一个 tag 驱动的 `release-desktop.yml`：
 
-1. macOS arm64、macOS x64、Windows x64 三个 build job/matrix entry；
+1. macOS arm64、Windows x64 两个 build job；
 2. 每个 job 只上传 workflow artifact，不直接发布 Release；
 3. 一个唯一的 aggregate job 等待所有必需平台；
 4. 统一生成资产清单和 SHA-256；
