@@ -147,7 +147,7 @@ pub fn delete_session(state: State<'_, AppState>, id: String) -> Result<bool, St
 /// Export one session as a pretty-printed `lumen-transcript.v1` JSON string.
 ///
 /// Duration is probed from the session WAV when it still exists; otherwise
-/// the export degrades gracefully (no duration, zero-length segment).
+/// the export degrades gracefully (no `media` block, zero-length segment).
 #[tauri::command]
 pub fn export_session_transcript(state: State<'_, AppState>, id: String) -> Result<String, String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
