@@ -37,6 +37,34 @@ impl Default for AppConfig {
     }
 }
 
+impl AppConfig {
+    fn apply_platform_fallbacks(&mut self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            let mut changed = false;
+            if matches!(
+                self.asr.provider.to_ascii_lowercase().as_str(),
+                "qwen" | "qwen3_asr" | "local_qwen"
+            ) {
+                self.asr.provider = "local_sensevoice".into();
+                changed = true;
+            }
+            if self.asr.qwen_shadow_enabled {
+                self.asr.qwen_shadow_enabled = false;
+                changed = true;
+            }
+            // Alt+Space is commonly reserved by Windows shell/utilities.
+            if self.hotkey.toggle.eq_ignore_ascii_case("Alt+Space") && !self.onboarding.completed {
+                self.hotkey.toggle = "Ctrl+Shift+Space".into();
+                changed = true;
+            }
+            return changed;
+        }
+        #[cfg(not(target_os = "windows"))]
+        false
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextCaptureConfig {
@@ -518,11 +546,22 @@ impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            toggle: "Alt+Space".into(),
+            toggle: default_hotkey_toggle().into(),
             show_capsule: true,
             mode: "hold".into(),
             intents: vec![HotkeyIntentConfig::default()],
         }
+    }
+}
+
+fn default_hotkey_toggle() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Ctrl+Shift+Space"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "Alt+Space"
     }
 }
 
@@ -644,7 +683,8 @@ impl AppConfig {
 
     pub fn load_from(path: &PathBuf) -> Self {
         if !path.exists() {
-            let cfg = Self::default();
+            let mut cfg = Self::default();
+            cfg.apply_platform_fallbacks();
             if let Err(e) = cfg.save_to(path) {
                 tracing::warn!(error = %e, "failed to write default config");
             }
@@ -655,6 +695,11 @@ impl AppConfig {
                 Ok(mut c) => {
                     ensure_default_intents(&mut c.hotkey);
                     c.asr.migrate_legacy_model_dir();
+                    if c.apply_platform_fallbacks() {
+                        if let Err(error) = c.save_to(path) {
+                            tracing::warn!(%error, "failed to persist platform fallbacks");
+                        }
+                    }
                     c
                 }
                 Err(e) => {
@@ -911,5 +956,19 @@ provider = "minimax"
         .unwrap();
 
         assert!(!config.corrector.use_captured_context);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_falls_back_from_mlx_qwen_and_migrates_default_hotkey() {
+        let mut config = AppConfig::default();
+        config.asr.provider = "local_qwen".into();
+        config.asr.qwen_shadow_enabled = true;
+        config.hotkey.toggle = "Alt+Space".into();
+
+        assert!(config.apply_platform_fallbacks());
+        assert_eq!(config.asr.provider, "local_sensevoice");
+        assert!(!config.asr.qwen_shadow_enabled);
+        assert_eq!(config.hotkey.toggle, "Ctrl+Shift+Space");
     }
 }

@@ -1,7 +1,7 @@
 # Lumen 共享 ASR 模型契约
 
-版本：1.0
-更新日期：2026-07-15
+版本：1.1
+更新日期：2026-07-27
 契约源：`lumen-asr/docs/SHARED_MODELS_CONTRACT.md`
 同步副本：`lumen-navi/docs/SHARED_MODELS_CONTRACT.md`
 
@@ -15,10 +15,14 @@
 2. 环境变量 `LUMEN_MODELS_DIR`。
 3. 平台默认目录：
    - macOS：`~/Library/Application Support/Lumen/models`
-   - Windows：`%USERPROFILE%\.lumen\models`
+   - Windows：`%LOCALAPPDATA%\Lumen\models`
    - 其他平台：`~/.lumen/models`
 
 用户主目录依次从 `HOME`、`USERPROFILE`、`HOMEDRIVE + HOMEPATH` 解析；均不可用时才允许退回系统临时目录。
+
+Windows 上若 `LOCALAPPDATA` 不可用，默认目录回退为
+`%USERPROFILE%\AppData\Local\Lumen\models`。旧的
+`%USERPROFILE%\.lumen\models` 继续作为 legacy 目录扫描，但新下载不再写入该目录。
 
 `asr.models_root` 只允许在用户显式修改时持久化。应用不得把一次运行中由环境变量或平台默认值推导出的根目录自动写回配置，否则会遮蔽后续的 `LUMEN_MODELS_DIR` 变更。
 
@@ -73,6 +77,7 @@ Whisper 目录必须同时包含：
 - `~/Library/Application Support/LumenNavi/models`
 - `~/.lumen-asr/models`
 - `~/.lumen-navi/models`
+- `~/.lumen/models`（Windows 1.0 默认目录）
 - `~/.coli/models` 下已知的 SenseVoice / Whisper 包目录
 
 发现旧模型时只允许读取和选择，不得自动移动、删除或复制。用户选择后必须持久化当前引擎与 `asr.model_dir`。

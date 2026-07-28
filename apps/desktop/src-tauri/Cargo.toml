@@ -7,6 +7,7 @@ license.workspace = true
 description = "Lumen ASR desktop shell (Tauri)"
 
 [build-dependencies]
+ico = "0.5"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
@@ -26,7 +27,6 @@ lumen-corrector = { workspace = true }
 lumen-prompts = { workspace = true }
 lumen-inject = { workspace = true }
 lumen-platform-macos = { workspace = true }
-lumen-context = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
@@ -39,6 +39,7 @@ blake3 = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 security-framework-sys = "2.17"
+lumen-context = { workspace = true }
 
 [features]
 default = ["custom-protocol"]

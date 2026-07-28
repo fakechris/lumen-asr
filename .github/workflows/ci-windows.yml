@@ -1,0 +1,118 @@
+name: Windows CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - port/windows
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: Four-part Microsoft Store package version
+        required: false
+        default: "0.1.0.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build and test (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Test desktop frontend
+        run: npm test
+        working-directory: apps/desktop
+
+      - name: Build desktop frontend
+        run: npm run build
+        working-directory: apps/desktop
+
+      - name: Test platform-neutral crates
+        run: cargo test
+
+      - name: Build Windows NSIS installer
+        run: npm run tauri -- build --bundles nsis
+        working-directory: apps/desktop
+
+      - name: Build Microsoft Store MSIX
+        shell: pwsh
+        env:
+          STORE_IDENTITY_NAME: ${{ vars.WINDOWS_STORE_IDENTITY_NAME }}
+          STORE_PUBLISHER: ${{ vars.WINDOWS_STORE_PUBLISHER }}
+          STORE_PUBLISHER_DISPLAY_NAME: ${{ vars.WINDOWS_STORE_PUBLISHER_DISPLAY_NAME }}
+          STORE_PACKAGE_VERSION: ${{ inputs.package_version }}
+        run: |
+          $storeValues = @(
+            $env:STORE_IDENTITY_NAME,
+            $env:STORE_PUBLISHER,
+            $env:STORE_PUBLISHER_DISPLAY_NAME
+          )
+          $hasStoreIdentity = ($storeValues | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+          }).Count -eq $storeValues.Count
+
+          if (-not $hasStoreIdentity -and '${{ github.event_name }}' -eq 'workflow_dispatch') {
+            throw "Set WINDOWS_STORE_IDENTITY_NAME, WINDOWS_STORE_PUBLISHER, and WINDOWS_STORE_PUBLISHER_DISPLAY_NAME as repository variables before building a Store submission package."
+          }
+
+          if (-not $hasStoreIdentity) {
+            $env:STORE_IDENTITY_NAME = 'LumenASR.Dev'
+            $env:STORE_PUBLISHER = 'CN=Lumen ASR Development, OID.2.25.269339209217466799157659632861705434293=1'
+            $env:STORE_PUBLISHER_DISPLAY_NAME = 'Lumen ASR Development'
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:STORE_PACKAGE_VERSION)) {
+            $tauri = Get-Content apps/desktop/src-tauri/tauri.conf.json | ConvertFrom-Json
+            $env:STORE_PACKAGE_VERSION = "$($tauri.version).0"
+          }
+
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          ./scripts/windows/build-msix.ps1 `
+            -ExecutablePath target/release/lumen-asr-desktop.exe `
+            -OutputPath "release-assets/Lumen-ASR-$($env:STORE_PACKAGE_VERSION)-windows-x64.msix" `
+            -Version $env:STORE_PACKAGE_VERSION `
+            -IdentityName $env:STORE_IDENTITY_NAME `
+            -Publisher $env:STORE_PUBLISHER `
+            -PublisherDisplayName $env:STORE_PUBLISHER_DISPLAY_NAME
+
+      - name: Upload Microsoft Store package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-store-msix-${{ github.sha }}
+          path: release-assets/*.msix
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

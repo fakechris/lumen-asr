@@ -2,6 +2,10 @@ mod asr_models;
 mod capsule;
 mod commands;
 mod config;
+#[cfg(target_os = "macos")]
+mod context_capture;
+#[cfg(not(target_os = "macos"))]
+#[path = "context_capture_stub.rs"]
 mod context_capture;
 mod corrector_cmd;
 mod corrector_probe;
@@ -354,6 +358,7 @@ pub fn run() {
                     tracing::warn!(%error, "could not schedule Qwen runtime probe");
                 }
             }
+            #[cfg(target_os = "macos")]
             if !lumen_platform_macos::is_accessibility_trusted() {
                 tracing::warn!(
                     "hotkey event-tap needs Accessibility; using fallback monitors until granted"
@@ -363,12 +368,20 @@ pub fn run() {
             let debug_dir = session_debug::debug_root();
             let _ = std::fs::create_dir_all(&debug_dir);
             let log_path = lumen_platform::default_data_dir().join("logs/lumen.log");
+            #[cfg(target_os = "macos")]
             tracing::info!(
                 name = app.package_info().name,
                 debug = %debug_dir.display(),
                 log = %log_path.display(),
                 accessibility = lumen_platform_macos::is_accessibility_trusted(),
                 "Lumen ASR desktop starting (session debug enabled)"
+            );
+            #[cfg(not(target_os = "macos"))]
+            tracing::info!(
+                name = app.package_info().name,
+                debug = %debug_dir.display(),
+                log = %log_path.display(),
+                "Lumen ASR desktop starting (copy-only platform mode)"
             );
             Ok(())
         })

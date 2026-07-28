@@ -2,7 +2,7 @@ use lumen_asr::{
     AsrEngine, AsrRequest, QwenAsr, QwenAsrConfig, QwenDecodeMode, QwenShadowRequest,
     QwenShadowStatus, QwenShadowTerm,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -19,6 +19,14 @@ fn python_executable() -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "python" } else { "python3" }))
+}
+
+fn marker_lines(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test]
@@ -122,7 +130,7 @@ for line in sys.stdin:
     assert_eq!(first.engine.as_str(), "qwen3_asr");
     assert_eq!(first.diagnostics.worker_reused, Some(false));
     assert_eq!(second.diagnostics.worker_reused, Some(true));
-    assert_eq!(std::fs::read_to_string(&starts).unwrap(), "started\n");
+    assert_eq!(marker_lines(&starts), ["started"]);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -475,10 +483,7 @@ for line in sys.stdin:
     let recovered = engine.transcribe(request()).await.unwrap();
 
     assert_eq!(recovered.text, "recovered");
-    assert_eq!(
-        std::fs::read_to_string(&starts).unwrap(),
-        "started\nstarted\n"
-    );
+    assert_eq!(marker_lines(&starts), ["started", "started"]);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -531,10 +536,7 @@ for line in sys.stdin:
     let restarted = engine.transcribe(request()).await.unwrap();
 
     assert_eq!(restarted.diagnostics.worker_reused, Some(false));
-    assert_eq!(
-        std::fs::read_to_string(&starts).unwrap(),
-        "started\nstarted\n"
-    );
+    assert_eq!(marker_lines(&starts), ["started", "started"]);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -597,10 +599,7 @@ for line in sys.stdin:
 
     engine.activate();
     assert_eq!(engine.transcribe(request()).await.unwrap().text, "ok");
-    assert_eq!(
-        std::fs::read_to_string(&starts).unwrap(),
-        "started\nstarted\n"
-    );
+    assert_eq!(marker_lines(&starts), ["started", "started"]);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -668,10 +667,7 @@ for line in sys.stdin:
     assert!(queued.await.unwrap().is_err());
     engine.activate();
     assert_eq!(engine.transcribe(request()).await.unwrap().text, "ok");
-    assert_eq!(
-        std::fs::read_to_string(&starts).unwrap(),
-        "started\nstarted\n"
-    );
+    assert_eq!(marker_lines(&starts), ["started", "started"]);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -728,10 +724,7 @@ for line in sys.stdin:
         engine.transcribe(request()).await.unwrap().text,
         "recovered"
     );
-    assert_eq!(
-        std::fs::read_to_string(&starts).unwrap(),
-        "started\nstarted\n"
-    );
+    assert_eq!(marker_lines(&starts), ["started", "started"]);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -790,10 +783,7 @@ for line in sys.stdin:
         engine.transcribe(request()).await.unwrap().text,
         "recovered"
     );
-    assert_eq!(
-        std::fs::read_to_string(&starts).unwrap(),
-        "started\nstarted\n"
-    );
+    assert_eq!(marker_lines(&starts), ["started", "started"]);
     let _ = std::fs::remove_dir_all(root);
 }
 

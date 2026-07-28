@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -983,11 +984,7 @@ fn tmux_socket_candidates(runner: &dyn CommandRunner) -> Vec<Option<PathBuf>> {
             continue;
         };
         for entry in entries.flatten() {
-            if !entry
-                .file_type()
-                .ok()
-                .is_some_and(|file_type| file_type.is_socket())
-            {
+            if !entry.file_type().ok().is_some_and(file_type_is_socket) {
                 continue;
             }
             let path = entry.path();
@@ -1000,6 +997,16 @@ fn tmux_socket_candidates(runner: &dyn CommandRunner) -> Vec<Option<PathBuf>> {
         }
     }
     candidates
+}
+
+#[cfg(unix)]
+fn file_type_is_socket(file_type: fs::FileType) -> bool {
+    file_type.is_socket()
+}
+
+#[cfg(not(unix))]
+fn file_type_is_socket(_file_type: fs::FileType) -> bool {
+    false
 }
 
 struct TmuxPane {

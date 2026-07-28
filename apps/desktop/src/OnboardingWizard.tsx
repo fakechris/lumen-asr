@@ -18,6 +18,7 @@ type Props = {
 
 const STEPS = ["欢迎", "权限", "麦克风", "模型", "修正", "热键", "试听"] as const;
 const PEAK_THRESHOLD = 0.04;
+const IS_WINDOWS = navigator.userAgent.includes("Windows");
 
 export function OnboardingWizard({ onDone }: Props) {
   const [step, setStep] = useState(0);
@@ -33,7 +34,9 @@ export function OnboardingWizard({ onDone }: Props) {
   const monitoring = useRef(false);
 
   const [asr, setAsr] = useState<AsrModelStatus | null>(null);
-  const [engineChoice, setEngineChoice] = useState<"sensevoice" | "whisper">("sensevoice");
+  const [engineChoice, setEngineChoice] = useState<"sensevoice" | "whisper" | "qwen">(
+    "sensevoice",
+  );
   const [dlMsg, setDlMsg] = useState("");
   const [dlPct, setDlPct] = useState<number | null>(null);
   const [customPath, setCustomPath] = useState("");
@@ -43,7 +46,7 @@ export function OnboardingWizard({ onDone }: Props) {
   const [corrModel, setCorrModel] = useState("qwen2.5:7b");
 
   const [hkEnabled, setHkEnabled] = useState(true);
-  const [hkToggle, setHkToggle] = useState("Alt+Space");
+  const [hkToggle, setHkToggle] = useState(IS_WINDOWS ? "Ctrl+Shift+Space" : "Alt+Space");
   const [hkMode, setHkMode] = useState("hold");
   const [hkCapsule, setHkCapsule] = useState(true);
   const [hkWarn, setHkWarn] = useState<string[]>([]);
@@ -65,7 +68,13 @@ export function OnboardingWizard({ onDone }: Props) {
     try {
       const status = await api.checkAsrModelStatus();
       setAsr(status);
-      setEngineChoice(status.activeEngine === "whisper" ? "whisper" : "sensevoice");
+      setEngineChoice(
+        status.activeEngine === "qwen" && status.qwenRuntimeSupported
+          ? "qwen"
+          : status.activeEngine === "whisper"
+            ? "whisper"
+            : "sensevoice",
+      );
     } catch (e) {
       setError(String(e));
     }
@@ -292,7 +301,9 @@ export function OnboardingWizard({ onDone }: Props) {
   const canLeavePerms = micOk;
   const meterPct = Math.min(100, Math.round(Math.max(peak, rms * 2) * 200));
   const asrReady =
-    engineChoice === "whisper"
+    engineChoice === "qwen"
+      ? ((asr?.qwenRuntimeSupported && asr?.qwenReady) ?? false)
+      : engineChoice === "whisper"
       ? (asr?.whisperReady ?? false)
       : (asr?.sensevoiceReady ?? false);
 
@@ -383,9 +394,9 @@ export function OnboardingWizard({ onDone }: Props) {
           <section className="onboard-step">
             <h1>核心权限</h1>
             <p className="muted-text">
-              麦克风会弹系统对话框。辅助功能<strong>不会弹窗</strong>，必须在系统设置里打开
-              <strong>当前这份进程</strong>。列表里若出现两个 Lumen，是不同签名/路径（开发版 vs
-              .app，或多次 adhoc 编译），只开对应当前路径的那一项；开完后建议完全退出再开一次。
+              {IS_WINDOWS
+                ? "Windows 会在首次录音时检查麦克风隐私权限。当前 Alpha 使用安全的复制到剪贴板模式，不要求管理员权限。"
+                : "麦克风会弹系统对话框。辅助功能不会弹窗，必须在系统设置里打开当前这份进程。列表里若出现两个 Lumen，是不同签名/路径，只开对应当前路径的那一项。"}
             </p>
             <div className="onboard-perm-grid">
               <div className={`onboard-perm-card ${micOk ? "ok" : ""}`}>
@@ -422,7 +433,18 @@ export function OnboardingWizard({ onDone }: Props) {
                   </button>
                 </div>
               </div>
-              <div className={`onboard-perm-card ${axOk ? "ok" : ""}`}>
+              {IS_WINDOWS ? (
+                <div className="onboard-perm-card ok">
+                  <div className="onboard-perm-title">
+                    Windows 输出模式 <span className="onboard-pill">复制到剪贴板</span>
+                  </div>
+                  <p className="muted-text">
+                    转写完成后会复制 UTF-16 文本。自动粘贴和跨权限级别注入暂未启用，因此无需
+                    macOS“辅助功能”授权，也不会要求以管理员身份运行。
+                  </p>
+                </div>
+              ) : (
+                <div className={`onboard-perm-card ${axOk ? "ok" : ""}`}>
                 <div className="onboard-perm-title">
                   辅助功能 <span className="onboard-pill">{axOk ? "已开启" : "需要开启"}</span>
                 </div>
@@ -475,7 +497,8 @@ export function OnboardingWizard({ onDone }: Props) {
                     刷新
                   </button>
                 </div>
-              </div>
+                </div>
+              )}
             </div>
             <div className="onboard-actions">
               <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(0)}>
@@ -487,7 +510,7 @@ export function OnboardingWizard({ onDone }: Props) {
                 disabled={busy || !canLeavePerms}
                 onClick={() => void goStep(2)}
               >
-                {axOk ? "下一步" : "继续（稍后补辅助功能）"}
+                {IS_WINDOWS ? "下一步" : axOk ? "下一步" : "继续（稍后补辅助功能）"}
               </button>
             </div>
           </section>
@@ -548,7 +571,23 @@ export function OnboardingWizard({ onDone }: Props) {
         {step === 3 && (
           <section className="onboard-step">
             <h1>本地 ASR 模型</h1>
-            <p className="muted-text">默认 SenseVoice。可使用本机已有模型，或下载官方 sherpa 包。</p>
+            <p className="muted-text">
+              默认 SenseVoice，适合无独显和低内存机器。Qwen3-ASR 本地 runtime 当前基于 Apple
+              MLX；Windows 会自动降级到 SenseVoice。
+            </p>
+            {asr?.qwenFallbackReason && (
+              <div className="onboard-perm-card" style={{ marginBottom: 12 }}>
+                <div className="onboard-perm-title">
+                  资源检测 <span className="onboard-pill">SenseVoice fallback</span>
+                </div>
+                <p className="muted-text">{asr.qwenFallbackReason}</p>
+                {asr.totalMemoryMb ? (
+                  <p className="muted-text">
+                    系统内存：{(asr.totalMemoryMb / 1024).toFixed(1)} GB
+                  </p>
+                ) : null}
+              </div>
+            )}
             <div className="form-row" style={{ marginBottom: 10 }}>
               <label className="form-label">
                 引擎
@@ -558,24 +597,35 @@ export function OnboardingWizard({ onDone }: Props) {
                 value={engineChoice}
                 disabled={busy}
                 onChange={(event) => {
-                  const next = event.target.value as "sensevoice" | "whisper";
+                  const next = event.target.value as "sensevoice" | "whisper" | "qwen";
                   setEngineChoice(next);
                   void api.setAsrEngine(next).catch((error) => setError(String(error)));
                 }}
               >
                 <option value="sensevoice">SenseVoice（推荐，可下载）</option>
+                <option value="qwen" disabled={!asr?.qwenRuntimeSupported}>
+                  Qwen3-ASR（需 Apple MLX；Windows 自动 fallback）
+                </option>
                 <option value="whisper">Whisper（使用已有模型）</option>
               </select>
             </div>
             {asr && (
               <div className={`onboard-perm-card ${asrReady ? "ok" : ""}`} style={{ marginBottom: 12 }}>
                 <div className="onboard-perm-title">
-                  {engineChoice === "whisper" ? "Whisper" : "SenseVoice"}{" "}
+                  {engineChoice === "qwen"
+                    ? "Qwen3-ASR"
+                    : engineChoice === "whisper"
+                      ? "Whisper"
+                      : "SenseVoice"}{" "}
                   <span className="onboard-pill">{asrReady ? "就绪" : "未就绪"}</span>
                 </div>
                 <p className="muted-text" style={{ wordBreak: "break-all" }}>
                   <code>
-                    {engineChoice === "whisper" ? asr.whisperDir : asr.sensevoiceDir}
+                    {engineChoice === "qwen"
+                      ? asr.qwenDir
+                      : engineChoice === "whisper"
+                        ? asr.whisperDir
+                        : asr.sensevoiceDir}
                   </code>
                 </p>
               </div>

@@ -77,6 +77,7 @@ const FLAG_SHIFT: u64 = 0x0002_0000;
 const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALTERNATE: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
+#[cfg(target_os = "macos")]
 const HID_SYSTEM_STATE: u32 = 1;
 
 const POLL_MS: u64 = 16;
@@ -94,7 +95,43 @@ fn read_mod_flags() -> u64 {
     unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+extern "system" {
+    fn GetAsyncKeyState(v_key: i32) -> i16;
+}
+
+#[cfg(target_os = "windows")]
+fn read_mod_flags() -> u64 {
+    const VK_SHIFT: i32 = 0x10;
+    const VK_CONTROL: i32 = 0x11;
+    const VK_MENU: i32 = 0x12;
+    const VK_LWIN: i32 = 0x5B;
+    const VK_RWIN: i32 = 0x5C;
+
+    fn down(v_key: i32) -> bool {
+        // The high bit reports the current key state. The low bit is a
+        // transition flag and must not be used for hold-to-talk semantics.
+        unsafe { GetAsyncKeyState(v_key) < 0 }
+    }
+
+    let mut flags = 0;
+    if down(VK_SHIFT) {
+        flags |= FLAG_SHIFT;
+    }
+    if down(VK_CONTROL) {
+        flags |= FLAG_CONTROL;
+    }
+    if down(VK_MENU) {
+        flags |= FLAG_ALTERNATE;
+    }
+    if down(VK_LWIN) || down(VK_RWIN) {
+        flags |= FLAG_COMMAND;
+    }
+    flags
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn read_mod_flags() -> u64 {
     0
 }

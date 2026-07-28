@@ -82,12 +82,16 @@ mod tests {
         assert_eq!(qwen_status().kind, EngineKind::Qwen);
     }
 
-    /// Re-assert the cluster model contract pin (the canonical hash test lives
-    /// in lumen-suite; this keeps the local doc copy byte-identical).
+    /// Re-assert the product-side contract pin. Normalize checkout line endings
+    /// so the same source has one fingerprint on Windows and macOS.
     #[test]
-    fn shared_model_contract_matches_cluster_v1() {
+    fn shared_model_contract_matches_cluster_v1_1() {
         let bytes = include_bytes!("../../../docs/SHARED_MODELS_CONTRACT.md");
-        assert_eq!(fnv1a64(bytes), 0xc877_89f4_de20_5e71);
+        let normalized = bytes
+            .split(|byte| *byte == b'\r')
+            .flat_map(|segment| segment.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(fnv1a64(&normalized), 0x9481_7905_7ee6_d582);
     }
 
     fn fnv1a64(bytes: &[u8]) -> u64 {

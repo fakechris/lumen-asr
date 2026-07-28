@@ -33,6 +33,10 @@ pub struct AsrModelStatus {
     pub whisper_dir: String,
     pub qwen_ready: bool,
     pub qwen_dir: String,
+    pub qwen_runtime_supported: bool,
+    pub qwen_fallback_reason: Option<String>,
+    pub recommended_engine: String,
+    pub total_memory_mb: Option<u64>,
     pub models_root: String,
     pub active_engine: String,
     pub active_model_dir: String,
@@ -98,6 +102,26 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
         "whisper" => wh_live.display().to_string(),
         _ => sv_live.display().to_string(),
     };
+    let qwen_runtime_supported = cfg!(target_os = "macos");
+    let total_memory_mb = total_memory_mb();
+    let qwen_fallback_reason = if !qwen_runtime_supported {
+        Some(
+            "Qwen3-ASR local runtime currently uses Apple MLX and is unavailable on Windows; SenseVoice was selected."
+                .into(),
+        )
+    } else if total_memory_mb.is_some_and(|memory| memory < 8 * 1024) {
+        Some("Available system memory is below the 8 GB Qwen safety threshold; SenseVoice was selected.".into())
+    } else {
+        None
+    };
+    let recommended_engine = if qwen_runtime_supported
+        && qwen_fallback_reason.is_none()
+        && (qwen_ready(&qw_live) || qwen_ready(&qw))
+    {
+        "qwen"
+    } else {
+        "sensevoice"
+    };
     Ok(AsrModelStatus {
         sensevoice_ready: sensevoice_ready(&sv_live) || sensevoice_ready(&sv),
         sensevoice_dir: if sensevoice_ready(&sv_live) {
@@ -117,12 +141,58 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
         } else {
             qw.display().to_string()
         },
+        qwen_runtime_supported,
+        qwen_fallback_reason,
+        recommended_engine: recommended_engine.into(),
+        total_memory_mb,
         models_root: lumen_models_dir().display().to_string(),
         active_engine: engine,
         active_model_dir,
         candidates: scan_candidates(),
         download_url: SENSEVOICE_ARCHIVE_URL.into(),
     })
+}
+
+#[cfg(target_os = "windows")]
+fn total_memory_mb() -> Option<u64> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut c_void) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    (unsafe { GlobalMemoryStatusEx((&mut status as *mut MemoryStatusEx).cast()) } != 0)
+        .then_some(status.total_phys / (1024 * 1024))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn total_memory_mb() -> Option<u64> {
+    None
 }
 
 #[tauri::command]
