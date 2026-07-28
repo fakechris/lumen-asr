@@ -149,10 +149,7 @@ pub fn delete_session(state: State<'_, AppState>, id: String) -> Result<bool, St
 /// Duration is probed from the session WAV when it still exists; otherwise
 /// the export degrades gracefully (no duration, zero-length segment).
 #[tauri::command]
-pub fn export_session_transcript(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<String, String> {
+pub fn export_session_transcript(state: State<'_, AppState>, id: String) -> Result<String, String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     let record = with_store(&state, |s| s.get_session(id).map_err(|e| e.to_string()))?
         .ok_or_else(|| "session not found".to_string())?;
