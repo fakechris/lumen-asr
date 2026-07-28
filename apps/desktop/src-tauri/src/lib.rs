@@ -263,6 +263,7 @@ pub fn run() {
             commands::list_session_attempts,
             commands::list_context_snapshots,
             commands::delete_session,
+            commands::export_session_transcript,
             commands::save_session,
             commands::seed_demo_session,
             commands::list_edit_events,

@@ -9,6 +9,9 @@ description = "Session state machine and orchestration types for Lumen ASR"
 # Types-only re-export source for AsrEngineId + ASR runtime diagnostics
 # (no sherpa/cloud features; the engine implementations are not pulled in).
 lumen-asr-engine = { workspace = true }
+# Shared lumen-transcript.v1 interchange types (re-exported as
+# `lumen_core::transcript`); serde-only, no extra features.
+lumen-transcript = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -17,3 +20,4 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"

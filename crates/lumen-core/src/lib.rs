@@ -2,9 +2,11 @@
 //!
 //! No Tauri, no platform FFI, no network — pure orchestration types.
 
+mod export;
 mod session;
 mod types;
 
+pub use export::{export_session_transcript, probe_wav_info, session_to_transcript, AudioInfo};
 pub use session::{Session, SessionCommand, SessionEvent, SessionState};
 pub use types::{
     CorrectorEngineId, DictEntryKind, DictEntrySource, EditSource, FocusInfo, InsertStrategy,
@@ -18,3 +20,8 @@ pub use lumen_asr_engine::{
     AsrEngineId, AsrRuntimeDiagnostics, AsrTokenEvidence, QwenDecodeMode, QwenRuntimeMetrics,
     QwenShadowCandidate, QwenShadowDiagnostics, QwenShadowScore, QwenShadowSpan, QwenShadowStatus,
 };
+
+// Shared `lumen-transcript.v1` interchange types (lumen-suite), re-exported
+// so app-layer callers of the export functions can name the document types
+// without a direct dependency on the shared crate.
+pub use lumen_transcript as transcript;

@@ -144,6 +144,20 @@ pub fn delete_session(state: State<'_, AppState>, id: String) -> Result<bool, St
     with_store(&state, |s| s.delete_session(id).map_err(|e| e.to_string()))
 }
 
+/// Export one session as a pretty-printed `lumen-transcript.v1` JSON string.
+///
+/// Duration is probed from the session WAV when it still exists; otherwise
+/// the export degrades gracefully (no `media` block, zero-length segment).
+#[tauri::command]
+pub fn export_session_transcript(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let record = with_store(&state, |s| s.get_session(id).map_err(|e| e.to_string()))?
+        .ok_or_else(|| "session not found".to_string())?;
+    lumen_core::export_session_transcript(&record)
+        .to_json_string_pretty()
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionInput {

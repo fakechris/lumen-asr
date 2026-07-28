@@ -57,8 +57,10 @@ lumen-prompts = { path = "crates/lumen-prompts" }
 lumen-context = { git = "https://github.com/fakechris/lumen-navi.git", rev = "67d7cfa8114bbd9f38105494ad5574fd51634cc7" }
 # Shared model path/lock/download layer and ASR engine layer for the Lumen
 # product cluster (replaces the former in-repo paths/install_lock/engine code).
-lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "c22f24af02260bcfd64a5dbb641ea105079f0591" }
-lumen-asr-engine = { git = "https://github.com/fakechris/lumen-suite.git", rev = "c22f24af02260bcfd64a5dbb641ea105079f0591", default-features = false }
+lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ef449465d18865d3d819309a64b1e723ae329817" }
+lumen-asr-engine = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ef449465d18865d3d819309a64b1e723ae329817", default-features = false }
+# Shared serde types for the lumen-transcript.v1 interchange format.
+lumen-transcript = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ef449465d18865d3d819309a64b1e723ae329817" }
 parking_lot = "0.12"
 cpal = "0.15"
 blake3 = "1"
