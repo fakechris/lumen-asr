@@ -1,4 +1,4 @@
-name: Release macOS DMGs
+name: Release desktop installers
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-release-${{ github.ref }}
+  group: desktop-release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -79,9 +79,61 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  build-windows:
+    name: Build Windows x64 NSIS
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Set release version from tag
+        run: node scripts/release/set-tauri-version.mjs "$env:GITHUB_REF_NAME"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Build unsigned Windows NSIS installer
+        run: npm run tauri -- build --bundles nsis
+        working-directory: apps/desktop
+
+      - name: Verify and name Windows release asset
+        shell: pwsh
+        run: >-
+          ./scripts/windows/collect-release-asset.ps1
+          -BundleDirectory "$env:CARGO_TARGET_DIR/release/bundle/nsis"
+          -VersionTag "$env:GITHUB_REF_NAME"
+          -OutputDirectory release-assets
+
+      - name: Upload Windows installer for release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-nsis-x64
+          path: release-assets/*.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs:
+      - build
+      - build-windows
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -97,11 +149,18 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Download Windows installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: windows-nsis-x64
+          path: release-assets
+
       - name: Generate and verify SHA-256 checksums
         run: |
           expected=(
             "Lumen-ASR-${GITHUB_REF_NAME}-arm64.dmg"
             "Lumen-ASR-${GITHUB_REF_NAME}-x64.dmg"
+            "Lumen-ASR-${GITHUB_REF_NAME}-windows-x64-setup.exe"
           )
           for asset in "${expected[@]}"; do
             test -f "release-assets/$asset"
@@ -117,6 +176,7 @@ jobs:
           expected_assets=(
             "Lumen-ASR-${GITHUB_REF_NAME}-arm64.dmg"
             "Lumen-ASR-${GITHUB_REF_NAME}-x64.dmg"
+            "Lumen-ASR-${GITHUB_REF_NAME}-windows-x64-setup.exe"
             "SHA256SUMS.txt"
           )
 
@@ -137,9 +197,10 @@ jobs:
             gh release create "$GITHUB_REF_NAME" \
               --verify-tag \
               --draft \
+              --prerelease \
               --title "Lumen ASR $GITHUB_REF_NAME" \
               --generate-notes \
-              --notes "$(cat docs/MACOS_RELEASE_NOTES.md)"
+              --notes "$(cat docs/RELEASE_NOTES.md)"
           fi
 
           # A rebuilt DMG is not byte-for-byte reproducible. Replace the complete draft
@@ -154,4 +215,4 @@ jobs:
             fi
           done
 
-          gh release edit "$GITHUB_REF_NAME" --draft=false
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease
