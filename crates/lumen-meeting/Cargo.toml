@@ -1,0 +1,38 @@
+[package]
+name = "lumen-meeting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Offline meeting pipeline (M2): diarize a wav, transcribe each turn, assemble a multi-segment lumen-transcript.v1 and persist to the v6 meeting tables"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+lumen-core = { workspace = true }
+lumen-store = { workspace = true }
+lumen-transcript = { workspace = true }
+# ASR engine port. default-features=false (via the workspace dep) keeps sherpa
+# out of the offline pipeline build; a real engine is injected by the caller.
+lumen-asr-engine = { workspace = true }
+
+# On-device diarization. macOS only (C++ fbank + ONNX Runtime): declared under
+# a cfg(target_os = "macos") target section so non-macOS (Windows CI) never
+# resolves, downloads, or compiles it. Optional + behind the `diarize` feature
+# so the default build/test (pure assembly + storage) needs neither the git
+# fetch, the C++ toolchain, nor the ONNX Runtime download.
+[target.'cfg(target_os = "macos")'.dependencies]
+diar-rs = { git = "https://github.com/fakechris/lumen-suite.git", rev = "b4eb36a20aac", optional = true }
+
+[features]
+default = []
+# Enable the real macOS diarization path (pulls diar-rs -> ONNX Runtime + C++).
+# No-op on non-macOS: the target-gated optional dep is simply not active there.
+diarize = ["dep:diar-rs"]
+
+[dev-dependencies]
+lumen-asr-engine = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"
