@@ -56,6 +56,10 @@ export type AsrModelStatus = {
   whisperDir: string;
   qwenReady: boolean;
   qwenDir: string;
+  qwenRuntimeSupported: boolean;
+  qwenFallbackReason?: string | null;
+  recommendedEngine: string;
+  totalMemoryMb?: number | null;
   modelsRoot: string;
   activeEngine: string;
   activeModelDir: string;

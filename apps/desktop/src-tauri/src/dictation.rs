@@ -1,7 +1,9 @@
 //! Recording + local ASR + model corrector IPC (M2–M5).
 
 use crate::config::AsrServiceConfig;
-use crate::context_capture::{ActiveContextCapture, CorrectorContextProjection, StageUsageInput};
+use crate::context_capture::{
+    ActiveContextCapture, CorrectorContextProjection, StageUsageInput, TargetHint,
+};
 use crate::pipeline_attempt::{
     apply_asr_result, build_pipeline_identity, elapsed_ms, mark_attempt_failed, persist_attempt,
     run_corrector_stage, write_attempt_debug, AttemptDebug,
@@ -12,7 +14,6 @@ use lumen_asr::{
     prepare_for_asr, probe_status, AsrEngine, AsrRequest, AsrResult, AudioDeviceInfo, EngineKind,
     EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig, QwenShadowRequest, QwenShadowTerm,
 };
-use lumen_context::TargetHint;
 use lumen_core::{DictEntryKind, FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use lumen_dictionary::DictionaryEntry;
 use lumen_platform_macos::{

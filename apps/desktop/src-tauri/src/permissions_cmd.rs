@@ -1,6 +1,9 @@
 //! Permission status + open System Settings.
 
-use lumen_platform::{PermissionStatus, Permissions};
+use lumen_platform::PermissionStatus;
+#[cfg(target_os = "macos")]
+use lumen_platform::Permissions;
+#[cfg(target_os = "macos")]
 use lumen_platform_macos::{is_accessibility_trusted, prompt_accessibility, MacPermissions};
 use serde::Serialize;
 use tauri::State;
@@ -41,7 +44,10 @@ fn map_status(s: PermissionStatus) -> PermissionDto {
         PermissionState::Restricted => "restricted",
         PermissionState::NotDetermined => "not_determined",
     };
+    #[cfg(target_os = "macos")]
     let trusted = is_accessibility_trusted();
+    #[cfg(not(target_os = "macos"))]
+    let trusted = false;
     let ax = if trusted {
         "granted"
     } else {
@@ -147,60 +153,89 @@ fn read_plist_string(path: &std::path::Path, key: &str) -> Option<String> {
 
 /// Parse `codesign -dv` for the running binary. Best-effort; empty on failure.
 fn codesign_info(path: &str) -> (String, String, bool) {
-    let out = std::process::Command::new("codesign")
-        .args(["-dv", "--verbose=4", path])
-        .output();
-    let Ok(out) = out else {
-        return ("unknown".into(), String::new(), false);
-    };
-    // codesign writes to stderr
-    let text = String::from_utf8_lossy(&out.stderr);
-    let mut identifier = String::new();
-    let mut signature = String::new();
-    let mut team = String::new();
-    let mut authority = String::new();
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("Identifier=") {
-            identifier = v.trim().into();
-        } else if let Some(v) = line.strip_prefix("Signature=") {
-            signature = v.trim().into();
-        } else if let Some(v) = line.strip_prefix("TeamIdentifier=") {
-            team = v.trim().into();
-        } else if authority.is_empty() {
-            // First Authority= is the leaf signer (e.g. "Lumen Local Codesign"
-            // or "Apple Development: …"). codesign prints the chain top-down.
-            if let Some(v) = line.strip_prefix("Authority=") {
-                authority = v.trim().into();
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        return ("not_applicable".into(), String::new(), false);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("codesign")
+            .args(["-dv", "--verbose=4", path])
+            .output();
+        let Ok(out) = out else {
+            return ("unknown".into(), String::new(), false);
+        };
+        // codesign writes to stderr
+        let text = String::from_utf8_lossy(&out.stderr);
+        let mut identifier = String::new();
+        let mut signature = String::new();
+        let mut team = String::new();
+        let mut authority = String::new();
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("Identifier=") {
+                identifier = v.trim().into();
+            } else if let Some(v) = line.strip_prefix("Signature=") {
+                signature = v.trim().into();
+            } else if let Some(v) = line.strip_prefix("TeamIdentifier=") {
+                team = v.trim().into();
+            } else if authority.is_empty() {
+                // First Authority= is the leaf signer (e.g. "Lumen Local Codesign"
+                // or "Apple Development: …"). codesign prints the chain top-down.
+                if let Some(v) = line.strip_prefix("Authority=") {
+                    authority = v.trim().into();
+                }
             }
         }
+        // codesign prints the flag label literally, e.g. `flags=0x2(adhoc)` vs
+        // `flags=0x0(none)` — match that rather than a fragile `0x2` substring
+        // (which would also hit 0x20000 etc.). No leaf Authority + no team is the
+        // other adhoc tell.
+        let adhoc = signature.eq_ignore_ascii_case("adhoc")
+            || text.contains("(adhoc)")
+            || (authority.is_empty() && team == "not set");
+        let kind = if adhoc {
+            "adhoc".into()
+        } else if !authority.is_empty() {
+            // Show the signer name — the thing that actually keeps TCC stable.
+            authority
+        } else if !team.is_empty() && team != "not set" {
+            format!("signed:{team}")
+        } else if !signature.is_empty() {
+            signature
+        } else {
+            "unknown".into()
+        };
+        (kind, identifier, adhoc)
     }
-    // codesign prints the flag label literally, e.g. `flags=0x2(adhoc)` vs
-    // `flags=0x0(none)` — match that rather than a fragile `0x2` substring
-    // (which would also hit 0x20000 etc.). No leaf Authority + no team is the
-    // other adhoc tell.
-    let adhoc = signature.eq_ignore_ascii_case("adhoc")
-        || text.contains("(adhoc)")
-        || (authority.is_empty() && team == "not set");
-    let kind = if adhoc {
-        "adhoc".into()
-    } else if !authority.is_empty() {
-        // Show the signer name — the thing that actually keeps TCC stable.
-        authority
-    } else if !team.is_empty() && team != "not set" {
-        format!("signed:{team}")
-    } else if !signature.is_empty() {
-        signature
-    } else {
-        "unknown".into()
-    };
-    (kind, identifier, adhoc)
 }
 
 #[tauri::command]
 pub async fn get_permission_status() -> Result<PermissionDto, String> {
-    let p = MacPermissions;
-    let s = p.status().await.map_err(|e| e.to_string())?;
-    Ok(map_status(s))
+    #[cfg(target_os = "macos")]
+    {
+        let p = MacPermissions;
+        let s = p.status().await.map_err(|e| e.to_string())?;
+        Ok(map_status(s))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use lumen_platform::PermissionState;
+        Ok(map_status(PermissionStatus {
+            // CPAL/WASAPI will trigger the actual privacy prompt when capture
+            // starts; Windows does not expose the macOS-style TCC query here.
+            microphone: PermissionState::NotDetermined,
+            accessibility: PermissionState::Restricted,
+        }))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        use lumen_platform::PermissionState;
+        Ok(map_status(PermissionStatus {
+            microphone: PermissionState::NotDetermined,
+            accessibility: PermissionState::Restricted,
+        }))
+    }
 }
 
 /// Lightweight poll for wizard / settings (same as get; named for intent).
@@ -211,39 +246,68 @@ pub async fn poll_permissions() -> Result<PermissionDto, String> {
 
 #[tauri::command]
 pub async fn open_microphone_settings() -> Result<(), String> {
-    MacPermissions
-        .open_microphone_settings()
-        .await
-        .map_err(|e| e.to_string())
+    #[cfg(target_os = "macos")]
+    {
+        MacPermissions
+            .open_microphone_settings()
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg("ms-settings:privacy-microphone")
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("open Windows microphone settings: {error}"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("opening microphone settings is not implemented on this platform".into())
+    }
 }
 
 #[tauri::command]
 pub async fn open_accessibility_settings() -> Result<(), String> {
-    MacPermissions
-        .open_accessibility_settings()
-        .await
-        .map_err(|e| e.to_string())
+    #[cfg(target_os = "macos")]
+    {
+        MacPermissions
+            .open_accessibility_settings()
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Accessibility settings are macOS-only; Windows currently uses copy-only mode".into())
+    }
 }
 
 /// User-initiated: try once to appear in the Accessibility list, then open Settings.
 /// Does **not** grant permission — user must flip the switch for *this* process path.
 #[tauri::command]
 pub async fn request_accessibility_access() -> Result<PermissionDto, String> {
-    let before = is_accessibility_trusted();
-    if !before {
-        // May register the app in the list (often no dialog on modern macOS).
-        let _ = prompt_accessibility();
+    #[cfg(target_os = "macos")]
+    {
+        let before = is_accessibility_trusted();
+        if !before {
+            // May register the app in the list (often no dialog on modern macOS).
+            let _ = prompt_accessibility();
+        }
+        let _ = MacPermissions.open_accessibility_settings().await;
+        let after = is_accessibility_trusted();
+        tracing::info!(
+            before,
+            after,
+            process = %process_hint(),
+            path = %process_path(),
+            "accessibility request (open Settings; user must enable toggle)"
+        );
+        get_permission_status().await
     }
-    let _ = MacPermissions.open_accessibility_settings().await;
-    let after = is_accessibility_trusted();
-    tracing::info!(
-        before,
-        after,
-        process = %process_hint(),
-        path = %process_path(),
-        "accessibility request (open Settings; user must enable toggle)"
-    );
-    get_permission_status().await
+    #[cfg(not(target_os = "macos"))]
+    {
+        get_permission_status().await
+    }
 }
 
 #[tauri::command]
@@ -261,27 +325,38 @@ pub async fn request_microphone_access(
             }
         }
     }
+    #[cfg(target_os = "macos")]
     let _ = MacPermissions.request_microphone().await;
     get_permission_status().await
 }
 
 /// Startup: log only — do not open Settings or force system prompts.
 pub fn bootstrap_permissions() {
-    let trusted = is_accessibility_trusted();
-    let path = process_path();
-    let (kind, id, adhoc) = codesign_info(&path);
-    tracing::info!(
-        accessibility_trusted = trusted,
-        process = %process_hint(),
-        path = %path,
-        codesign_kind = %kind,
-        codesign_identifier = %id,
-        codesign_adhoc = adhoc,
-        "permission bootstrap (no auto Settings open)"
-    );
-    if !trusted {
-        tracing::warn!(
+    #[cfg(target_os = "macos")]
+    {
+        let trusted = is_accessibility_trusted();
+        let path = process_path();
+        let (kind, id, adhoc) = codesign_info(&path);
+        tracing::info!(
+            accessibility_trusted = trusted,
+            process = %process_hint(),
+            path = %path,
+            codesign_kind = %kind,
+            codesign_identifier = %id,
+            codesign_adhoc = adhoc,
+            "permission bootstrap (no auto Settings open)"
+        );
+        if !trusted {
+            tracing::warn!(
             "Accessibility not granted for this process — inject/event-tap need it. Enable in System Settings → Privacy & Security → Accessibility. Adhoc builds need re-enable after each rebuild; then fully quit & reopen."
         );
+        }
     }
+    #[cfg(target_os = "windows")]
+    tracing::info!(
+        path = %process_path(),
+        "Windows permission bootstrap: microphone is probed on capture; text output is copy-only"
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    tracing::info!("permission bootstrap unavailable on this platform");
 }

@@ -8,11 +8,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+pub use lumen_context::TargetHint;
 use lumen_context::{
     ArtifactPayload, CaptureId, CaptureProfile, CaptureRequest, CaptureSession, CaptureTrigger,
     ContextCollector, ContextConfig, ContextManifest, ContextSealer, ContextSnapshot,
-    PrivacyPolicy, SealedContextEnvelope, SourceKind, SourceSelection, SourceState, TargetHint,
-    TriggerKind,
+    PrivacyPolicy, SealedContextEnvelope, SourceKind, SourceSelection, SourceState, TriggerKind,
 };
 use lumen_store::{
     ContextInputRef, ContextSnapshotRecord, ContextStageUsage, PipelineStage, Store,

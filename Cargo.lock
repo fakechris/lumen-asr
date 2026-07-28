@@ -2194,6 +2194,7 @@ dependencies = [
  "blake3",
  "chrono",
  "cpal",
+ "ico",
  "lumen-asr",
  "lumen-context",
  "lumen-core",
