@@ -23,7 +23,7 @@ certificate.
 ### macOS
 
 - Apple Silicon: download the `arm64.dmg`.
-- Intel Mac: download the `x64.dmg`.
+- Intel Mac builds are not provided.
 
 Current DMGs use ad-hoc code signing and are not notarized with an Apple
 Developer ID. On first launch, macOS may require approval under
