@@ -82,10 +82,13 @@ pub async fn process_meeting(
         opts,
     )
     .await;
-    if result.is_err() {
+    if let Err(err) = &result {
         // Best-effort: never let a processing failure leave the meeting stuck in
-        // an in-flight state. The original error is what we return.
-        if let Err(e) = store.update_meeting_status(meeting_id, MeetingStatus::Failed) {
+        // an in-flight state. Record *why* it failed so the UI can surface an
+        // actionable reason (missing diar models, diarization unsupported here,
+        // …) instead of a bare "failed". The original error is what we return.
+        let reason = err.to_string();
+        if let Err(e) = store.fail_meeting(meeting_id, Some(reason.as_str())) {
             tracing::warn!(meeting_id = %meeting_id, error = %e, "could not mark meeting failed");
         }
     }
@@ -193,6 +196,11 @@ mod tests {
         assert!(matches!(result, Err(ProcessError::Transcribe(_))));
         let after = store.get_meeting(meeting.id).unwrap().unwrap();
         assert_eq!(after.status, MeetingStatus::Failed);
+        // The failure reason is recorded so the UI can surface it.
+        assert!(after
+            .failure_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("transcribe")));
         // No transcript rows were written on the failed path.
         assert!(store.list_segments(meeting.id).unwrap().is_empty());
     }

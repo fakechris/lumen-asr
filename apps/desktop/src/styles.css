@@ -2539,3 +2539,106 @@ html:has(.capsule-root) body {
   margin: 0;
   line-height: 1.6;
 }
+
+/* ---- start / inline recording bar ------------------------------------ */
+.meeting-start-bar {
+  margin-bottom: 14px;
+}
+
+.meeting-start {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.meeting-start-title {
+  flex: 1;
+  min-height: var(--control-h);
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card-soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.meeting-start-btn {
+  flex-shrink: 0;
+}
+
+.meeting-recording {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--error) 45%, transparent);
+  background: color-mix(in srgb, var(--error) 8%, transparent);
+}
+
+.meeting-rec-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--error);
+  flex-shrink: 0;
+  animation: mtg-pulse 1.4s ease-in-out infinite;
+}
+
+.meeting-rec-label {
+  font-weight: 600;
+  color: var(--error);
+}
+
+.meeting-rec-timer {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.meeting-rec-hint {
+  font-size: 0.75rem;
+}
+
+.meeting-rec-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+@keyframes mtg-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ---- failure reason + guidance --------------------------------------- */
+.meeting-fail-reason {
+  margin: 6px 0 0;
+  font-size: 0.82rem;
+  color: var(--error);
+  word-break: break-word;
+}
+
+.meeting-fail-guide {
+  margin: 8px 0 0;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  color: var(--text);
+}
+
+.meeting-fail-guide code {
+  font-size: 0.78rem;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--accent-dim);
+}
+
+.meeting-config-llm {
+  margin-top: 10px;
+}

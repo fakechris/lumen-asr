@@ -23,8 +23,9 @@ impl Store {
         self.conn.execute(
             r#"
             INSERT INTO meetings (
-              id, created_at, title, audio_path, duration_seconds, status, language
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7)
+              id, created_at, title, audio_path, duration_seconds, status,
+              language, failure_reason
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
             "#,
             params![
                 meeting.id.to_string(),
@@ -34,6 +35,7 @@ impl Store {
                 meeting.duration_seconds,
                 meeting.status.as_str(),
                 meeting.language,
+                meeting.failure_reason,
             ],
         )?;
         Ok(())
@@ -41,10 +43,32 @@ impl Store {
 
     /// Update only the lifecycle status of a meeting. Returns `true` if a row
     /// was updated.
+    ///
+    /// Moving a meeting to any **non-failed** status clears any previously
+    /// recorded [`failure_reason`](lumen_core::Meeting::failure_reason) — so a
+    /// meeting that is re-processed (advancing back through
+    /// `transcribing → … → ready`) does not keep a stale reason from an earlier
+    /// failed run. To move a meeting *to* failed **with** a reason, use
+    /// [`fail_meeting`](Self::fail_meeting).
     pub fn update_meeting_status(&self, id: Uuid, status: MeetingStatus) -> Result<bool> {
         let changed = self.conn.execute(
-            "UPDATE meetings SET status=?2 WHERE id=?1",
+            "UPDATE meetings \
+             SET status=?2, \
+                 failure_reason = CASE WHEN ?2 = 'failed' THEN failure_reason ELSE NULL END \
+             WHERE id=?1",
             params![id.to_string(), status.as_str()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Move a meeting to [`MeetingStatus::Failed`] and record why. The `reason`
+    /// is surfaced to the UI (`get_meeting` / `get_meeting_detail` / list) so a
+    /// failure is actionable instead of a bare "失败" badge. Returns `true` if a
+    /// row was updated.
+    pub fn fail_meeting(&self, id: Uuid, reason: Option<&str>) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE meetings SET status='failed', failure_reason=?2 WHERE id=?1",
+            params![id.to_string(), reason],
         )?;
         Ok(changed > 0)
     }
@@ -61,7 +85,10 @@ impl Store {
         status: MeetingStatus,
     ) -> Result<bool> {
         let changed = self.conn.execute(
-            "UPDATE meetings SET audio_path=?2, duration_seconds=?3, status=?4 WHERE id=?1",
+            "UPDATE meetings \
+             SET audio_path=?2, duration_seconds=?3, status=?4, \
+                 failure_reason = CASE WHEN ?4 = 'failed' THEN failure_reason ELSE NULL END \
+             WHERE id=?1",
             params![
                 id.to_string(),
                 audio_path,
@@ -76,7 +103,8 @@ impl Store {
         self.conn
             .query_row(
                 r#"
-                SELECT id, created_at, title, audio_path, duration_seconds, status, language
+                SELECT id, created_at, title, audio_path, duration_seconds, status,
+                       language, failure_reason
                 FROM meetings WHERE id=?1
                 "#,
                 params![id.to_string()],
@@ -90,7 +118,8 @@ impl Store {
     pub fn list_meetings(&self, limit: u32) -> Result<Vec<Meeting>> {
         let mut statement = self.conn.prepare(
             r#"
-            SELECT id, created_at, title, audio_path, duration_seconds, status, language
+            SELECT id, created_at, title, audio_path, duration_seconds, status,
+                   language, failure_reason
             FROM meetings
             ORDER BY created_at DESC
             LIMIT ?1
@@ -122,7 +151,8 @@ impl Store {
             .map(str::to_string);
         let mut statement = self.conn.prepare(
             r#"
-            SELECT id, created_at, title, audio_path, duration_seconds, status, language
+            SELECT id, created_at, title, audio_path, duration_seconds, status,
+                   language, failure_reason
             FROM meetings
             WHERE (?1 IS NULL OR status = ?1)
               AND (?2 IS NULL OR instr(title, ?2) > 0)
@@ -398,6 +428,7 @@ fn map_meeting(row: &rusqlite::Row<'_>) -> rusqlite::Result<Meeting> {
         duration_seconds: row.get(4)?,
         status: MeetingStatus::from_str_or_recording(&row.get::<_, String>(5)?),
         language: row.get(6)?,
+        failure_reason: row.get(7)?,
     })
 }
 
@@ -528,6 +559,42 @@ mod tests {
         assert!(!store
             .set_meeting_audio(Uuid::new_v4(), "/x.wav", 1.0, MeetingStatus::Failed)
             .unwrap());
+    }
+
+    #[test]
+    fn fail_meeting_records_reason_and_non_failed_transition_clears_it() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+
+        // Failing records both the status and a human-readable reason.
+        assert!(store
+            .fail_meeting(
+                meeting.id,
+                Some("diar models not found: missing segmentation")
+            )
+            .unwrap());
+        let failed = store.get_meeting(meeting.id).unwrap().unwrap();
+        assert_eq!(failed.status, MeetingStatus::Failed);
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("diar models not found: missing segmentation")
+        );
+
+        // Re-processing (a non-failed transition) clears the stale reason so a
+        // meeting that recovers does not keep an old failure message.
+        assert!(store
+            .update_meeting_status(meeting.id, MeetingStatus::Transcribing)
+            .unwrap());
+        let recovering = store.get_meeting(meeting.id).unwrap().unwrap();
+        assert_eq!(recovering.status, MeetingStatus::Transcribing);
+        assert_eq!(recovering.failure_reason, None);
+
+        // Failing without a specific reason is allowed (reason stays NULL).
+        assert!(store.fail_meeting(meeting.id, None).unwrap());
+        let failed_again = store.get_meeting(meeting.id).unwrap().unwrap();
+        assert_eq!(failed_again.status, MeetingStatus::Failed);
+        assert_eq!(failed_again.failure_reason, None);
     }
 
     #[test]

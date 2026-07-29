@@ -16,7 +16,7 @@
 
 use crate::mode_arbiter::HotkeyAction;
 use crate::AppState;
-use lumen_core::{Meeting, MeetingDetail, MeetingStatus};
+use lumen_core::{Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SummaryKind};
 use lumen_meeting::{
     export_meeting as render_export, process_meeting, DiarModels, ExportOutput, ExportPreset,
     MeetingOptions, MinutesConfig, DEFAULT_MAX_SPEAKERS,
@@ -114,11 +114,12 @@ pub fn start_meeting_recording(
     let dir = default_data_dir().join("meetings");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         state.capture.force_idle();
+        let reason = format!("could not create meetings dir: {e}");
         let _ = with_store(&state, |s| {
-            s.update_meeting_status(meeting_id, MeetingStatus::Failed)
+            s.fail_meeting(meeting_id, Some(&reason))
                 .map_err(|e| e.to_string())
         });
-        return Err(format!("could not create meetings dir: {e}"));
+        return Err(reason);
     }
     let out_path = dir.join(format!("{meeting_id}.wav"));
 
@@ -128,11 +129,12 @@ pub fn start_meeting_recording(
         // Roll back: mark failed and release the arbiter. No hotkey suspend was
         // applied yet, so nothing to restore.
         state.capture.force_idle();
+        let reason = format!("could not start recording: {e}");
         let _ = with_store(&state, |s| {
-            s.update_meeting_status(meeting_id, MeetingStatus::Failed)
+            s.fail_meeting(meeting_id, Some(&reason))
                 .map_err(|e| e.to_string())
         });
-        return Err(format!("could not start recording: {e}"));
+        return Err(reason);
     }
 
     // 5. Recording is live — now suspend the dictation hotkey.
@@ -175,9 +177,9 @@ pub fn stop_meeting_recording(
     let summary = match stop_result {
         Ok(summary) => summary,
         Err(e) => {
+            let reason = format!("recorder stop failed: {e}");
             let _ = with_store(&state, |s| {
-                s.update_meeting_status(id, MeetingStatus::Failed)
-                    .map_err(|e| e.to_string())
+                s.fail_meeting(id, Some(&reason)).map_err(|e| e.to_string())
             });
             tracing::warn!(meeting_id = %id, error = %e, "meeting recorder stop failed");
             return Err(e.to_string());
@@ -270,7 +272,9 @@ fn spawn_meeting_processing(app: AppHandle, meeting_id: Uuid, wav: PathBuf) {
             Ok(runtime) => runtime,
             Err(e) => {
                 tracing::warn!(meeting_id = %meeting_id, error = %e, "could not build meeting runtime");
-                if let Err(e) = mark_meeting_failed(meeting_id) {
+                if let Err(e) =
+                    mark_meeting_failed(meeting_id, Some("could not start meeting runtime"))
+                {
                     tracing::warn!(meeting_id = %meeting_id, error = %e, "could not mark meeting failed");
                 }
                 return;
@@ -282,7 +286,10 @@ fn spawn_meeting_processing(app: AppHandle, meeting_id: Uuid, wav: PathBuf) {
                 Ok(()) => tracing::info!(meeting_id = %meeting_id, "meeting processing finished"),
                 Err(reason) => {
                     tracing::warn!(meeting_id = %meeting_id, error = %reason, "meeting processing failed");
-                    if let Err(e) = mark_meeting_failed(meeting_id) {
+                    // `process_meeting` records the reason for in-pipeline
+                    // failures itself; this covers the pre-flight failures
+                    // (engine/model/config build) that never reach it.
+                    if let Err(e) = mark_meeting_failed(meeting_id, Some(&reason)) {
                         tracing::warn!(
                             meeting_id = %meeting_id,
                             error = %e,
@@ -358,6 +365,11 @@ async fn process_meeting_pipeline(
         ..MeetingOptions::default()
     };
 
+    // When no LLM is configured the minutes step is skipped (transcript-only →
+    // ready). Remember that so we can leave a marker for the UI to prompt the
+    // user to configure an LLM, instead of silently showing an empty 纪要 page.
+    let no_llm = minutes_cfg.is_none();
+
     process_meeting(
         &store,
         meeting_id,
@@ -368,7 +380,23 @@ async fn process_meeting_pipeline(
         &opts,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    if no_llm {
+        // Sentinel summary (kind=summary) the 纪要 page detects to show
+        // "未配置 LLM，配置后可自动生成会议纪要" rather than a bare "暂无纪要".
+        // Only written on the success path — a failed pipeline never reaches
+        // here, so a failed meeting is not mistaken for a no-LLM one.
+        let marker = MeetingSummary::new(
+            meeting_id,
+            SummaryKind::Summary,
+            r#"{"skipped_no_llm":true}"#,
+        );
+        store
+            .save_summary(&marker)
+            .map_err(|e| format!("save no-llm marker: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Verify the three diarization model artifacts exist before running, so a
@@ -392,12 +420,12 @@ fn ensure_diar_models_present(models: &DiarModels) -> Result<(), String> {
     Ok(())
 }
 
-/// Mark a meeting `failed` from the background worker, on its own connection
-/// (never touches the UI store lock).
-fn mark_meeting_failed(meeting_id: Uuid) -> Result<(), String> {
+/// Mark a meeting `failed` (with an optional reason) from the background
+/// worker, on its own connection (never touches the UI store lock).
+fn mark_meeting_failed(meeting_id: Uuid, reason: Option<&str>) -> Result<(), String> {
     let store = Store::open(default_db_path()).map_err(|e| e.to_string())?;
     store
-        .update_meeting_status(meeting_id, MeetingStatus::Failed)
+        .fail_meeting(meeting_id, reason)
         .map_err(|e| e.to_string())?;
     Ok(())
 }

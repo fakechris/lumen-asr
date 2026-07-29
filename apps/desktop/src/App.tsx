@@ -454,7 +454,9 @@ export default function App() {
               />
             )}
 
-            {tab === "meeting" && <MeetingPanel onError={setError} />}
+            {tab === "meeting" && (
+              <MeetingPanel onError={setError} onNavigate={(t) => setTab(t)} />
+            )}
 
             {tab === "overview" && (
               <Overview
