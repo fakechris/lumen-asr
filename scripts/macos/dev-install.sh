@@ -23,6 +23,11 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 APP_DIR="$ROOT/target/release/bundle/macos/Lumen ASR.app"
 BIN_SRC="$ROOT/target/release/lumen-asr-desktop"
 BIN_DST="$APP_DIR/Contents/MacOS/lumen-asr-desktop"
+# Final install location. Building into target/ but launching from /Applications
+# (Spotlight/Dock) is how you end up running a stale copy — so after signing we
+# sync the fresh bundle here and open THIS one. Override with LUMEN_INSTALL_DEST=
+# (set empty to skip and run in place from target/).
+INSTALL_DEST="${LUMEN_INSTALL_DEST-/Applications/Lumen ASR.app}"
 OPEN_APP=0
 SKIP_BUILD=0
 SKIP_FRONTEND=0
@@ -146,8 +151,51 @@ fi
 echo "==> sign"
 "$ROOT/scripts/macos/sign-app.sh" "$APP_DIR"
 
+# Sync the signed bundle to its final launch location so Spotlight/Dock always
+# start the build we just made — the codesign signature is identifier-based
+# (path-independent), so it travels with the bundle. ditto preserves it.
+FINAL_APP="$APP_DIR"
+if [[ -n "$INSTALL_DEST" ]]; then
+  # Guard the destructive replace: INSTALL_DEST is caller-overridable, so refuse
+  # anything but an absolute *.app path, and never a path inside the build tree
+  # (that would delete the source bundle we just built).
+  case "$INSTALL_DEST" in
+    /*.app) : ;;
+    *)
+      echo "ERROR: LUMEN_INSTALL_DEST must be an absolute path ending in .app" >&2
+      echo "       (got: '$INSTALL_DEST')" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$INSTALL_DEST" == "$ROOT"* ]]; then
+    echo "ERROR: LUMEN_INSTALL_DEST must not point inside the build tree" >&2
+    echo "       (got: '$INSTALL_DEST')" >&2
+    exit 2
+  fi
+
+  echo "==> install → $INSTALL_DEST"
+  if pgrep -x "lumen-asr-desktop" >/dev/null 2>&1; then
+    osascript -e 'tell application "Lumen ASR" to quit' 2>/dev/null || true
+    sleep 0.4
+  fi
+  # Stage to a sibling, verify the signature there, and only then swap it in — so
+  # a failed copy/verify never leaves the destination half-removed, and a verify
+  # failure falls through to the run-in-place warning instead of exiting (set -e).
+  STAGE="${INSTALL_DEST}.new"
+  rm -rf "$STAGE"
+  if ditto "$APP_DIR" "$STAGE" && codesign --verify --verbose=1 "$STAGE" 2>&1 | tail -1; then
+    rm -rf "$INSTALL_DEST"
+    mv "$STAGE" "$INSTALL_DEST"
+    FINAL_APP="$INSTALL_DEST"
+  else
+    rm -rf "$STAGE"
+    echo "WARNING: could not install into $INSTALL_DEST; run in place from" >&2
+    echo "         $APP_DIR instead (set LUMEN_INSTALL_DEST= to silence)." >&2
+  fi
+fi
+
 echo ""
-echo "Installed: $APP_DIR"
+echo "Installed: $FINAL_APP"
 echo "Identity:  ${LUMEN_CODESIGN_IDENTITY:-Lumen Local Codesign}"
 echo ""
 echo "TCC tip: first run → System Settings → Privacy → Microphone + Accessibility"
@@ -156,5 +204,5 @@ echo "         (same cert). Ad-hoc (-s -) does NOT."
 
 if [[ "$OPEN_APP" -eq 1 ]]; then
   echo "==> open"
-  open "$APP_DIR"
+  open "$FINAL_APP"
 fi
