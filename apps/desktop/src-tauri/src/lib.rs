@@ -16,7 +16,9 @@ mod hotkey;
 mod hotkey_validate;
 mod inject_cmd;
 mod learning;
+mod meeting_cmd;
 mod mod_chord;
+mod mode_arbiter;
 mod onboard;
 mod pane_observer;
 mod permissions_cmd;
@@ -31,11 +33,12 @@ pub(crate) static MACOS_LIVE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mu
 use config::AppConfig;
 use lumen_asr::{
     default_qwen_dir, default_sensevoice_dir, default_whisper_dir, qwen_ready, sensevoice_ready,
-    whisper_ready, AudioCapture, EngineKind, QwenAsr, QwenAsrConfig, SenseVoiceSherpaAsr,
-    WhisperAsr,
+    whisper_ready, AudioCapture, EngineKind, MeetingRecorder, QwenAsr, QwenAsrConfig,
+    SenseVoiceSherpaAsr, WhisperAsr,
 };
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
+use mode_arbiter::CaptureArbiter;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -55,6 +58,10 @@ pub struct QwenRuntimeStatus {
 pub struct AppState {
     pub store: Mutex<Option<Store>>,
     pub audio: AudioCapture,
+    /// Independent continuous recorder for meetings (never touches `audio`).
+    pub meeting_recorder: MeetingRecorder,
+    /// Mutual-exclusion arbiter between dictation and meeting recording.
+    pub capture: CaptureArbiter,
     pub engine: Mutex<EngineKind>,
     pub sensevoice: Mutex<SenseVoiceSherpaAsr>,
     pub qwen: Mutex<QwenAsr>,
@@ -252,6 +259,8 @@ pub fn run() {
         .manage(AppState {
             store: Mutex::new(store),
             audio,
+            meeting_recorder: MeetingRecorder::new(),
+            capture: CaptureArbiter::new(),
             engine: Mutex::new(initial_engine),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sv_dir)),
             qwen: Mutex::new(qwen),
@@ -311,6 +320,10 @@ pub fn run() {
             hotkey::save_hotkey_config,
             hotkey::pause_hotkeys,
             hotkey::resume_hotkeys,
+            meeting_cmd::start_meeting_recording,
+            meeting_cmd::stop_meeting_recording,
+            meeting_cmd::pause_meeting_recording,
+            meeting_cmd::resume_meeting_recording,
             learning::get_learning_config,
             learning::save_learning_config,
             learning::process_edit,

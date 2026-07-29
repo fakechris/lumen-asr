@@ -1966,6 +1966,8 @@ mod attempt_metric_tests {
                 Store::open(dir.path().join("capture.sqlite")).unwrap(),
             )),
             audio: AudioCapture::new(),
+            meeting_recorder: lumen_asr::MeetingRecorder::new(),
+            capture: crate::mode_arbiter::CaptureArbiter::new(),
             engine: Mutex::new(EngineKind::SenseVoice),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(dir.path().join("sensevoice"))),
             qwen: Mutex::new(qwen),
