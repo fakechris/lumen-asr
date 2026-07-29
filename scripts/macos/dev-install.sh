@@ -4,10 +4,15 @@
 # This is the daily local loop WITHOUT a paid Apple Developer Program account.
 #
 # Usage:
-#   ./scripts/macos/dev-install.sh           # build + install + sign
-#   ./scripts/macos/dev-install.sh --open    # also launch
-#   ./scripts/macos/dev-install.sh --skip-build  # only reinstall/sign current binary
+#   ./scripts/macos/dev-install.sh              # rebuild frontend + backend, install, sign
+#   ./scripts/macos/dev-install.sh --open       # also launch
+#   ./scripts/macos/dev-install.sh --skip-frontend  # backend-only iteration (reuse dist)
+#   ./scripts/macos/dev-install.sh --skip-build # only reinstall/sign the current binary
 #   LUMEN_CODESIGN_IDENTITY="Apple Development: you@x.com (…)" ./scripts/macos/dev-install.sh
+#
+# By default the frontend is rebuilt first so a fresh backend never ships stale
+# UI (plain `cargo build` embeds whatever `dist/` already exists). Use
+# --skip-frontend to skip that when only backend code changed.
 #
 # After first install, grant Accessibility / Microphone once for this app.
 # Re-running this script keeps the same signing identity → TCC usually sticks.
@@ -20,13 +25,15 @@ BIN_SRC="$ROOT/target/release/lumen-asr-desktop"
 BIN_DST="$APP_DIR/Contents/MacOS/lumen-asr-desktop"
 OPEN_APP=0
 SKIP_BUILD=0
+SKIP_FRONTEND=0
 
 for arg in "$@"; do
   case "$arg" in
     --open) OPEN_APP=1 ;;
     --skip-build) SKIP_BUILD=1 ;;
+    --skip-frontend) SKIP_FRONTEND=1 ;;
     -h|--help)
-      sed -n '2,20p' "$0"
+      sed -n '2,18p' "$0"
       exit 0
       ;;
     *)
@@ -39,6 +46,16 @@ done
 cd "$ROOT"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
+  if [[ "$SKIP_FRONTEND" -eq 0 ]]; then
+    echo "==> rebuild frontend (npm run build → apps/desktop/dist)"
+    npm --prefix "$ROOT/apps/desktop" run build
+    # The Rust shell embeds dist/ via generate_context! in lib.rs at compile
+    # time. Bump its mtime so cargo re-embeds the freshly built UI instead of
+    # baking a stale copy into the new backend.
+    touch "$ROOT/apps/desktop/src-tauri/src/lib.rs"
+  else
+    echo "==> skipping frontend rebuild (--skip-frontend); dist/ may be stale"
+  fi
   echo "==> cargo build -p lumen-asr-desktop --release"
   cargo build -p lumen-asr-desktop --release
 fi
@@ -65,6 +82,7 @@ if [[ ! -d "$APP_DIR" ]]; then
   <key>CFBundleIdentifier</key><string>com.lumenopen.asr</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Lumen ASR</string>
+  <key>CFBundleIconFile</key><string>icon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>0.1.0</string>
@@ -92,9 +110,38 @@ mkdir -p "$(dirname "$BIN_DST")"
 cp -f "$BIN_SRC" "$BIN_DST"
 chmod +x "$BIN_DST"
 
-echo "==> app icon (generated from the mark SVG; not committed as a binary)"
-"$ROOT/scripts/macos/gen-app-icon.sh" "$APP_DIR" \
-  || echo "  icon generation skipped (install rsvg-convert or ImageMagick)"
+echo "==> app icon"
+# Goal: the dock icon is present after EVERY install. Prefer a prebuilt .icns
+# already in the repo (no external rasterizer needed); only fall back to the
+# SVG generator when none exists, and warn loudly if even that fails.
+ICON_SRC=""
+for cand in \
+  "$ROOT/apps/desktop/src-tauri/icons/icon.icns" \
+  "$ROOT/apps/desktop/src-tauri/icons/Lumen.icns"; do
+  if [[ -f "$cand" ]]; then ICON_SRC="$cand"; break; fi
+done
+
+ICON_DST="$APP_DIR/Contents/Resources/icon.icns"
+PLIST="$APP_DIR/Contents/Info.plist"
+
+if [[ -n "$ICON_SRC" ]]; then
+  mkdir -p "$APP_DIR/Contents/Resources"
+  cp -f "$ICON_SRC" "$ICON_DST"
+  echo "  icon ← $ICON_SRC"
+elif "$ROOT/scripts/macos/gen-app-icon.sh" "$APP_DIR"; then
+  echo "  icon generated from mark SVG"
+else
+  echo "WARNING: could not install a dock icon (no prebuilt .icns and the SVG" >&2
+  echo "         generator failed — install rsvg-convert or ImageMagick). The" >&2
+  echo "         app will show the generic macOS icon." >&2
+fi
+
+# Point Info.plist at the icon so the Finder/Dock actually load it. PlistBuddy
+# ships with macOS and preserves the XML format (unlike `defaults write`).
+if [[ -f "$ICON_DST" && -f "$PLIST" ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile icon" "$PLIST" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string icon" "$PLIST"
+fi
 
 echo "==> sign"
 "$ROOT/scripts/macos/sign-app.sh" "$APP_DIR"

@@ -13,6 +13,7 @@ import lumenMark from "./assets/product-icons/lumen-asr.svg";
 import type {
   AsrStatus,
   AudioDevice,
+  BuildInfo,
   CorrectorStatus,
   DictionaryEntry,
   EditEvent,
@@ -1240,6 +1241,14 @@ function SettingsPanel({
   const [promoteN, setPromoteN] = useState(3);
   const [postPaste, setPostPaste] = useState(true);
   const [postPasteSecs, setPostPasteSecs] = useState(20);
+  // null = still loading, "error" = lookup failed (never stuck on loading).
+  const [buildInfo, setBuildInfo] = useState<BuildInfo | "error" | null>(null);
+  useEffect(() => {
+    void api
+      .buildInfo()
+      .then(setBuildInfo)
+      .catch(() => setBuildInfo("error"));
+  }, []);
 
   useEffect(() => {
     void (async () => {
@@ -2526,6 +2535,23 @@ function SettingsPanel({
           </li>
         </ul>
       </section>
+
+      <p
+        className="muted-text"
+        style={{
+          margin: "0.25rem 0 0",
+          fontSize: "0.78rem",
+          textAlign: "center",
+          userSelect: "text",
+        }}
+        title="构建标识：版本 · git 短 sha · 构建时间"
+      >
+        {buildInfo === null
+          ? "构建信息加载中…"
+          : buildInfo === "error"
+            ? "构建信息不可用（版本未知）"
+            : `v${buildInfo.version} · ${buildInfo.git_sha} · ${buildInfo.build_time}`}
+      </p>
     </>
   );
 }
