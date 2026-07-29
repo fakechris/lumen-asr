@@ -74,6 +74,7 @@ export type TranscribeOutcome = {
   asrText: string;
   correctedText: string;
   modelApplied: boolean;
+  fallbackReason?: string | null;
   asrEngine: string;
   correctorEngine: string;
   sampleRate: number;

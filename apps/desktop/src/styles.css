@@ -952,6 +952,24 @@ code {
   box-shadow: var(--shadow);
 }
 
+.history-corrector-fallback {
+  display: grid;
+  gap: 3px;
+  margin-bottom: 12px;
+  padding: 11px 13px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 8%, var(--card-soft));
+  color: var(--text);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.history-corrector-fallback strong {
+  color: color-mix(in srgb, var(--accent) 76%, var(--text));
+  font-size: 0.88rem;
+}
+
 .history-result-soft {
   border-style: dashed;
   background: color-mix(in srgb, var(--text) 2.5%, var(--card));
@@ -1914,6 +1932,12 @@ html:has(.capsule-root) body {
   border-color: rgba(224, 138, 79, 0.9);
 }
 
+.capsule-root.phase-notice {
+  background: #1a1407;
+  border-color: rgba(240, 190, 72, 0.95);
+  color: #fff4cf;
+}
+
 /* Translate — gold, distinct from the red/amber record path */
 .capsule-root.intent-translate {
   background: #191309;
@@ -1957,6 +1981,12 @@ html:has(.capsule-root) body {
   color: #ffcc66;
   border-color: rgba(255, 159, 10, 0.55);
   animation: pulse 0.7s ease-in-out infinite;
+}
+
+.phase-notice .capsule-badge {
+  background: rgba(240, 190, 72, 0.24);
+  color: #ffdc85;
+  border-color: rgba(240, 190, 72, 0.65);
 }
 
 .intent-translate .capsule-badge {
