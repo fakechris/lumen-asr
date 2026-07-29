@@ -15,6 +15,7 @@ import type {
   LearnCandidate,
   Meeting,
   MeetingDetail,
+  MeetingRecordingResult,
   MeetingStatus,
   SessionRecord,
   TranscribeOutcome,
@@ -389,6 +390,22 @@ export const api = {
     invoke<void>("delete_dictionary_entry", { id }),
 
   // ---- Meeting mode (M4) ------------------------------------------------
+
+  /** Start a new meeting recording; resolves with the new meeting id. Suspends
+   * the dictation hotkey for the duration (M3 mode arbiter). */
+  startMeetingRecording: (title?: string) =>
+    invoke<string>("start_meeting_recording", { title: title ?? null }),
+
+  /** Stop the active meeting recording; the meeting then advances
+   * `processing → … → ready`/`failed` in the background (poll the list/detail). */
+  stopMeetingRecording: (meetingId: string) =>
+    invoke<MeetingRecordingResult>("stop_meeting_recording", { meetingId }),
+
+  /** Pause the active meeting recording (paused audio is dropped, no gap). */
+  pauseMeetingRecording: () => invoke<void>("pause_meeting_recording"),
+
+  /** Resume a paused meeting recording. */
+  resumeMeetingRecording: () => invoke<void>("resume_meeting_recording"),
 
   /** List meetings newest first, optionally filtered by status token / title query. */
   listMeetings: (opts?: {

@@ -437,6 +437,18 @@ export type Meeting = {
   duration_seconds?: number | null;
   status: MeetingStatus;
   language?: string | null;
+  /** Why a `failed` meeting failed (missing diar models, unsupported platform,
+   * …); absent on every non-failed meeting. */
+  failure_reason?: string | null;
+};
+
+/** Result of `stop_meeting_recording` (camelCase DTO). */
+export type MeetingRecordingResult = {
+  id: string;
+  audioPath: string;
+  durationSeconds: number;
+  sampleRate: number;
+  status: string;
 };
 
 /** A speaker cluster within one meeting. Unconfirmed while `display_name` is null. */

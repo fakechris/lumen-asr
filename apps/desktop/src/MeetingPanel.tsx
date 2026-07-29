@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { Icon } from "./Icons";
+import { diarGuidance, isNoLlmMarker } from "./meetingGuidance";
 import type {
   ActionItem,
   ExportPreset,
@@ -10,6 +11,7 @@ import type {
   Minutes,
   Speaker,
   SourceRef,
+  TabId,
   TranscriptSegment,
 } from "./types";
 
@@ -122,10 +124,19 @@ function speakerDisplay(speaker?: Speaker | null): {
   return { name: speaker.label, confirmed: false };
 }
 
-/** Parse the structured Minutes JSON out of the `summary`-kind row. */
+/** True when the meeting is `ready` but its minutes were skipped because no LLM
+ * was configured (the backend leaves a sentinel `summary` row). */
+function noLlmMinutes(detail: MeetingDetail): boolean {
+  const row = detail.summaries.find((s) => s.kind === "summary");
+  return row != null && isNoLlmMarker(row.content);
+}
+
+/** Parse the structured Minutes JSON out of the `summary`-kind row. Returns
+ * null for the no-LLM sentinel so it is never rendered as real minutes. */
 function parseMinutes(detail: MeetingDetail): Minutes | null {
   const row = detail.summaries.find((s) => s.kind === "summary");
   if (!row) return null;
+  if (isNoLlmMarker(row.content)) return null;
   try {
     const raw = JSON.parse(row.content) as Partial<Minutes>;
     return {
@@ -144,8 +155,11 @@ function parseMinutes(detail: MeetingDetail): Minutes | null {
 
 export function MeetingPanel({
   onError,
+  onNavigate,
 }: {
   onError: (e: string | null) => void;
+  /** Switch the top-level app tab (used by the "配置 LLM" / "去设置" links). */
+  onNavigate?: (tab: TabId) => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
@@ -155,6 +169,7 @@ export function MeetingPanel({
         meetingId={selectedId}
         onBack={() => setSelectedId(null)}
         onError={onError}
+        onNavigate={onNavigate}
       />
     );
   }
@@ -196,6 +211,14 @@ function MeetingLibrary({
   const [filter, setFilter] = useState<FilterId>("all");
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  // Local recording handle set on start; `null` when idle. Kept alongside the
+  // list-derived recording row so the recording bar keeps an accurate start
+  // time even before the next poll reflects the new meeting.
+  const [active, setActive] = useState<{ id: string; startedAtMs: number } | null>(
+    null,
+  );
+  const [titleDraft, setTitleDraft] = useState("");
+  const [starting, setStarting] = useState(false);
 
   const refresh = useCallback(
     async (q: string) => {
@@ -245,6 +268,38 @@ function MeetingLibrary({
     }
     return c;
   }, [meetings]);
+
+  // A backend meeting still in `recording` status is the source of truth for
+  // "we are recording"; `active` supplies the accurate wall-clock start time.
+  const listRecording = meetings.find((m) => m.status === "recording") ?? null;
+  const recording =
+    active ??
+    (listRecording
+      ? {
+          id: listRecording.id,
+          startedAtMs: Date.parse(listRecording.created_at),
+        }
+      : null);
+
+  const startMeeting = useCallback(async () => {
+    setStarting(true);
+    onError(null);
+    try {
+      const id = await api.startMeetingRecording(titleDraft.trim() || undefined);
+      setActive({ id, startedAtMs: Date.now() });
+      setTitleDraft("");
+      await refresh(query);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setStarting(false);
+    }
+  }, [titleDraft, refresh, query, onError]);
+
+  const onStopped = useCallback(() => {
+    setActive(null);
+    void refresh(query);
+  }, [refresh, query]);
 
   const visible = meetings.filter((m) => matchesFilter(m.status, filter));
 
@@ -301,6 +356,41 @@ function MeetingLibrary({
       </aside>
 
       <section className="card meeting-list-pane">
+        <div className="meeting-start-bar">
+          {recording ? (
+            <RecordingBar
+              meetingId={recording.id}
+              startedAtMs={recording.startedAtMs}
+              onStopped={onStopped}
+              onError={onError}
+            />
+          ) : (
+            <form
+              className="meeting-start"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void startMeeting();
+              }}
+            >
+              <input
+                className="meeting-start-title"
+                type="text"
+                value={titleDraft}
+                placeholder="会议标题（可选）"
+                disabled={starting}
+                onChange={(e) => setTitleDraft(e.target.value)}
+              />
+              <button
+                type="submit"
+                className="btn meeting-start-btn"
+                disabled={starting}
+              >
+                <Icon name="mic" size={16} />
+                {starting ? "正在开始…" : "开始会议"}
+              </button>
+            </form>
+          )}
+        </div>
         {visible.length === 0 ? (
           <div className="meeting-empty">
             <p className="empty-history-title">
@@ -309,7 +399,7 @@ function MeetingLibrary({
             <p className="muted-text">
               {query.trim()
                 ? "没有匹配的会议标题。"
-                : "在录音里开始一场会议后，会议会按时间出现在这里。"}
+                : "点上方“开始会议”录一场会议，停止后它会按时间出现在这里。"}
             </p>
           </div>
         ) : (
@@ -333,10 +423,114 @@ function MeetingLibrary({
   );
 }
 
-function StatusBadge({ status }: { status: MeetingStatus }) {
+// ---- inline recording state --------------------------------------------
+// A deliberately restrained recording strip: ● 正在录制 + elapsed timer +
+// pause/resume + stop. No in-meeting editing, no live transcript, and no mic
+// level (there is no meeting-recorder level interface yet). Speaker separation
+// and the transcript all happen offline after stop.
+function RecordingBar({
+  meetingId,
+  startedAtMs,
+  onStopped,
+  onError,
+}: {
+  meetingId: string;
+  startedAtMs: number;
+  onStopped: () => void;
+  onError: (e: string | null) => void;
+}) {
+  // Seconds elapsed since start; frozen while paused. Seed from the (possibly
+  // reconstructed) start time so a remount mid-recording shows the right clock.
+  const initial = Number.isFinite(startedAtMs)
+    ? Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000))
+    : 0;
+  const [seconds, setSeconds] = useState(initial);
+  const [paused, setPaused] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (paused) return;
+    const id = window.setInterval(() => setSeconds((s) => s + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [paused]);
+
+  async function togglePause() {
+    setBusy(true);
+    onError(null);
+    try {
+      if (paused) {
+        await api.resumeMeetingRecording();
+        setPaused(false);
+      } else {
+        await api.pauseMeetingRecording();
+        setPaused(true);
+      }
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stop() {
+    setBusy(true);
+    onError(null);
+    try {
+      await api.stopMeetingRecording(meetingId);
+      onStopped();
+    } catch (e) {
+      onError(String(e));
+      // Even on a stop error the backend restores the mic/hotkey; clear the
+      // recording UI so the user is not stuck with a dead bar.
+      onStopped();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className={`meeting-recording ${paused ? "paused" : ""}`}>
+      <span className="meeting-rec-dot" aria-hidden />
+      <span className="meeting-rec-label">
+        {paused ? "已暂停" : "正在录制"}
+      </span>
+      <span className="meeting-rec-timer" aria-live="off">
+        {formatClock(seconds)}
+      </span>
+      <span className="meeting-rec-hint muted-text">听写已暂停</span>
+      <span className="meeting-rec-actions">
+        <button
+          type="button"
+          className="btn ghost small"
+          disabled={busy}
+          onClick={() => void togglePause()}
+        >
+          {paused ? "继续" : "暂停"}
+        </button>
+        <button
+          type="button"
+          className="btn danger small"
+          disabled={busy}
+          onClick={() => void stop()}
+        >
+          <Icon name="stop" size={15} />
+          停止
+        </button>
+      </span>
+    </div>
+  );
+}
+
+function StatusBadge({
+  status,
+  title,
+}: {
+  status: MeetingStatus;
+  title?: string;
+}) {
   const meta = STATUS_META[status];
   return (
-    <span className={`meeting-badge ${meta.tone}`}>
+    <span className={`meeting-badge ${meta.tone}`} title={title}>
       {isInProgress(status) && <span className="mtg-spinner" aria-hidden />}
       {meta.label}
     </span>
@@ -366,7 +560,14 @@ function MeetingRow({
           ) : null}
         </span>
       </div>
-      <StatusBadge status={meeting.status} />
+      <StatusBadge
+        status={meeting.status}
+        title={
+          meeting.status === "failed"
+            ? (meeting.failure_reason ?? undefined)
+            : undefined
+        }
+      />
     </button>
   );
 }
@@ -379,10 +580,12 @@ function MeetingDetailView({
   meetingId,
   onBack,
   onError,
+  onNavigate,
 }: {
   meetingId: string;
   onBack: () => void;
   onError: (e: string | null) => void;
+  onNavigate?: (tab: TabId) => void;
 }) {
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
   const [view, setView] = useState<DetailView>("summary");
@@ -551,6 +754,7 @@ function MeetingDetailView({
           detail={detail}
           minutes={minutes}
           onJump={jumpToSource}
+          onNavigate={onNavigate}
         />
       ) : (
         <TranscriptView detail={detail} jump={jump} />
@@ -561,6 +765,45 @@ function MeetingDetailView({
 
 // ---- status note (processing / failed) ----------------------------------
 
+/** A failed meeting: shows the concrete failure reason plus, when the reason
+ * points at diarization, an actionable hint (install models / macOS-only). */
+function FailureNote({
+  detail,
+  kind,
+}: {
+  detail: MeetingDetail;
+  kind: "summary" | "transcript";
+}) {
+  const reason = detail.meeting.failure_reason?.trim() || null;
+  const guidance = diarGuidance(reason);
+  return (
+    <div className="meeting-statusnote bad">
+      <div>
+        <strong>处理失败</strong>
+        <p className="muted-text">
+          这场会议的{kind === "summary" ? "纪要" : "逐字稿"}没有生成成功。
+        </p>
+        {reason && <p className="meeting-fail-reason">原因：{reason}</p>}
+        {guidance === "install_models" && (
+          <p className="meeting-fail-guide">
+            说话人分离模型未安装。请将 <code>seg.onnx</code>、
+            <code>emb.onnx</code> 和 <code>plda</code> 放入应用模型目录的{" "}
+            <code>diar/</code> 子目录（上面的路径即缺失位置），然后在“录音”里重试。
+          </p>
+        )}
+        {guidance === "macos_only" && (
+          <p className="meeting-fail-guide">
+            离线说话人分离目前仅在 macOS 上支持，此平台无法生成逐字稿。
+          </p>
+        )}
+        {!guidance && (
+          <p className="muted-text">可在“录音”里重试，或查看原始音频。</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function StatusNote({
   detail,
   kind,
@@ -570,15 +813,7 @@ function StatusNote({
 }) {
   const status = detail.meeting.status;
   if (status === "failed") {
-    return (
-      <div className="meeting-statusnote bad">
-        <strong>处理失败</strong>
-        <p className="muted-text">
-          这场会议的{kind === "summary" ? "纪要" : "逐字稿"}没有生成成功。
-          可在录音重试，或查看原始音频。
-        </p>
-      </div>
-    );
+    return <FailureNote detail={detail} kind={kind} />;
   }
   // A terminal (ready) meeting that simply has no content must not show a
   // "transcribing…" spinner — the pipeline is done, there is just nothing here.
@@ -636,26 +871,50 @@ function SummaryView({
   detail,
   minutes,
   onJump,
+  onNavigate,
 }: {
   detail: MeetingDetail;
   minutes: Minutes | null;
   onJump: (src: SourceRef) => void;
+  onNavigate?: (tab: TabId) => void;
 }) {
   const hasMinutes = minutes != null && !minutesEmpty(minutes);
+  const noLlm = noLlmMinutes(detail);
 
   return (
     <div className="split meeting-summary-layout">
       <div className="card meeting-summary-main">
         {!hasMinutes ? (
           detail.meeting.status === "ready" ? (
-            <div className="meeting-statusnote">
-              <div>
-                <strong>暂无纪要</strong>
-                <p className="muted-text">
-                  这场会议没有可用的结构化纪要（可能是总结步骤未产出内容）。
-                </p>
+            noLlm ? (
+              <div className="meeting-statusnote">
+                <div>
+                  <strong>未配置 LLM</strong>
+                  <p className="muted-text">
+                    逐字稿已生成，但尚未配置语言模型，无法自动生成会议纪要
+                    （摘要 / 决策 / 行动项）。在设置里配置一个 LLM 后即可自动生成。
+                  </p>
+                  {onNavigate && (
+                    <button
+                      type="button"
+                      className="btn small meeting-config-llm"
+                      onClick={() => onNavigate("settings")}
+                    >
+                      去设置配置 LLM
+                    </button>
+                  )}
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="meeting-statusnote">
+                <div>
+                  <strong>暂无纪要</strong>
+                  <p className="muted-text">
+                    这场会议没有可用的结构化纪要（可能是总结步骤未产出内容）。
+                  </p>
+                </div>
+              </div>
+            )
           ) : (
             <StatusNote detail={detail} kind="summary" />
           )

@@ -95,6 +95,10 @@ pub struct Meeting {
     pub status: MeetingStatus,
     /// Primary language as a BCP-47 tag, when detected.
     pub language: Option<String>,
+    /// Human-readable reason the meeting is [`MeetingStatus::Failed`], when
+    /// known (e.g. missing diarization models, or diarization unsupported on
+    /// this platform). Absent on every non-failed meeting.
+    pub failure_reason: Option<String>,
 }
 
 impl Meeting {
@@ -108,6 +112,7 @@ impl Meeting {
             duration_seconds: None,
             status: MeetingStatus::Recording,
             language: None,
+            failure_reason: None,
         }
     }
 }

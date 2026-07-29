@@ -3,9 +3,10 @@ use rusqlite::Connection;
 
 pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"attempt_id":null,"target_app_name":null,"target_bundle_id":null,"observer":null,"target_fingerprint_hash":null,"field_before_hash":null,"field_after_hash":null,"status":"unattributed"}"#;
 
-/// Current storage schema version. Bumped to 6 for the meeting data model
-/// (`meetings`, `speakers`, `transcript_segments`, `meeting_summaries`).
-pub(crate) const SCHEMA_VERSION: i64 = 6;
+/// Current storage schema version. v6 added the meeting data model
+/// (`meetings`, `speakers`, `transcript_segments`, `meeting_summaries`); v7
+/// adds the additive `meetings.failure_reason` column.
+pub(crate) const SCHEMA_VERSION: i64 = 7;
 
 /// Additive v6 migration: the meeting-mode tables. These sit alongside the
 /// dictation tables and never touch them. `speakers` is created before
@@ -252,6 +253,23 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // v6: meeting-mode tables. Additive — the CREATE ... IF NOT EXISTS block
     // leaves every existing table and row untouched.
     conn.execute_batch(MEETING_SCHEMA_V6)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (6)",
+        [],
+    )?;
+    // v7: additive `failure_reason` column on `meetings`. Guarded by a column
+    // check (SQLite has no `ADD COLUMN IF NOT EXISTS`) so re-running is a no-op.
+    let has_failure_reason = {
+        let mut statement = conn.prepare("PRAGMA table_info(meetings)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "failure_reason")
+    };
+    if !has_failure_reason {
+        conn.execute("ALTER TABLE meetings ADD COLUMN failure_reason TEXT", [])?;
+    }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
         [SCHEMA_VERSION],
@@ -542,6 +560,67 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert!(indexes.contains(&"idx_transcript_segments_meeting_seq".to_owned()));
+
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_seven_adds_failure_reason_column_without_touching_v6_meetings() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Stand up a v6 database (schema recorded up to 6, meetings table without
+        // the failure_reason column) holding one meeting row.
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (1),(2),(3),(4),(5),(6);
+                CREATE TABLE meetings (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  title TEXT,
+                  audio_path TEXT,
+                  duration_seconds REAL,
+                  status TEXT NOT NULL DEFAULT 'recording',
+                  language TEXT
+                );
+                INSERT INTO meetings (id, created_at, status)
+                VALUES ('m1', '2026-07-25T00:00:00Z', 'ready');
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        // The new column exists and existing rows default it to NULL.
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(meetings)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"failure_reason".to_owned()));
+
+        let reason: Option<String> = connection
+            .query_row(
+                "SELECT failure_reason FROM meetings WHERE id='m1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, None);
+        // The pre-existing meeting row is otherwise untouched.
+        let status: String = connection
+            .query_row("SELECT status FROM meetings WHERE id='m1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "ready");
 
         let version: i64 = connection
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
