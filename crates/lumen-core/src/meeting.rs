@@ -25,9 +25,13 @@ use uuid::Uuid;
 pub enum MeetingStatus {
     /// Audio is being captured.
     Recording,
-    /// Recording finished; diarization/transcription in flight.
+    /// Recording finished; the offline pipeline is starting up.
     Processing,
-    /// Transcript is available.
+    /// Diarization + per-turn ASR in flight.
+    Transcribing,
+    /// Transcript is ready; the structured minutes LLM pass is in flight.
+    Summarizing,
+    /// Transcript (and minutes, when requested) are available.
     Ready,
     /// Recording or processing failed terminally.
     Failed,
@@ -39,6 +43,8 @@ impl MeetingStatus {
         match self {
             Self::Recording => "recording",
             Self::Processing => "processing",
+            Self::Transcribing => "transcribing",
+            Self::Summarizing => "summarizing",
             Self::Ready => "ready",
             Self::Failed => "failed",
         }
@@ -49,9 +55,28 @@ impl MeetingStatus {
     pub fn from_str_or_recording(value: &str) -> Self {
         match value {
             "processing" => Self::Processing,
+            "transcribing" => Self::Transcribing,
+            "summarizing" => Self::Summarizing,
             "ready" => Self::Ready,
             "failed" => Self::Failed,
             _ => Self::Recording,
+        }
+    }
+
+    /// The next status on the happy path of the offline pipeline:
+    /// `recording → processing → transcribing → summarizing → ready`.
+    ///
+    /// Terminal states ([`Ready`](Self::Ready), [`Failed`](Self::Failed)) are
+    /// fixed points. This is the pure state-transition rule; a step that fails
+    /// moves straight to [`Failed`](Self::Failed) instead of advancing.
+    pub fn advance(self) -> Self {
+        match self {
+            Self::Recording => Self::Processing,
+            Self::Processing => Self::Transcribing,
+            Self::Transcribing => Self::Summarizing,
+            Self::Summarizing => Self::Ready,
+            Self::Ready => Self::Ready,
+            Self::Failed => Self::Failed,
         }
     }
 }
@@ -223,9 +248,62 @@ impl MeetingSummary {
     }
 }
 
+/// An aggregate read-model for one meeting: the meeting row plus its speakers,
+/// its `seq`-ordered transcript segments, and all stored summaries.
+///
+/// This is the single shape the detail view (and the export functions) consume,
+/// so callers make one round trip instead of four separate queries. It is a
+/// pure value object — the store assembles it in
+/// [`get_meeting_detail`](crate::Meeting) territory (see `lumen_store`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeetingDetail {
+    pub meeting: Meeting,
+    /// Speakers ordered by label (`S1, S2, …`).
+    pub speakers: Vec<Speaker>,
+    /// Transcript segments in `seq` order.
+    pub segments: Vec<TranscriptSegment>,
+    /// All stored summaries (any kind), newest first.
+    pub summaries: Vec<MeetingSummary>,
+}
+
+impl MeetingDetail {
+    /// Look up a speaker within this detail by id.
+    pub fn speaker(&self, id: Uuid) -> Option<&Speaker> {
+        self.speakers.iter().find(|s| s.id == id)
+    }
+
+    /// The best human-facing name for a speaker id: the user display name when
+    /// set, otherwise the engine label (`S1`), otherwise `"未知说话人"`.
+    pub fn speaker_name(&self, id: Option<Uuid>) -> String {
+        match id.and_then(|id| self.speaker(id)) {
+            Some(s) => s.display_name.clone().unwrap_or_else(|| s.label.clone()),
+            None => "未知说话人".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meeting_status_advances_along_the_happy_path_and_pins_terminals() {
+        assert_eq!(
+            MeetingStatus::Recording.advance(),
+            MeetingStatus::Processing
+        );
+        assert_eq!(
+            MeetingStatus::Processing.advance(),
+            MeetingStatus::Transcribing
+        );
+        assert_eq!(
+            MeetingStatus::Transcribing.advance(),
+            MeetingStatus::Summarizing
+        );
+        assert_eq!(MeetingStatus::Summarizing.advance(), MeetingStatus::Ready);
+        assert_eq!(MeetingStatus::Ready.advance(), MeetingStatus::Ready);
+        assert_eq!(MeetingStatus::Failed.advance(), MeetingStatus::Failed);
+    }
 
     #[test]
     fn meeting_status_serde_uses_snake_case_tokens() {
@@ -240,6 +318,8 @@ mod tests {
         for status in [
             MeetingStatus::Recording,
             MeetingStatus::Processing,
+            MeetingStatus::Transcribing,
+            MeetingStatus::Summarizing,
             MeetingStatus::Ready,
             MeetingStatus::Failed,
         ] {

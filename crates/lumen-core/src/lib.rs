@@ -9,7 +9,7 @@ mod types;
 
 pub use export::{export_session_transcript, probe_wav_info, session_to_transcript, AudioInfo};
 pub use meeting::{
-    Meeting, MeetingStatus, MeetingSummary, Speaker, SummaryKind, TranscriptSegment,
+    Meeting, MeetingDetail, MeetingStatus, MeetingSummary, Speaker, SummaryKind, TranscriptSegment,
 };
 pub use session::{Session, SessionCommand, SessionEvent, SessionState};
 pub use types::{
