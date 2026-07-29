@@ -47,6 +47,29 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Record the finalized recording (audio path + duration) and move the
+    /// meeting to a new lifecycle status in one update. Used when a live
+    /// recording stops: the WAV is on disk and the meeting moves to
+    /// `Processing`. Returns `true` if a row was updated.
+    pub fn set_meeting_audio(
+        &self,
+        id: Uuid,
+        audio_path: &str,
+        duration_seconds: f64,
+        status: MeetingStatus,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE meetings SET audio_path=?2, duration_seconds=?3, status=?4 WHERE id=?1",
+            params![
+                id.to_string(),
+                audio_path,
+                duration_seconds,
+                status.as_str()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn get_meeting(&self, id: Uuid) -> Result<Option<Meeting>> {
         self.conn
             .query_row(
@@ -342,6 +365,38 @@ mod tests {
         let listed = store.list_meetings(10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, meeting.id);
+    }
+
+    #[test]
+    fn set_meeting_audio_records_path_duration_and_status() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        // Fresh meeting starts Recording with no audio yet.
+        assert_eq!(meeting.status, MeetingStatus::Recording);
+        assert!(meeting.audio_path.is_none());
+        store.create_meeting(&meeting).unwrap();
+
+        assert!(store
+            .set_meeting_audio(
+                meeting.id,
+                "/store/meetings/take.wav",
+                61.5,
+                MeetingStatus::Processing,
+            )
+            .unwrap());
+
+        let updated = store.get_meeting(meeting.id).unwrap().unwrap();
+        assert_eq!(
+            updated.audio_path.as_deref(),
+            Some("/store/meetings/take.wav")
+        );
+        assert_eq!(updated.duration_seconds, Some(61.5));
+        assert_eq!(updated.status, MeetingStatus::Processing);
+
+        // No row for an unknown id.
+        assert!(!store
+            .set_meeting_audio(Uuid::new_v4(), "/x.wav", 1.0, MeetingStatus::Failed)
+            .unwrap());
     }
 
     #[test]

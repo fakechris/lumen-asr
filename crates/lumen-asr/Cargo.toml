@@ -18,6 +18,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"
 
 [features]
 default = ["sherpa"]

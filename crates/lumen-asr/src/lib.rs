@@ -9,8 +9,10 @@
 //! helpers that combine the two shared layers.
 
 mod audio;
+mod meeting_recorder;
 
 pub use audio::{AudioCapture, AudioDeviceInfo, AudioError, CaptureResult};
+pub use meeting_recorder::{MeetingRecorder, MeetingRecorderError, RecordingSummary, WavSink};
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).
 pub use lumen_asr_engine::{
