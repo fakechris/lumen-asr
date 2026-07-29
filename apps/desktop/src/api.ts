@@ -63,6 +63,10 @@ export type AsrModelStatus = {
   whisperDir: string;
   qwenReady: boolean;
   qwenDir: string;
+  paraformerOfflineReady: boolean;
+  paraformerOfflineDir: string;
+  paraformerStreamingReady: boolean;
+  paraformerStreamingDir: string;
   qwenRuntimeSupported: boolean;
   qwenFallbackReason?: string | null;
   recommendedEngine: string;
@@ -72,6 +76,8 @@ export type AsrModelStatus = {
   activeModelDir: string;
   candidates: AsrModelCandidate[];
   downloadUrl: string;
+  paraformerOfflineDownloadUrl: string;
+  paraformerStreamingDownloadUrl: string;
 };
 
 export type CorrectorProbeResult = {
@@ -227,6 +233,10 @@ export const api = {
       input: { path, engine },
     }),
   startAsrModelDownload: () => invoke<AsrModelStatus>("start_asr_model_download"),
+  downloadParaformerOffline: () =>
+    invoke<AsrModelStatus>("start_paraformer_offline_download"),
+  downloadParaformerStreaming: () =>
+    invoke<AsrModelStatus>("start_paraformer_streaming_download"),
   cancelAsrModelDownload: () => invoke<void>("cancel_asr_model_download"),
 
   probeCorrector: () => invoke<CorrectorProbeResult>("probe_corrector"),

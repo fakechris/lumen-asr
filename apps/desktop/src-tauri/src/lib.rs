@@ -348,6 +348,8 @@ pub fn run() {
             asr_models::list_local_asr_models,
             asr_models::use_existing_asr_model,
             asr_models::start_asr_model_download,
+            asr_models::start_paraformer_offline_download,
+            asr_models::start_paraformer_streaming_download,
             asr_models::cancel_asr_model_download,
             corrector_probe::probe_corrector,
             corrector_probe::ollama_list_models,

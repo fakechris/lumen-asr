@@ -738,6 +738,81 @@ export function OnboardingWizard({ onDone }: Props) {
                 {dlPct != null ? ` · ${dlPct.toFixed(0)}%` : ""}
               </p>
             )}
+            {asr && (
+              <div className="onboard-perm-card" style={{ marginBottom: 12 }}>
+                <div className="onboard-perm-title">
+                  会议模型 · Paraformer <span className="onboard-pill">可选</span>
+                </div>
+                <p className="muted-text">
+                  用于会议记录（实时转写 + 词级时间戳）。日常听写无需安装，仅在使用会议功能时需要；点「安装」即可，无需手动下载。
+                </p>
+                <div className="onboard-candidate">
+                  <span>
+                    Paraformer 离线（会议转写）{" "}
+                    <span className="onboard-pill">
+                      {asr.paraformerOfflineReady ? "已安装" : "未安装"}
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={busy || asr.paraformerOfflineReady}
+                    onClick={() =>
+                      void (async () => {
+                        setBusy(true);
+                        setError(null);
+                        setDlMsg("开始下载 Paraformer 离线模型…");
+                        setDlPct(null);
+                        try {
+                          setAsr(await api.downloadParaformerOffline());
+                          setDlMsg("Paraformer 离线模型已安装");
+                        } catch (e) {
+                          setError(String(e));
+                        } finally {
+                          setBusy(false);
+                        }
+                      })()
+                    }
+                  >
+                    {asr.paraformerOfflineReady ? "已安装" : "安装"}
+                  </button>
+                </div>
+                <div className="onboard-candidate">
+                  <span>
+                    Paraformer 流式（会议实时）{" "}
+                    <span className="onboard-pill">
+                      {asr.paraformerStreamingReady ? "已安装" : "未安装"}
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={busy || asr.paraformerStreamingReady}
+                    onClick={() =>
+                      void (async () => {
+                        setBusy(true);
+                        setError(null);
+                        setDlMsg("开始下载 Paraformer 流式模型…");
+                        setDlPct(null);
+                        try {
+                          setAsr(await api.downloadParaformerStreaming());
+                          setDlMsg("Paraformer 流式模型已安装");
+                        } catch (e) {
+                          setError(String(e));
+                        } finally {
+                          setBusy(false);
+                        }
+                      })()
+                    }
+                  >
+                    {asr.paraformerStreamingReady ? "已安装" : "安装"}
+                  </button>
+                </div>
+                <p className="muted-text" style={{ wordBreak: "break-all" }}>
+                  <code>{asr.paraformerOfflineDir}</code>
+                </p>
+              </div>
+            )}
             <div className="onboard-actions">
               <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(2)}>
                 上一步

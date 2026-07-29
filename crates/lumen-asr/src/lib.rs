@@ -29,13 +29,17 @@ pub use lumen_asr_engine::{
 #[allow(deprecated)]
 pub use lumen_models::app_models_dir;
 pub use lumen_models::{
-    default_qwen_dir, default_sensevoice_dir, default_sensevoice_dir_with_root,
-    default_whisper_dir, default_whisper_dir_with_root, download_sensevoice_package,
-    legacy_model_roots, lumen_models_dir, lumen_models_dir_with_override, qwen_ready,
+    default_paraformer_offline_dir, default_paraformer_offline_dir_with_root,
+    default_paraformer_streaming_dir, default_paraformer_streaming_dir_with_root, default_qwen_dir,
+    default_sensevoice_dir, default_sensevoice_dir_with_root, default_whisper_dir,
+    default_whisper_dir_with_root, download_paraformer_offline_package,
+    download_paraformer_streaming_package, download_sensevoice_package, legacy_model_roots,
+    lumen_models_dir, lumen_models_dir_with_override, paraformer_streaming_ready, qwen_ready,
     scan_model_candidates, scan_model_candidates_with_root, sensevoice_ready,
     shared_sensevoice_dir, shared_whisper_dir, user_home_dir, whisper_ready, DownloadError,
     DownloadProgress, ModelCandidate, ModelInstallLock, ENV_LUMEN_MODELS_DIR,
-    SENSEVOICE_ARCHIVE_NAME, SENSEVOICE_ARCHIVE_URL,
+    PARAFORMER_OFFLINE_ARCHIVE_URL, PARAFORMER_STREAMING_ARCHIVE_URL, SENSEVOICE_ARCHIVE_NAME,
+    SENSEVOICE_ARCHIVE_URL,
 };
 
 /// Status of the default SenseVoice install (default dir + readiness probe).
