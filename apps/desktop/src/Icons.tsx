@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 
 export type IconName =
   | "mic"
+  | "meeting"
   | "history"
   | "dictionary"
   | "learn"
@@ -34,6 +35,14 @@ const PATHS: Record<IconName, ReactNode> = {
       <path d="M5 11a7 7 0 0 0 14 0" />
       <path d="M12 18v3" />
       <path d="M8.5 21h7" />
+    </>
+  ),
+  meeting: (
+    <>
+      <circle cx="8.5" cy="9" r="2.6" />
+      <circle cx="16" cy="9.5" r="2.1" />
+      <path d="M3.5 18.5c0-2.6 2.2-4.4 5-4.4s5 1.8 5 4.4" />
+      <path d="M14.5 14.4c2.4.1 4 1.8 4 4.1" />
     </>
   ),
   history: (

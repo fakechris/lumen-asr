@@ -9,8 +9,13 @@ import type {
   DictionaryEntry,
   EditEvent,
   EditObservation,
+  ExportOutput,
+  ExportPreset,
   Health,
   LearnCandidate,
+  Meeting,
+  MeetingDetail,
+  MeetingStatus,
   SessionRecord,
   TranscribeOutcome,
 } from "./types";
@@ -382,4 +387,43 @@ export const api = {
 
   deleteDictionaryEntry: (id: string) =>
     invoke<void>("delete_dictionary_entry", { id }),
+
+  // ---- Meeting mode (M4) ------------------------------------------------
+
+  /** List meetings newest first, optionally filtered by status token / title query. */
+  listMeetings: (opts?: {
+    status?: MeetingStatus;
+    query?: string;
+    limit?: number;
+  }) =>
+    invoke<Meeting[]>("list_meetings", {
+      status: opts?.status ?? null,
+      query: opts?.query ?? null,
+      limit: opts?.limit ?? null,
+    }),
+
+  /** Read one meeting with its speakers, seq-ordered segments, and summaries. */
+  getMeetingDetail: (meetingId: string) =>
+    invoke<MeetingDetail>("get_meeting_detail", { meetingId }),
+
+  /** Render a meeting into one of the four export presets. */
+  exportMeeting: (meetingId: string, preset: ExportPreset) =>
+    invoke<ExportOutput>("export_meeting", { meetingId, preset }),
+
+  // Speaker-correction commands (backend ready in M4a; the correction UI is
+  // wired in M4c, these bindings are provided for that stage).
+  renameSpeaker: (speakerId: string, displayName: string) =>
+    invoke<boolean>("rename_speaker", { speakerId, displayName }),
+  reassignSegmentSpeaker: (segmentId: string, speakerId: string) =>
+    invoke<boolean>("reassign_segment_speaker", { segmentId, speakerId }),
+  mergeSpeakers: (
+    meetingId: string,
+    fromSpeakerId: string,
+    intoSpeakerId: string,
+  ) =>
+    invoke<number>("merge_speakers", {
+      meetingId,
+      fromSpeakerId,
+      intoSpeakerId,
+    }),
 };

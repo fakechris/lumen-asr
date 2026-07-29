@@ -8,6 +8,7 @@ import { chooseAudioDevice } from "./audioDeviceSelection";
 import { Icon, type IconName } from "./Icons";
 import { ThemeToggle } from "./ThemeToggle";
 import { ChordCaptureChip } from "./ChordCaptureChip";
+import { MeetingPanel } from "./MeetingPanel";
 import lumenMark from "./assets/product-icons/lumen-asr.svg";
 import type {
   AsrStatus,
@@ -87,6 +88,13 @@ const NAV: { id: TabId; label: string; icon: IconName; title: string; blurb: str
     icon: "mic",
     title: "录音",
     blurb: "本地转写 · 热键或按钮开始",
+  },
+  {
+    id: "meeting",
+    label: "会议",
+    icon: "meeting",
+    title: "会议",
+    blurb: "会议库 · 纪要 · 逐字稿",
   },
   {
     id: "history",
@@ -445,6 +453,8 @@ export default function App() {
                 }}
               />
             )}
+
+            {tab === "meeting" && <MeetingPanel onError={setError} />}
 
             {tab === "overview" && (
               <Overview

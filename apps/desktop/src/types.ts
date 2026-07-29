@@ -407,8 +407,111 @@ export type LearnCandidate = {
 
 export type TabId =
   | "record"
+  | "meeting"
   | "overview"
   | "history"
   | "dictionary"
   | "learn"
   | "settings";
+
+// ---- Meeting mode (M4) --------------------------------------------------
+// TS mirrors of the lumen-core / lumen-meeting types the meeting_cmd Tauri
+// commands return. Field names match the serde output (default snake_case for
+// the domain structs; camelCase only where a DTO opts in).
+
+/** Coarse lifecycle of a stored meeting (serde snake_case). */
+export type MeetingStatus =
+  | "recording"
+  | "processing"
+  | "transcribing"
+  | "summarizing"
+  | "ready"
+  | "failed";
+
+/** A meeting recording row (`list_meetings` returns `Meeting[]`). */
+export type Meeting = {
+  id: string;
+  created_at: string;
+  title?: string | null;
+  audio_path?: string | null;
+  duration_seconds?: number | null;
+  status: MeetingStatus;
+  language?: string | null;
+};
+
+/** A speaker cluster within one meeting. Unconfirmed while `display_name` is null. */
+export type Speaker = {
+  id: string;
+  meeting_id: string;
+  label: string;
+  display_name?: string | null;
+  embedding_ref?: string | null;
+};
+
+/** One transcript segment (aligned with the lumen-transcript.v1 shape). */
+export type TranscriptSegment = {
+  id: string;
+  meeting_id: string;
+  seq: number;
+  start_seconds: number;
+  end_seconds: number;
+  text: string;
+  speaker_id?: string | null;
+  confidence?: number | null;
+  /** Optional word-level timing; not rendered in M4b. */
+  words?: unknown[] | null;
+};
+
+export type SummaryKind = "summary" | "action_items" | "decisions";
+
+/** A stored generated summary. For `kind === "summary"`, `content` is Minutes JSON. */
+export type MeetingSummary = {
+  id: string;
+  meeting_id: string;
+  kind: SummaryKind;
+  content: string;
+  created_at: string;
+  model?: string | null;
+};
+
+/** Aggregate read-model returned by `get_meeting_detail`. */
+export type MeetingDetail = {
+  meeting: Meeting;
+  speakers: Speaker[];
+  segments: TranscriptSegment[];
+  summaries: MeetingSummary[];
+};
+
+// ---- Structured minutes JSON (lumen-meeting::Minutes) --------------------
+
+/** A time range (seconds from media start) grounding a minutes item. */
+export type SourceRef = { start: number; end: number };
+
+export type Decision = { text: string; source?: SourceRef | null };
+export type ActionItem = {
+  text: string;
+  owner?: string | null;
+  due?: string | null;
+  source?: SourceRef | null;
+};
+export type DiscussionPoint = { topic: string; source?: SourceRef | null };
+export type OpenQuestion = { text: string; source?: SourceRef | null };
+
+/** The structured minutes document (parsed from the Summary row `content`). */
+export type Minutes = {
+  one_liner: string;
+  decisions: Decision[];
+  action_items: ActionItem[];
+  discussion: DiscussionPoint[];
+  open_questions: OpenQuestion[];
+};
+
+/** Rendered export payload from `export_meeting`. */
+export type ExportOutput = { filename: string; content: string };
+
+/** The four fixed export presets. */
+export type ExportPreset =
+  | "minutes_md"
+  | "transcript_md"
+  | "subtitles_srt"
+  | "data_json";
