@@ -76,6 +76,21 @@ pub fn plan_end_meeting(mode: CaptureMode) -> Result<HotkeyAction, ArbiterError>
     }
 }
 
+/// Pure transition: what happens when a dictation capture wants to start from
+/// `mode`.
+///
+/// Only allowed from [`CaptureMode::Idle`]. A running meeting rejects with
+/// [`ArbiterError::Busy`] — this is the meeting→dictation half of the mutual
+/// exclusion (the dictation hotkey is already suspended during a meeting, so
+/// this is a defensive backstop). No hotkey side effect: dictation never touches
+/// its own global shortcut, so the action is always [`HotkeyAction::None`].
+pub fn plan_begin_dictation(mode: CaptureMode) -> Result<HotkeyAction, ArbiterError> {
+    match mode {
+        CaptureMode::Idle => Ok(HotkeyAction::None),
+        other => Err(ArbiterError::Busy(other)),
+    }
+}
+
 /// Thread-safe holder of the current [`CaptureMode`]. Applies the pure
 /// transitions above and only mutates on success.
 pub struct CaptureArbiter {
@@ -120,6 +135,29 @@ impl CaptureArbiter {
         let action = plan_end_meeting(*guard)?;
         *guard = CaptureMode::Idle;
         Ok(action)
+    }
+
+    /// Enter dictation capture. On success the mode becomes
+    /// [`CaptureMode::Dictation`]. Rejects with [`ArbiterError::Busy`] if a
+    /// meeting (or another dictation capture) already owns the mic, which makes
+    /// "no dictation while a meeting is recording" a real, enforced invariant.
+    pub fn begin_dictation(&self) -> Result<(), ArbiterError> {
+        let mut guard = self.mode.lock().expect("arbiter mutex poisoned");
+        plan_begin_dictation(*guard)?;
+        *guard = CaptureMode::Dictation;
+        Ok(())
+    }
+
+    /// Leave dictation capture, returning to [`CaptureMode::Idle`]. Idempotent
+    /// and *only* clears when the current mode is actually
+    /// [`CaptureMode::Dictation`] — it never clobbers an in-flight meeting, so a
+    /// stray dictation-end can't accidentally release a meeting's exclusive
+    /// hold.
+    pub fn end_dictation(&self) {
+        let mut guard = self.mode.lock().expect("arbiter mutex poisoned");
+        if *guard == CaptureMode::Dictation {
+            *guard = CaptureMode::Idle;
+        }
     }
 
     /// Force the mode back to [`CaptureMode::Idle`] without emitting a hotkey
@@ -187,6 +225,72 @@ mod tests {
 
         // Stopping when idle is rejected.
         assert_eq!(arbiter.end_meeting(), Err(ArbiterError::NotRecording));
+    }
+
+    #[test]
+    fn plan_begin_dictation_only_from_idle() {
+        assert_eq!(
+            plan_begin_dictation(CaptureMode::Idle),
+            Ok(HotkeyAction::None)
+        );
+        assert_eq!(
+            plan_begin_dictation(CaptureMode::MeetingRecording),
+            Err(ArbiterError::Busy(CaptureMode::MeetingRecording))
+        );
+        assert_eq!(
+            plan_begin_dictation(CaptureMode::Dictation),
+            Err(ArbiterError::Busy(CaptureMode::Dictation))
+        );
+    }
+
+    #[test]
+    fn dictation_round_trips_and_returns_to_idle() {
+        let arbiter = CaptureArbiter::new();
+        assert_eq!(arbiter.mode(), CaptureMode::Idle);
+
+        assert_eq!(arbiter.begin_dictation(), Ok(()));
+        assert_eq!(arbiter.mode(), CaptureMode::Dictation);
+
+        arbiter.end_dictation();
+        assert_eq!(arbiter.mode(), CaptureMode::Idle);
+    }
+
+    #[test]
+    fn meeting_and_dictation_are_mutually_exclusive_both_ways() {
+        // A dictation in flight blocks a meeting from starting.
+        let arbiter = CaptureArbiter::new();
+        assert_eq!(arbiter.begin_dictation(), Ok(()));
+        assert_eq!(
+            arbiter.begin_meeting(),
+            Err(ArbiterError::Busy(CaptureMode::Dictation))
+        );
+        arbiter.end_dictation();
+
+        // A meeting in flight blocks dictation from starting.
+        assert_eq!(arbiter.begin_meeting(), Ok(HotkeyAction::Suspend));
+        assert_eq!(
+            arbiter.begin_dictation(),
+            Err(ArbiterError::Busy(CaptureMode::MeetingRecording))
+        );
+        assert_eq!(arbiter.mode(), CaptureMode::MeetingRecording);
+    }
+
+    #[test]
+    fn end_dictation_never_clobbers_a_meeting() {
+        let arbiter = CaptureArbiter::new();
+        assert_eq!(arbiter.begin_meeting(), Ok(HotkeyAction::Suspend));
+        // A stray dictation-end must not release the meeting's exclusive hold.
+        arbiter.end_dictation();
+        assert_eq!(arbiter.mode(), CaptureMode::MeetingRecording);
+        assert_eq!(arbiter.end_meeting(), Ok(HotkeyAction::Resume));
+        assert_eq!(arbiter.mode(), CaptureMode::Idle);
+    }
+
+    #[test]
+    fn end_dictation_is_idempotent_when_idle() {
+        let arbiter = CaptureArbiter::new();
+        arbiter.end_dictation();
+        assert_eq!(arbiter.mode(), CaptureMode::Idle);
     }
 
     #[test]

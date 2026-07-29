@@ -212,6 +212,9 @@ pub struct MeetingRecorder {
     recording: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     cmd_tx: Mutex<Option<Sender<RecCmd>>>,
+    /// Join handle for the control thread. Kept so [`Drop`] can wait for the
+    /// thread's teardown (WAV finalize + writer join) to finish on shutdown.
+    control_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Default for MeetingRecorder {
@@ -239,7 +242,7 @@ impl MeetingRecorder {
         let epoch = Arc::new(AtomicU64::new(0));
         let sample_rate_atom = Arc::new(AtomicU32::new(0));
 
-        thread::Builder::new()
+        let control_handle = thread::Builder::new()
             .name("lumen-meeting-rec".into())
             .spawn(move || {
                 // Stream (and its per-session writer handle) live on this thread.
@@ -274,6 +277,14 @@ impl MeetingRecorder {
                         }
                     }
                 }
+                // The command channel closed — the `MeetingRecorder` was dropped
+                // (e.g. app shutdown) while a recording may still be live. Finalize
+                // it: invalidate zombie CoreAudio callbacks, stop the stream, and
+                // finalize+join the writer so the WAV footer is back-filled instead
+                // of leaving a truncated, header-only file.
+                epoch.fetch_add(1, Ordering::SeqCst);
+                teardown_session(&mut session);
+                rec_flag.store(false, Ordering::SeqCst);
             })
             .expect("spawn meeting recorder thread");
 
@@ -281,6 +292,7 @@ impl MeetingRecorder {
             recording,
             paused,
             cmd_tx: Mutex::new(Some(tx)),
+            control_handle: Mutex::new(Some(control_handle)),
         }
     }
 
@@ -363,6 +375,31 @@ impl MeetingRecorder {
         reply_rx
             .recv()
             .map_err(|_| MeetingRecorderError::ThreadGone)?
+    }
+}
+
+impl Drop for MeetingRecorder {
+    /// Graceful shutdown for an in-flight (or idle) recorder.
+    ///
+    /// If the process drops the recorder mid-recording, we must not leave a
+    /// dangling cpal stream (zombie CoreAudio callbacks) or an un-joined writer
+    /// thread (WAV footer never back-filled → corrupt file). We:
+    /// 1. drop the command sender, which ends the control thread's `recv` loop;
+    ///    on exit that loop finalizes any live session (stop-equivalent teardown
+    ///    that reuses [`teardown_session`]);
+    /// 2. join the control thread so all teardown completes before we return.
+    ///
+    /// `Option::take` guards both steps so we never double-drop or double-join,
+    /// and nothing here can panic.
+    fn drop(&mut self) {
+        // Step 1: signal the control thread to stop by closing the channel.
+        if let Some(tx) = self.cmd_tx.lock().take() {
+            drop(tx);
+        }
+        // Step 2: wait for the control thread's teardown (finalize + writer join).
+        if let Some(handle) = self.control_handle.lock().take() {
+            let _ = handle.join();
+        }
     }
 }
 

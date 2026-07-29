@@ -143,16 +143,35 @@ pub fn stop_meeting_recording(
 ) -> Result<MeetingRecordingDto, String> {
     let id = Uuid::parse_str(&meeting_id).map_err(|e| format!("invalid meeting id: {e}"))?;
 
-    // Stop + finalize the recorder first.
-    let summary = state.meeting_recorder.stop().map_err(|e| e.to_string())?;
-    let audio_path = summary.wav_path.to_string_lossy().to_string();
+    // Try to stop + finalize the recorder, but *keep* the result — the recovery
+    // below (restore hotkey + reset arbiter) must run on every path, success or
+    // failure. This is finally/defer semantics: whatever happens to the
+    // recorder or the store write, "the mic and hotkey always come back".
+    let stop_result = state.meeting_recorder.stop();
 
-    // Release the exclusive mode and restore the dictation hotkey, even if the
-    // store write below fails — the mic and hotkey must always come back.
+    // Unconditionally release the exclusive mode and restore the dictation
+    // hotkey. If we bailed out on the `stop()` error above, `end_meeting` and
+    // `resume` would never run — the app would be stuck in MeetingRecording with
+    // the dictation hotkey unregistered forever.
     match state.capture.end_meeting() {
         Ok(action) => apply_hotkey_action(&app, action),
         Err(e) => tracing::warn!(error = %e, "arbiter end_meeting on stop"),
     }
+
+    // Now that the mic and hotkey are restored, surface any recorder failure.
+    // Mark the meeting Failed so it does not linger in `Recording`.
+    let summary = match stop_result {
+        Ok(summary) => summary,
+        Err(e) => {
+            let _ = with_store(&state, |s| {
+                s.update_meeting_status(id, MeetingStatus::Failed)
+                    .map_err(|e| e.to_string())
+            });
+            tracing::warn!(meeting_id = %id, error = %e, "meeting recorder stop failed");
+            return Err(e.to_string());
+        }
+    };
+    let audio_path = summary.wav_path.to_string_lossy().to_string();
 
     with_store(&state, |s| {
         s.set_meeting_audio(

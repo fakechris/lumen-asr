@@ -574,6 +574,13 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
         state.context.clear_active();
         error.to_string()
     })?;
+    // Notify the capture arbiter that a dictation is now live (CaptureMode::
+    // Dictation). Recording is already running here, so this is a state-only
+    // signal — it never touches the audio/hotkey path. A meeting suspends the
+    // dictation hotkey, so this normally can't collide; log if it ever does.
+    if let Err(e) = state.capture.begin_dictation() {
+        tracing::warn!(error = %e, "arbiter begin_dictation (meeting active?)");
+    }
     crate::learning::cancel_post_insert_watches();
     let pane_observation_enabled = state
         .config
@@ -753,6 +760,9 @@ pub async fn stop_and_transcribe_inner(
     );
 
     let capture_result = state.audio.stop();
+    // Dictation capture is done — return the arbiter to Idle so a meeting can
+    // start again. State-only signal; the audio path already stopped above.
+    state.capture.end_dictation();
     let captured_context =
         attach_frozen_context(state, active_context.as_ref(), &mut attempt, app).await;
     let capture = match capture_result {
@@ -1402,6 +1412,8 @@ pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
     if state.audio.is_recording() {
         let _ = state.audio.stop();
     }
+    // Cancelled dictation still owns the arbiter — release it back to Idle.
+    state.capture.end_dictation();
     Ok(())
 }
 
