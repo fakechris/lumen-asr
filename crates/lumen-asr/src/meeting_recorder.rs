@@ -18,8 +18,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, StreamConfig};
 use parking_lot::Mutex;
-use std::fs::File;
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -154,6 +154,97 @@ fn write_placeholder_header<W: Write>(w: &mut W, sample_rate: u32) -> io::Result
     w.write_all(b"data")?;
     w.write_all(&0u32.to_le_bytes())?; // patched on finalize
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Crash recovery — back-fill a WAV whose length fields were never patched.
+//
+// [`WavSink`] writes a placeholder header on `create` and only patches the RIFF
+// and `data` chunk sizes on `finalize`. If the app is killed mid-recording the
+// PCM samples are already on disk but the header still says `0` bytes, so a
+// standard reader sees a zero-length (empty) file. On the next launch the crash
+// recovery scan re-derives both sizes from the file's **actual** byte length and
+// patches them, so the salvaged audio can be transcribed instead of lost.
+//
+// Pure file I/O (no cpal), so it is unit-testable by writing a placeholder
+// header + N bytes of data and asserting the repaired header.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a [`repair_wav_header`] call recovered from the salvaged file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RepairedWav {
+    /// Sample rate read from the (already-written) fmt chunk.
+    pub sample_rate: u32,
+    /// Channel count read from the fmt chunk (mono for meeting takes).
+    pub channels: u16,
+    /// Number of PCM data bytes now recorded in the `data` chunk size.
+    pub data_bytes: u64,
+    /// Recovered audio length in seconds (`0.0` for a header-only, empty take).
+    pub duration_seconds: f64,
+}
+
+/// Re-derive and back-fill the RIFF and `data` chunk sizes of `path` from the
+/// file's actual byte length, salvaging a recording whose header was never
+/// patched (see the module comment above). This is idempotent: a file whose
+/// sizes are already correct is rewritten with the same values.
+///
+/// `data_size = file_len - 44` and `RIFF size = file_len - 8` (the WAV header
+/// this recorder writes is a fixed 44 bytes: PCM `fmt ` + `data`). Returns the
+/// sample rate, channel count, data length, and derived duration.
+///
+/// Fails with [`io::ErrorKind::InvalidData`] when the file is shorter than the
+/// 44-byte header or is missing the `RIFF`/`WAVE`/`data` markers (i.e. not a WAV
+/// this recorder produced) — a header-only file (exactly 44 bytes) is *not* an
+/// error: it repairs to a valid zero-length take (`data_bytes == 0`), which the
+/// caller treats as "no audio captured".
+pub fn repair_wav_header(path: impl AsRef<Path>) -> io::Result<RepairedWav> {
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len < WAV_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("wav too small to repair: {file_len} bytes (< {WAV_HEADER_LEN}-byte header)"),
+        ));
+    }
+
+    // Read the fixed header and validate the markers so we never "repair" an
+    // unrelated file into a bogus WAV.
+    let mut header = [0u8; WAV_HEADER_LEN as usize];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header)?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" || &header[36..40] != b"data" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a PCM WAV file (missing RIFF/WAVE/data markers)",
+        ));
+    }
+    let channels = u16::from_le_bytes([header[22], header[23]]);
+    let sample_rate = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
+    let bits_per_sample = u16::from_le_bytes([header[34], header[35]]);
+
+    let data_bytes = file_len - WAV_HEADER_LEN;
+    let riff_size = file_len - 8;
+
+    // RIFF chunk size at offset 4, data chunk size at offset 40.
+    file.seek(SeekFrom::Start(4))?;
+    file.write_all(&(riff_size as u32).to_le_bytes())?;
+    file.seek(SeekFrom::Start(40))?;
+    file.write_all(&(data_bytes as u32).to_le_bytes())?;
+    file.flush()?;
+
+    let bytes_per_frame = u64::from(channels) * u64::from(bits_per_sample / 8);
+    let duration_seconds = if sample_rate > 0 && bytes_per_frame > 0 {
+        (data_bytes / bytes_per_frame) as f64 / f64::from(sample_rate)
+    } else {
+        0.0
+    };
+
+    Ok(RepairedWav {
+        sample_rate,
+        channels,
+        data_bytes,
+        duration_seconds,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -840,6 +931,105 @@ mod tests {
         let sink: Option<SampleSink> = Some(tx);
         // Send fails but is swallowed — the recorder never breaks on a dead sink.
         assert!(!fanout_chunk(&sink, &[0.5f32]));
+    }
+
+    /// Simulate a crash: write a placeholder header + `n_samples` of PCM but
+    /// never call `finalize`, so the RIFF/`data` sizes stay `0`.
+    fn write_unfinalized_wav(path: &Path, sample_rate: u32, n_samples: u64) {
+        let file = File::create(path).unwrap();
+        let mut writer = BufWriter::new(file);
+        write_placeholder_header(&mut writer, sample_rate).unwrap();
+        for i in 0..n_samples {
+            // A deterministic non-zero body so the repaired file has real audio.
+            let s = ((i % 100) as i16) - 50;
+            writer.write_all(&s.to_le_bytes()).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn repair_backfills_lengths_of_an_unfinalized_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crashed.wav");
+        let sample_rate = 16_000u32;
+        let n_samples = 8_000u64; // 0.5s of mono 16-bit PCM
+        write_unfinalized_wav(&path, sample_rate, n_samples);
+
+        // Before repair the header lies: both sizes read 0.
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(read_u32_le(&before, 4), 0);
+        assert_eq!(read_u32_le(&before, 40), 0);
+
+        let repaired = repair_wav_header(&path).unwrap();
+        let data_bytes = n_samples * 2;
+        assert_eq!(repaired.sample_rate, sample_rate);
+        assert_eq!(repaired.channels, 1);
+        assert_eq!(repaired.data_bytes, data_bytes);
+        assert!((repaired.duration_seconds - 0.5).abs() < 1e-9);
+
+        // Header now carries the correct RIFF + data sizes.
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(read_u32_le(&after, 4) as u64, 36 + data_bytes);
+        assert_eq!(read_u32_le(&after, 40) as u64, data_bytes);
+        assert_eq!(after.len() as u64, WAV_HEADER_LEN + data_bytes);
+
+        // And a standard WAV reader can now open it and read every sample.
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().sample_rate, sample_rate);
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        assert_eq!(reader.len() as u64, n_samples);
+        let decoded: Vec<i16> = reader.samples::<i16>().map(Result::unwrap).collect();
+        assert_eq!(decoded.len() as u64, n_samples);
+        assert_eq!(decoded[0], -50);
+        assert_eq!(decoded[100], -50);
+    }
+
+    #[test]
+    fn repair_is_idempotent_on_a_finalized_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.wav");
+        let mut sink = WavSink::create(&path, 48_000).unwrap();
+        sink.write_samples(&[0.0f32, 0.5, -0.5, 1.0]).unwrap();
+        sink.finalize().unwrap();
+
+        let good = std::fs::read(&path).unwrap();
+        let repaired = repair_wav_header(&path).unwrap();
+        assert_eq!(repaired.data_bytes, 8);
+        // Re-deriving the sizes of an already-correct file is a no-op.
+        assert_eq!(std::fs::read(&path).unwrap(), good);
+    }
+
+    #[test]
+    fn repair_of_header_only_file_is_valid_zero_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.wav");
+        // Header only, no samples, never finalized.
+        write_unfinalized_wav(&path, 16_000, 0);
+
+        let repaired = repair_wav_header(&path).unwrap();
+        assert_eq!(repaired.data_bytes, 0);
+        assert_eq!(repaired.duration_seconds, 0.0);
+        // Repairs to a valid empty WAV rather than erroring — the caller treats
+        // `data_bytes == 0` as "no audio captured".
+        assert!(hound::WavReader::open(&path).unwrap().len() == 0);
+    }
+
+    #[test]
+    fn repair_rejects_a_truncated_or_non_wav_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Too small to even hold the 44-byte header.
+        let tiny = dir.path().join("tiny.wav");
+        std::fs::write(&tiny, b"RIFF").unwrap();
+        let err = repair_wav_header(&tiny).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Full 44 bytes but not a WAV (bad markers).
+        let bogus = dir.path().join("bogus.bin");
+        std::fs::write(&bogus, vec![0u8; WAV_HEADER_LEN as usize]).unwrap();
+        let err = repair_wav_header(&bogus).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
