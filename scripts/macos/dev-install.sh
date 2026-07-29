@@ -23,6 +23,11 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 APP_DIR="$ROOT/target/release/bundle/macos/Lumen ASR.app"
 BIN_SRC="$ROOT/target/release/lumen-asr-desktop"
 BIN_DST="$APP_DIR/Contents/MacOS/lumen-asr-desktop"
+# Final install location. Building into target/ but launching from /Applications
+# (Spotlight/Dock) is how you end up running a stale copy — so after signing we
+# sync the fresh bundle here and open THIS one. Override with LUMEN_INSTALL_DEST=
+# (set empty to skip and run in place from target/).
+INSTALL_DEST="${LUMEN_INSTALL_DEST-/Applications/Lumen ASR.app}"
 OPEN_APP=0
 SKIP_BUILD=0
 SKIP_FRONTEND=0
@@ -146,8 +151,27 @@ fi
 echo "==> sign"
 "$ROOT/scripts/macos/sign-app.sh" "$APP_DIR"
 
+# Sync the signed bundle to its final launch location so Spotlight/Dock always
+# start the build we just made — the codesign signature is identifier-based
+# (path-independent), so it travels with the bundle. ditto preserves it.
+FINAL_APP="$APP_DIR"
+if [[ -n "$INSTALL_DEST" ]]; then
+  echo "==> install → $INSTALL_DEST"
+  if pgrep -x "lumen-asr-desktop" >/dev/null 2>&1; then
+    osascript -e 'tell application "Lumen ASR" to quit' 2>/dev/null || true
+    sleep 0.4
+  fi
+  if rm -rf "$INSTALL_DEST" && ditto "$APP_DIR" "$INSTALL_DEST"; then
+    codesign --verify --verbose=1 "$INSTALL_DEST" 2>&1 | tail -1
+    FINAL_APP="$INSTALL_DEST"
+  else
+    echo "WARNING: could not install into $INSTALL_DEST; run in place from" >&2
+    echo "         $APP_DIR instead (set LUMEN_INSTALL_DEST= to silence)." >&2
+  fi
+fi
+
 echo ""
-echo "Installed: $APP_DIR"
+echo "Installed: $FINAL_APP"
 echo "Identity:  ${LUMEN_CODESIGN_IDENTITY:-Lumen Local Codesign}"
 echo ""
 echo "TCC tip: first run → System Settings → Privacy → Microphone + Accessibility"
@@ -156,5 +180,5 @@ echo "         (same cert). Ad-hoc (-s -) does NOT."
 
 if [[ "$OPEN_APP" -eq 1 ]]; then
   echo "==> open"
-  open "$APP_DIR"
+  open "$FINAL_APP"
 fi
