@@ -9,6 +9,7 @@ description = "Lumen ASR desktop shell (Tauri)"
 [build-dependencies]
 ico = "0.5"
 tauri-build = { version = "2", features = [] }
+chrono = { workspace = true }
 
 [dependencies]
 tauri = { version = "2", features = ["macos-private-api"] }
