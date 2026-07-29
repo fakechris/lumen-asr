@@ -324,6 +324,7 @@ pub fn run() {
             meeting_cmd::stop_meeting_recording,
             meeting_cmd::pause_meeting_recording,
             meeting_cmd::resume_meeting_recording,
+            meeting_cmd::process_meeting_now,
             meeting_cmd::list_meetings,
             meeting_cmd::get_meeting_detail,
             meeting_cmd::rename_speaker,
