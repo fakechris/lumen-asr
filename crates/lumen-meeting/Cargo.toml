@@ -11,9 +11,15 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 lumen-core = { workspace = true }
 lumen-store = { workspace = true }
 lumen-transcript = { workspace = true }
+# Structured-minutes LLM pass (OpenAI-compat client) + its prompt layer. No
+# platform gating: the minutes call is cross-platform.
+lumen-corrector = { workspace = true }
+lumen-prompts = { workspace = true }
 # ASR engine port. default-features=false (via the workspace dep) keeps sherpa
 # out of the offline pipeline build; a real engine is injected by the caller.
 lumen-asr-engine = { workspace = true }
@@ -34,5 +40,6 @@ diarize = ["dep:diar-rs"]
 
 [dev-dependencies]
 lumen-asr-engine = { workspace = true }
+async-trait = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros"] }
 tempfile = "3"

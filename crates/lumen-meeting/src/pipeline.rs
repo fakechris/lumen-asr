@@ -89,10 +89,10 @@ pub enum MeetingError {
 
 /// Result of diarization: the decoded 16 kHz mono samples plus the speaker
 /// turns, so the caller can slice per-turn audio for ASR without reloading.
-struct DiarOutput {
-    samples: Vec<f32>,
-    sample_rate: u32,
-    turns: Vec<DiarTurn>,
+pub(crate) struct DiarOutput {
+    pub(crate) samples: Vec<f32>,
+    pub(crate) sample_rate: u32,
+    pub(crate) turns: Vec<DiarTurn>,
 }
 
 /// Transcribe a pre-recorded `wav` into a stored, speaker-attributed meeting.
@@ -163,7 +163,7 @@ pub async fn transcribe_meeting(
 
 /// Transcribe one turn's audio slice. Empty/out-of-bounds ranges (and engines
 /// that reject empty audio) yield an empty string rather than failing the run.
-async fn transcribe_turn(
+pub(crate) async fn transcribe_turn(
     engine: &dyn AsrEngine,
     samples: &[f32],
     sample_rate: u32,
@@ -186,7 +186,7 @@ async fn transcribe_turn(
 
 /// Real diarization via `diar-rs`. macOS + `diarize` feature only.
 #[cfg(all(target_os = "macos", feature = "diarize"))]
-fn diarize_wav(
+pub(crate) fn diarize_wav(
     wav: &Path,
     models: &DiarModels,
     opts: &MeetingOptions,
@@ -225,7 +225,7 @@ fn diarize_wav(
 /// `diarize` feature). Keeps the crate compiling and callable everywhere while
 /// never referencing `diar-rs`.
 #[cfg(not(all(target_os = "macos", feature = "diarize")))]
-fn diarize_wav(
+pub(crate) fn diarize_wav(
     _wav: &Path,
     _models: &DiarModels,
     _opts: &MeetingOptions,

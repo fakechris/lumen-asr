@@ -51,6 +51,7 @@ lumen-asr = { path = "crates/lumen-asr" }
 lumen-corrector = { path = "crates/lumen-corrector" }
 lumen-dictionary = { path = "crates/lumen-dictionary" }
 lumen-store = { path = "crates/lumen-store" }
+lumen-meeting = { path = "crates/lumen-meeting" }
 lumen-inject = { path = "crates/lumen-inject" }
 lumen-platform = { path = "crates/lumen-platform" }
 lumen-platform-macos = { path = "crates/lumen-platform-macos" }
