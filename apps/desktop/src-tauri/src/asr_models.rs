@@ -2,9 +2,12 @@
 
 use crate::AppState;
 use lumen_asr::{
-    default_qwen_dir, default_sensevoice_dir, default_whisper_dir, download_sensevoice_package,
-    lumen_models_dir, qwen_ready, scan_model_candidates, sensevoice_ready, whisper_ready,
-    EngineKind, SenseVoiceSherpaAsr, WhisperAsr, SENSEVOICE_ARCHIVE_URL,
+    default_paraformer_offline_dir, default_paraformer_streaming_dir, default_qwen_dir,
+    default_sensevoice_dir, default_whisper_dir, download_paraformer_offline_package,
+    download_paraformer_streaming_package, download_sensevoice_package, lumen_models_dir,
+    paraformer_offline_ready, paraformer_streaming_ready, qwen_ready, scan_model_candidates,
+    sensevoice_ready, whisper_ready, EngineKind, SenseVoiceSherpaAsr, WhisperAsr,
+    PARAFORMER_OFFLINE_ARCHIVE_URL, PARAFORMER_STREAMING_ARCHIVE_URL, SENSEVOICE_ARCHIVE_URL,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -33,6 +36,12 @@ pub struct AsrModelStatus {
     pub whisper_dir: String,
     pub qwen_ready: bool,
     pub qwen_dir: String,
+    /// Offline Paraformer (meeting transcription): word-level timestamps.
+    pub paraformer_offline_ready: bool,
+    pub paraformer_offline_dir: String,
+    /// Streaming Paraformer (meeting real-time transcription).
+    pub paraformer_streaming_ready: bool,
+    pub paraformer_streaming_dir: String,
     pub qwen_runtime_supported: bool,
     pub qwen_fallback_reason: Option<String>,
     pub recommended_engine: String,
@@ -42,6 +51,8 @@ pub struct AsrModelStatus {
     pub active_model_dir: String,
     pub candidates: Vec<AsrModelCandidate>,
     pub download_url: String,
+    pub paraformer_offline_download_url: String,
+    pub paraformer_streaming_download_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,6 +88,8 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
     let sv = default_sensevoice_dir();
     let wh = default_whisper_dir();
     let qw = default_qwen_dir();
+    let pf_offline = default_paraformer_offline_dir();
+    let pf_streaming = default_paraformer_streaming_dir();
     // Prefer live engine dirs if already loaded.
     let sv_live = state
         .sensevoice
@@ -141,6 +154,10 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
         } else {
             qw.display().to_string()
         },
+        paraformer_offline_ready: paraformer_offline_ready(&pf_offline),
+        paraformer_offline_dir: pf_offline.display().to_string(),
+        paraformer_streaming_ready: paraformer_streaming_ready(&pf_streaming),
+        paraformer_streaming_dir: pf_streaming.display().to_string(),
         qwen_runtime_supported,
         qwen_fallback_reason,
         recommended_engine: recommended_engine.into(),
@@ -150,6 +167,8 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
         active_model_dir,
         candidates: scan_candidates(),
         download_url: SENSEVOICE_ARCHIVE_URL.into(),
+        paraformer_offline_download_url: PARAFORMER_OFFLINE_ARCHIVE_URL.into(),
+        paraformer_streaming_download_url: PARAFORMER_STREAMING_ARCHIVE_URL.into(),
     })
 }
 
@@ -378,5 +397,72 @@ fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
     })
     .map_err(|error| error.to_string())?;
     tracing::info!(dir = %installed.display(), "SenseVoice model installed");
+    Ok(installed)
+}
+
+/// Install the offline Paraformer model (meeting transcription, word-level
+/// timestamps). Unlike the SenseVoice command this does **not** switch the
+/// active dictation engine — Paraformer is an optional meeting model — so it
+/// just downloads and returns refreshed model status.
+#[tauri::command]
+pub async fn start_paraformer_offline_download(app: AppHandle) -> Result<AsrModelStatus, String> {
+    run_paraformer_download(app, PfVariant::Offline).await
+}
+
+/// Install the streaming Paraformer model (meeting real-time transcription).
+#[tauri::command]
+pub async fn start_paraformer_streaming_download(app: AppHandle) -> Result<AsrModelStatus, String> {
+    run_paraformer_download(app, PfVariant::Streaming).await
+}
+
+#[derive(Clone, Copy)]
+enum PfVariant {
+    Offline,
+    Streaming,
+}
+
+async fn run_paraformer_download(
+    app: AppHandle,
+    variant: PfVariant,
+) -> Result<AsrModelStatus, String> {
+    // Shares the single-download guard + cancel flag with the SenseVoice
+    // installer; the cluster install lock serializes any cross-process races.
+    if DOWNLOAD_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err("download already running".into());
+    }
+    DOWNLOAD_CANCEL.store(false, Ordering::SeqCst);
+
+    let app_for_dl = app.clone();
+    let result =
+        tauri::async_runtime::spawn_blocking(move || download_paraformer(&app_for_dl, variant))
+            .await;
+    DOWNLOAD_RUNNING.store(false, Ordering::SeqCst);
+
+    match result {
+        // Meeting models are not the active dictation engine, so there is no
+        // engine/state reload here — just report the new readiness.
+        Ok(Ok(_dir)) => check_asr_model_status(app.state::<AppState>()),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("download task failed: {e}")),
+    }
+}
+
+fn download_paraformer(app: &AppHandle, variant: PfVariant) -> Result<PathBuf, String> {
+    let root = lumen_models_dir();
+    let on_progress =
+        |p: lumen_asr::DownloadProgress| emit_progress(app, &p.phase, &p.message, p.bytes, p.total);
+    let (installed, label) = match variant {
+        PfVariant::Offline => (
+            download_paraformer_offline_package(&root, &DOWNLOAD_CANCEL, on_progress)
+                .map_err(|error| error.to_string())?,
+            "Paraformer (offline)",
+        ),
+        PfVariant::Streaming => (
+            download_paraformer_streaming_package(&root, &DOWNLOAD_CANCEL, on_progress)
+                .map_err(|error| error.to_string())?,
+            "Paraformer (streaming)",
+        ),
+    };
+    tracing::info!(dir = %installed.display(), model = label, "Paraformer model installed");
     Ok(installed)
 }
