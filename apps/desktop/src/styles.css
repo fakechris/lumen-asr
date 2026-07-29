@@ -942,7 +942,7 @@ code {
   font-size: 1.05rem;
   line-height: 1.6;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: break-word;
   user-select: text;
   transition: border-color 0.12s var(--ease), box-shadow 0.12s var(--ease);
 }
@@ -1403,7 +1403,7 @@ code {
   border-radius: 8px;
   border: 1px solid var(--border);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: break-word;
   font-family: var(--font-mono);
   font-size: 0.88rem;
   line-height: 1.45;
@@ -2787,12 +2787,69 @@ button.meeting-index-item:hover {
   }
 }
 
+/* ---- live transcript (P3, record-time preview) ----------------------- */
+.meeting-recording-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.meeting-live {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card-soft);
+  overflow: hidden;
+}
+
+.meeting-live-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-soft, var(--text));
+}
+
+.meeting-live-note {
+  font-weight: 400;
+  margin-left: auto;
+}
+
+.meeting-live-body {
+  max-height: 132px;
+  overflow-y: auto;
+  padding: 10px 12px;
+}
+
+.meeting-live-text {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.55;
+  overflow-wrap: break-word;
+}
+
+.meeting-live-final {
+  color: var(--text);
+}
+
+.meeting-live-partial {
+  color: var(--text-muted, #8a8a8a);
+}
+
+.meeting-live-empty {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
 /* ---- failure reason + guidance --------------------------------------- */
 .meeting-fail-reason {
   margin: 6px 0 0;
   font-size: 0.82rem;
   color: var(--error);
-  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 .meeting-fail-guide {

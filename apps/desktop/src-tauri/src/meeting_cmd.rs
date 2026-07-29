@@ -124,21 +124,43 @@ pub fn start_meeting_recording(
     }
     let out_path = dir.join(format!("{meeting_id}.wav"));
 
-    // 4. Start the independent continuous recorder.
+    // 4. Start the independent continuous recorder. When the real-time layer is
+    //    engaged (macOS + streaming Paraformer installed), attach an audio
+    //    fan-out so the streaming worker can transcribe live; otherwise record
+    //    plainly (no sink → zero extra work in the audio callback).
     let device = preferred_device(&state);
-    if let Err(e) = state.meeting_recorder.start(device, out_path) {
-        // Roll back: mark failed and release the arbiter. No hotkey suspend was
-        // applied yet, so nothing to restore.
-        state.capture.force_idle();
-        let reason = format!("could not start recording: {e}");
-        let _ = with_store(&state, |s| {
-            s.fail_meeting(meeting_id, Some(&reason))
-                .map_err(|e| e.to_string())
-        });
-        return Err(reason);
-    }
+    let streaming_dir = crate::meeting_live::streaming_dir_if_ready();
+    let (sample_sink, sample_rx) = if streaming_dir.is_some() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let sample_rate = match state
+        .meeting_recorder
+        .start_with_sink(device, out_path, sample_sink)
+    {
+        Ok(rate) => rate,
+        Err(e) => {
+            // Roll back: mark failed and release the arbiter. No hotkey suspend
+            // was applied yet, so nothing to restore. `sample_rx` drops here,
+            // so no worker is left dangling.
+            state.capture.force_idle();
+            let reason = format!("could not start recording: {e}");
+            let _ = with_store(&state, |s| {
+                s.fail_meeting(meeting_id, Some(&reason))
+                    .map_err(|e| e.to_string())
+            });
+            return Err(reason);
+        }
+    };
 
-    // 5. Recording is live — now suspend the dictation hotkey.
+    // 5. Recording is live — spawn the live-transcript worker (if streaming) and
+    //    suspend the dictation hotkey. A live-worker failure never fails the
+    //    recording: the worker itself degrades to "no live text" on any error.
+    if let (Some(dir), Some(rx)) = (streaming_dir, sample_rx) {
+        state.meeting_live.start(app.clone(), rx, sample_rate, dir);
+    }
     apply_hotkey_action(&app, action);
 
     tracing::info!(meeting_id = %meeting_id, "meeting recording started");
@@ -163,6 +185,13 @@ pub fn stop_meeting_recording(
     // failure. This is finally/defer semantics: whatever happens to the
     // recorder or the store write, "the mic and hotkey always come back".
     let stop_result = state.meeting_recorder.stop();
+
+    // Stop the real-time worker (no-op if none was running). The recorder stop
+    // above already dropped the audio fan-out sender, which ends the worker's
+    // loop; this joins it (flushing the last live segment) so it never outlives
+    // the recording. The authoritative transcript comes from the offline
+    // pipeline below, which replaces the live preview.
+    state.meeting_live.stop();
 
     // Unconditionally release the exclusive mode and restore the dictation
     // hotkey. If we bailed out on the `stop()` error above, `end_meeting` and

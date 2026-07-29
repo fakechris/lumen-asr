@@ -17,6 +17,7 @@ mod hotkey_validate;
 mod inject_cmd;
 mod learning;
 mod meeting_cmd;
+mod meeting_live;
 mod mod_chord;
 mod mode_arbiter;
 mod onboard;
@@ -60,6 +61,9 @@ pub struct AppState {
     pub audio: AudioCapture,
     /// Independent continuous recorder for meetings (never touches `audio`).
     pub meeting_recorder: MeetingRecorder,
+    /// Real-time (P3) streaming-Paraformer live-transcript worker for the
+    /// active recording. Idle (no worker) unless a recording is streaming.
+    pub meeting_live: meeting_live::MeetingLive,
     /// Mutual-exclusion arbiter between dictation and meeting recording.
     pub capture: CaptureArbiter,
     pub engine: Mutex<EngineKind>,
@@ -260,6 +264,7 @@ pub fn run() {
             store: Mutex::new(store),
             audio,
             meeting_recorder: MeetingRecorder::new(),
+            meeting_live: meeting_live::MeetingLive::default(),
             capture: CaptureArbiter::new(),
             engine: Mutex::new(initial_engine),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sv_dir)),

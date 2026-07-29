@@ -2060,6 +2060,7 @@ mod attempt_metric_tests {
             )),
             audio: AudioCapture::new(),
             meeting_recorder: lumen_asr::MeetingRecorder::new(),
+            meeting_live: crate::meeting_live::MeetingLive::default(),
             capture: crate::mode_arbiter::CaptureArbiter::new(),
             engine: Mutex::new(EngineKind::SenseVoice),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(dir.path().join("sensevoice"))),
