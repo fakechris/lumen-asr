@@ -99,11 +99,13 @@ impl Corrector for OpenAiCompatCorrector {
         let base = self.config.base_url.trim_end_matches('/');
         let url = format!("{base}/chat/completions");
 
-        // Competitor defaults: temperature ~0.3, max_tokens for short dictation outputs.
+        // Competitor defaults: temperature ~0.3, max_tokens for short dictation
+        // outputs; long-form callers (minutes) raise it via `req.max_tokens`.
+        let max_tokens = req.max_tokens.unwrap_or(1024);
         let mut body = json!({
             "model": self.config.model,
             "temperature": temperature.clamp(0.01, 1.0),
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user }
