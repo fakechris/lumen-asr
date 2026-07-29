@@ -401,6 +401,10 @@ export const api = {
   stopMeetingRecording: (meetingId: string) =>
     invoke<MeetingRecordingResult>("stop_meeting_recording", { meetingId }),
 
+  // Pause/resume are backend-ready but intentionally NOT surfaced by the minimal
+  // inline recording bar (which is reconstructed from backend state on remount
+  // and so cannot track a pause state); they are reserved for the full recording
+  // window that reports true paused-excluded elapsed.
   /** Pause the active meeting recording (paused audio is dropped, no gap). */
   pauseMeetingRecording: () => invoke<void>("pause_meeting_recording"),
 

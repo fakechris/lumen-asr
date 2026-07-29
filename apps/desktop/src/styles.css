@@ -2586,18 +2586,9 @@ html:has(.capsule-root) body {
   animation: mtg-pulse 1.4s ease-in-out infinite;
 }
 
-.meeting-recording.paused .meeting-rec-dot {
-  animation: none;
-  opacity: 0.5;
-}
-
 .meeting-rec-label {
   font-weight: 600;
   color: var(--error);
-}
-
-.meeting-recording.paused .meeting-rec-label {
-  color: var(--warn);
 }
 
 .meeting-rec-timer {

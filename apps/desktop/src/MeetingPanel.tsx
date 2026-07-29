@@ -424,10 +424,20 @@ function MeetingLibrary({
 }
 
 // ---- inline recording state --------------------------------------------
-// A deliberately restrained recording strip: ● 正在录制 + elapsed timer +
-// pause/resume + stop. No in-meeting editing, no live transcript, and no mic
-// level (there is no meeting-recorder level interface yet). Speaker separation
-// and the transcript all happen offline after stop.
+// A deliberately restrained recording strip: ● 正在录制 + elapsed timer + stop.
+// No in-meeting editing, no live transcript, and no mic level (there is no
+// meeting-recorder level interface yet). Speaker separation and the transcript
+// all happen offline after stop.
+//
+// Intentionally **start/stop only — no pause/resume here**. This bar is
+// reconstructed from the backend `recording` row on remount (only the meeting
+// id + start time survive), so it cannot know a pause state; showing a pause
+// button would let "paused" be silently lost across a tab switch and mislead
+// the user with a running clock. Proper pause/resume (with backend-reported
+// elapsed that excludes paused gaps) belongs to the full recording window; the
+// `pause_meeting_recording` / `resume_meeting_recording` commands stay wired in
+// `api.ts` for it. The elapsed clock here is plain wall-clock since start, which
+// is exact without pauses; the authoritative duration is set at stop.
 function RecordingBar({
   meetingId,
   startedAtMs,
@@ -439,38 +449,18 @@ function RecordingBar({
   onStopped: () => void;
   onError: (e: string | null) => void;
 }) {
-  // Seconds elapsed since start; frozen while paused. Seed from the (possibly
-  // reconstructed) start time so a remount mid-recording shows the right clock.
+  // Seconds elapsed since start. Seed from the (possibly reconstructed) start
+  // time so a remount mid-recording shows the right clock.
   const initial = Number.isFinite(startedAtMs)
     ? Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000))
     : 0;
   const [seconds, setSeconds] = useState(initial);
-  const [paused, setPaused] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    if (paused) return;
     const id = window.setInterval(() => setSeconds((s) => s + 1), 1000);
     return () => window.clearInterval(id);
-  }, [paused]);
-
-  async function togglePause() {
-    setBusy(true);
-    onError(null);
-    try {
-      if (paused) {
-        await api.resumeMeetingRecording();
-        setPaused(false);
-      } else {
-        await api.pauseMeetingRecording();
-        setPaused(true);
-      }
-    } catch (e) {
-      onError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
+  }, []);
 
   async function stop() {
     setBusy(true);
@@ -489,24 +479,14 @@ function RecordingBar({
   }
 
   return (
-    <div className={`meeting-recording ${paused ? "paused" : ""}`}>
+    <div className="meeting-recording">
       <span className="meeting-rec-dot" aria-hidden />
-      <span className="meeting-rec-label">
-        {paused ? "已暂停" : "正在录制"}
-      </span>
+      <span className="meeting-rec-label">正在录制</span>
       <span className="meeting-rec-timer" aria-live="off">
         {formatClock(seconds)}
       </span>
       <span className="meeting-rec-hint muted-text">听写已暂停</span>
       <span className="meeting-rec-actions">
-        <button
-          type="button"
-          className="btn ghost small"
-          disabled={busy}
-          onClick={() => void togglePause()}
-        >
-          {paused ? "继续" : "暂停"}
-        </button>
         <button
           type="button"
           className="btn danger small"
