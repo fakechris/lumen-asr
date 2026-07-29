@@ -30,7 +30,7 @@ lumen-asr-engine = { workspace = true }
 # so the default build/test (pure assembly + storage) needs neither the git
 # fetch, the C++ toolchain, nor the ONNX Runtime download.
 [target.'cfg(target_os = "macos")'.dependencies]
-diar-rs = { git = "https://github.com/fakechris/lumen-suite.git", rev = "27b2ed57ef316cdbafb577faef32f9d3a6ce97d2", optional = true }
+diar-rs = { git = "https://github.com/fakechris/lumen-suite.git", rev = "8719c032f6dc5dbc8c16c694150517547d623131", optional = true }
 
 [features]
 default = []
