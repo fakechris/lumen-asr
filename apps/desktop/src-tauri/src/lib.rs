@@ -377,6 +377,12 @@ pub fn run() {
             if let Err(e) = hotkey::setup_hotkeys(app.handle()) {
                 tracing::warn!(error = %e, "hotkey setup failed");
             }
+
+            // Crash recovery: if a previous run was killed mid-recording, its
+            // meeting is stuck in `Recording` with an un-finalized WAV on disk.
+            // Salvage it (repair the header, transcribe the captured audio) or
+            // mark it failed — off the launch path so the UI never blocks.
+            meeting_cmd::recover_interrupted_meetings(app.handle().clone());
             let qwen_selected = app
                 .state::<AppState>()
                 .engine

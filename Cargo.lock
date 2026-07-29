@@ -2242,6 +2242,7 @@ name = "lumen-asr"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "hound",
  "lumen-asr-engine",
  "lumen-models",
  "parking_lot",
