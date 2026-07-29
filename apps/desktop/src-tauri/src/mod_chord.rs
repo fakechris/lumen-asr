@@ -59,13 +59,17 @@ impl ModChord {
     }
 
     /// Required mods down; extras OK (single-chord path).
-    pub fn is_active(self, flags: u64) -> bool {
-        let fn_key = flags & FLAG_SECONDARY_FN != 0;
+    ///
+    /// `phys_fn` is the *physical* Fn/Globe key state (keyCode 63), never the
+    /// shared secondary-Fn flag bit — arrow keys, F1–F12, Home/End, Page
+    /// Up/Down and forward-delete all raise that bit and would otherwise
+    /// misfire a bare-Fn chord.
+    pub fn is_active(self, flags: u64, phys_fn: bool) -> bool {
         let alt = flags & FLAG_ALTERNATE != 0;
         let shift = flags & FLAG_SHIFT != 0;
         let control = flags & FLAG_CONTROL != 0;
         let meta = flags & FLAG_COMMAND != 0;
-        (!self.fn_key || fn_key)
+        (!self.fn_key || phys_fn)
             && (!self.alt || alt)
             && (!self.shift || shift)
             && (!self.control || control)
@@ -73,13 +77,15 @@ impl ModChord {
     }
 
     /// Exact modifier set — use when several pure-mod chords are registered.
-    pub fn is_exact(self, flags: u64) -> bool {
-        let fn_key = flags & FLAG_SECONDARY_FN != 0;
+    ///
+    /// Fn is judged from `phys_fn` (physical keyCode 63), not the flag bit; see
+    /// [`Self::is_active`] for why the flag bit is unreliable.
+    pub fn is_exact(self, flags: u64, phys_fn: bool) -> bool {
         let alt = flags & FLAG_ALTERNATE != 0;
         let shift = flags & FLAG_SHIFT != 0;
         let control = flags & FLAG_CONTROL != 0;
         let meta = flags & FLAG_COMMAND != 0;
-        self.fn_key == fn_key
+        self.fn_key == phys_fn
             && self.alt == alt
             && self.shift == shift
             && self.control == control
@@ -91,8 +97,11 @@ const FLAG_SHIFT: u64 = 0x0002_0000;
 const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALTERNATE: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
-// kCGEventFlagMaskSecondaryFn / NX_SECONDARYFNMASK.
-const FLAG_SECONDARY_FN: u64 = 0x0080_0000;
+// NOTE: The secondary-Fn flag bit (kCGEventFlagMaskSecondaryFn, 0x0080_0000) is
+// deliberately NOT polled here. It is shared by the whole function-key class
+// (arrows, F1–F12, nav keys, forward-delete), so polling it from
+// CGEventSourceFlagsState misfires the Fn chord on any of those keys. Physical
+// Fn is instead read via `read_physical_fn()` (keyCode 63, see hotkey_tap).
 #[cfg(target_os = "macos")]
 const HID_SYSTEM_STATE: u32 = 1;
 
@@ -150,6 +159,21 @@ fn read_mod_flags() -> u64 {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn read_mod_flags() -> u64 {
     0
+}
+
+/// Physical Fn/Globe key state (keyCode 63), maintained by the FlagsChanged
+/// event tap. This is authoritative for Fn — never the shared secondary-Fn flag
+/// bit. When no event tap is running (fallback path without Accessibility), it
+/// stays `false`, which is the safe outcome: not firing beats misfiring.
+#[cfg(target_os = "macos")]
+fn read_physical_fn() -> bool {
+    lumen_platform_macos::physical_fn_down()
+}
+
+/// Non-macOS has no Fn key concept at this layer, so Fn is always `false`.
+#[cfg(not(target_os = "macos"))]
+fn read_physical_fn() -> bool {
+    false
 }
 
 struct WatcherState {
@@ -219,10 +243,11 @@ where
                 }
 
                 let flags = read_mod_flags();
+                let phys_fn = read_physical_fn();
                 // Prefer exact match with most modifiers.
                 let mut best: Option<(String, u8)> = None;
                 for (id, chord) in &chords {
-                    if chord.is_exact(flags) {
+                    if chord.is_exact(flags, phys_fn) {
                         let score = chord.count();
                         if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
                             best = Some((id.clone(), score));
@@ -232,7 +257,7 @@ where
                 // Soft match only if nothing exact (single-chord UX: extras OK).
                 if best.is_none() && chords.len() == 1 {
                     let (id, chord) = &chords[0];
-                    if chord.is_active(flags) {
+                    if chord.is_active(flags, phys_fn) {
                         best = Some((id.clone(), chord.count()));
                     }
                 }
@@ -302,30 +327,51 @@ mod tests {
         assert!(c.alt && c.shift && !c.fn_key && !c.control && !c.meta);
     }
 
+    // The secondary-Fn flag bit shared by the function-key class. A bare-Fn
+    // chord must NEVER match on this bit alone (physical Fn not held).
+    const FLAG_SECONDARY_FN: u64 = 0x0080_0000;
+
     #[test]
     fn parses_single_fn() {
         let c = ModChord::parse_modifier_only("Fn").unwrap();
         assert!(c.fn_key);
-        assert!(c.is_exact(FLAG_SECONDARY_FN));
-        assert!(!c.is_exact(0));
-        assert!(!c.is_exact(FLAG_SECONDARY_FN | FLAG_SHIFT));
+        // Physical Fn held → exact match; flags carry no Fn signal now.
+        assert!(c.is_exact(0, true));
+        assert!(!c.is_exact(0, false));
+        // A real extra modifier while Fn is held is no longer a bare-Fn chord.
+        assert!(!c.is_exact(FLAG_SHIFT, true));
+    }
+
+    #[test]
+    fn fn_ignores_shared_secondary_fn_flag() {
+        // Regression for the misfire bug: arrow keys, F1–F12 and nav keys raise
+        // the secondary-Fn flag bit but never press the physical Fn key. With
+        // the flag set yet physical Fn NOT held, a bare-Fn chord must not fire.
+        let c = ModChord::parse_modifier_only("Fn").unwrap();
+        assert!(!c.is_exact(FLAG_SECONDARY_FN, false));
+        assert!(!c.is_active(FLAG_SECONDARY_FN, false));
+        // Genuine physical Fn press still matches (flag bit present or not).
+        assert!(c.is_exact(FLAG_SECONDARY_FN, true));
+        assert!(c.is_active(0, true));
     }
 
     #[test]
     fn active_allows_extra_mods() {
         let c = ModChord::parse_modifier_only("Alt+Shift").unwrap();
         let flags = FLAG_ALTERNATE | FLAG_SHIFT;
-        assert!(c.is_active(flags));
-        assert!(c.is_active(flags | FLAG_COMMAND));
-        assert!(!c.is_active(FLAG_ALTERNATE));
+        assert!(c.is_active(flags, false));
+        assert!(c.is_active(flags | FLAG_COMMAND, false));
+        assert!(!c.is_active(FLAG_ALTERNATE, false));
     }
 
     #[test]
     fn exact_rejects_extra_mods() {
         let c = ModChord::parse_modifier_only("Control+Alt").unwrap();
         let flags = FLAG_CONTROL | FLAG_ALTERNATE;
-        assert!(c.is_exact(flags));
-        assert!(!c.is_exact(flags | FLAG_SHIFT));
+        assert!(c.is_exact(flags, false));
+        assert!(!c.is_exact(flags | FLAG_SHIFT, false));
+        // Physical Fn held must break an exact non-Fn chord.
+        assert!(!c.is_exact(flags, true));
     }
 
     #[test]

@@ -87,15 +87,19 @@ impl HotkeySpec {
         })
     }
 
-    fn mods_active(&self, flags: u64) -> bool {
-        let fn_key = flags & FLAG_SECONDARY_FN != 0;
+    fn mods_active(&self, flags: u64, phys_fn: bool) -> bool {
         let alt = flags & FLAG_ALTERNATE != 0;
         let shift = flags & FLAG_SHIFT != 0;
         let control = flags & FLAG_CONTROL != 0;
         let meta = flags & FLAG_COMMAND != 0;
-        // Exact modifier set: required on, others off.
-        // Prevents Alt+Shift primary from also matching Alt+Control+Shift, etc.
-        self.fn_key == fn_key
+        // Fn is judged from the *physical* Fn/Globe key state (keyCode 63),
+        // never the shared secondary-Fn flag bit. Arrow keys, F1–F12, Home/End,
+        // Page Up/Down and forward-delete all raise that bit, so matching on it
+        // misfires a bare-Fn chord on every one of those keys.
+        //
+        // Exact modifier set: required on, others off. Prevents Alt+Shift
+        // primary from also matching Alt+Control+Shift, etc.
+        self.fn_key == phys_fn
             && self.alt == alt
             && self.shift == shift
             && self.control == control
@@ -165,8 +169,32 @@ const FLAG_SHIFT: u64 = 0x0002_0000;
 const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALTERNATE: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
-// kCGEventFlagMaskSecondaryFn / NX_SECONDARYFNMASK.
+// kCGEventFlagMaskSecondaryFn / NX_SECONDARYFNMASK. Shared by the whole
+// function-key class (arrows, F1–F12, nav keys, forward-delete), so it only
+// tells us "physical Fn is down" when it rides a FlagsChanged event whose
+// keycode is the physical Fn/Globe key (kVK_Function).
+#[cfg(any(target_os = "macos", test))]
 const FLAG_SECONDARY_FN: u64 = 0x0080_0000;
+
+/// Virtual keycode of the physical Fn/Globe key (kVK_Function). A FlagsChanged
+/// event reports this keycode only when the real Fn/Globe key toggles — the
+/// function-key class carries the secondary-Fn *flag* but never this keycode.
+#[cfg(target_os = "macos")]
+const KVK_FUNCTION: i64 = 0x3F; // 63
+
+/// Whether the physical Fn/Globe key is currently held. Updated *only* from
+/// FlagsChanged events whose keycode is `KVK_FUNCTION`, so the function-key
+/// class can never flip it. Reading the secondary-Fn flag bit directly would
+/// misfire on arrows, F-keys and nav keys.
+static PHYSICAL_FN_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Current physical Fn/Globe held state, as observed by the event tap.
+///
+/// Non-macOS builds never set it, so it stays `false` (there is no Fn key
+/// concept at this layer on Windows/Linux).
+pub fn physical_fn_down() -> bool {
+    PHYSICAL_FN_DOWN.load(Ordering::SeqCst)
+}
 
 #[derive(Debug, Clone)]
 pub struct HotkeyBinding {
@@ -306,6 +334,15 @@ fn run_tap_loop_multi<F>(
             let flags = event.get_flags().bits();
             let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
 
+            // Physical Fn/Globe state is authoritative and comes *only* from a
+            // FlagsChanged event carrying the Fn keycode (63). Every other key —
+            // arrows, F1–F12, nav, forward-delete — raises the secondary-Fn flag
+            // bit but never this keycode, so it can no longer flip Fn on.
+            if matches!(etype, CGEventType::FlagsChanged) && keycode == KVK_FUNCTION {
+                PHYSICAL_FN_DOWN.store(flags & FLAG_SECONDARY_FN != 0, Ordering::SeqCst);
+            }
+            let phys_fn = PHYSICAL_FN_DOWN.load(Ordering::SeqCst);
+
             let mut map = latches_c.borrow_mut();
             // Track per-binding key held, then pick the single most-specific match.
             // e.g. primary Alt+Shift must lose to translate Alt+Shift+T while T is held.
@@ -333,9 +370,9 @@ fn run_tap_loop_multi<F>(
             for b in bindings_c.iter() {
                 let latch = map.get(&b.id).unwrap();
                 let want = if b.spec.keycode.is_some() {
-                    b.spec.mods_active(flags) && latch.key_held
+                    b.spec.mods_active(flags, phys_fn) && latch.key_held
                 } else {
-                    b.spec.mods_active(flags)
+                    b.spec.mods_active(flags, phys_fn)
                 };
                 if want {
                     let score = b.spec.specificity() as i32;
@@ -446,12 +483,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_single_fn_and_match_secondary_fn_flag() {
+    fn fn_matches_physical_key_not_shared_flag() {
         let s = HotkeySpec::parse("Fn", HotkeyMode::Hold).unwrap();
         assert!(s.fn_key && s.keycode.is_none());
-        assert!(s.mods_active(FLAG_SECONDARY_FN));
-        assert!(!s.mods_active(0));
-        assert!(!s.mods_active(FLAG_SECONDARY_FN | FLAG_SHIFT));
+        // Physical Fn/Globe held (keyCode 63) → match, regardless of raw flags.
+        assert!(s.mods_active(0, true));
+        assert!(s.mods_active(FLAG_SECONDARY_FN, true));
+        // Regression: the shared secondary-Fn bit alone (an arrow key, an F-key,
+        // a nav key) must NOT match a bare-Fn chord — physical Fn isn't held.
+        assert!(!s.mods_active(FLAG_SECONDARY_FN, false));
+        assert!(!s.mods_active(0, false));
+        // A real extra modifier while Fn is held is still not a bare-Fn chord.
+        assert!(!s.mods_active(FLAG_SECONDARY_FN | FLAG_SHIFT, true));
     }
 
     #[test]
