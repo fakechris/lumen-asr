@@ -31,7 +31,7 @@ fn assembled_meeting_persists_and_reads_back() {
     let mut meeting = new_meeting(Some("/store/audio.wav".into()), Some(6.0));
     meeting.title = Some("Weekly sync".into());
     let meeting_id = meeting.id;
-    let assembled = assemble_meeting(meeting_id, &turns, &texts, Some(16_000), Some(6.0));
+    let assembled = assemble_meeting(meeting_id, &turns, &texts, &[], Some(16_000), Some(6.0));
 
     // Same sequence transcribe_meeting runs.
     store.create_meeting(&meeting).unwrap();

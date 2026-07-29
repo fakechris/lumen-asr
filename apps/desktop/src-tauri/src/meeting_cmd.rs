@@ -17,6 +17,7 @@
 use crate::mode_arbiter::HotkeyAction;
 use crate::AppState;
 use lumen_core::{Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SummaryKind};
+use lumen_dictionary::split_for_injection;
 use lumen_meeting::{
     export_meeting as render_export, process_meeting, DiarModels, ExportOutput, ExportPreset,
     MeetingOptions, MinutesConfig, DEFAULT_MAX_SPEAKERS,
@@ -302,6 +303,24 @@ fn spawn_meeting_processing(app: AppHandle, meeting_id: Uuid, wav: PathBuf) {
     });
 }
 
+/// Upper bound on dictionary terms forwarded as ASR hotwords. sherpa-onnx
+/// contextual biasing cost grows with the phrase list, so cap it to keep the
+/// per-turn decode bounded. `list_dictionary` returns most-recently-updated
+/// first, so the cap keeps the freshest terms.
+const MAX_MEETING_HOTWORDS: usize = 128;
+
+/// Collect the user's confirmed dictionary **terms** as ASR hotwords for the
+/// meeting engine. Replacement pairs are intentionally excluded — they are a
+/// post-ASR correction concern, not a recognition-bias one. Returns at most
+/// [`MAX_MEETING_HOTWORDS`] terms; a store read error yields an empty list so the
+/// meeting still runs (just without biasing).
+fn meeting_hotwords(store: &Store) -> Vec<String> {
+    let entries = store.list_dictionary().unwrap_or_default();
+    let (mut terms, _replacements) = split_for_injection(&entries);
+    terms.truncate(MAX_MEETING_HOTWORDS);
+    terms
+}
+
 /// Build the pipeline's dependencies from app config and run
 /// [`process_meeting`]. Errors are surfaced to [`spawn_meeting_processing`] which
 /// logs them and ensures the meeting ends `failed`.
@@ -321,19 +340,14 @@ async fn process_meeting_pipeline(
     // async run below.
     let (asr_engine, corrector, minutes_model) = {
         let state = app.state::<AppState>();
-        let engine_kind = *state
-            .engine
-            .lock()
-            .map_err(|_| "engine lock poisoned".to_string())?;
-        let (asr_cfg, corrector_cfg) = {
+        let corrector_cfg = {
             let cfg = state
                 .config
                 .lock()
                 .map_err(|_| "config lock poisoned".to_string())?;
-            (cfg.asr.clone(), cfg.corrector.clone())
+            cfg.corrector.clone()
         };
-        let asr_engine =
-            crate::dictation::build_meeting_asr_engine(state.inner(), engine_kind, &asr_cfg)?;
+        let asr_engine = crate::dictation::build_meeting_asr_engine(state.inner())?;
         // Only build a corrector when an LLM is actually configured. With none,
         // the minutes step is skipped (transcript-only → ready) rather than
         // failing on an unparseable non-LLM response.
@@ -360,8 +374,13 @@ async fn process_meeting_pipeline(
         max_tokens: None,
     });
 
+    // Reuse the user's personal dictionary terms as ASR hotwords so the offline
+    // Paraformer engine biases toward them per turn (SenseVoice fallback ignores
+    // hotwords). Read from the background worker's own store connection; a read
+    // failure just yields no hotwords rather than aborting the meeting.
     let opts = MeetingOptions {
         max_speakers: Some(DEFAULT_MAX_SPEAKERS),
+        hotwords: meeting_hotwords(&store),
         ..MeetingOptions::default()
     };
 

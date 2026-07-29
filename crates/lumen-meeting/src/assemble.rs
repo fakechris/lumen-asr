@@ -7,7 +7,9 @@
 //! with stub data (no model weights, no audio, no network).
 
 use lumen_core::{Meeting, Speaker, TranscriptSegment};
-use lumen_transcript::{Media, Provenance, Segment as TSegment, Speaker as TSpeaker, TranscriptV1};
+use lumen_transcript::{
+    Media, Provenance, Segment as TSegment, Speaker as TSpeaker, TranscriptV1, Word,
+};
 use uuid::Uuid;
 
 /// A single diarization turn: a half-open `[start, end)` window (seconds from
@@ -56,9 +58,16 @@ pub struct AssembledMeeting {
 /// Assemble diarization turns plus their transcribed text into storage rows and
 /// an interchange document for `meeting_id`.
 ///
-/// `turns` and `texts` are zipped positionally; excess of either is ignored.
-/// Engine speaker ids are deduplicated into [`Speaker`] rows labelled
-/// `S{id+1}`; each turn becomes one segment referencing its speaker.
+/// `turns`, `texts`, and `words` are zipped positionally; excess of any is
+/// ignored (`words` shorter than `texts` simply leaves later segments without
+/// word timing). Engine speaker ids are deduplicated into [`Speaker`] rows
+/// labelled `S{id+1}`; each turn becomes one segment referencing its speaker.
+///
+/// `words[i]` holds the word-level timings for turn `i`, already offset into
+/// **absolute** media time by the caller (see
+/// [`transcribe_turn`](crate::pipeline::transcribe_turn)). An empty inner vec
+/// leaves that segment's `words` absent (`None`) so payloads for engines
+/// without alignment (SenseVoice fallback) stay byte-for-byte unchanged.
 ///
 /// `sample_rate` and `duration_seconds` are recorded in the transcript's
 /// `media` block only (informational); pass `None`/`0` when unknown.
@@ -66,6 +75,7 @@ pub fn assemble_meeting(
     meeting_id: Uuid,
     turns: &[DiarTurn],
     texts: &[String],
+    words: &[Vec<Word>],
     sample_rate: Option<u32>,
     duration_seconds: Option<f64>,
 ) -> AssembledMeeting {
@@ -92,16 +102,22 @@ pub fn assemble_meeting(
         let speaker = speaker_for(turn.speaker);
         let seq_u32 = seq as u32;
 
+        // Word timings for this turn (absolute media time); empty -> no timing.
+        let turn_words = words.get(seq).filter(|w| !w.is_empty()).cloned();
+
         let mut segment =
             TranscriptSegment::new(meeting_id, seq_u32, turn.start, turn.end, text.clone());
         segment.speaker_id = Some(speaker.id);
+        segment.words = turn_words.clone();
         segments.push(segment);
 
-        t_segments.push(
-            TSegment::new(turn.start, turn.end, text.clone())
-                .with_id(seq.to_string())
-                .with_speaker(speaker.label.clone()),
-        );
+        let mut t_segment = TSegment::new(turn.start, turn.end, text.clone())
+            .with_id(seq.to_string())
+            .with_speaker(speaker.label.clone());
+        if let Some(w) = turn_words {
+            t_segment = t_segment.with_words(w);
+        }
+        t_segments.push(t_segment);
     }
 
     let t_speakers: Vec<TSpeaker> = speakers
@@ -187,7 +203,7 @@ mod tests {
     fn speakers_are_deduped_and_labelled_in_order() {
         let mid = Uuid::new_v4();
         let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let out = assemble_meeting(mid, &turns(), &texts, Some(16_000), Some(6.5));
+        let out = assemble_meeting(mid, &turns(), &texts, &[], Some(16_000), Some(6.5));
 
         assert_eq!(out.speakers.len(), 2, "two distinct engine ids -> two rows");
         assert_eq!(out.speakers[0].label, "S1");
@@ -205,7 +221,7 @@ mod tests {
             "world".to_string(),
             "again".to_string(),
         ];
-        let out = assemble_meeting(mid, &turns(), &texts, None, None);
+        let out = assemble_meeting(mid, &turns(), &texts, &[], None, None);
 
         assert_eq!(out.segments.len(), 3);
         for (i, seg) in out.segments.iter().enumerate() {
@@ -230,7 +246,7 @@ mod tests {
             "world".to_string(),
             "again".to_string(),
         ];
-        let out = assemble_meeting(mid, &turns(), &texts, Some(16_000), Some(6.5));
+        let out = assemble_meeting(mid, &turns(), &texts, &[], Some(16_000), Some(6.5));
         let t = &out.transcript;
 
         assert_eq!(t.segments.len(), 3);
@@ -256,10 +272,56 @@ mod tests {
     fn mismatched_turns_and_texts_take_the_shorter() {
         let mid = Uuid::new_v4();
         let texts = vec!["only-one".to_string()];
-        let out = assemble_meeting(mid, &turns(), &texts, None, None);
+        let out = assemble_meeting(mid, &turns(), &texts, &[], None, None);
         assert_eq!(out.segments.len(), 1);
         // Speakers still reflect all turns (dedup over the full turn list).
         assert_eq!(out.speakers.len(), 2);
+    }
+
+    #[test]
+    fn per_turn_words_land_on_segments_and_transcript() {
+        let mid = Uuid::new_v4();
+        let texts = vec!["你好".to_string(), "世界".to_string(), "".to_string()];
+        // Word timings are already in absolute media time (offset applied upstream).
+        let words = vec![
+            vec![Word::new("你", 0.1, 0.4), Word::new("好", 0.4, 0.8)],
+            vec![Word::new("世", 2.2, 2.5), Word::new("界", 2.5, 2.9)],
+            // Third turn has no alignment (e.g. SenseVoice fallback / empty audio).
+            vec![],
+        ];
+        let out = assemble_meeting(mid, &turns(), &texts, &words, Some(16_000), Some(6.5));
+
+        // Stored segment carries the words verbatim.
+        let s0 = out.segments[0].words.as_ref().expect("turn 0 words");
+        assert_eq!(s0.len(), 2);
+        assert_eq!(s0[0].word, "你");
+        assert_eq!(s0[0].start, 0.1);
+        assert_eq!(out.segments[1].words.as_ref().unwrap()[1].word, "界");
+        // Empty inner vec -> absent, not Some(vec![]).
+        assert!(out.segments[2].words.is_none());
+
+        // Interchange transcript mirrors the same word timing.
+        let t0 = out.transcript.segments[0].words.as_ref().expect("t words");
+        assert_eq!(t0.len(), 2);
+        assert_eq!(t0[1].end, 0.8);
+        assert!(out.transcript.segments[2].words.is_none());
+
+        // Round-trips through the interchange JSON with words intact.
+        let json = out.transcript.to_json_string().unwrap();
+        let back = TranscriptV1::from_json_str(&json).unwrap();
+        assert_eq!(&back, &out.transcript);
+    }
+
+    #[test]
+    fn fewer_words_than_turns_leaves_later_segments_unaligned() {
+        let mid = Uuid::new_v4();
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        // Only the first turn has words.
+        let words = vec![vec![Word::new("a", 0.0, 1.0)]];
+        let out = assemble_meeting(mid, &turns(), &texts, &words, None, None);
+        assert!(out.segments[0].words.is_some());
+        assert!(out.segments[1].words.is_none());
+        assert!(out.segments[2].words.is_none());
     }
 
     #[test]
