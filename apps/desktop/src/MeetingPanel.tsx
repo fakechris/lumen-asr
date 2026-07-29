@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
 import { Icon } from "./Icons";
 import { diarGuidance, isNoLlmMarker } from "./meetingGuidance";
@@ -425,10 +426,13 @@ function MeetingLibrary({
 }
 
 // ---- inline recording state --------------------------------------------
-// A deliberately restrained recording strip: ● 正在录制 + elapsed timer + stop.
-// No in-meeting editing, no live transcript, and no mic level (there is no
-// meeting-recorder level interface yet). Speaker separation and the transcript
-// all happen offline after stop.
+// A deliberately restrained recording strip: ● 正在录制 + elapsed timer + stop,
+// plus a rolling **live transcript** (P3) beneath it when the streaming
+// Paraformer model is installed (macOS). The live text is an unpolished,
+// speaker-less preview — the authoritative, speaker-attributed transcript is
+// produced by the offline pipeline after stop and shown on the detail page. No
+// in-meeting editing and no mic level (there is no meeting-recorder level
+// interface yet).
 //
 // Intentionally **start/stop only — no pause/resume here**. This bar is
 // reconstructed from the backend `recording` row on remount (only the meeting
@@ -480,24 +484,108 @@ function RecordingBar({
   }
 
   return (
-    <div className="meeting-recording">
-      <span className="meeting-rec-dot" aria-hidden />
-      <span className="meeting-rec-label">正在录制</span>
-      <span className="meeting-rec-timer" aria-live="off">
-        {formatClock(seconds)}
-      </span>
-      <span className="meeting-rec-hint muted-text">听写已暂停</span>
-      <span className="meeting-rec-actions">
-        <button
-          type="button"
-          className="btn danger small"
-          disabled={busy}
-          onClick={() => void stop()}
-        >
-          <Icon name="stop" size={15} />
-          停止
-        </button>
-      </span>
+    <div className="meeting-recording-wrap">
+      <div className="meeting-recording">
+        <span className="meeting-rec-dot" aria-hidden />
+        <span className="meeting-rec-label">正在录制</span>
+        <span className="meeting-rec-timer" aria-live="off">
+          {formatClock(seconds)}
+        </span>
+        <span className="meeting-rec-hint muted-text">听写已暂停</span>
+        <span className="meeting-rec-actions">
+          <button
+            type="button"
+            className="btn danger small"
+            disabled={busy}
+            onClick={() => void stop()}
+          >
+            <Icon name="stop" size={15} />
+            停止
+          </button>
+        </span>
+      </div>
+      <LiveTranscript />
+    </div>
+  );
+}
+
+// Rolling live transcript (P3). Listens for `meeting-live-transcript` events
+// emitted by the streaming Paraformer worker while recording: finalized
+// segments accumulate as fixed lines; the in-progress partial trails greyed at
+// the end. If the streaming model is not installed (or the platform is not
+// macOS), no events ever arrive and a muted hint is shown instead — the
+// recording and the offline final transcript are unaffected either way.
+type LiveEvent = { text: string; isFinal: boolean; seq: number };
+
+function LiveTranscript() {
+  // Finalized segment lines, in order.
+  const [finals, setFinals] = useState<string[]>([]);
+  // The current rolling partial (not yet finalized).
+  const [partial, setPartial] = useState("");
+  // Whether we've received any event at all (distinguishes "no model" from
+  // "recording started, nothing said yet").
+  const [active, setActive] = useState(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let disposed = false;
+    void listen<LiveEvent>("meeting-live-transcript", (e) => {
+      const p = e.payload;
+      setActive(true);
+      if (p.isFinal) {
+        const t = p.text.trim();
+        if (t) setFinals((prev) => [...prev, t]);
+        setPartial("");
+      } else {
+        setPartial(p.text);
+      }
+    }).then((fn) => {
+      if (disposed) fn();
+      else un = fn;
+    });
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  }, []);
+
+  // Keep the newest text in view.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [finals, partial]);
+
+  return (
+    <div className="meeting-live" aria-live="polite">
+      <div className="meeting-live-head">
+        <Icon name="mic" size={12} />
+        <span>实时预览</span>
+        <span className="muted-text meeting-live-note">
+          无说话人区分 · 停止后生成带说话人最终稿
+        </span>
+      </div>
+      <div className="meeting-live-body" ref={scrollRef}>
+        {active ? (
+          <p className="meeting-live-text">
+            {finals.map((line, i) => (
+              <span key={i} className="meeting-live-final">
+                {line}
+                {i < finals.length - 1 || partial ? " " : ""}
+              </span>
+            ))}
+            {partial ? (
+              <span className="meeting-live-partial">{partial}</span>
+            ) : finals.length === 0 ? (
+              <span className="muted-text">正在聆听…</span>
+            ) : null}
+          </p>
+        ) : (
+          <p className="muted-text meeting-live-empty">
+            安装 Paraformer streaming 模型可在录制中实时预览逐字稿（停止后仍会生成带说话人的最终稿）。
+          </p>
+        )}
+      </div>
     </div>
   );
 }

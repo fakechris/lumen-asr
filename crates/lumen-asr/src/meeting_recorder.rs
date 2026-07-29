@@ -194,10 +194,18 @@ fn spawn_writer(mut sink: WavSink) -> (Sender<WriterMsg>, JoinHandle<()>) {
 // MeetingRecorder — cross-platform (no cfg gate); control handles only.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A subscriber that receives the same mono `f32` sample chunks the WAV writer
+/// gets, at the **native capture sample rate**. Used by the real-time meeting
+/// layer (streaming Paraformer) to consume audio while it is still being
+/// recorded (see `docs/MEETING.md` M6/P3). When no sink is attached the audio
+/// callback does zero extra work.
+pub type SampleSink = Sender<Vec<f32>>;
+
 enum RecCmd {
     Start {
         device: Option<String>,
         out_path: PathBuf,
+        sample_sink: Option<SampleSink>,
         reply: Sender<Result<u32, MeetingRecorderError>>,
     },
     Pause,
@@ -252,11 +260,13 @@ impl MeetingRecorder {
                         RecCmd::Start {
                             device,
                             out_path,
+                            sample_sink,
                             reply,
                         } => {
                             let res = start_on_thread(
                                 device,
                                 out_path,
+                                sample_sink,
                                 &rec_flag,
                                 &paused_flag,
                                 &epoch,
@@ -311,6 +321,21 @@ impl MeetingRecorder {
         device: Option<String>,
         out_path: PathBuf,
     ) -> Result<u32, MeetingRecorderError> {
+        self.start_with_sink(device, out_path, None)
+    }
+
+    /// Like [`start`](Self::start), but also fans each captured mono chunk out
+    /// to `sample_sink` (at the native capture sample rate) in addition to
+    /// writing the WAV. This powers the real-time meeting layer (streaming
+    /// Paraformer) without disturbing the WAV write / pause / Drop teardown.
+    /// Passing `None` is byte-for-byte equivalent to [`start`](Self::start)
+    /// (the audio callback does no extra work).
+    pub fn start_with_sink(
+        &self,
+        device: Option<String>,
+        out_path: PathBuf,
+        sample_sink: Option<SampleSink>,
+    ) -> Result<u32, MeetingRecorderError> {
         if self.recording.load(Ordering::SeqCst) {
             return Err(MeetingRecorderError::AlreadyRecording);
         }
@@ -323,6 +348,7 @@ impl MeetingRecorder {
         tx.send(RecCmd::Start {
             device,
             out_path,
+            sample_sink,
             reply: reply_tx,
         })
         .map_err(|_| MeetingRecorderError::ThreadGone)?;
@@ -407,6 +433,7 @@ impl Drop for MeetingRecorder {
 fn start_on_thread(
     preferred: Option<String>,
     out_path: PathBuf,
+    sample_sink: Option<SampleSink>,
     recording: &AtomicBool,
     paused: &Arc<AtomicBool>,
     epoch: &Arc<AtomicU64>,
@@ -454,15 +481,20 @@ fn start_on_thread(
     let stream_config: StreamConfig = config.clone().into();
     let err_fn = |e| tracing::error!(error = %e, "meeting audio stream error");
 
-    let build = |writer_tx: Sender<WriterMsg>| -> Result<cpal::Stream, MeetingRecorderError> {
+    let build = |writer_tx: Sender<WriterMsg>,
+                 sample_sink: Option<SampleSink>|
+     -> Result<cpal::Stream, MeetingRecorderError> {
         let epoch_cb = Arc::clone(epoch);
         let paused_cb = Arc::clone(paused);
+        // Each match arm moves `sample_sink`; only one arm runs, so this is a
+        // valid single move (not a use-after-move).
         match config.sample_format() {
             SampleFormat::F32 => build_stream::<f32>(
                 &device,
                 &stream_config,
                 channels,
                 writer_tx,
+                sample_sink,
                 epoch_cb,
                 paused_cb,
                 session_epoch,
@@ -473,6 +505,7 @@ fn start_on_thread(
                 &stream_config,
                 channels,
                 writer_tx,
+                sample_sink,
                 epoch_cb,
                 paused_cb,
                 session_epoch,
@@ -483,6 +516,7 @@ fn start_on_thread(
                 &stream_config,
                 channels,
                 writer_tx,
+                sample_sink,
                 epoch_cb,
                 paused_cb,
                 session_epoch,
@@ -494,7 +528,7 @@ fn start_on_thread(
         }
     };
 
-    let stream = build(writer_tx.clone());
+    let stream = build(writer_tx.clone(), sample_sink);
     let stream = match stream {
         Ok(s) => s,
         Err(e) => {
@@ -616,6 +650,7 @@ fn build_stream<T>(
     config: &StreamConfig,
     channels: usize,
     writer_tx: Sender<WriterMsg>,
+    sample_sink: Option<SampleSink>,
     epoch: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
     session_epoch: u64,
@@ -633,28 +668,17 @@ where
                 if epoch.load(Ordering::SeqCst) != session_epoch {
                     return;
                 }
-                // Paused: drop samples so the file has no silent gap.
+                // Paused: drop samples so the file has no silent gap. Paused
+                // audio is likewise withheld from the fan-out subscriber.
                 if paused.load(Ordering::SeqCst) {
                     return;
                 }
-                let mut mono = Vec::with_capacity(if channels <= 1 {
-                    data.len()
-                } else {
-                    data.len() / channels
-                });
-                if channels <= 1 {
-                    for &s in data {
-                        mono.push(s.to_sample::<f32>());
-                    }
-                } else {
-                    for frame in data.chunks(channels) {
-                        let mut sum = 0.0f32;
-                        for &s in frame {
-                            sum += s.to_sample::<f32>();
-                        }
-                        mono.push(sum / channels as f32);
-                    }
-                }
+                let mono = downmix_to_mono(data, channels);
+                // Fan-out to the real-time subscriber (streaming ASR), if any.
+                // A clone keeps the WAV path authoritative and untouched; when
+                // no sink is attached this is skipped entirely (zero extra work
+                // / no allocation on the default recording path).
+                fanout_chunk(&sample_sink, &mono);
                 // Writer thread does the file I/O; if it has gone away the
                 // recording is being torn down and dropping the chunk is fine.
                 let _ = writer_tx.send(WriterMsg::Chunk(mono));
@@ -663,6 +687,46 @@ where
             None,
         )
         .map_err(|e| MeetingRecorderError::Stream(e.to_string()))
+}
+
+/// Down-mix an interleaved multi-channel `T` frame buffer to mono `f32`.
+/// Extracted from the audio callback so the (device-free) mixing logic is unit
+/// testable.
+fn downmix_to_mono<T>(data: &[T], channels: usize) -> Vec<f32>
+where
+    T: Sample,
+    f32: FromSample<T>,
+{
+    let mut mono = Vec::with_capacity(if channels <= 1 {
+        data.len()
+    } else {
+        data.len() / channels
+    });
+    if channels <= 1 {
+        for &s in data {
+            mono.push(s.to_sample::<f32>());
+        }
+    } else {
+        for frame in data.chunks(channels) {
+            let mut sum = 0.0f32;
+            for &s in frame {
+                sum += s.to_sample::<f32>();
+            }
+            mono.push(sum / channels as f32);
+        }
+    }
+    mono
+}
+
+/// Forward one already-down-mixed mono chunk to an optional fan-out subscriber.
+/// Mirrors the audio-callback branch so the "clone-and-send when present,
+/// no-op when absent" contract is unit-testable without a live cpal stream.
+/// Returns `true` if a chunk was delivered to a live subscriber.
+fn fanout_chunk(sink: &Option<SampleSink>, mono: &[f32]) -> bool {
+    match sink {
+        Some(tx) => tx.send(mono.to_vec()).is_ok(),
+        None => false,
+    }
 }
 
 fn teardown_session(session: &mut Option<Session>) {
@@ -738,6 +802,44 @@ mod tests {
         assert_eq!(read_u16_le(&bytes, 44) as i16, 0);
         assert_eq!(read_u16_le(&bytes, 46) as i16, 32767);
         assert_eq!(read_u16_le(&bytes, 48) as i16, -32767);
+    }
+
+    #[test]
+    fn downmix_mono_passes_through() {
+        let data = [0.0f32, 0.5, -0.5, 1.0];
+        assert_eq!(downmix_to_mono(&data, 1), vec![0.0, 0.5, -0.5, 1.0]);
+    }
+
+    #[test]
+    fn downmix_stereo_averages_frames() {
+        // Two stereo frames: (0.0, 1.0) -> 0.5, (-1.0, 1.0) -> 0.0.
+        let data = [0.0f32, 1.0, -1.0, 1.0];
+        assert_eq!(downmix_to_mono(&data, 2), vec![0.5, 0.0]);
+    }
+
+    #[test]
+    fn fanout_delivers_clone_when_subscribed() {
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let sink: Option<SampleSink> = Some(tx);
+        let chunk = [0.1f32, 0.2, 0.3];
+        assert!(fanout_chunk(&sink, &chunk));
+        assert_eq!(rx.recv().unwrap(), vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn fanout_is_noop_when_unsubscribed() {
+        let sink: Option<SampleSink> = None;
+        // No panic, no delivery, reports "not delivered".
+        assert!(!fanout_chunk(&sink, &[0.0f32, 1.0]));
+    }
+
+    #[test]
+    fn fanout_reports_false_when_receiver_dropped() {
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        drop(rx); // subscriber went away (e.g. streaming task ended)
+        let sink: Option<SampleSink> = Some(tx);
+        // Send fails but is swallowed — the recorder never breaks on a dead sink.
+        assert!(!fanout_chunk(&sink, &[0.5f32]));
     }
 
     #[test]
