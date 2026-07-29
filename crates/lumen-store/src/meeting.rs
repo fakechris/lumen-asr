@@ -7,7 +7,9 @@
 
 use anyhow::Result;
 use lumen_core::transcript::Word;
-use lumen_core::{Meeting, MeetingStatus, MeetingSummary, Speaker, SummaryKind, TranscriptSegment};
+use lumen_core::{
+    Meeting, MeetingDetail, MeetingStatus, MeetingSummary, Speaker, SummaryKind, TranscriptSegment,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
@@ -95,6 +97,40 @@ impl Store {
             "#,
         )?;
         let rows = statement.query_map(params![limit], map_meeting)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// List meetings newest first, optionally filtered by lifecycle `status`
+    /// and/or a case-sensitive title substring `query`. Both filters are
+    /// optional and independent; an empty/whitespace query is treated as no
+    /// query. Untitled meetings never match a non-empty `query` (their title is
+    /// `NULL`, and `NULL LIKE …` is never true) — which is the intended
+    /// behavior for a title search.
+    pub fn list_meetings_filtered(
+        &self,
+        status: Option<MeetingStatus>,
+        query: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Meeting>> {
+        let status_token = status.map(|s| s.as_str());
+        // Raw substring; matched with `instr()` below so the (case-sensitive)
+        // contract is query-local and does not depend on the connection's
+        // `case_sensitive_like` setting.
+        let needle = query
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(str::to_string);
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, created_at, title, audio_path, duration_seconds, status, language
+            FROM meetings
+            WHERE (?1 IS NULL OR status = ?1)
+              AND (?2 IS NULL OR instr(title, ?2) > 0)
+            ORDER BY created_at DESC
+            LIMIT ?3
+            "#,
+        )?;
+        let rows = statement.query_map(params![status_token, needle, limit], map_meeting)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -187,6 +223,69 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Reassign one transcript segment to a different speaker. This is the
+    /// "the model split this one line onto the wrong person" fix — it moves a
+    /// single segment without touching the rest of the cluster. Returns `true`
+    /// if the segment was updated.
+    ///
+    /// The target speaker must belong to the same meeting as the segment;
+    /// otherwise the update is a no-op (returns `false`) rather than attaching
+    /// the segment to a speaker from another meeting.
+    pub fn reassign_segment_speaker(&self, segment_id: Uuid, speaker_id: Uuid) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE transcript_segments SET speaker_id=?2 \
+             WHERE id=?1 \
+               AND EXISTS ( \
+                 SELECT 1 FROM speakers \
+                 WHERE speakers.id=?2 AND speakers.meeting_id=transcript_segments.meeting_id \
+               )",
+            params![segment_id.to_string(), speaker_id.to_string()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Merge speaker `from` into speaker `into` within one meeting: every
+    /// segment attributed to `from` is re-pointed at `into`, then the now-empty
+    /// `from` speaker row is deleted. This is the "these two clusters are
+    /// actually the same person" fix. Runs in a single transaction so the
+    /// re-point and the delete are atomic. Returns the number of segments moved.
+    ///
+    /// A no-op (`from == into`) returns `0` without touching anything. The
+    /// `meeting_id` scopes both statements defensively even though speaker ids
+    /// are globally unique.
+    pub fn merge_speakers(&self, meeting_id: Uuid, from: Uuid, into: Uuid) -> Result<u64> {
+        if from == into {
+            return Ok(0);
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        // Refuse to merge into a speaker that doesn't belong to this meeting —
+        // otherwise the meeting's segments would be attached to a foreign
+        // speaker row.
+        let into_owned: bool = transaction
+            .query_row(
+                "SELECT 1 FROM speakers WHERE id=?1 AND meeting_id=?2",
+                params![into.to_string(), meeting_id.to_string()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !into_owned {
+            return Err(anyhow::anyhow!(
+                "merge target speaker does not belong to meeting {meeting_id}"
+            ));
+        }
+        let moved = transaction.execute(
+            "UPDATE transcript_segments SET speaker_id=?3 WHERE meeting_id=?1 AND speaker_id=?2",
+            params![meeting_id.to_string(), from.to_string(), into.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM speakers WHERE id=?1 AND meeting_id=?2",
+            params![from.to_string(), meeting_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(moved as u64)
+    }
+
     // ----- summaries --------------------------------------------------------
 
     /// Persist a generated summary.
@@ -228,6 +327,38 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// List every stored summary for a meeting, newest first (all kinds).
+    pub fn list_summaries(&self, meeting_id: Uuid) -> Result<Vec<MeetingSummary>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, meeting_id, kind, content, created_at, model
+            FROM meeting_summaries
+            WHERE meeting_id=?1
+            ORDER BY created_at DESC
+            "#,
+        )?;
+        let rows = statement.query_map(params![meeting_id.to_string()], map_summary)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // ----- aggregate read ---------------------------------------------------
+
+    /// Read a meeting and everything attached to it (speakers, `seq`-ordered
+    /// segments, all summaries) in one call. Returns `None` if the meeting does
+    /// not exist. This is the single query the detail view and the export
+    /// functions consume.
+    pub fn get_meeting_detail(&self, meeting_id: Uuid) -> Result<Option<MeetingDetail>> {
+        let Some(meeting) = self.get_meeting(meeting_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(MeetingDetail {
+            meeting,
+            speakers: self.list_speakers(meeting_id)?,
+            segments: self.list_segments(meeting_id)?,
+            summaries: self.list_summaries(meeting_id)?,
+        }))
     }
 }
 
@@ -508,5 +639,187 @@ mod tests {
             .is_none());
         // Deleting a missing meeting is a no-op.
         assert!(!store.delete_meeting(Uuid::new_v4()).unwrap());
+    }
+
+    #[test]
+    fn reassign_segment_moves_one_line_without_touching_the_cluster() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        let s1 = Speaker::new(meeting.id, "S1");
+        let s2 = Speaker::new(meeting.id, "S2");
+        store.upsert_speaker(&s1).unwrap();
+        store.upsert_speaker(&s2).unwrap();
+
+        let mut seg0 = TranscriptSegment::new(meeting.id, 0, 0.0, 1.0, "a");
+        seg0.speaker_id = Some(s1.id);
+        let mut seg1 = TranscriptSegment::new(meeting.id, 1, 1.0, 2.0, "b");
+        seg1.speaker_id = Some(s1.id);
+        store.add_segments(&[seg0.clone(), seg1.clone()]).unwrap();
+
+        // Move only the second line to S2.
+        assert!(store.reassign_segment_speaker(seg1.id, s2.id).unwrap());
+        let segments = store.list_segments(meeting.id).unwrap();
+        assert_eq!(segments[0].speaker_id, Some(s1.id));
+        assert_eq!(segments[1].speaker_id, Some(s2.id));
+
+        // Unknown segment id is a no-op.
+        assert!(!store
+            .reassign_segment_speaker(Uuid::new_v4(), s2.id)
+            .unwrap());
+    }
+
+    #[test]
+    fn merge_speakers_repoints_segments_and_deletes_the_source() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        let keep = Speaker::new(meeting.id, "S1");
+        let dupe = Speaker::new(meeting.id, "S2");
+        store.upsert_speaker(&keep).unwrap();
+        store.upsert_speaker(&dupe).unwrap();
+
+        let mut a = TranscriptSegment::new(meeting.id, 0, 0.0, 1.0, "a");
+        a.speaker_id = Some(keep.id);
+        let mut b = TranscriptSegment::new(meeting.id, 1, 1.0, 2.0, "b");
+        b.speaker_id = Some(dupe.id);
+        let mut c = TranscriptSegment::new(meeting.id, 2, 2.0, 3.0, "c");
+        c.speaker_id = Some(dupe.id);
+        store.add_segments(&[a.clone(), b, c]).unwrap();
+
+        // Merge S2 into S1: both of S2's segments move, S2 disappears.
+        let moved = store.merge_speakers(meeting.id, dupe.id, keep.id).unwrap();
+        assert_eq!(moved, 2);
+        let speakers = store.list_speakers(meeting.id).unwrap();
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].id, keep.id);
+        for seg in store.list_segments(meeting.id).unwrap() {
+            assert_eq!(seg.speaker_id, Some(keep.id));
+        }
+
+        // Merging a speaker into itself is a no-op.
+        assert_eq!(
+            store.merge_speakers(meeting.id, keep.id, keep.id).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn speaker_ops_reject_speakers_from_another_meeting() {
+        let (_dir, store) = open_store();
+        let m1 = Meeting::new();
+        let m2 = Meeting::new();
+        store.create_meeting(&m1).unwrap();
+        store.create_meeting(&m2).unwrap();
+        let m1_spk = Speaker::new(m1.id, "S1");
+        let m2_spk = Speaker::new(m2.id, "X1");
+        store.upsert_speaker(&m1_spk).unwrap();
+        store.upsert_speaker(&m2_spk).unwrap();
+
+        let mut seg = TranscriptSegment::new(m1.id, 0, 0.0, 1.0, "a");
+        seg.speaker_id = Some(m1_spk.id);
+        store.add_segments(&[seg.clone()]).unwrap();
+
+        // Reassigning a m1 segment to a m2 speaker is rejected (no-op, false);
+        // the segment keeps its original speaker.
+        assert!(!store.reassign_segment_speaker(seg.id, m2_spk.id).unwrap());
+        assert_eq!(
+            store.list_segments(m1.id).unwrap()[0].speaker_id,
+            Some(m1_spk.id)
+        );
+
+        // Merging within m1 into a m2 speaker is rejected, and m1's segment is
+        // left untouched.
+        assert!(store.merge_speakers(m1.id, m1_spk.id, m2_spk.id).is_err());
+        assert_eq!(
+            store.list_segments(m1.id).unwrap()[0].speaker_id,
+            Some(m1_spk.id)
+        );
+    }
+
+    #[test]
+    fn get_meeting_detail_aggregates_meeting_speakers_segments_and_summaries() {
+        let (_dir, store) = open_store();
+        let mut meeting = Meeting::new();
+        meeting.title = Some("Sync".into());
+        store.create_meeting(&meeting).unwrap();
+        let s1 = Speaker::new(meeting.id, "S1");
+        store.upsert_speaker(&s1).unwrap();
+        // Insert out of order; detail must return segments in seq order.
+        let seg1 = TranscriptSegment::new(meeting.id, 1, 1.0, 2.0, "second");
+        let seg0 = TranscriptSegment::new(meeting.id, 0, 0.0, 1.0, "first");
+        store.add_segments(&[seg1, seg0]).unwrap();
+        store
+            .save_summary(&MeetingSummary::new(meeting.id, SummaryKind::Summary, "{}"))
+            .unwrap();
+        store
+            .save_summary(&MeetingSummary::new(
+                meeting.id,
+                SummaryKind::Decisions,
+                "[]",
+            ))
+            .unwrap();
+
+        let detail = store.get_meeting_detail(meeting.id).unwrap().unwrap();
+        assert_eq!(detail.meeting.id, meeting.id);
+        assert_eq!(detail.speakers.len(), 1);
+        assert_eq!(detail.segments.len(), 2);
+        assert_eq!(detail.segments[0].text, "first");
+        assert_eq!(detail.segments[1].text, "second");
+        assert_eq!(detail.summaries.len(), 2);
+        assert_eq!(detail.speaker_name(Some(s1.id)), "S1");
+        assert_eq!(detail.speaker_name(None), "未知说话人");
+
+        assert!(store.get_meeting_detail(Uuid::new_v4()).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_meetings_filtered_by_status_and_title_query() {
+        let (_dir, store) = open_store();
+        let mut ready = Meeting::new();
+        ready.title = Some("Weekly Planning".into());
+        ready.status = MeetingStatus::Ready;
+        let mut failed = Meeting::new();
+        failed.title = Some("Broken Recording".into());
+        failed.status = MeetingStatus::Failed;
+        let untitled = Meeting::new(); // Recording, no title
+        store.create_meeting(&ready).unwrap();
+        store.create_meeting(&failed).unwrap();
+        store.create_meeting(&untitled).unwrap();
+
+        // Status filter only.
+        let ready_only = store
+            .list_meetings_filtered(Some(MeetingStatus::Ready), None, 10)
+            .unwrap();
+        assert_eq!(ready_only.len(), 1);
+        assert_eq!(ready_only[0].id, ready.id);
+
+        // Title substring only (case-sensitive), untitled excluded.
+        let planning = store
+            .list_meetings_filtered(None, Some("Planning"), 10)
+            .unwrap();
+        assert_eq!(planning.len(), 1);
+        assert_eq!(planning[0].id, ready.id);
+
+        // No filters returns everything.
+        assert_eq!(
+            store.list_meetings_filtered(None, None, 10).unwrap().len(),
+            3
+        );
+
+        // Blank query behaves like no query.
+        assert_eq!(
+            store
+                .list_meetings_filtered(None, Some("   "), 10)
+                .unwrap()
+                .len(),
+            3
+        );
+
+        // Combined filters with no match.
+        assert!(store
+            .list_meetings_filtered(Some(MeetingStatus::Ready), Some("Broken"), 10)
+            .unwrap()
+            .is_empty());
     }
 }

@@ -445,6 +445,57 @@ pub fn corrector_user_message_with_context(
     sections.join("\n\n")
 }
 
+// ── Meeting minutes (M4a) ────────────────────────────────────────────
+//
+// The minutes pass is a separate LLM call from the dictation corrector: its
+// input is a whole meeting transcript (timestamped, speaker-attributed) and its
+// output is a *structured* JSON object, not free-form Markdown, so every
+// decision / action item can carry a `source` time range the UI turns into a
+// click-to-jump link. See docs/MEETING_M4_UX.md ("裁决 2: 纪要是结构化输出").
+
+/// Immutable system prompt for the structured meeting-minutes pass.
+///
+/// It fixes the JSON contract and the red lines (no invented facts, every item
+/// grounded in the transcript, output JSON only). The exact object shape is
+/// mirrored by `lumen_meeting::minutes::Minutes`.
+pub const MINUTES_SYSTEM_ZH: &str = r#"你是会议纪要生成器，把一段带时间戳和说话人的会议转录整理成结构化纪要。
+
+# 输出格式（严格）
+- 只输出一个 JSON 对象，不要 Markdown、不要代码围栏、不要前后说明文字。
+- JSON 结构：
+{
+  "one_liner": "一句话总结整场会议",
+  "decisions": [ { "text": "达成的决策", "source": { "start": 12.5, "end": 20.0 } } ],
+  "action_items": [ { "text": "要做的事", "owner": "负责人或省略", "due": "截止时间或省略", "source": { "start": 30.0, "end": 42.0 } } ],
+  "discussion": [ { "topic": "讨论要点", "source": { "start": 5.0, "end": 9.0 } } ],
+  "open_questions": [ { "text": "未决问题", "source": { "start": 50.0, "end": 55.0 } } ]
+}
+
+# 规则（红线）
+- 每一条 decision / action_item 尽量给出 source：它对应转录中最相关片段的起止秒数（来自输入里每段前的 [start-end] 时间）。
+- discussion / open_questions 的 source 可省略（找不到就不写该字段）。
+- action_items 的 owner / due 只有在转录中明确出现才填，否则省略该字段，不要编造。
+- 不发明会上没有的事实、数字、人名或决策；宁可少写也不编。
+- 任何数组没有内容就输出空数组 []，不要省略这个键。
+- one_liner 必须是非空字符串。
+- 语言与转录一致（中文转录输出中文）。
+"#;
+
+/// The minutes system prompt (currently a constant; a function for symmetry
+/// with the corrector builders and future per-run tuning).
+pub fn build_minutes_system_prompt() -> String {
+    MINUTES_SYSTEM_ZH.to_string()
+}
+
+/// Wrap a rendered transcript (one timestamped, speaker-attributed line per
+/// turn) as the minutes user message. The transcript is untrusted content, so
+/// it is fenced with explicit begin/end markers.
+pub fn minutes_user_message(transcript: &str) -> String {
+    format!(
+        "# 会议转录（每行格式：[起-止秒] 说话人：内容）\nTRANSCRIPT_BEGIN\n{transcript}\nTRANSCRIPT_END\n\n请按系统指令输出结构化 JSON 纪要。"
+    )
+}
+
 pub fn format_dictionary_block(terms: &[String], replacements: &[(String, String)]) -> String {
     let mut parts = Vec::new();
     if !terms.is_empty() {
@@ -534,6 +585,28 @@ mod tests {
         });
         assert!(!p.is_empty());
         assert!(p.contains("整理强度：轻") || p.contains("翻译"));
+    }
+
+    #[test]
+    fn minutes_prompt_fixes_the_json_contract_and_red_lines() {
+        let system = build_minutes_system_prompt();
+        for key in [
+            "one_liner",
+            "decisions",
+            "action_items",
+            "discussion",
+            "open_questions",
+            "source",
+        ] {
+            assert!(system.contains(key), "minutes prompt missing key: {key}");
+        }
+        assert!(system.contains("只输出一个 JSON 对象"));
+        assert!(system.contains("不发明"));
+
+        let user = minutes_user_message("[0-2] S1：你好");
+        assert!(user.contains("TRANSCRIPT_BEGIN"));
+        assert!(user.contains("TRANSCRIPT_END"));
+        assert!(user.contains("[0-2] S1：你好"));
     }
 
     #[test]

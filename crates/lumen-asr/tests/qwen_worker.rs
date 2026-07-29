@@ -587,7 +587,10 @@ for line in sys.stdin:
 
     let in_flight_engine = engine.clone();
     let in_flight = tokio::spawn(async move { in_flight_engine.transcribe(request()).await });
-    for _ in 0..100 {
+    // Wait up to 5s for the worker subprocess to write its startup marker.
+    // 500ms was too tight on loaded Windows CI runners (python spawn + import
+    // + file write), causing spurious "worker did not start" failures.
+    for _ in 0..1000 {
         if starts.is_file() {
             break;
         }
@@ -650,7 +653,10 @@ for line in sys.stdin:
 
     let first_engine = engine.clone();
     let first = tokio::spawn(async move { first_engine.transcribe(request()).await });
-    for _ in 0..100 {
+    // Wait up to 5s for the worker subprocess to write its startup marker.
+    // 500ms was too tight on loaded Windows CI runners (python spawn + import
+    // + file write), causing spurious "worker did not start" failures.
+    for _ in 0..1000 {
         if starts.is_file() {
             break;
         }

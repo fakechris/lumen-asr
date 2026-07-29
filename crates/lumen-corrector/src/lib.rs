@@ -109,6 +109,11 @@ pub struct CorrectRequest {
     /// Sampling temperature hint for the provider.
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    /// Max output tokens. `None` uses the dictation-sized default (1024).
+    /// Long-form callers (e.g. meeting minutes) raise this so structured JSON
+    /// output is not truncated mid-document.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 fn default_temperature() -> f32 {
@@ -214,6 +219,7 @@ pub async fn correct_or_fallback_with_context(
             context_json,
             system_prompt,
             temperature,
+            max_tokens: None,
         })
         .await
     {
