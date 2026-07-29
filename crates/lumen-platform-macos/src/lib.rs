@@ -7,8 +7,8 @@ mod permissions;
 
 pub use focused_field::{focused_text_field_snapshot, FocusedTextFieldSnapshot};
 pub use hotkey_tap::{
-    start_monitor, start_multi_monitor, stop_monitor, HotkeyBinding, HotkeyEdge, HotkeyMode,
-    HotkeySpec,
+    physical_fn_down, start_monitor, start_multi_monitor, stop_monitor, HotkeyBinding, HotkeyEdge,
+    HotkeyMode, HotkeySpec,
 };
 pub use inject::MacTextInjectorBackend;
 pub use permissions::{

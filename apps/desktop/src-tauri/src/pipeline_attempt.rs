@@ -154,6 +154,7 @@ pub(crate) struct CorrectionStageOutput {
     pub text: String,
     pub engine: String,
     pub model_applied: bool,
+    pub fallback_reason: Option<String>,
 }
 
 fn select_corrector_context(
@@ -420,14 +421,18 @@ pub(crate) async fn run_corrector_stage(
     attempt.pipeline_inputs.stage_usages.push(dictionary_usage);
     let outcome_identity = corrector_outcome_identity(&run, result.model_applied);
     let engine = outcome_identity.engine;
+    let fallback_reason = outcome_identity.fallback.then(|| {
+        result
+            .fallback_reason
+            .map(|value| value.as_str())
+            .unwrap_or("model_not_applied")
+            .to_owned()
+    });
     attempt.corrected = Some(text.clone());
     attempt.pipeline_identity.corrector_engine = engine.clone();
     attempt.pipeline_metrics.corrector_fallback = outcome_identity.fallback;
     if attempt.pipeline_metrics.corrector_fallback {
-        let reason = result
-            .fallback_reason
-            .map(|value| value.as_str())
-            .unwrap_or("model_not_applied");
+        let reason = fallback_reason.as_deref().unwrap_or("model_not_applied");
         attempt
             .pipeline_metrics
             .stage_issues
@@ -449,6 +454,7 @@ pub(crate) async fn run_corrector_stage(
         text,
         engine,
         model_applied: result.model_applied,
+        fallback_reason,
     })
 }
 

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AsrStatus,
   AudioDevice,
+  BuildInfo,
   CorrectorStatus,
   CorrectTextOutcome,
   ContextSnapshotRecord,
@@ -105,6 +106,7 @@ export type HotkeyIntent = {
 
 export const api = {
   health: () => invoke<Health>("app_health"),
+  buildInfo: () => invoke<BuildInfo>("build_info"),
 
   listAudioDevices: () => invoke<AudioDevice[]>("list_audio_devices"),
   getAudioDevice: () => invoke<string | null>("get_audio_device"),
@@ -343,6 +345,7 @@ export const api = {
       asrEngine: string;
       correctorEngine: string;
       modelApplied: boolean;
+      fallbackReason?: string | null;
     }>("retry_session_transcription", { id }),
 
   seedDemoSession: () => invoke<SessionRecord>("seed_demo_session"),

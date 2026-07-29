@@ -9,11 +9,17 @@ import { Icon, type IconName } from "./Icons";
 import { ThemeToggle } from "./ThemeToggle";
 import { ChordCaptureChip } from "./ChordCaptureChip";
 import { MeetingPanel } from "./MeetingPanel";
+import {
+  correctorFallbackNotice,
+  correctorFallbackReasonLabel,
+} from "./fallbackPresentation";
 import lumenMark from "./assets/product-icons/lumen-asr.svg";
 import type {
   AsrStatus,
   AudioDevice,
+  BuildInfo,
   CorrectorStatus,
+  DictationAttemptRecord,
   DictionaryEntry,
   EditEvent,
   EditObservation,
@@ -243,6 +249,7 @@ export default function App() {
         asrText?: string;
         asrEngine?: string;
         correctorEngine?: string;
+        fallbackReason?: string | null;
         session?: SessionRecord;
       };
     }>("dictation", (e) => {
@@ -745,6 +752,7 @@ function RecordPanel({
         session?: SessionRecord;
         asrEngine?: string;
         correctorEngine?: string;
+        fallbackReason?: string | null;
       };
       if (!detail) return;
       const finalText = detail.text || detail.correctedText || "";
@@ -754,7 +762,9 @@ function RecordPanel({
       setSessionId(detail.session?.id ?? null);
       setLiveCandidates([]);
       setMeta(
-        `hotkey · ASR ${detail.asrEngine || "?"} · ${detail.correctorEngine || ""}`
+        detail.fallbackReason
+          ? `hotkey · ASR ${detail.asrEngine || "?"} · ${correctorFallbackNotice(detail.fallbackReason)}`
+          : `hotkey · ASR ${detail.asrEngine || "?"} · ${detail.correctorEngine || ""}`
       );
     };
     window.addEventListener("lumen-dictation-done", handler);
@@ -824,7 +834,7 @@ function RecordPanel({
       setLiveCandidates([]);
       const corr = out.modelApplied
         ? `corrector ${out.correctorEngine}`
-        : `corrector fallback (${out.correctorEngine})`;
+        : `${correctorFallbackNotice(out.fallbackReason)} (${out.correctorEngine})`;
       setMeta(
         `ASR ${out.asrEngine} · ${corr} · ${(out.durationMs / 1000).toFixed(1)}s · ${out.numSamples} samples`
       );
@@ -1240,6 +1250,14 @@ function SettingsPanel({
   const [promoteN, setPromoteN] = useState(3);
   const [postPaste, setPostPaste] = useState(true);
   const [postPasteSecs, setPostPasteSecs] = useState(20);
+  // null = still loading, "error" = lookup failed (never stuck on loading).
+  const [buildInfo, setBuildInfo] = useState<BuildInfo | "error" | null>(null);
+  useEffect(() => {
+    void api
+      .buildInfo()
+      .then(setBuildInfo)
+      .catch(() => setBuildInfo("error"));
+  }, []);
 
   useEffect(() => {
     void (async () => {
@@ -2526,6 +2544,23 @@ function SettingsPanel({
           </li>
         </ul>
       </section>
+
+      <p
+        className="muted-text"
+        style={{
+          margin: "0.25rem 0 0",
+          fontSize: "0.78rem",
+          textAlign: "center",
+          userSelect: "text",
+        }}
+        title="构建标识：版本 · git 短 sha · 构建时间"
+      >
+        {buildInfo === null
+          ? "构建信息加载中…"
+          : buildInfo === "error"
+            ? "构建信息不可用（版本未知）"
+            : `v${buildInfo.version} · ${buildInfo.git_sha} · ${buildInfo.build_time}`}
+      </p>
     </>
   );
 }
@@ -2667,6 +2702,7 @@ function HistoryPanel({
   const [copied, setCopied] = useState(false);
   const [showPipeline, setShowPipeline] = useState(false);
   const [retryNote, setRetryNote] = useState<string | null>(null);
+  const [attempts, setAttempts] = useState<DictationAttemptRecord[]>([]);
   const [editEvents, setEditEvents] = useState<EditEvent[]>([]);
   const [editObservations, setEditObservations] = useState<EditObservation[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -2694,22 +2730,25 @@ function HistoryPanel({
   useEffect(() => {
     let cancelled = false;
     if (!selected) {
+      setAttempts([]);
       setEditEvents([]);
       setEditObservations([]);
       return;
     }
     void Promise.all([
+      api.listSessionAttempts(selected.id, 20),
       api.listEditEvents(selected.id),
       api.listEditObservations(selected.id),
     ])
-      .then(([events, observations]) => {
+      .then(([attemptRows, events, observations]) => {
         if (!cancelled) {
+          setAttempts(attemptRows);
           setEditEvents(events);
           setEditObservations(observations);
         }
       })
       .catch((error) => {
-        if (!cancelled) onError(`读取编辑反馈失败: ${String(error)}`);
+        if (!cancelled) onError(`读取历史详情失败: ${String(error)}`);
       });
     return () => {
       cancelled = true;
@@ -2775,8 +2814,11 @@ function HistoryPanel({
       const out = await api.retrySessionTranscription(selected.id);
       onUpdated(out.session);
       onRefresh();
+      setAttempts(await api.listSessionAttempts(selected.id, 20));
       const after = sessionMainText(out.session);
-      if (after && after !== before) {
+      if (out.fallbackReason) {
+        setRetryNote(correctorFallbackNotice(out.fallbackReason));
+      } else if (after && after !== before) {
         setRetryNote("识别结果已更新");
       } else if (!after) {
         setRetryNote("仍然没有识别出文字，可先听录音确认环境音");
@@ -2794,6 +2836,17 @@ function HistoryPanel({
   const needsRecovery = q === "empty" || q === "weak";
   const hasAudio = Boolean(selected?.audio_path);
   const text = selected ? sessionMainText(selected) : "";
+  const resultAttempt =
+    attempts.find((attempt) => attempt.status === "completed" && attempt.corrected != null) ||
+    attempts[0];
+  const correctorFallback = resultAttempt?.pipeline_metrics.corrector_fallback === true;
+  const correctorFallbackReason = correctorFallback
+    ? resultAttempt?.pipeline_metrics.stage_issues.find(
+        (issue) => issue.stage === "corrector" && issue.kind === "fallback",
+      )?.message || "model_not_applied"
+    : null;
+  const pipelineAsrText = resultAttempt?.asr_raw || selected?.asr_raw || "";
+  const pipelineCorrectedText = resultAttempt?.corrected ?? selected?.corrected ?? "";
 
   return (
     <div className="split history-layout">
@@ -2956,6 +3009,16 @@ function HistoryPanel({
               </div>
             </header>
 
+            {correctorFallback && (
+              <div className="history-corrector-fallback" role="status">
+                <strong>本次 AI 修订未采用</strong>
+                <span>
+                  {correctorFallbackReasonLabel(correctorFallbackReason)}
+                  。已保留基础整理文本，且没有再次调用大模型。
+                </span>
+              </div>
+            )}
+
             {/* Result first — text is the product */}
             <div
               className={`history-result ${needsRecovery ? "history-result-soft" : ""}`}
@@ -3088,7 +3151,7 @@ function HistoryPanel({
             )}
 
             {/* Pipeline detail is secondary — for power users */}
-            {(selected.asr_raw || selected.corrected) && (
+            {(pipelineAsrText || pipelineCorrectedText) && (
               <div className="history-pipeline">
                 <button
                   type="button"
@@ -3100,13 +3163,16 @@ function HistoryPanel({
                 {showPipeline && (
                   <div className="history-pipeline-body">
                     <div>
-                      <div className="field-label">模型输出</div>
-                      <pre className="field-value">{selected.asr_raw || "—"}</pre>
+                      <div className="field-label">ASR 原始转写</div>
+                      <pre className="field-value">{pipelineAsrText || "—"}</pre>
                     </div>
-                    {selected.corrected && selected.corrected !== selected.asr_raw && (
+                    {pipelineCorrectedText &&
+                      (correctorFallback || pipelineCorrectedText !== pipelineAsrText) && (
                       <div>
-                        <div className="field-label">修正后</div>
-                        <pre className="field-value">{selected.corrected}</pre>
+                        <div className="field-label">
+                          {correctorFallback ? "最终文本（AI 修订回退）" : "修正后"}
+                        </div>
+                        <pre className="field-value">{pipelineCorrectedText}</pre>
                       </div>
                     )}
                   </div>

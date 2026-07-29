@@ -271,6 +271,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_health,
+            commands::build_info,
             commands::list_sessions,
             commands::get_session,
             commands::list_session_attempts,

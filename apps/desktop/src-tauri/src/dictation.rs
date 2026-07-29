@@ -613,6 +613,7 @@ pub struct TranscribeOutcome {
     pub asr_text: String,
     pub corrected_text: String,
     pub model_applied: bool,
+    pub fallback_reason: Option<String>,
     pub asr_engine: String,
     pub corrector_engine: String,
     pub sample_rate: u32,
@@ -918,6 +919,7 @@ pub async fn stop_and_transcribe_inner(
     .await?;
     let corrected_text = correction.text;
     let corrector_engine = correction.engine;
+    let fallback_reason = correction.fallback_reason;
     if !correction.model_applied && matches!(intent, IntentSpec::Translate { .. }) {
         tracing::warn!(
             %corrector_engine,
@@ -1111,6 +1113,7 @@ pub async fn stop_and_transcribe_inner(
         asr_text,
         corrected_text,
         model_applied: correction.model_applied,
+        fallback_reason,
         asr_engine: engine_kind.as_str().into(),
         corrector_engine,
         sample_rate,
@@ -1159,6 +1162,7 @@ pub struct RetryOutcome {
     pub asr_engine: String,
     pub corrector_engine: String,
     pub model_applied: bool,
+    pub fallback_reason: Option<String>,
 }
 
 /// Re-run ASR + corrector from saved session audio (no re-record, no auto-insert).
@@ -1372,6 +1376,7 @@ pub async fn retry_session_transcription(
     .await?;
     let corrected_text = correction.text;
     let corrector_engine = correction.engine;
+    let fallback_reason = correction.fallback_reason;
     attempt.status = AttemptStatus::Completed;
     attempt.pipeline_metrics.total_ms = elapsed_ms(pipeline_started);
 
@@ -1399,6 +1404,7 @@ pub async fn retry_session_transcription(
         asr_engine: engine_kind.as_str().into(),
         corrector_engine,
         model_applied: correction.model_applied,
+        fallback_reason,
     })
 }
 
@@ -1765,6 +1771,33 @@ fn finish_with_transient_error(app: &AppHandle, message: String) {
     });
 }
 
+fn finish_with_transient_fallback(app: &AppHandle, outcome: TranscribeOutcome) {
+    let notice_epoch = {
+        let _transition = UI_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        let notice_epoch = UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        crate::capsule::set_capsule_visible(app, true, "fallback");
+        emit_dictation(app, DictationUiEvent::Done { outcome });
+        notice_epoch
+    };
+
+    let app_for_notice = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let _transition = UI_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if UI_NOTICE_EPOCH.load(Ordering::SeqCst) == notice_epoch
+            && PHASE.load(Ordering::SeqCst) == PHASE_IDLE
+        {
+            emit_dictation(&app_for_notice, DictationUiEvent::Idle);
+            crate::capsule::set_capsule_visible(&app_for_notice, false, "idle");
+        }
+    });
+}
+
 /// Start recording if idle (push-to-talk press / toggle start).
 pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
     dictation_start_with_intent(app, IntentSpec::Default).await
@@ -1935,10 +1968,14 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
     clear_ui_intent();
     match result {
         Ok(outcome) => {
-            crate::capsule::set_capsule_visible(&app, false, "idle");
-            emit_dictation(&app, DictationUiEvent::Done { outcome });
-            emit_dictation(&app, DictationUiEvent::Idle);
-            PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+            if outcome.fallback_reason.is_some() {
+                finish_with_transient_fallback(&app, outcome);
+            } else {
+                crate::capsule::set_capsule_visible(&app, false, "idle");
+                emit_dictation(&app, DictationUiEvent::Done { outcome });
+                emit_dictation(&app, DictationUiEvent::Idle);
+                PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+            }
             Ok(())
         }
         Err(e) => {
