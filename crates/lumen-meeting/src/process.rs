@@ -27,6 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::assemble::assemble_meeting;
+use crate::correct::{correct_segment, correct_words};
 use crate::minutes::{
     generate_minutes, minutes_summaries, render_transcript_for_minutes, MinutesError,
 };
@@ -120,6 +121,21 @@ async fn run(
             transcribe_turn(asr_engine, &diar.samples, sample_rate, turn, opts).await?;
         texts.push(text);
         words.push(turn_words);
+    }
+
+    // Post-ASR dictionary correction (meeting "hotword" strategy A): repair
+    // near-miss mis-recognitions of the user's names/jargon before assembly, so
+    // the stored transcript *and* the minutes summary below both see the
+    // corrected text. Engine-agnostic (runs for Paraformer and SenseVoice) and
+    // cross-platform; a no-op when the dictionary is empty. Word-level timings are
+    // preserved (see `correct_words`).
+    if !opts.correction.is_empty() {
+        for text in &mut texts {
+            *text = correct_segment(text, &opts.correction);
+        }
+        for turn_words in &mut words {
+            *turn_words = correct_words(turn_words, &opts.correction);
+        }
     }
 
     let assembled = assemble_meeting(
