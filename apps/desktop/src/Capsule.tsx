@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { correctorFallbackNotice } from "./fallbackPresentation";
 
-type Phase = "idle" | "listening" | "processing" | "error";
+type Phase = "idle" | "listening" | "processing" | "notice" | "error";
 
 type DictationEvent =
   | { phase: "idle" }
@@ -18,7 +19,10 @@ type DictationEvent =
       intent?: string;
       targetLanguage?: string | null;
     }
-  | { phase: "done"; outcome: { text: string } }
+  | {
+      phase: "done";
+      outcome: { text: string; fallbackReason?: string | null };
+    }
   | { phase: "error"; message: string }
   | { phase: "cancelled" };
 
@@ -49,8 +53,13 @@ export default function Capsule() {
         setPhase("error");
         setMessage(p.message);
       } else if (p.phase === "done") {
-        setPhase("idle");
-        setMessage("完成");
+        if (p.outcome.fallbackReason) {
+          setPhase("notice");
+          setMessage(correctorFallbackNotice(p.outcome.fallbackReason));
+        } else {
+          setPhase("idle");
+          setMessage("完成");
+        }
         setIntent("default");
         setTargetLang(null);
       } else {
@@ -113,6 +122,9 @@ export default function Capsule() {
     }
   } else if (phase === "error") {
     badge = "!";
+    label = message;
+  } else if (phase === "notice") {
+    badge = "回";
     label = message;
   } else {
     badge = "·";
