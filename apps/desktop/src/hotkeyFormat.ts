@@ -2,6 +2,7 @@
 export function formatHotkeyLabel(raw: string): string {
   if (!raw) return "—";
   return raw
+    .replace(/\b(?:Fn|Function|Globe)\b/gi, "fn")
     .replace(/CommandOrControl/gi, "⌘")
     .replace(/CmdOrCtrl/gi, "⌘")
     .replace(/Command/gi, "⌘")
@@ -25,6 +26,8 @@ const MOD_CODES = new Set([
   "MetaRight",
   "OSLeft",
   "OSRight",
+  "Fn",
+  "Globe",
 ]);
 
 const MOD_KEYS = new Set([
@@ -34,6 +37,9 @@ const MOD_KEYS = new Set([
   "Meta",
   "OS",
   "AltGraph",
+  "Fn",
+  "Function",
+  "Globe",
 ]);
 
 export function isModifierEvent(e: KeyboardEvent): boolean {
@@ -42,6 +48,7 @@ export function isModifierEvent(e: KeyboardEvent): boolean {
 
 export type ChordState = {
   /** True if corresponding modifier is part of the chord. */
+  fn: boolean;
   command: boolean;
   control: boolean;
   alt: boolean;
@@ -52,6 +59,7 @@ export type ChordState = {
 
 export function emptyChord(): ChordState {
   return {
+    fn: false,
     command: false,
     control: false,
     alt: false,
@@ -63,7 +71,19 @@ export function emptyChord(): ChordState {
 /** Merge a keydown into the accumulating chord (natural whole-combo capture). */
 export function absorbKeyDown(chord: ChordState, e: KeyboardEvent): ChordState {
   const next = { ...chord };
-  if (e.code === "MetaLeft" || e.code === "MetaRight" || e.key === "Meta") {
+  if (
+    e.code === "Fn" ||
+    e.code === "Globe" ||
+    e.key === "Fn" ||
+    e.key === "Function" ||
+    e.key === "Globe"
+  ) {
+    next.fn = true;
+  } else if (
+    e.code === "MetaLeft" ||
+    e.code === "MetaRight" ||
+    e.key === "Meta"
+  ) {
     next.command = true;
   } else if (
     e.code === "ControlLeft" ||
@@ -93,6 +113,7 @@ export function absorbKeyDown(chord: ChordState, e: KeyboardEvent): ChordState {
 
 export function chordModCount(c: ChordState): number {
   return (
+    (c.fn ? 1 : 0) +
     (c.command ? 1 : 0) +
     (c.control ? 1 : 0) +
     (c.alt ? 1 : 0) +
@@ -102,6 +123,7 @@ export function chordModCount(c: ChordState): number {
 
 /**
  * Whether this chord is a valid dictation hotkey:
+ * - Fn by itself
  * - modifiers + key (e.g. ⌥Space)
  * - 2+ modifiers only (e.g. ⌥⇧) — registered via macOS mod watcher
  * - F-keys alone
@@ -111,13 +133,14 @@ export function isValidChord(c: ChordState): boolean {
     const isFunctionKey = /^F\d{1,2}$/i.test(c.key);
     return chordModCount(c) > 0 || isFunctionKey;
   }
-  return chordModCount(c) >= 2;
+  return c.fn || chordModCount(c) >= 2;
 }
 
-/** Serialize to config / global-shortcut string. Order: Command Control Alt Shift Key */
+/** Serialize to config string. Order: Fn Command Control Alt Shift Key */
 export function chordToShortcut(c: ChordState): string | null {
   if (!isValidChord(c)) return null;
   const parts: string[] = [];
+  if (c.fn) parts.push("Fn");
   if (c.command) parts.push("Command");
   if (c.control) parts.push("Control");
   if (c.alt) parts.push("Alt");
@@ -131,6 +154,7 @@ export function formatChordLive(c: ChordState): string {
   if (sc) return formatHotkeyLabel(sc);
   // Incomplete preview while holding
   const parts: string[] = [];
+  if (c.fn) parts.push("fn");
   if (c.command) parts.push("⌘");
   if (c.control) parts.push("⌃");
   if (c.alt) parts.push("⌥");
@@ -181,6 +205,7 @@ function codeToShortcutKey(code: string, key: string): string | null {
 
 /** Common presets (safe defaults + modifier-only). */
 export const HOTKEY_PRESETS: { label: string; value: string }[] = [
+  { label: "fn", value: "Fn" },
   { label: "⌥Space", value: "Alt+Space" },
   { label: "⌥⇧", value: "Alt+Shift" },
   { label: "⌃⇧", value: "Control+Shift" },

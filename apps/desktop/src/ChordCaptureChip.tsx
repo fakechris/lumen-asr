@@ -150,7 +150,12 @@ export function ChordCaptureChip({
   }, [recording]);
 
   const label = recording
-    ? live.alt || live.shift || live.control || live.command || live.key
+    ? live.fn ||
+      live.alt ||
+      live.shift ||
+      live.control ||
+      live.command ||
+      live.key
       ? formatChordLive(live)
       : "按下快捷键…"
     : value

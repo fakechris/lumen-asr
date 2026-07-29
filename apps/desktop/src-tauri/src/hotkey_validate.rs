@@ -40,19 +40,24 @@ pub fn validate_hotkey(shortcut: String) -> HotkeyValidation {
     // Count known modifier tokens vs non-modifier key.
     let mut mc = 0u8;
     let mut has_key = false;
+    let mut has_fn = false;
     for p in &parts {
-        match p.as_ref() {
+        match *p {
             "ALT" | "OPTION" | "SHIFT" | "CONTROL" | "CTRL" | "COMMAND" | "CMD" | "META"
             | "SUPER" | "COMMANDORCONTROL" | "COMMANDORCTRL" => mc += 1,
+            "FN" | "FUNCTION" | "GLOBE" => {
+                mc += 1;
+                has_fn = true;
+            }
             _ => has_key = true,
         }
     }
 
     if mc == 0 {
-        errors.push("至少需要一个修饰键（如 Alt / Shift / Control）".into());
+        errors.push("至少需要一个修饰键（如 Fn / Alt / Shift / Control）".into());
     }
-    if !has_key && mc < 2 {
-        errors.push("纯修饰键组合至少需要两个修饰键（如 Alt+Shift）".into());
+    if !has_key && mc < 2 && !has_fn {
+        errors.push("除 Fn 外，纯修饰键组合至少需要两个修饰键（如 Alt+Shift）".into());
     }
 
     // Soft conflicts
@@ -64,6 +69,11 @@ pub fn validate_hotkey(shortcut: String) -> HotkeyValidation {
     }
     if upper.contains("COMMAND") && upper.contains("TAB") {
         warnings.push("可能与应用切换冲突".into());
+    }
+    if has_fn {
+        warnings.push(
+            "若 macOS 已将 Fn/🌐 设为听写或切换输入法，建议在系统设置中关闭该动作以免冲突".into(),
+        );
     }
 
     // Try parse with HotkeySpec if available
@@ -83,5 +93,21 @@ pub fn validate_hotkey(shortcut: String) -> HotkeyValidation {
         shortcut: s,
         warnings,
         errors,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_single_fn_with_system_conflict_hint() {
+        let result = validate_hotkey("Fn".into());
+        assert!(result.ok);
+        assert!(result.errors.is_empty());
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("macOS")));
     }
 }

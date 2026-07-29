@@ -21,6 +21,7 @@ pub enum HotkeyMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeySpec {
+    pub fn_key: bool,
     pub alt: bool,
     pub shift: bool,
     pub control: bool,
@@ -31,6 +32,7 @@ pub struct HotkeySpec {
 
 impl HotkeySpec {
     pub fn parse(s: &str, mode: HotkeyMode) -> Result<Self, String> {
+        let mut fn_key = false;
         let mut alt = false;
         let mut shift = false;
         let mut control = false;
@@ -44,6 +46,7 @@ impl HotkeySpec {
             }
             let u = t.to_ascii_uppercase();
             match u.as_str() {
+                "FN" | "FUNCTION" | "GLOBE" => fn_key = true,
                 "OPTION" | "ALT" => alt = true,
                 "SHIFT" => shift = true,
                 "CONTROL" | "CTRL" => control = true,
@@ -62,15 +65,19 @@ impl HotkeySpec {
             }
         }
 
-        let mod_count = (alt as u8) + (shift as u8) + (control as u8) + (meta as u8);
+        let mod_count =
+            (fn_key as u8) + (alt as u8) + (shift as u8) + (control as u8) + (meta as u8);
         if mod_count == 0 {
             return Err("hotkey must include at least one modifier".into());
         }
-        if keycode.is_none() && mod_count < 2 {
+        // Fn is useful and unambiguous as a standalone hold-to-record key.
+        // Other modifier-only shortcuts still require at least two modifiers.
+        if keycode.is_none() && mod_count < 2 && !fn_key {
             return Err("modifier-only hotkey needs at least two modifiers".into());
         }
 
         Ok(Self {
+            fn_key,
             alt,
             shift,
             control,
@@ -81,13 +88,15 @@ impl HotkeySpec {
     }
 
     fn mods_active(&self, flags: u64) -> bool {
+        let fn_key = flags & FLAG_SECONDARY_FN != 0;
         let alt = flags & FLAG_ALTERNATE != 0;
         let shift = flags & FLAG_SHIFT != 0;
         let control = flags & FLAG_CONTROL != 0;
         let meta = flags & FLAG_COMMAND != 0;
         // Exact modifier set: required on, others off.
         // Prevents Alt+Shift primary from also matching Alt+Control+Shift, etc.
-        self.alt == alt
+        self.fn_key == fn_key
+            && self.alt == alt
             && self.shift == shift
             && self.control == control
             && self.meta == meta
@@ -95,7 +104,8 @@ impl HotkeySpec {
 
     /// Higher = more specific. Prefer key+mods over pure modifier chords.
     fn specificity(&self) -> u32 {
-        let mods = (self.alt as u32)
+        let mods = (self.fn_key as u32)
+            + (self.alt as u32)
             + (self.shift as u32)
             + (self.control as u32)
             + (self.meta as u32);
@@ -155,6 +165,8 @@ const FLAG_SHIFT: u64 = 0x0002_0000;
 const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALTERNATE: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
+// kCGEventFlagMaskSecondaryFn / NX_SECONDARYFNMASK.
+const FLAG_SECONDARY_FN: u64 = 0x0080_0000;
 
 #[derive(Debug, Clone)]
 pub struct HotkeyBinding {
@@ -431,6 +443,21 @@ mod tests {
     fn parse_alt_space() {
         let s = HotkeySpec::parse("Alt+Space", HotkeyMode::Hold).unwrap();
         assert!(s.alt && s.keycode == Some(0x31));
+    }
+
+    #[test]
+    fn parse_single_fn_and_match_secondary_fn_flag() {
+        let s = HotkeySpec::parse("Fn", HotkeyMode::Hold).unwrap();
+        assert!(s.fn_key && s.keycode.is_none());
+        assert!(s.mods_active(FLAG_SECONDARY_FN));
+        assert!(!s.mods_active(0));
+        assert!(!s.mods_active(FLAG_SECONDARY_FN | FLAG_SHIFT));
+    }
+
+    #[test]
+    fn globe_is_an_alias_for_fn() {
+        let s = HotkeySpec::parse("Globe", HotkeyMode::Hold).unwrap();
+        assert!(s.fn_key);
     }
 
     #[test]
