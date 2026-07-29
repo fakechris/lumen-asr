@@ -2201,8 +2201,8 @@ html:has(.capsule-root) body {
   width: 11px;
   height: 11px;
   border-radius: 50%;
-  border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
-  border-top-color: currentColor;
+  border: 2px solid color-mix(in srgb, currentcolor 30%, transparent);
+  border-top-color: currentcolor;
   animation: mtg-spin 0.8s linear infinite;
 }
 

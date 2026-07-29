@@ -444,7 +444,9 @@ function MeetingDetailView({
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(url);
+      // Revoke only after the download has had a chance to start; revoking
+      // synchronously can cut the download off before the webview reads it.
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch (e) {
       onError(String(e));
     } finally {
@@ -575,6 +577,20 @@ function StatusNote({
           这场会议的{kind === "summary" ? "纪要" : "逐字稿"}没有生成成功。
           可在录音重试，或查看原始音频。
         </p>
+      </div>
+    );
+  }
+  // A terminal (ready) meeting that simply has no content must not show a
+  // "transcribing…" spinner — the pipeline is done, there is just nothing here.
+  if (!isInProgress(status)) {
+    return (
+      <div className="meeting-statusnote">
+        <div>
+          <strong>{kind === "summary" ? "暂无纪要" : "暂无逐字稿"}</strong>
+          <p className="muted-text">
+            这场会议没有可用的{kind === "summary" ? "结构化纪要" : "逐字稿内容"}。
+          </p>
+        </div>
       </div>
     );
   }
@@ -788,7 +804,10 @@ function buildTurns(segments: TranscriptSegment[]): Turn[] {
   for (const seg of segments) {
     const sid = seg.speaker_id ?? null;
     const last = turns[turns.length - 1];
-    if (last && last.speakerId === sid) {
+    // Only merge consecutive segments that share the *same known* speaker.
+    // Unattributed segments (no speaker id) each stand alone — merging them
+    // would wrongly collapse distinct unknown speakers into one turn.
+    if (last && sid !== null && last.speakerId === sid) {
       last.text = `${last.text} ${seg.text}`.trim();
       last.endSeconds = seg.end_seconds;
     } else {
