@@ -57,13 +57,13 @@ lumen-platform = { path = "crates/lumen-platform" }
 lumen-platform-macos = { path = "crates/lumen-platform-macos" }
 lumen-prompts = { path = "crates/lumen-prompts" }
 # Versioned capture contracts shared with Lumen's local macOS context collector.
-lumen-context = { git = "https://github.com/fakechris/lumen-suite.git", rev = "c33c13ef782ff141d8299507902268d6b1b7e06b" }
+lumen-context = { git = "https://github.com/fakechris/lumen-suite.git", rev = "27b2ed57ef316cdbafb577faef32f9d3a6ce97d2" }
 # Shared model path/lock/download layer and ASR engine layer for the Lumen
 # product cluster (replaces the former in-repo paths/install_lock/engine code).
-lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "c33c13ef782ff141d8299507902268d6b1b7e06b" }
-lumen-asr-engine = { git = "https://github.com/fakechris/lumen-suite.git", rev = "c33c13ef782ff141d8299507902268d6b1b7e06b", default-features = false }
+lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "27b2ed57ef316cdbafb577faef32f9d3a6ce97d2" }
+lumen-asr-engine = { git = "https://github.com/fakechris/lumen-suite.git", rev = "27b2ed57ef316cdbafb577faef32f9d3a6ce97d2", default-features = false }
 # Shared serde types for the lumen-transcript.v1 interchange format.
-lumen-transcript = { git = "https://github.com/fakechris/lumen-suite.git", rev = "c33c13ef782ff141d8299507902268d6b1b7e06b" }
+lumen-transcript = { git = "https://github.com/fakechris/lumen-suite.git", rev = "27b2ed57ef316cdbafb577faef32f9d3a6ce97d2" }
 parking_lot = "0.12"
 cpal = "0.15"
 blake3 = "1"

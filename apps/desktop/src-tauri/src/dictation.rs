@@ -11,8 +11,9 @@ use crate::pipeline_attempt::{
 use crate::session_debug;
 use crate::AppState;
 use lumen_asr::{
-    prepare_for_asr, probe_status, AsrEngine, AsrRequest, AsrResult, AudioDeviceInfo, EngineKind,
-    EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig, QwenShadowRequest, QwenShadowTerm,
+    lumen_models_dir, paraformer_offline_ready, prepare_for_asr, probe_status, AsrEngine,
+    AsrRequest, AsrResult, AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr,
+    OpenAiAudioConfig, ParaformerAsr, QwenShadowRequest, QwenShadowTerm,
 };
 use lumen_core::{DictEntryKind, FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use lumen_dictionary::DictionaryEntry;
@@ -1423,81 +1424,47 @@ pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-/// Build a standalone ASR engine from the user's ASR settings, for callers that
-/// need an owned [`AsrEngine`] to hand to another pipeline (the meeting
-/// transcription task). Mirrors the provider selection in [`run_asr`] but skips
-/// the dictation-only Qwen shadow / provenance path — the meeting pipeline drives
-/// per-turn `transcribe` itself. The returned engine is `Send + Sync` (the trait
-/// requires it), so it can be moved into a background task.
-pub(crate) fn build_meeting_asr_engine(
-    state: &AppState,
-    engine_kind: EngineKind,
-    asr_cfg: &AsrServiceConfig,
-) -> Result<Box<dyn AsrEngine>, String> {
-    let provider = canonical_asr_provider(&asr_cfg.provider);
-    let provider = provider.as_str();
-
-    if matches!(
-        provider,
-        "aliyun_qwen" | "volcengine" | "soniox" | "stepfun" | "mimo"
-    ) {
-        return Err(format!(
-            "ASR「{provider}」仅预置了 endpoint，完整流式客户端尚未接入。请改用本地 SenseVoice 或 OpenAI Audio。"
-        ));
+/// Build the offline meeting-transcription ASR engine.
+///
+/// Meetings persist **per-turn word timestamps** (M4c click-to-seek) and apply
+/// **hotword biasing** from the user's dictionary — both of which only the
+/// offline Paraformer engine provides. So the meeting engine is Paraformer-first
+/// and independent of the *dictation* ASR provider selection (dictation keeps
+/// SenseVoice/Whisper/Qwen/cloud as configured; this is the meeting path only).
+///
+/// Resolution:
+/// 1. If the Paraformer offline model is provisioned under
+///    `<lumen_models_dir>/paraformer/offline/`, use [`ParaformerAsr`].
+/// 2. Otherwise fall back to the already-provisioned SenseVoice engine and log a
+///    warning — the meeting still transcribes, just without word-level
+///    timestamps or hotwords.
+///
+/// The returned engine is `Send + Sync` (trait requirement), so it can be moved
+/// into the background meeting-processing task.
+pub(crate) fn build_meeting_asr_engine(state: &AppState) -> Result<Box<dyn AsrEngine>, String> {
+    // Directory convention shared with lumen-models: `<root>/paraformer/offline/`.
+    let paraformer_dir = lumen_models_dir().join("paraformer").join("offline");
+    if paraformer_offline_ready(&paraformer_dir) {
+        tracing::info!(
+            dir = %paraformer_dir.display(),
+            "meeting ASR engine: Paraformer (offline, word timestamps + hotwords)"
+        );
+        return Ok(Box::new(ParaformerAsr::new(paraformer_dir)));
     }
 
-    if matches!(provider, "openai_audio" | "custom") {
-        let base = if asr_cfg.base_url.trim().is_empty() {
-            "https://api.openai.com/v1".into()
-        } else {
-            asr_cfg.base_url.clone()
-        };
-        let model = if asr_cfg.model.trim().is_empty() {
-            "whisper-1".into()
-        } else {
-            asr_cfg.model.clone()
-        };
-        let eng = OpenAiAudioAsr::new(OpenAiAudioConfig {
-            base_url: base,
-            api_key: asr_cfg.api_key.clone(),
-            model,
-            timeout: std::time::Duration::from_secs(asr_cfg.timeout_secs.max(30)),
-            language: if asr_cfg.language.trim().is_empty() {
-                None
-            } else {
-                Some(asr_cfg.language.clone())
-            },
-            ..OpenAiAudioConfig::default()
-        })
-        .map_err(|e| e.to_string())?;
-        return Ok(Box::new(eng));
-    }
-
-    let selected_local_engine = engine_kind_for_provider(provider).unwrap_or(engine_kind);
-    let engine: Box<dyn AsrEngine> = match selected_local_engine {
-        EngineKind::Whisper => Box::new(
-            state
-                .whisper
-                .lock()
-                .map_err(|_| "asr lock poisoned".to_string())?
-                .clone(),
-        ),
-        EngineKind::Qwen => Box::new(
-            state
-                .qwen
-                .lock()
-                .map_err(|_| "asr lock poisoned".to_string())?
-                .clone(),
-        ),
-        _ => Box::new(
-            state
-                .sensevoice
-                .lock()
-                .map_err(|_| "asr lock poisoned".to_string())?
-                .clone(),
-        ),
-    };
-    Ok(engine)
+    // Robustness: no Paraformer model installed -> use the provisioned SenseVoice
+    // engine so meetings still work (without word-level timestamps / hotwords).
+    tracing::warn!(
+        dir = %paraformer_dir.display(),
+        "Paraformer offline model not installed; meeting falls back to SenseVoice \
+         (no word-level timestamps / hotwords)"
+    );
+    let engine = state
+        .sensevoice
+        .lock()
+        .map_err(|_| "asr lock poisoned".to_string())?
+        .clone();
+    Ok(Box::new(engine))
 }
 
 async fn run_asr(

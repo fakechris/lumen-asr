@@ -114,11 +114,22 @@ async fn run(
     let duration = (sample_rate > 0).then(|| diar.samples.len() as f64 / sample_rate as f64);
 
     let mut texts = Vec::with_capacity(diar.turns.len());
+    let mut words = Vec::with_capacity(diar.turns.len());
     for turn in &diar.turns {
-        texts.push(transcribe_turn(asr_engine, &diar.samples, sample_rate, turn, opts).await?);
+        let (text, turn_words) =
+            transcribe_turn(asr_engine, &diar.samples, sample_rate, turn, opts).await?;
+        texts.push(text);
+        words.push(turn_words);
     }
 
-    let assembled = assemble_meeting(meeting_id, &diar.turns, &texts, Some(sample_rate), duration);
+    let assembled = assemble_meeting(
+        meeting_id,
+        &diar.turns,
+        &texts,
+        &words,
+        Some(sample_rate),
+        duration,
+    );
     for speaker in &assembled.speakers {
         store.upsert_speaker(speaker).map_err(ProcessError::Store)?;
     }

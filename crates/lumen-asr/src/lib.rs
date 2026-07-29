@@ -16,12 +16,13 @@ pub use meeting_recorder::{MeetingRecorder, MeetingRecorderError, RecordingSumma
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).
 pub use lumen_asr_engine::{
-    model_identity_from_path, prepare_for_asr, probe_status, resample_linear, AsrEngine,
-    AsrEngineId, AsrError, AsrRequest, AsrResult, AsrRuntimeDiagnostics, AsrTokenEvidence,
-    EngineKind, EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig, QwenAsr, QwenAsrConfig,
+    model_identity_from_path, paraformer_offline_ready, prepare_for_asr, probe_status,
+    resample_linear, AsrEngine, AsrEngineId, AsrError, AsrRequest, AsrResult,
+    AsrRuntimeDiagnostics, AsrTokenEvidence, EngineKind, EngineStatus, OpenAiAudioAsr,
+    OpenAiAudioConfig, ParaformerAsr, ParaformerOfflineModelPaths, QwenAsr, QwenAsrConfig,
     QwenDecodeMode, QwenRuntimeMetrics, QwenShadowCandidate, QwenShadowDiagnostics,
     QwenShadowRequest, QwenShadowScore, QwenShadowSpan, QwenShadowStatus, QwenShadowTerm,
-    SenseVoiceSherpaAsr, StubAsr, WhisperAsr,
+    SenseVoiceSherpaAsr, StubAsr, WhisperAsr, WordTiming,
 };
 
 // Model layer (path resolution, readiness probes, install lock, download).
