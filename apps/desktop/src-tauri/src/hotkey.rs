@@ -6,6 +6,8 @@ use crate::mod_chord::{self, ModChord};
 use crate::AppState;
 use lumen_prompts::IntentSpec;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
@@ -455,6 +457,54 @@ pub fn pause_hotkeys(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn resume_hotkeys(app: AppHandle) -> Result<(), String> {
     reregister(&app)
+}
+
+/// Poll the Fn/🌐 key while the settings UI is recording a hotkey.
+///
+/// The webview never receives Fn keydown/keyup on macOS, so the JS recorder
+/// cannot see it the way it sees ⌥/⇧. We bridge by reading the same HID
+/// secondary-fn flag the runtime watcher uses (`CGEventSourceFlagsState`) and
+/// emitting `fn-key-pressed` / `fn-key-released` edges to the recorder.
+///
+/// Only valid while normal hotkeys are paused (the recorder pauses them before
+/// calling this), so it safely reuses the single mod-chord watcher slot.
+/// Non-macOS is a no-op: there is no Fn flag, so nothing is emitted and the
+/// recorder falls back to the "fn" preset button.
+#[tauri::command]
+pub fn start_fn_capture(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let fn_chord = ModChord {
+            fn_key: true,
+            alt: false,
+            shift: false,
+            control: false,
+            meta: false,
+        };
+        let app_c = app.clone();
+        mod_chord::start_multi_watcher(vec![("fn".into(), fn_chord)], move |_id, press| {
+            let event = if press {
+                "fn-key-pressed"
+            } else {
+                "fn-key-released"
+            };
+            let _ = app_c.emit(event, ());
+        });
+        tracing::info!("fn-capture watcher started for hotkey recording");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No secondary-fn HID flag outside macOS — recorder degrades gracefully.
+        let _ = app;
+    }
+    Ok(())
+}
+
+/// Stop the recording-time Fn watcher started by [`start_fn_capture`].
+#[tauri::command]
+pub fn stop_fn_capture(_app: AppHandle) -> Result<(), String> {
+    mod_chord::stop_watcher();
+    Ok(())
 }
 
 pub fn setup_hotkeys(app: &AppHandle) -> Result<(), String> {
