@@ -210,13 +210,10 @@ pub fn resume_meeting_recording(state: State<'_, AppState>) -> Result<(), String
     state.meeting_recorder.resume().map_err(|e| e.to_string())
 }
 
-// ── M4a: library / detail / speaker ops / export (read-side for M4b+) ──
-//
-// These commands are model-free and cross-platform: the offline transcription
-// (diar-rs, macOS-only) and the structured-minutes LLM pass run in
-// `lumen_meeting::process_meeting`, which is wired to a trigger in a follow-up
-// (M4a-2 — it needs the macOS+`diarize`-gated active ASR engine and diar model
-// paths). Everything below only reads/mutates already-stored meetings.
+// Meeting library / detail / speaker-ops / export commands. These are
+// model-free and cross-platform: they only read or mutate already-stored
+// meetings. Offline transcription (macOS-only diarization) and the
+// structured-minutes LLM pass live in `lumen_meeting::process_meeting`.
 
 fn parse_id(value: &str, what: &str) -> Result<Uuid, String> {
     Uuid::parse_str(value).map_err(|e| format!("invalid {what} id: {e}"))

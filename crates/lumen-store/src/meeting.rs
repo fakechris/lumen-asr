@@ -113,30 +113,24 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<Meeting>> {
         let status_token = status.map(|s| s.as_str());
-        let like = query
+        // Raw substring; matched with `instr()` below so the (case-sensitive)
+        // contract is query-local and does not depend on the connection's
+        // `case_sensitive_like` setting.
+        let needle = query
             .map(str::trim)
             .filter(|q| !q.is_empty())
-            // Escape LIKE wildcards so a literal % or _ in the query is matched
-            // literally (paired with `ESCAPE '\'` below).
-            .map(|q| {
-                format!(
-                    "%{}%",
-                    q.replace('\\', "\\\\")
-                        .replace('%', "\\%")
-                        .replace('_', "\\_")
-                )
-            });
+            .map(str::to_string);
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, created_at, title, audio_path, duration_seconds, status, language
             FROM meetings
             WHERE (?1 IS NULL OR status = ?1)
-              AND (?2 IS NULL OR title LIKE ?2 ESCAPE '\')
+              AND (?2 IS NULL OR instr(title, ?2) > 0)
             ORDER BY created_at DESC
             LIMIT ?3
             "#,
         )?;
-        let rows = statement.query_map(params![status_token, like, limit], map_meeting)?;
+        let rows = statement.query_map(params![status_token, needle, limit], map_meeting)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -232,10 +226,19 @@ impl Store {
     /// Reassign one transcript segment to a different speaker. This is the
     /// "the model split this one line onto the wrong person" fix — it moves a
     /// single segment without touching the rest of the cluster. Returns `true`
-    /// if the segment existed.
+    /// if the segment was updated.
+    ///
+    /// The target speaker must belong to the same meeting as the segment;
+    /// otherwise the update is a no-op (returns `false`) rather than attaching
+    /// the segment to a speaker from another meeting.
     pub fn reassign_segment_speaker(&self, segment_id: Uuid, speaker_id: Uuid) -> Result<bool> {
         let changed = self.conn.execute(
-            "UPDATE transcript_segments SET speaker_id=?2 WHERE id=?1",
+            "UPDATE transcript_segments SET speaker_id=?2 \
+             WHERE id=?1 \
+               AND EXISTS ( \
+                 SELECT 1 FROM speakers \
+                 WHERE speakers.id=?2 AND speakers.meeting_id=transcript_segments.meeting_id \
+               )",
             params![segment_id.to_string(), speaker_id.to_string()],
         )?;
         Ok(changed > 0)
@@ -255,6 +258,22 @@ impl Store {
             return Ok(0);
         }
         let transaction = self.conn.unchecked_transaction()?;
+        // Refuse to merge into a speaker that doesn't belong to this meeting —
+        // otherwise the meeting's segments would be attached to a foreign
+        // speaker row.
+        let into_owned: bool = transaction
+            .query_row(
+                "SELECT 1 FROM speakers WHERE id=?1 AND meeting_id=?2",
+                params![into.to_string(), meeting_id.to_string()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !into_owned {
+            return Err(anyhow::anyhow!(
+                "merge target speaker does not belong to meeting {meeting_id}"
+            ));
+        }
         let moved = transaction.execute(
             "UPDATE transcript_segments SET speaker_id=?3 WHERE meeting_id=?1 AND speaker_id=?2",
             params![meeting_id.to_string(), from.to_string(), into.to_string()],
@@ -682,6 +701,39 @@ mod tests {
         assert_eq!(
             store.merge_speakers(meeting.id, keep.id, keep.id).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn speaker_ops_reject_speakers_from_another_meeting() {
+        let (_dir, store) = open_store();
+        let m1 = Meeting::new();
+        let m2 = Meeting::new();
+        store.create_meeting(&m1).unwrap();
+        store.create_meeting(&m2).unwrap();
+        let m1_spk = Speaker::new(m1.id, "S1");
+        let m2_spk = Speaker::new(m2.id, "X1");
+        store.upsert_speaker(&m1_spk).unwrap();
+        store.upsert_speaker(&m2_spk).unwrap();
+
+        let mut seg = TranscriptSegment::new(m1.id, 0, 0.0, 1.0, "a");
+        seg.speaker_id = Some(m1_spk.id);
+        store.add_segments(&[seg.clone()]).unwrap();
+
+        // Reassigning a m1 segment to a m2 speaker is rejected (no-op, false);
+        // the segment keeps its original speaker.
+        assert!(!store.reassign_segment_speaker(seg.id, m2_spk.id).unwrap());
+        assert_eq!(
+            store.list_segments(m1.id).unwrap()[0].speaker_id,
+            Some(m1_spk.id)
+        );
+
+        // Merging within m1 into a m2 speaker is rejected, and m1's segment is
+        // left untouched.
+        assert!(store.merge_speakers(m1.id, m1_spk.id, m2_spk.id).is_err());
+        assert_eq!(
+            store.list_segments(m1.id).unwrap()[0].speaker_id,
+            Some(m1_spk.id)
         );
     }
 
