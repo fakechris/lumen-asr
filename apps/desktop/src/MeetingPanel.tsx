@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { Icon } from "./Icons";
@@ -552,9 +553,11 @@ function MeetingRow({
   );
 }
 
-// ---- detail (shell: summary / transcript, default summary) --------------
-
-type DetailView = "summary" | "transcript";
+// ---- detail (transcript-first; minutes as a left index) -----------------
+// dogfood revision (docs/MEETING_M4_UX.md, 2026-07-29): the transcript is the
+// default, always-visible main area; the structured minutes collapse into a
+// narrow left index whose items scroll+flash the matching transcript turn. No
+// more 纪要/逐字稿 tab toggle. A "查看完整纪要" entry still opens the full minutes.
 
 function MeetingDetailView({
   meetingId,
@@ -568,11 +571,12 @@ function MeetingDetailView({
   onNavigate?: (tab: TabId) => void;
 }) {
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
-  const [view, setView] = useState<DetailView>("summary");
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
-  // A jump request from a minutes item → transcript. The token forces the
+  // Whether the full-minutes reading overlay is open.
+  const [fullOpen, setFullOpen] = useState(false);
+  // A jump request from a minutes index item → transcript. The token forces the
   // transcript to (re)scroll even when the target seconds repeat.
   const [jump, setJump] = useState<{ seconds: number; token: number } | null>(
     null,
@@ -607,7 +611,7 @@ function MeetingDetailView({
   );
 
   const jumpToSource = useCallback((src: SourceRef) => {
-    setView("transcript");
+    // Transcript is already visible; just (re)scroll it to the source turn.
     setJump({ seconds: src.start, token: Date.now() });
   }, []);
 
@@ -666,26 +670,6 @@ function MeetingDetailView({
           )}
         </div>
         <div className="meeting-detail-actions">
-          <div className="meeting-viewtabs" role="tablist">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={view === "summary"}
-              className={`meeting-viewtab ${view === "summary" ? "active" : ""}`}
-              onClick={() => setView("summary")}
-            >
-              纪要
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={view === "transcript"}
-              className={`meeting-viewtab ${view === "transcript" ? "active" : ""}`}
-              onClick={() => setView("transcript")}
-            >
-              逐字稿
-            </button>
-          </div>
           <div className="meeting-export">
             <button
               type="button"
@@ -729,15 +713,30 @@ function MeetingDetailView({
         <div className="card meeting-empty">
           <p className="muted-text">无法读取这场会议。</p>
         </div>
-      ) : view === "summary" ? (
-        <SummaryView
-          detail={detail}
-          minutes={minutes}
-          onJump={jumpToSource}
-          onNavigate={onNavigate}
-        />
       ) : (
-        <TranscriptView detail={detail} jump={jump} />
+        <div className="meeting-detail-body">
+          <aside className="card meeting-index">
+            <MinutesIndex
+              detail={detail}
+              minutes={minutes}
+              onJump={jumpToSource}
+              onNavigate={onNavigate}
+              onOpenFull={() => setFullOpen(true)}
+            />
+          </aside>
+          <TranscriptView detail={detail} jump={jump} />
+        </div>
+      )}
+
+      {fullOpen && detail && minutes && (
+        <MinutesFullModal
+          minutes={minutes}
+          onJump={(src) => {
+            setFullOpen(false);
+            jumpToSource(src);
+          }}
+          onClose={() => setFullOpen(false)}
+        />
       )}
     </div>
   );
@@ -847,163 +846,366 @@ function SourceChip({
   );
 }
 
-function SummaryView({
+/** One compact, clickable index row: the minutes text plus a small timestamp.
+ * The whole row jumps to the matching transcript turn when it has a source. */
+function IndexItem({
+  text,
+  sub,
+  source,
+  onJump,
+}: {
+  text: string;
+  sub?: string | null;
+  source?: SourceRef | null;
+  onJump: (src: SourceRef) => void;
+}) {
+  const body = (
+    <>
+      <span className="meeting-index-item-text">{text}</span>
+      {sub && <span className="meeting-index-item-sub muted-text">{sub}</span>}
+    </>
+  );
+  if (!source) {
+    return <li className="meeting-index-item static">{body}</li>;
+  }
+  return (
+    <li>
+      <button
+        type="button"
+        className="meeting-index-item"
+        title="跳到逐字稿对应位置"
+        onClick={() => onJump(source)}
+      >
+        {body}
+        <span className="meeting-index-item-time">
+          {formatClock(source.start)}
+        </span>
+      </button>
+    </li>
+  );
+}
+
+function actionSub(item: ActionItem): string | null {
+  const parts: string[] = [];
+  if (item.owner?.trim()) parts.push(`负责人：${item.owner.trim()}`);
+  if (item.due?.trim()) parts.push(`截止：${item.due.trim()}`);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/** The narrow left column: structured minutes rendered as a compact, clickable
+ * index into the transcript, plus participant/meeting info folded in at the
+ * bottom. Restrained styling (muted, small, grouped) so it stays a secondary
+ * index and the transcript keeps the stage. */
+function MinutesIndex({
   detail,
   minutes,
   onJump,
   onNavigate,
+  onOpenFull,
 }: {
   detail: MeetingDetail;
   minutes: Minutes | null;
   onJump: (src: SourceRef) => void;
   onNavigate?: (tab: TabId) => void;
+  onOpenFull: () => void;
 }) {
   const hasMinutes = minutes != null && !minutesEmpty(minutes);
-  const noLlm = noLlmMinutes(detail);
+  const status = detail.meeting.status;
+
+  let guide: ReactNode = null;
+  if (!hasMinutes) {
+    if (status === "failed") {
+      guide = (
+        <p className="muted-text meeting-index-note">
+          纪要未生成（处理失败）。详情见右侧。
+        </p>
+      );
+    } else if (isInProgress(status)) {
+      guide = (
+        <p className="muted-text meeting-index-note">
+          <span className="mtg-spinner" aria-hidden />{" "}
+          {status === "summarizing"
+            ? "正在生成纪要…"
+            : "转录完成后会自动生成纪要索引。"}
+        </p>
+      );
+    } else if (noLlmMinutes(detail)) {
+      guide = (
+        <div className="meeting-index-note">
+          <strong>未配置 LLM</strong>
+          <p className="muted-text">
+            逐字稿已生成，但尚未配置语言模型，无法自动生成会议纪要
+            （摘要 / 决策 / 行动项）。配置后即可在此看到纪要索引。
+          </p>
+          {onNavigate && (
+            <button
+              type="button"
+              className="btn small meeting-config-llm"
+              onClick={() => onNavigate("settings")}
+            >
+              去设置配置 LLM
+            </button>
+          )}
+        </div>
+      );
+    } else {
+      guide = (
+        <p className="muted-text meeting-index-note">
+          这场会议没有可用的结构化纪要。
+        </p>
+      );
+    }
+  }
 
   return (
-    <div className="split meeting-summary-layout">
-      <div className="card meeting-summary-main">
-        {!hasMinutes ? (
-          detail.meeting.status === "ready" ? (
-            noLlm ? (
-              <div className="meeting-statusnote">
-                <div>
-                  <strong>未配置 LLM</strong>
-                  <p className="muted-text">
-                    逐字稿已生成，但尚未配置语言模型，无法自动生成会议纪要
-                    （摘要 / 决策 / 行动项）。在设置里配置一个 LLM 后即可自动生成。
-                  </p>
-                  {onNavigate && (
-                    <button
-                      type="button"
-                      className="btn small meeting-config-llm"
-                      onClick={() => onNavigate("settings")}
-                    >
-                      去设置配置 LLM
-                    </button>
-                  )}
-                </div>
-              </div>
-            ) : (
-              <div className="meeting-statusnote">
-                <div>
-                  <strong>暂无纪要</strong>
-                  <p className="muted-text">
-                    这场会议没有可用的结构化纪要（可能是总结步骤未产出内容）。
-                  </p>
-                </div>
-              </div>
-            )
-          ) : (
-            <StatusNote detail={detail} kind="summary" />
-          )
-        ) : (
-          <>
-            {minutes!.one_liner.trim() && (
-              <section className="meeting-sec">
-                <p className="meeting-oneliner">{minutes!.one_liner}</p>
-              </section>
-            )}
-
-            {minutes!.decisions.length > 0 && (
-              <section className="meeting-sec">
-                <h3 className="meeting-sec-title">决策</h3>
-                <ul className="meeting-itemlist">
-                  {minutes!.decisions.map((d, i) => (
-                    <li key={i} className="meeting-item">
-                      <span className="meeting-item-text">{d.text}</span>
-                      <SourceChip source={d.source} onJump={onJump} />
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            )}
-
-            {minutes!.action_items.length > 0 && (
-              <section className="meeting-sec">
-                <h3 className="meeting-sec-title">行动项</h3>
-                <ul className="meeting-itemlist">
-                  {minutes!.action_items.map((a, i) => (
-                    <li key={i} className="meeting-item">
-                      <div className="meeting-item-body">
-                        <span className="meeting-item-text">{a.text}</span>
-                        <ActionMeta item={a} />
-                      </div>
-                      <SourceChip source={a.source} onJump={onJump} />
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            )}
-
-            {minutes!.discussion.length > 0 && (
-              <section className="meeting-sec">
-                <h3 className="meeting-sec-title">关键讨论</h3>
-                <ul className="meeting-itemlist">
-                  {minutes!.discussion.map((d, i) => (
-                    <li key={i} className="meeting-item">
-                      <span className="meeting-item-text">{d.topic}</span>
-                      <SourceChip source={d.source} onJump={onJump} />
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            )}
-
-            {minutes!.open_questions.length > 0 && (
-              <section className="meeting-sec">
-                <h3 className="meeting-sec-title">未决问题</h3>
-                <ul className="meeting-itemlist">
-                  {minutes!.open_questions.map((q, i) => (
-                    <li key={i} className="meeting-item">
-                      <span className="meeting-item-text">{q.text}</span>
-                      <SourceChip source={q.source} onJump={onJump} />
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            )}
-          </>
+    <div className="meeting-index-inner">
+      <div className="meeting-index-head">
+        <h3 className="meeting-index-heading">纪要索引</h3>
+        {hasMinutes && (
+          <button
+            type="button"
+            className="btn ghost small meeting-index-more"
+            onClick={onOpenFull}
+          >
+            查看完整纪要
+          </button>
         )}
       </div>
 
-      <aside className="card meeting-side">
-        <section className="meeting-side-sec">
-          <h3 className="meeting-sec-title">参与者</h3>
-          {detail.speakers.length === 0 ? (
-            <p className="muted-text">尚未识别到说话人。</p>
-          ) : (
-            <ul className="meeting-participants">
-              {detail.speakers.map((s) => {
-                const { name, confirmed } = speakerDisplay(s);
-                return (
-                  <li key={s.id} className="meeting-participant">
-                    <span className="meeting-avatar" aria-hidden>
-                      {name.slice(0, 1)}
-                    </span>
-                    <span className="meeting-participant-name">{name}</span>
-                    {!confirmed && (
-                      <span className="meeting-unconfirmed">未确认</span>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
+      {guide}
+
+      {hasMinutes && (
+        <>
+          {minutes!.one_liner.trim() && (
+            <p className="meeting-index-oneliner">{minutes!.one_liner}</p>
           )}
-        </section>
-        <section className="meeting-side-sec">
-          <h3 className="meeting-sec-title">会议信息</h3>
-          <dl className="meeting-info">
-            <dt>时长</dt>
-            <dd>{formatDuration(detail.meeting.duration_seconds)}</dd>
-            <dt>日期</dt>
-            <dd>{formatFullDate(detail.meeting.created_at)}</dd>
-            <dt>来源</dt>
-            <dd>本地麦克风</dd>
-          </dl>
-        </section>
-      </aside>
+
+          {minutes!.decisions.length > 0 && (
+            <section className="meeting-index-sec">
+              <h4 className="meeting-index-title">决策</h4>
+              <ul className="meeting-index-list">
+                {minutes!.decisions.map((d, i) => (
+                  <IndexItem
+                    key={i}
+                    text={d.text}
+                    source={d.source}
+                    onJump={onJump}
+                  />
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {minutes!.action_items.length > 0 && (
+            <section className="meeting-index-sec">
+              <h4 className="meeting-index-title">行动项</h4>
+              <ul className="meeting-index-list">
+                {minutes!.action_items.map((a, i) => (
+                  <IndexItem
+                    key={i}
+                    text={a.text}
+                    sub={actionSub(a)}
+                    source={a.source}
+                    onJump={onJump}
+                  />
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {minutes!.discussion.length > 0 && (
+            <section className="meeting-index-sec">
+              <h4 className="meeting-index-title">关键讨论</h4>
+              <ul className="meeting-index-list">
+                {minutes!.discussion.map((d, i) => (
+                  <IndexItem
+                    key={i}
+                    text={d.topic}
+                    source={d.source}
+                    onJump={onJump}
+                  />
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {minutes!.open_questions.length > 0 && (
+            <section className="meeting-index-sec">
+              <h4 className="meeting-index-title">未决问题</h4>
+              <ul className="meeting-index-list">
+                {minutes!.open_questions.map((q, i) => (
+                  <IndexItem
+                    key={i}
+                    text={q.text}
+                    source={q.source}
+                    onJump={onJump}
+                  />
+                ))}
+              </ul>
+            </section>
+          )}
+        </>
+      )}
+
+      <MeetingSideInfo detail={detail} />
+    </div>
+  );
+}
+
+/** Participants + meeting facts, folded into the left column bottom (kept
+ * compact so it never competes with the minutes index above it). */
+function MeetingSideInfo({ detail }: { detail: MeetingDetail }) {
+  return (
+    <div className="meeting-index-info">
+      <section className="meeting-side-sec">
+        <h4 className="meeting-index-title">参与者</h4>
+        {detail.speakers.length === 0 ? (
+          <p className="muted-text meeting-index-note">尚未识别到说话人。</p>
+        ) : (
+          <ul className="meeting-participants">
+            {detail.speakers.map((s) => {
+              const { name, confirmed } = speakerDisplay(s);
+              return (
+                <li key={s.id} className="meeting-participant">
+                  <span className="meeting-avatar sm" aria-hidden>
+                    {name.slice(0, 1)}
+                  </span>
+                  <span className="meeting-participant-name">{name}</span>
+                  {!confirmed && (
+                    <span className="meeting-unconfirmed">未确认</span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+      <section className="meeting-side-sec">
+        <h4 className="meeting-index-title">会议信息</h4>
+        <dl className="meeting-info">
+          <dt>时长</dt>
+          <dd>{formatDuration(detail.meeting.duration_seconds)}</dd>
+          <dt>日期</dt>
+          <dd>{formatFullDate(detail.meeting.created_at)}</dd>
+          <dt>来源</dt>
+          <dd>本地麦克风</dd>
+        </dl>
+      </section>
+    </div>
+  );
+}
+
+/** On-demand full minutes reading view (opened from "查看完整纪要"). Source
+ * chips still jump into the transcript behind it, closing the overlay first. */
+function MinutesFullModal({
+  minutes,
+  onJump,
+  onClose,
+}: {
+  minutes: Minutes;
+  onJump: (src: SourceRef) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="meeting-modal-overlay"
+      role="presentation"
+      onClick={onClose}
+    >
+      <div
+        className="card meeting-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="完整纪要"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="meeting-modal-head">
+          <h3 className="meeting-modal-title">完整纪要</h3>
+          <button
+            type="button"
+            className="icon-btn meeting-modal-close"
+            onClick={onClose}
+            aria-label="关闭"
+            title="关闭"
+          >
+            ×
+          </button>
+        </div>
+        <div className="meeting-modal-body">
+          {minutes.one_liner.trim() && (
+            <section className="meeting-sec">
+              <p className="meeting-oneliner">{minutes.one_liner}</p>
+            </section>
+          )}
+
+          {minutes.decisions.length > 0 && (
+            <section className="meeting-sec">
+              <h3 className="meeting-sec-title">决策</h3>
+              <ul className="meeting-itemlist">
+                {minutes.decisions.map((d, i) => (
+                  <li key={i} className="meeting-item">
+                    <span className="meeting-item-text">{d.text}</span>
+                    <SourceChip source={d.source} onJump={onJump} />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {minutes.action_items.length > 0 && (
+            <section className="meeting-sec">
+              <h3 className="meeting-sec-title">行动项</h3>
+              <ul className="meeting-itemlist">
+                {minutes.action_items.map((a, i) => (
+                  <li key={i} className="meeting-item">
+                    <div className="meeting-item-body">
+                      <span className="meeting-item-text">{a.text}</span>
+                      <ActionMeta item={a} />
+                    </div>
+                    <SourceChip source={a.source} onJump={onJump} />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {minutes.discussion.length > 0 && (
+            <section className="meeting-sec">
+              <h3 className="meeting-sec-title">关键讨论</h3>
+              <ul className="meeting-itemlist">
+                {minutes.discussion.map((d, i) => (
+                  <li key={i} className="meeting-item">
+                    <span className="meeting-item-text">{d.topic}</span>
+                    <SourceChip source={d.source} onJump={onJump} />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {minutes.open_questions.length > 0 && (
+            <section className="meeting-sec">
+              <h3 className="meeting-sec-title">未决问题</h3>
+              <ul className="meeting-itemlist">
+                {minutes.open_questions.map((q, i) => (
+                  <li key={i} className="meeting-item">
+                    <span className="meeting-item-text">{q.text}</span>
+                    <SourceChip source={q.source} onJump={onJump} />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

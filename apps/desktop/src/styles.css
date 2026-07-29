@@ -2261,29 +2261,6 @@ html:has(.capsule-root) body {
   gap: 10px;
 }
 
-.meeting-viewtabs {
-  display: inline-flex;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-}
-
-.meeting-viewtab {
-  border: none;
-  background: transparent;
-  color: var(--muted);
-  font: inherit;
-  font-size: 0.85rem;
-  padding: 6px 14px;
-  cursor: pointer;
-}
-
-.meeting-viewtab.active {
-  background: var(--accent-dim);
-  color: var(--accent-strong);
-  font-weight: 600;
-}
-
 .meeting-export {
   position: relative;
 }
@@ -2319,9 +2296,172 @@ html:has(.capsule-root) body {
   background: color-mix(in srgb, var(--text) 5%, transparent);
 }
 
-.meeting-summary-layout {
-  grid-template-columns: 1fr minmax(220px, 300px);
+/* Transcript-first detail body: a narrow left minutes index + the transcript
+   as the always-visible main column. */
+.meeting-detail-body {
+  display: grid;
+  grid-template-columns: minmax(220px, 264px) 1fr;
+  gap: 14px;
   align-items: start;
+}
+
+/* left index column */
+.meeting-index {
+  position: sticky;
+  top: 12px;
+  max-height: calc(100vh - 140px);
+  overflow-y: auto;
+}
+
+.meeting-index-inner {
+  display: flex;
+  flex-direction: column;
+}
+
+.meeting-index-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.meeting-index-heading {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.meeting-index-more {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+}
+
+.meeting-index-note {
+  font-size: 0.8rem;
+  line-height: 1.5;
+  margin: 0 0 12px;
+}
+
+.meeting-index-oneliner {
+  margin: 0 0 14px;
+  font-size: 0.9rem;
+  line-height: 1.55;
+  font-weight: 500;
+}
+
+.meeting-index-sec {
+  margin-bottom: 14px;
+}
+
+.meeting-index-title {
+  margin: 0 0 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.meeting-index-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.meeting-index-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.12s var(--ease);
+}
+
+button.meeting-index-item:hover {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.meeting-index-item.static {
+  cursor: default;
+  color: var(--muted);
+}
+
+.meeting-index-item-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.meeting-index-item-sub {
+  display: block;
+  font-size: 0.72rem;
+  margin-top: 2px;
+}
+
+.meeting-index-item-time {
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+/* participant / meeting info folded into the index bottom */
+.meeting-index-info {
+  margin-top: 6px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+/* full-minutes overlay */
+.meeting-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 20px;
+  background: color-mix(in srgb, #000 42%, transparent);
+  overflow-y: auto;
+}
+
+.meeting-modal {
+  width: min(680px, 100%);
+  max-height: calc(100vh - 96px);
+  overflow-y: auto;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+
+.meeting-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.meeting-modal-title {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.meeting-modal-close {
+  font-size: 1.3rem;
+  line-height: 1;
 }
 
 .meeting-sec {

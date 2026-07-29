@@ -84,6 +84,27 @@ pub fn app_health(state: State<'_, AppState>) -> Health {
     }
 }
 
+/// Visible build identity, so users can confirm which source a running build
+/// came from (dev builds otherwise report a constant `0.1.0` with no sha).
+#[derive(Debug, Serialize)]
+pub struct BuildInfo {
+    /// Crate version (from `CARGO_PKG_VERSION`).
+    pub version: String,
+    /// Git short sha at build time, or `"unknown"` when git was unavailable.
+    pub git_sha: String,
+    /// UTC build timestamp, e.g. `2026-07-29 14:03 UTC`.
+    pub build_time: String,
+}
+
+#[tauri::command]
+pub fn build_info() -> BuildInfo {
+    BuildInfo {
+        version: env!("CARGO_PKG_VERSION").into(),
+        git_sha: env!("LUMEN_GIT_SHA").into(),
+        build_time: env!("LUMEN_BUILD_TIME").into(),
+    }
+}
+
 // ── Sessions ──────────────────────────────────────────────────────────────
 
 #[tauri::command]

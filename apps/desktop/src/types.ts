@@ -16,6 +16,12 @@ export type Health = {
   corrector_label: string;
 };
 
+export type BuildInfo = {
+  version: string;
+  git_sha: string;
+  build_time: string;
+};
+
 export type CorrectorStatus = {
   enabled: boolean;
   useCapturedContext: boolean;
