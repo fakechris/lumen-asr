@@ -1,4 +1,4 @@
-//! Modifier-only global chords (e.g. Alt+Shift, Control+Alt) via HID flag polling.
+//! Modifier-only global chords (e.g. Fn, Alt+Shift) via HID flag polling.
 //!
 //! Supports multiple chords at once (primary + translate) with **most-specific wins**.
 
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModChord {
+    pub fn_key: bool,
     pub alt: bool,
     pub shift: bool,
     pub control: bool,
@@ -17,11 +18,16 @@ pub struct ModChord {
 
 impl ModChord {
     pub fn count(self) -> u8 {
-        (self.alt as u8) + (self.shift as u8) + (self.control as u8) + (self.meta as u8)
+        (self.fn_key as u8)
+            + (self.alt as u8)
+            + (self.shift as u8)
+            + (self.control as u8)
+            + (self.meta as u8)
     }
 
     pub fn parse_modifier_only(s: &str) -> Option<Self> {
         let mut chord = ModChord {
+            fn_key: false,
             alt: false,
             shift: false,
             control: false,
@@ -34,6 +40,7 @@ impl ModChord {
                 continue;
             }
             match t.to_ascii_uppercase().as_str() {
+                "FN" | "FUNCTION" | "GLOBE" => chord.fn_key = true,
                 "OPTION" | "ALT" => chord.alt = true,
                 "SHIFT" => chord.shift = true,
                 "CONTROL" | "CTRL" => chord.control = true,
@@ -44,7 +51,7 @@ impl ModChord {
                 _ => saw_key = true,
             }
         }
-        if saw_key || chord.count() < 2 {
+        if saw_key || (chord.count() < 2 && !chord.fn_key) {
             None
         } else {
             Some(chord)
@@ -53,11 +60,13 @@ impl ModChord {
 
     /// Required mods down; extras OK (single-chord path).
     pub fn is_active(self, flags: u64) -> bool {
+        let fn_key = flags & FLAG_SECONDARY_FN != 0;
         let alt = flags & FLAG_ALTERNATE != 0;
         let shift = flags & FLAG_SHIFT != 0;
         let control = flags & FLAG_CONTROL != 0;
         let meta = flags & FLAG_COMMAND != 0;
-        (!self.alt || alt)
+        (!self.fn_key || fn_key)
+            && (!self.alt || alt)
             && (!self.shift || shift)
             && (!self.control || control)
             && (!self.meta || meta)
@@ -65,11 +74,16 @@ impl ModChord {
 
     /// Exact modifier set — use when several pure-mod chords are registered.
     pub fn is_exact(self, flags: u64) -> bool {
+        let fn_key = flags & FLAG_SECONDARY_FN != 0;
         let alt = flags & FLAG_ALTERNATE != 0;
         let shift = flags & FLAG_SHIFT != 0;
         let control = flags & FLAG_CONTROL != 0;
         let meta = flags & FLAG_COMMAND != 0;
-        self.alt == alt && self.shift == shift && self.control == control && self.meta == meta
+        self.fn_key == fn_key
+            && self.alt == alt
+            && self.shift == shift
+            && self.control == control
+            && self.meta == meta
     }
 }
 
@@ -77,6 +91,8 @@ const FLAG_SHIFT: u64 = 0x0002_0000;
 const FLAG_CONTROL: u64 = 0x0004_0000;
 const FLAG_ALTERNATE: u64 = 0x0008_0000;
 const FLAG_COMMAND: u64 = 0x0010_0000;
+// kCGEventFlagMaskSecondaryFn / NX_SECONDARYFNMASK.
+const FLAG_SECONDARY_FN: u64 = 0x0080_0000;
 #[cfg(target_os = "macos")]
 const HID_SYSTEM_STATE: u32 = 1;
 
@@ -283,7 +299,16 @@ mod tests {
     #[test]
     fn parses_alt_shift() {
         let c = ModChord::parse_modifier_only("Alt+Shift").unwrap();
-        assert!(c.alt && c.shift && !c.control && !c.meta);
+        assert!(c.alt && c.shift && !c.fn_key && !c.control && !c.meta);
+    }
+
+    #[test]
+    fn parses_single_fn() {
+        let c = ModChord::parse_modifier_only("Fn").unwrap();
+        assert!(c.fn_key);
+        assert!(c.is_exact(FLAG_SECONDARY_FN));
+        assert!(!c.is_exact(0));
+        assert!(!c.is_exact(FLAG_SECONDARY_FN | FLAG_SHIFT));
     }
 
     #[test]

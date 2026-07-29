@@ -191,7 +191,12 @@ export function HotkeyRecorder({
   }, [recording]);
 
   const chipLabel = recording
-    ? live.alt || live.shift || live.control || live.command || live.key
+    ? live.fn ||
+      live.alt ||
+      live.shift ||
+      live.control ||
+      live.command ||
+      live.key
       ? formatChordLive(live)
       : "按下快捷键…"
     : formatHotkeyLabel(toggle);
@@ -365,8 +370,8 @@ export function HotkeyRecorder({
       </div>
 
       <p className="muted-text" style={{ marginTop: 12, fontSize: "0.85rem" }}>
-        仅修饰键（如 ⌥⇧）在 macOS 上通过系统修饰键状态监听，无需再按字母键。
-        裸 <code>Fn</code> / 右 ⌘ 按住说话仍需后续底层钩子。
+        可直接选择 <code>fn</code>，按住开始录音、松开结束。若 macOS
+        已将 Fn/🌐 设置为听写或切换输入法，请先关闭该系统动作以免冲突。
       </p>
     </section>
   );
