@@ -289,6 +289,10 @@ export const api = {
     }>("save_hotkey_config", { input }),
   pauseHotkeys: () => invoke<void>("pause_hotkeys"),
   resumeHotkeys: () => invoke<void>("resume_hotkeys"),
+  /** Start backend Fn/🌐 polling so the recorder can capture a Fn press
+   * (webview never receives Fn events on macOS). No-op off macOS. */
+  startFnCapture: () => invoke<void>("start_fn_capture"),
+  stopFnCapture: () => invoke<void>("stop_fn_capture"),
 
   getLearningConfig: () =>
     invoke<import("./types").LearningConfig>("get_learning_config"),

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
 import {
   absorbKeyDown,
@@ -180,6 +181,50 @@ export function HotkeyRecorder({
       window.removeEventListener("keyup", onKeyUp, true);
     };
   }, [recording, applyShortcut, stopRecording]);
+
+  // macOS: the webview never receives Fn/🌐 key events, so bridge them via
+  // backend HID polling (same secondary-fn flag the runtime watcher reads).
+  // Press → preview highlight; release → commit "Fn" (matches the release-to-
+  // confirm timing of other modifier-only chords). No-op off macOS: no events
+  // arrive, so the recorder still works via the "fn" preset button below.
+  useEffect(() => {
+    if (!recording) return;
+    let unPressed: (() => void) | undefined;
+    let unReleased: (() => void) | undefined;
+    let cancelled = false;
+
+    const onFnPressed = () => {
+      if (committedRef.current) return;
+      const next: ChordState = { ...chordRef.current, fn: true };
+      chordRef.current = next;
+      setLive(next);
+      setHint(`按住中：${formatChordLive(next)}  · 松开确认`);
+    };
+    const onFnReleased = () => {
+      const chord = chordRef.current;
+      if (chord.fn && isValidChord(chord)) {
+        const sc = chordToShortcut(chord);
+        if (sc) void applyShortcut(sc);
+      }
+    };
+
+    void api.startFnCapture().catch(() => undefined);
+    void listen("fn-key-pressed", onFnPressed).then((fn) => {
+      if (cancelled) fn();
+      else unPressed = fn;
+    });
+    void listen("fn-key-released", onFnReleased).then((fn) => {
+      if (cancelled) fn();
+      else unReleased = fn;
+    });
+
+    return () => {
+      cancelled = true;
+      unPressed?.();
+      unReleased?.();
+      void api.stopFnCapture().catch(() => undefined);
+    };
+  }, [recording, applyShortcut]);
 
   useEffect(() => {
     return () => {
@@ -370,8 +415,9 @@ export function HotkeyRecorder({
       </div>
 
       <p className="muted-text" style={{ marginTop: 12, fontSize: "0.85rem" }}>
-        可直接选择 <code>fn</code>，按住开始录音、松开结束。若 macOS
-        已将 Fn/🌐 设置为听写或切换输入法，请先关闭该系统动作以免冲突。
+        录制时可直接按 <code>fn</code>/🌐 键，松开即生效；也可点下方
+        <code>fn</code> 预设按钮。若 macOS 已将 Fn/🌐 设置为听写或切换输入法，
+        请先关闭该系统动作以免冲突。
       </p>
     </section>
   );

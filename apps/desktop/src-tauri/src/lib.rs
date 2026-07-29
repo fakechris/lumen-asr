@@ -320,6 +320,8 @@ pub fn run() {
             hotkey::save_hotkey_config,
             hotkey::pause_hotkeys,
             hotkey::resume_hotkeys,
+            hotkey::start_fn_capture,
+            hotkey::stop_fn_capture,
             meeting_cmd::start_meeting_recording,
             meeting_cmd::stop_meeting_recording,
             meeting_cmd::pause_meeting_recording,
