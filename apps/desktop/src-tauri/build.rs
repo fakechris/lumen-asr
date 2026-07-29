@@ -13,15 +13,20 @@ fn emit_build_info() {
 
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
-    // Re-run when the checkout moves (commit, checkout, reset) so the embedded
-    // sha never goes stale on incremental dev builds. `logs/HEAD` changes on
-    // every ref update; `HEAD` changes on branch switches. Both are optional.
-    if let Some(git_dir) = git_output(&["rev-parse", "--absolute-git-dir"]) {
-        for rel in ["HEAD", "logs/HEAD"] {
-            let path = Path::new(&git_dir).join(rel);
-            if path.exists() {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
+    // Re-run whenever the checkout moves (commit, checkout, reset) so the
+    // embedded sha never goes stale on incremental dev builds. A commit updates
+    // the current branch's ref file, not `HEAD`, so we must track that ref too;
+    // refs may also be packed into `packed-refs`. `git rev-parse --git-path`
+    // resolves each against the right location, including linked worktrees
+    // (HEAD is per-worktree; branch refs / packed-refs live in the common dir).
+    let mut watch = vec![git_path("HEAD"), git_path("packed-refs")];
+    if let Some(branch_ref) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
+        // e.g. refs/heads/feat/build-info — the loose file bumped on commit.
+        watch.push(git_path(&branch_ref));
+    }
+    for path in watch.into_iter().flatten() {
+        if Path::new(&path).exists() {
+            println!("cargo:rerun-if-changed={path}");
         }
     }
 
@@ -30,6 +35,13 @@ fn emit_build_info() {
     println!("cargo:rustc-env=LUMEN_GIT_SHA={sha}");
 
     println!("cargo:rustc-env=LUMEN_BUILD_TIME={}", build_timestamp());
+}
+
+/// Resolve `name` (e.g. `HEAD`, `packed-refs`, `refs/heads/x`) to its on-disk
+/// path via `git rev-parse --git-path`, relative to the crate root (the build
+/// script's working dir), or `None` when git is unavailable.
+fn git_path(name: &str) -> Option<String> {
+    git_output(&["rev-parse", "--git-path", name])
 }
 
 /// Run `git <args>` and return trimmed non-empty stdout, or `None` if git is
