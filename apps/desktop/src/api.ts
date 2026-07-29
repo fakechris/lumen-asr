@@ -341,6 +341,7 @@ export const api = {
       asrEngine: string;
       correctorEngine: string;
       modelApplied: boolean;
+      fallbackReason?: string | null;
     }>("retry_session_transcription", { id }),
 
   seedDemoSession: () => invoke<SessionRecord>("seed_demo_session"),
