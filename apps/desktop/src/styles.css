@@ -942,7 +942,7 @@ code {
   font-size: 1.05rem;
   line-height: 1.6;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: break-word;
   user-select: text;
   transition: border-color 0.12s var(--ease), box-shadow 0.12s var(--ease);
 }
@@ -1403,7 +1403,7 @@ code {
   border-radius: 8px;
   border: 1px solid var(--border);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: break-word;
   font-family: var(--font-mono);
   font-size: 0.88rem;
   line-height: 1.45;
@@ -2827,7 +2827,7 @@ button.meeting-index-item:hover {
   margin: 0;
   font-size: 0.9rem;
   line-height: 1.55;
-  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 .meeting-live-final {
@@ -2849,7 +2849,7 @@ button.meeting-index-item:hover {
   margin: 6px 0 0;
   font-size: 0.82rem;
   color: var(--error);
-  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 .meeting-fail-guide {
