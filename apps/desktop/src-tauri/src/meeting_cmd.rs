@@ -470,6 +470,119 @@ fn ensure_diar_models_present(models: &DiarModels) -> Result<(), String> {
     Ok(())
 }
 
+/// Reason recorded for an interrupted meeting we cannot salvage on launch.
+const INTERRUPTED_NO_AUDIO: &str = "recording interrupted, no audio";
+
+/// Recover meetings a previous run left mid-recording after a crash.
+///
+/// A meeting is written to storage as `Recording` the moment capture starts and
+/// only advances when the `stop` command runs. If the app is killed mid-capture
+/// the WAV's PCM samples are already on disk but its header length fields were
+/// never patched (that happens on the recorder's finalize) and the row is stuck
+/// at `Recording`. On the next launch we scan for those rows and, for each one:
+///
+/// - **Salvageable audio** (file exists with PCM data): back-fill the WAV header
+///   the crash skipped, record the recovered duration + path (status →
+///   `Processing`), and hand it to the same background transcription pipeline the
+///   `stop` command uses. The already-captured audio (the first half of the
+///   meeting) is preserved instead of lost.
+/// - **No audio** (no path, a missing/empty file, or a header-only WAV): mark it
+///   `failed` with a clear reason. We *keep* the row rather than delete it so the
+///   interruption stays visible in the library instead of a meeting the user
+///   started silently vanishing.
+///
+/// Runs on its own thread so it never blocks startup / the UI, and uses its own
+/// SQLite connection (never the UI store lock), matching the background worker.
+/// Platform gating is inherited from the pipeline: on non-macOS (or with the
+/// diar models absent) the spawned `process_meeting` reports `Unsupported` and
+/// the meeting ends `failed` — the same path a normal recording takes there.
+pub fn recover_interrupted_meetings(app: AppHandle) {
+    std::thread::spawn(move || {
+        let store = match Store::open(default_db_path()) {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::warn!(error = %e, "crash recovery: could not open store");
+                return;
+            }
+        };
+        let stale = match store.list_meetings_by_status(MeetingStatus::Recording) {
+            Ok(stale) => stale,
+            Err(e) => {
+                tracing::warn!(error = %e, "crash recovery: could not list interrupted meetings");
+                return;
+            }
+        };
+        if stale.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = stale.len(),
+            "crash recovery: found interrupted meeting(s) from a previous run"
+        );
+        for meeting in stale {
+            recover_one_meeting(&app, &store, &meeting);
+        }
+    });
+}
+
+/// Recover a single interrupted meeting. See [`recover_interrupted_meetings`].
+fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
+    let id = meeting.id;
+    let Some(audio_path) = meeting.audio_path.clone() else {
+        // Crashed before the stop path ever recorded an audio path.
+        fail_interrupted(store, id);
+        return;
+    };
+    let wav = PathBuf::from(&audio_path);
+    // A missing or truly empty (0-byte) file has nothing to salvage.
+    let has_bytes = std::fs::metadata(&wav)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    if !has_bytes {
+        fail_interrupted(store, id);
+        return;
+    }
+
+    match lumen_asr::repair_wav_header(&wav) {
+        // Real PCM data recovered → advance to Processing and transcribe it.
+        Ok(repaired) if repaired.data_bytes > 0 => {
+            if let Err(e) = store.set_meeting_audio(
+                id,
+                &audio_path,
+                repaired.duration_seconds,
+                MeetingStatus::Processing,
+            ) {
+                tracing::warn!(meeting_id = %id, error = %e, "crash recovery: could not update recovered meeting");
+                return;
+            }
+            tracing::info!(
+                meeting_id = %id,
+                duration_seconds = repaired.duration_seconds,
+                "crash recovery: salvaged recording, header repaired → processing"
+            );
+            spawn_meeting_processing(app.clone(), id, wav);
+        }
+        // Header-only WAV: repaired to a valid 0-length take — no audio to keep.
+        Ok(_) => fail_interrupted(store, id),
+        Err(e) => {
+            // File exists but is not a repairable WAV (truncated / corrupt).
+            let reason = format!("recording interrupted, audio unrecoverable: {e}");
+            tracing::warn!(meeting_id = %id, error = %e, "crash recovery: wav unrepairable");
+            if let Err(e) = store.fail_meeting(id, Some(&reason)) {
+                tracing::warn!(meeting_id = %id, error = %e, "crash recovery: could not mark failed");
+            }
+        }
+    }
+}
+
+/// Mark an interrupted meeting `failed` with the standard "no audio" reason.
+fn fail_interrupted(store: &Store, id: Uuid) {
+    tracing::info!(meeting_id = %id, "crash recovery: no salvageable audio → failed");
+    if let Err(e) = store.fail_meeting(id, Some(INTERRUPTED_NO_AUDIO)) {
+        tracing::warn!(meeting_id = %id, error = %e, "crash recovery: could not mark failed");
+    }
+}
+
 /// Mark a meeting `failed` (with an optional reason) from the background
 /// worker, on its own connection (never touches the UI store lock).
 fn mark_meeting_failed(meeting_id: Uuid, reason: Option<&str>) -> Result<(), String> {

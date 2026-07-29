@@ -164,6 +164,17 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// List every meeting in a given lifecycle `status`, newest first. Thin
+    /// convenience over [`list_meetings_filtered`](Self::list_meetings_filtered)
+    /// with no title query and no practical limit.
+    ///
+    /// Used by crash recovery on launch to find meetings left in
+    /// [`MeetingStatus::Recording`] by a previous run that was killed mid-capture
+    /// (the stop path never ran, so the row never advanced past `recording`).
+    pub fn list_meetings_by_status(&self, status: MeetingStatus) -> Result<Vec<Meeting>> {
+        self.list_meetings_filtered(Some(status), None, u32::MAX)
+    }
+
     /// Delete a meeting; its segments, speakers, and summaries cascade away via
     /// foreign keys (the store opens connections with `foreign_keys = ON`).
     /// Returns `true` if a meeting was deleted.
@@ -838,6 +849,34 @@ mod tests {
         assert_eq!(detail.speaker_name(None), "未知说话人");
 
         assert!(store.get_meeting_detail(Uuid::new_v4()).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_meetings_by_status_finds_interrupted_recordings() {
+        let (_dir, store) = open_store();
+        // Two meetings left mid-recording by a crashed run, plus one that
+        // finished normally.
+        let crashed_a = Meeting::new(); // status = Recording
+        let crashed_b = Meeting::new(); // status = Recording
+        let mut done = Meeting::new();
+        done.status = MeetingStatus::Ready;
+        store.create_meeting(&crashed_a).unwrap();
+        store.create_meeting(&crashed_b).unwrap();
+        store.create_meeting(&done).unwrap();
+
+        let stale = store
+            .list_meetings_by_status(MeetingStatus::Recording)
+            .unwrap();
+        assert_eq!(stale.len(), 2);
+        let ids: Vec<_> = stale.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&crashed_a.id));
+        assert!(ids.contains(&crashed_b.id));
+
+        // A status with no meetings returns empty.
+        assert!(store
+            .list_meetings_by_status(MeetingStatus::Failed)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
