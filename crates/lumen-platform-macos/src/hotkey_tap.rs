@@ -2,7 +2,7 @@
 //!
 //! Supports multiple bindings (primary + intent chords) on one tap thread.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -179,7 +179,7 @@ const FLAG_SECONDARY_FN: u64 = 0x0080_0000;
 /// Virtual keycode of the physical Fn/Globe key (kVK_Function). A FlagsChanged
 /// event reports this keycode only when the real Fn/Globe key toggles — the
 /// function-key class carries the secondary-Fn *flag* but never this keycode.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const KVK_FUNCTION: i64 = 0x3F; // 63
 
 /// Whether the physical Fn/Globe key is currently held. Updated *only* from
@@ -188,12 +188,67 @@ const KVK_FUNCTION: i64 = 0x3F; // 63
 /// misfire on arrows, F-keys and nav keys.
 static PHYSICAL_FN_DOWN: AtomicBool = AtomicBool::new(false);
 
+/// Monotonic tap generation. Bumped every time a monitor stops (or a new one is
+/// about to start), so a lingering callback belonging to a torn-down tap can
+/// detect it is stale and refuse to publish physical-Fn updates. Without this,
+/// a Fn release that lands while the old tap is being replaced could leave
+/// `PHYSICAL_FN_DOWN` stuck `true` and re-introduce the misfire.
+static TAP_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Current physical Fn/Globe held state, as observed by the event tap.
 ///
 /// Non-macOS builds never set it, so it stays `false` (there is no Fn key
 /// concept at this layer on Windows/Linux).
 pub fn physical_fn_down() -> bool {
     PHYSICAL_FN_DOWN.load(Ordering::SeqCst)
+}
+
+/// Clear physical Fn and retire the current tap generation. Called at every
+/// lifecycle transition where we stop observing key events (monitor stop /
+/// restart): after this, any in-flight callback from the old tap is stale and
+/// cannot resurrect the state. Clearing is the safe direction — a missed Fn
+/// release must fail to `false` (not firing) rather than stick `true`
+/// (misfiring on the next ordinary key).
+fn reset_physical_fn_tracking() {
+    // Bump first so a concurrent stale callback observes the new generation and
+    // skips its store, then clear the state it may have left set.
+    TAP_GENERATION.fetch_add(1, Ordering::SeqCst);
+    PHYSICAL_FN_DOWN.store(false, Ordering::SeqCst);
+}
+
+/// Claim a fresh tap generation for a newly started tap. Any generation issued
+/// earlier becomes stale.
+#[cfg(any(target_os = "macos", test))]
+fn begin_tap_generation() -> u64 {
+    TAP_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Whether `generation` is still the live tap (i.e. no stop/restart happened
+/// since it was claimed).
+#[cfg(any(target_os = "macos", test))]
+fn tap_generation_is_current(generation: u64) -> bool {
+    TAP_GENERATION.load(Ordering::SeqCst) == generation
+}
+
+/// Publish physical Fn from a FlagsChanged observation, but only while
+/// `generation` is still live and only for the physical Fn/Globe keycode. A
+/// torn-down tap (stale generation) is ignored, and every other key — which
+/// merely rides the shared secondary-Fn flag — is filtered out by the keycode.
+#[cfg(any(target_os = "macos", test))]
+fn observe_flags_changed(generation: u64, keycode: i64, flags: u64) {
+    if keycode == KVK_FUNCTION && tap_generation_is_current(generation) {
+        PHYSICAL_FN_DOWN.store(flags & FLAG_SECONDARY_FN != 0, Ordering::SeqCst);
+    }
+}
+
+/// Clear physical Fn when the system disables the tap: we stop receiving events,
+/// so a Fn release during the gap would otherwise be lost. Guarded on the live
+/// generation so a stale tap can't clear the live one's state.
+#[cfg(any(target_os = "macos", test))]
+fn observe_tap_disabled(generation: u64) {
+    if tap_generation_is_current(generation) {
+        PHYSICAL_FN_DOWN.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +269,9 @@ pub fn stop_monitor() {
             m.stop.store(true, Ordering::SeqCst);
         }
     }
+    // We are no longer observing key events; retire the generation and clear Fn
+    // so a release missed during teardown can't leave a bare-Fn chord armed.
+    reset_physical_fn_tracking();
 }
 
 /// Single binding (backward compatible).
@@ -254,7 +312,10 @@ where
         .spawn(move || {
             #[cfg(target_os = "macos")]
             {
-                run_tap_loop_multi(bindings, on_edge, stop, ready_tx);
+                // Claim a fresh generation so this tap — and only this tap —
+                // may publish physical-Fn updates until the next stop/restart.
+                let generation = begin_tap_generation();
+                run_tap_loop_multi(bindings, on_edge, stop, generation, ready_tx);
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -275,6 +336,7 @@ fn run_tap_loop_multi<F>(
     bindings: Vec<HotkeyBinding>,
     on_edge: F,
     stop: Arc<AtomicBool>,
+    generation: u64,
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) where
     F: Fn(HotkeyEdge, String) + Send + 'static,
@@ -327,6 +389,9 @@ fn run_tap_loop_multi<F>(
                 etype,
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
+                // Lost our event stream: clear Fn so a release missed during the
+                // outage can't leave a bare-Fn chord armed once we re-enable.
+                observe_tap_disabled(generation);
                 tracing::warn!("keyboard event tap disabled by system; will re-enable");
                 return None;
             }
@@ -337,9 +402,10 @@ fn run_tap_loop_multi<F>(
             // Physical Fn/Globe state is authoritative and comes *only* from a
             // FlagsChanged event carrying the Fn keycode (63). Every other key —
             // arrows, F1–F12, nav, forward-delete — raises the secondary-Fn flag
-            // bit but never this keycode, so it can no longer flip Fn on.
-            if matches!(etype, CGEventType::FlagsChanged) && keycode == KVK_FUNCTION {
-                PHYSICAL_FN_DOWN.store(flags & FLAG_SECONDARY_FN != 0, Ordering::SeqCst);
+            // bit but never this keycode, so it can no longer flip Fn on. The
+            // update is generation-guarded so a torn-down tap can't publish.
+            if matches!(etype, CGEventType::FlagsChanged) {
+                observe_flags_changed(generation, keycode, flags);
             }
             let phys_fn = PHYSICAL_FN_DOWN.load(Ordering::SeqCst);
 
@@ -508,5 +574,85 @@ mod tests {
         let mods = HotkeySpec::parse("Alt+Shift", HotkeyMode::Hold).unwrap();
         let key = HotkeySpec::parse("Alt+Shift+T", HotkeyMode::Hold).unwrap();
         assert!(key.specificity() > mods.specificity());
+    }
+
+    // The physical-Fn state is a process-global atomic; serialize the tests that
+    // mutate it so parallel runs don't clobber each other.
+    static FN_STATE_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn arrow_keycode_never_publishes_physical_fn() {
+        let _g = FN_STATE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset_physical_fn_tracking();
+        let generation = begin_tap_generation();
+        // Up arrow (0x7E) raises the shared secondary-Fn flag bit but is NOT
+        // keyCode 63 — the exact root cause of the misfire. It must not arm Fn.
+        observe_flags_changed(generation, 0x7E, FLAG_SECONDARY_FN);
+        assert!(!physical_fn_down(), "arrow key must not set physical Fn");
+        // The genuine Fn/Globe keycode still tracks correctly.
+        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        assert!(physical_fn_down(), "physical Fn/Globe key sets the state");
+        reset_physical_fn_tracking();
+    }
+
+    #[test]
+    fn stop_clears_and_invalidates_physical_fn() {
+        let _g = FN_STATE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset_physical_fn_tracking();
+
+        let generation = begin_tap_generation();
+        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        assert!(physical_fn_down(), "Fn should be set while observed");
+
+        // Stopping the monitor must clear Fn immediately...
+        reset_physical_fn_tracking();
+        assert!(!physical_fn_down(), "stop must clear physical Fn");
+
+        // ...and retire this generation, so the old tap's lingering callback
+        // (e.g. a stray Fn-down event after the Fn-up was missed) cannot
+        // resurrect the state and re-arm a bare-Fn chord.
+        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        assert!(!physical_fn_down(), "a stale tap must not publish Fn state");
+    }
+
+    #[test]
+    fn tap_disabled_clears_physical_fn() {
+        let _g = FN_STATE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset_physical_fn_tracking();
+
+        let generation = begin_tap_generation();
+        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        assert!(physical_fn_down());
+
+        // System disables the tap: a Fn release during the gap would be lost, so
+        // Fn must be cleared to avoid a later ordinary key matching bare-Fn.
+        observe_tap_disabled(generation);
+        assert!(!physical_fn_down(), "tap disable must clear physical Fn");
+        reset_physical_fn_tracking();
+    }
+
+    #[test]
+    fn restart_resumes_tracking() {
+        let _g = FN_STATE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset_physical_fn_tracking();
+
+        // Old monitor observed Fn down, then stopped (state cleared, gen retired).
+        let old = begin_tap_generation();
+        observe_flags_changed(old, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        reset_physical_fn_tracking();
+        assert!(!physical_fn_down());
+
+        // A fresh monitor claims a new generation and tracks correctly again.
+        let new = begin_tap_generation();
+        assert_ne!(old, new, "restart must claim a distinct generation");
+        observe_flags_changed(new, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        assert!(physical_fn_down(), "restarted tap tracks Fn down");
+        observe_flags_changed(new, KVK_FUNCTION, 0);
+        assert!(!physical_fn_down(), "restarted tap tracks Fn up");
+
+        // The retired old generation still cannot publish after the restart.
+        observe_flags_changed(old, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        assert!(!physical_fn_down(), "retired generation stays inert");
+        reset_physical_fn_tracking();
     }
 }
