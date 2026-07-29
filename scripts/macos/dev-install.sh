@@ -156,15 +156,39 @@ echo "==> sign"
 # (path-independent), so it travels with the bundle. ditto preserves it.
 FINAL_APP="$APP_DIR"
 if [[ -n "$INSTALL_DEST" ]]; then
+  # Guard the destructive replace: INSTALL_DEST is caller-overridable, so refuse
+  # anything but an absolute *.app path, and never a path inside the build tree
+  # (that would delete the source bundle we just built).
+  case "$INSTALL_DEST" in
+    /*.app) : ;;
+    *)
+      echo "ERROR: LUMEN_INSTALL_DEST must be an absolute path ending in .app" >&2
+      echo "       (got: '$INSTALL_DEST')" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$INSTALL_DEST" == "$ROOT"* ]]; then
+    echo "ERROR: LUMEN_INSTALL_DEST must not point inside the build tree" >&2
+    echo "       (got: '$INSTALL_DEST')" >&2
+    exit 2
+  fi
+
   echo "==> install → $INSTALL_DEST"
   if pgrep -x "lumen-asr-desktop" >/dev/null 2>&1; then
     osascript -e 'tell application "Lumen ASR" to quit' 2>/dev/null || true
     sleep 0.4
   fi
-  if rm -rf "$INSTALL_DEST" && ditto "$APP_DIR" "$INSTALL_DEST"; then
-    codesign --verify --verbose=1 "$INSTALL_DEST" 2>&1 | tail -1
+  # Stage to a sibling, verify the signature there, and only then swap it in — so
+  # a failed copy/verify never leaves the destination half-removed, and a verify
+  # failure falls through to the run-in-place warning instead of exiting (set -e).
+  STAGE="${INSTALL_DEST}.new"
+  rm -rf "$STAGE"
+  if ditto "$APP_DIR" "$STAGE" && codesign --verify --verbose=1 "$STAGE" 2>&1 | tail -1; then
+    rm -rf "$INSTALL_DEST"
+    mv "$STAGE" "$INSTALL_DEST"
     FINAL_APP="$INSTALL_DEST"
   else
+    rm -rf "$STAGE"
     echo "WARNING: could not install into $INSTALL_DEST; run in place from" >&2
     echo "         $APP_DIR instead (set LUMEN_INSTALL_DEST= to silence)." >&2
   fi
