@@ -21,6 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lumen-platform = { workspace = true }
 lumen-store = { workspace = true }
 lumen-core = { workspace = true }
+lumen-meeting = { workspace = true }
 lumen-dictionary = { workspace = true }
 lumen-asr = { workspace = true }
 lumen-corrector = { workspace = true }

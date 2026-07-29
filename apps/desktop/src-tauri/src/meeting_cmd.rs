@@ -11,7 +11,8 @@
 
 use crate::mode_arbiter::HotkeyAction;
 use crate::AppState;
-use lumen_core::{Meeting, MeetingStatus};
+use lumen_core::{Meeting, MeetingDetail, MeetingStatus};
+use lumen_meeting::{export_meeting as render_export, ExportOutput, ExportPreset};
 use lumen_platform::default_data_dir;
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -207,4 +208,123 @@ pub fn pause_meeting_recording(state: State<'_, AppState>) -> Result<(), String>
 #[tauri::command]
 pub fn resume_meeting_recording(state: State<'_, AppState>) -> Result<(), String> {
     state.meeting_recorder.resume().map_err(|e| e.to_string())
+}
+
+// ── M4a: library / detail / speaker ops / export (read-side for M4b+) ──
+//
+// These commands are model-free and cross-platform: the offline transcription
+// (diar-rs, macOS-only) and the structured-minutes LLM pass run in
+// `lumen_meeting::process_meeting`, which is wired to a trigger in a follow-up
+// (M4a-2 — it needs the macOS+`diarize`-gated active ASR engine and diar model
+// paths). Everything below only reads/mutates already-stored meetings.
+
+fn parse_id(value: &str, what: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(value).map_err(|e| format!("invalid {what} id: {e}"))
+}
+
+fn parse_status_filter(token: &str) -> Option<MeetingStatus> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "recording" => Some(MeetingStatus::Recording),
+        "processing" => Some(MeetingStatus::Processing),
+        "transcribing" => Some(MeetingStatus::Transcribing),
+        "summarizing" => Some(MeetingStatus::Summarizing),
+        "ready" => Some(MeetingStatus::Ready),
+        "failed" => Some(MeetingStatus::Failed),
+        _ => None,
+    }
+}
+
+/// List meetings newest first, optionally filtered by lifecycle `status` and/or
+/// a title substring `query`. Unknown `status` tokens are ignored (treated as
+/// no filter). `limit` defaults to 200.
+#[tauri::command]
+pub fn list_meetings(
+    state: State<'_, AppState>,
+    status: Option<String>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<Meeting>, String> {
+    let status = status.as_deref().and_then(parse_status_filter);
+    let limit = limit.unwrap_or(200);
+    with_store(&state, |s| {
+        s.list_meetings_filtered(status, query.as_deref(), limit)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Read one meeting with its speakers, `seq`-ordered segments, and summaries.
+#[tauri::command]
+pub fn get_meeting_detail(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<MeetingDetail, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    with_store(&state, |s| {
+        s.get_meeting_detail(id).map_err(|e| e.to_string())
+    })?
+    .ok_or_else(|| "meeting not found".to_string())
+}
+
+/// Rename a speaker cluster (Speaker 3 → 李明). Returns `true` if updated.
+#[tauri::command]
+pub fn rename_speaker(
+    state: State<'_, AppState>,
+    speaker_id: String,
+    display_name: String,
+) -> Result<bool, String> {
+    let id = parse_id(&speaker_id, "speaker")?;
+    with_store(&state, |s| {
+        s.rename_speaker(id, display_name.trim())
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Reassign a single mis-attributed segment to another speaker.
+#[tauri::command]
+pub fn reassign_segment_speaker(
+    state: State<'_, AppState>,
+    segment_id: String,
+    speaker_id: String,
+) -> Result<bool, String> {
+    let seg = parse_id(&segment_id, "segment")?;
+    let spk = parse_id(&speaker_id, "speaker")?;
+    with_store(&state, |s| {
+        s.reassign_segment_speaker(seg, spk)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Merge two speaker clusters (they are the same person): `from` is folded into
+/// `into` and deleted. Returns the number of segments moved.
+#[tauri::command]
+pub fn merge_speakers(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    from_speaker_id: String,
+    into_speaker_id: String,
+) -> Result<u64, String> {
+    let mid = parse_id(&meeting_id, "meeting")?;
+    let from = parse_id(&from_speaker_id, "from speaker")?;
+    let into = parse_id(&into_speaker_id, "into speaker")?;
+    with_store(&state, |s| {
+        s.merge_speakers(mid, from, into).map_err(|e| e.to_string())
+    })
+}
+
+/// Export a meeting into one of the four presets: `minutes_md`, `transcript_md`,
+/// `subtitles_srt`, `data_json`. Returns the filename + text content.
+#[tauri::command]
+pub fn export_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    preset: String,
+) -> Result<ExportOutput, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    let preset =
+        ExportPreset::parse(&preset).ok_or_else(|| format!("unknown export preset: {preset}"))?;
+    let detail = with_store(&state, |s| {
+        s.get_meeting_detail(id).map_err(|e| e.to_string())
+    })?
+    .ok_or_else(|| "meeting not found".to_string())?;
+    render_export(&detail, preset).map_err(|e| e.to_string())
 }
