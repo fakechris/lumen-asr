@@ -16,6 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::assemble::{assemble_meeting, new_meeting, turn_sample_range, DiarTurn};
+use crate::correct::CorrectionDict;
 
 /// Filesystem locations of the three diarization model artifacts.
 ///
@@ -64,8 +65,15 @@ pub struct MeetingOptions {
     pub title: Option<String>,
     /// ISO-639-1 language hint forwarded to the ASR engine per turn.
     pub language_hint: Option<String>,
-    /// Hotwords forwarded to the ASR engine per turn.
+    /// Hotwords forwarded to the ASR engine per turn. sherpa-onnx's offline
+    /// Paraformer does not reliably act on these, so the authoritative
+    /// name/jargon fix is the post-ASR [`correction`](Self::correction) pass
+    /// below; this field is kept as a best-effort engine hint.
     pub hotwords: Vec<String>,
+    /// Personal-dictionary view driving the post-ASR correction pass (meeting
+    /// "hotword" strategy A). Empty = correction is skipped and text is stored
+    /// exactly as transcribed.
+    pub correction: CorrectionDict,
     /// Upper bound on speaker count for clustering (maps to diar-rs
     /// `ahc_max_speakers`). `None` keeps the diar-rs default.
     pub max_speakers: Option<usize>,

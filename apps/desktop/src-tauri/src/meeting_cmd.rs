@@ -19,8 +19,8 @@ use crate::AppState;
 use lumen_core::{Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SummaryKind};
 use lumen_dictionary::split_for_injection;
 use lumen_meeting::{
-    export_meeting as render_export, process_meeting, DiarModels, ExportOutput, ExportPreset,
-    MeetingOptions, MinutesConfig, DEFAULT_MAX_SPEAKERS,
+    export_meeting as render_export, process_meeting, CorrectionDict, DiarModels, ExportOutput,
+    ExportPreset, MeetingOptions, MinutesConfig, DEFAULT_MAX_SPEAKERS,
 };
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
@@ -332,22 +332,23 @@ fn spawn_meeting_processing(app: AppHandle, meeting_id: Uuid, wav: PathBuf) {
     });
 }
 
-/// Upper bound on dictionary terms forwarded as ASR hotwords. sherpa-onnx
-/// contextual biasing cost grows with the phrase list, so cap it to keep the
-/// per-turn decode bounded. `list_dictionary` returns most-recently-updated
+/// Upper bound on dictionary **terms** fed to the post-ASR correction pass. The
+/// per-segment fuzzy scan is O(terms × text), so cap the list to keep correction
+/// bounded on large dictionaries. `list_dictionary` returns most-recently-updated
 /// first, so the cap keeps the freshest terms.
 const MAX_MEETING_HOTWORDS: usize = 128;
 
-/// Collect the user's confirmed dictionary **terms** as ASR hotwords for the
-/// meeting engine. Replacement pairs are intentionally excluded — they are a
-/// post-ASR correction concern, not a recognition-bias one. Returns at most
-/// [`MAX_MEETING_HOTWORDS`] terms; a store read error yields an empty list so the
-/// meeting still runs (just without biasing).
-fn meeting_hotwords(store: &Store) -> Vec<String> {
+/// Build the meeting's post-ASR correction view from the user's confirmed
+/// dictionary (meeting "hotword" strategy A). Terms (names/jargon) drive the
+/// fuzzy near-miss correction; replacement pairs (`from -> to`) are applied
+/// verbatim. Replaces the old "forward terms to the ASR engine as hotwords"
+/// behaviour, which was effectively a no-op on sherpa's offline Paraformer.
+/// A store read error yields an empty dict so the meeting still runs (uncorrected).
+fn meeting_correction_dict(store: &Store) -> CorrectionDict {
     let entries = store.list_dictionary().unwrap_or_default();
-    let (mut terms, _replacements) = split_for_injection(&entries);
+    let (mut terms, replacements) = split_for_injection(&entries);
     terms.truncate(MAX_MEETING_HOTWORDS);
-    terms
+    CorrectionDict::new(terms, replacements)
 }
 
 /// Build the pipeline's dependencies from app config and run
@@ -403,13 +404,14 @@ async fn process_meeting_pipeline(
         max_tokens: None,
     });
 
-    // Reuse the user's personal dictionary terms as ASR hotwords so the offline
-    // Paraformer engine biases toward them per turn (SenseVoice fallback ignores
-    // hotwords). Read from the background worker's own store connection; a read
-    // failure just yields no hotwords rather than aborting the meeting.
+    // Feed the user's personal dictionary into the post-ASR correction pass
+    // (meeting "hotword" strategy A): after each turn is transcribed, near-miss
+    // mis-recognitions of the user's names/jargon are repaired in the transcript
+    // (and thus in the minutes). Read from the background worker's own store
+    // connection; a read failure just yields no correction rather than aborting.
     let opts = MeetingOptions {
         max_speakers: Some(DEFAULT_MAX_SPEAKERS),
-        hotwords: meeting_hotwords(&store),
+        correction: meeting_correction_dict(&store),
         ..MeetingOptions::default()
     };
 
