@@ -230,6 +230,21 @@ impl Store {
         Ok(())
     }
 
+    /// Overwrite only the `text` of one transcript segment. Its timing
+    /// (`start_seconds`/`end_seconds`), ordering (`seq`), speaker attribution
+    /// (`speaker_id`), and word timing (`words_json`) are all left untouched.
+    ///
+    /// This is the manual "the ASR mis-heard this sentence, fix the words" edit
+    /// from the review page — it never moves a segment in time or reassigns it.
+    /// Returns `true` if a row was updated (`false` for an unknown segment id).
+    pub fn update_segment_text(&self, segment_id: Uuid, text: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE transcript_segments SET text=?2 WHERE id=?1",
+            params![segment_id.to_string(), text],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// List a meeting's segments in `seq` order.
     pub fn list_segments(&self, meeting_id: Uuid) -> Result<Vec<TranscriptSegment>> {
         let mut statement = self.conn.prepare(
@@ -747,6 +762,44 @@ mod tests {
         let words = segments[1].words.as_ref().unwrap();
         assert_eq!(words[0].word, "world");
         assert_eq!(words[0].confidence, Some(0.9));
+    }
+
+    #[test]
+    fn update_segment_text_changes_only_text() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        let speaker = Speaker::new(meeting.id, "S1");
+        store.upsert_speaker(&speaker).unwrap();
+
+        let mut seg = TranscriptSegment::new(meeting.id, 3, 12.5, 15.0, "wrong words");
+        seg.speaker_id = Some(speaker.id);
+        seg.confidence = Some(0.7);
+        seg.words = Some(vec![Word::new("wrong", 12.5, 15.0).with_confidence(0.7)]);
+        store.add_segment(&seg).unwrap();
+
+        // Editing the text updates only that column.
+        assert!(store
+            .update_segment_text(seg.id, "corrected words")
+            .unwrap());
+        let updated = store.list_segments(meeting.id).unwrap();
+        assert_eq!(updated.len(), 1);
+        let got = &updated[0];
+        assert_eq!(got.text, "corrected words");
+        // Timing, ordering, speaker, confidence, and word timing are untouched.
+        assert_eq!(got.start_seconds, 12.5);
+        assert_eq!(got.end_seconds, 15.0);
+        assert_eq!(got.seq, 3);
+        assert_eq!(got.speaker_id, Some(speaker.id));
+        assert_eq!(got.confidence, Some(0.7));
+        assert_eq!(got.words.as_ref().unwrap()[0].word, "wrong");
+
+        // Empty text is allowed (last-write-wins, e.g. the user cleared a line).
+        assert!(store.update_segment_text(seg.id, "").unwrap());
+        assert_eq!(store.list_segments(meeting.id).unwrap()[0].text, "");
+
+        // Unknown segment id is a no-op.
+        assert!(!store.update_segment_text(Uuid::new_v4(), "x").unwrap());
     }
 
     #[test]
