@@ -154,6 +154,13 @@ export default function App() {
   const [hotkeyEnabled, setHotkeyEnabledUi] = useState(true);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [onboardingIncomplete, setOnboardingIncomplete] = useState(false);
+  // App-level meeting-detection prompt (opt-in, capability-gated). The backend
+  // policy decides *when* to prompt; here we only render it and relay the user's
+  // choice. Kept out of MeetingPanel on purpose so it is visible on any tab.
+  const [detected, setDetected] = useState<{
+    bundleId: string;
+    appClass: string;
+  } | null>(null);
 
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -284,6 +291,26 @@ export default function App() {
     return () => un?.();
   }, [refreshHealth, refreshSessions]);
 
+  // Meeting-detection prompt lifecycle: the backend emits `meeting-detected`
+  // when a stable meeting-app input is seen, and `meeting-detection-cancelled`
+  // when the signal disappears before the user acts (auto-retract the prompt).
+  useEffect(() => {
+    let unDetected: (() => void) | undefined;
+    let unCancelled: (() => void) | undefined;
+    listen<{ bundleId: string; appClass: string }>("meeting-detected", (e) => {
+      setDetected(e.payload);
+    }).then((fn) => {
+      unDetected = fn;
+    });
+    listen("meeting-detection-cancelled", () => setDetected(null)).then((fn) => {
+      unCancelled = fn;
+    });
+    return () => {
+      unDetected?.();
+      unCancelled?.();
+    };
+  }, []);
+
   useEffect(() => {
     void (async () => {
       try {
@@ -361,6 +388,32 @@ export default function App() {
             setOnboardingIncomplete(false);
             void refreshHealth();
           }}
+        />
+      )}
+      {detected && (
+        <DetectionPrompt
+          bundleId={detected.bundleId}
+          onStart={() =>
+            void (async () => {
+              setDetected(null);
+              try {
+                await api.acceptMeetingDetection();
+                setTab("meeting");
+              } catch (e) {
+                setError(String(e));
+              }
+            })()
+          }
+          onDismiss={() =>
+            void (async () => {
+              setDetected(null);
+              try {
+                await api.dismissMeetingDetection();
+              } catch {
+                /* ignore */
+              }
+            })()
+          }
         />
       )}
       {/* System titlebar (Visible) — native macOS drag / traffic lights */}
@@ -676,6 +729,78 @@ export default function App() {
       </footer>
     </div>
     </MeetingModelsProvider>
+  );
+}
+
+// Friendly display name for a detected meeting app's bundle id. Falls back to
+// the raw id so an unmapped-but-allow-listed app still reads sensibly. Keys are
+// lowercase and the lookup lowercases too: the backend passes the OS-reported
+// bundle id, whose casing varies (e.g. `com.apple.FaceTime`).
+const MEETING_APP_LABELS: Record<string, string> = {
+  "us.zoom.xos": "Zoom",
+  "com.microsoft.teams": "Microsoft Teams",
+  "com.microsoft.teams2": "Microsoft Teams",
+  "com.tinyspeck.slackmacgap": "Slack",
+  "com.apple.facetime": "FaceTime",
+  "com.cisco.webexmeetingsapp": "Webex",
+  "com.webex.meetingmanager": "Webex",
+  "com.hnc.discord": "Discord",
+  "com.skype.skype": "Skype",
+  "com.microsoft.skypeforbusiness": "Skype for Business",
+  "com.google.meetings": "Google Meet",
+};
+
+function meetingAppLabel(bundleId: string): string {
+  return MEETING_APP_LABELS[bundleId.toLowerCase()] || bundleId;
+}
+
+// App-level, non-blocking prompt shown when the backend detects likely meeting
+// audio activity. It never records on its own — the user must click "开始记录".
+// Accessibility: labelled by its title, focus moves to the primary action on
+// open, and Esc dismisses (same as clicking 忽略).
+function DetectionPrompt({
+  bundleId,
+  onStart,
+  onDismiss,
+}: {
+  bundleId: string;
+  onStart: () => void;
+  onDismiss: () => void;
+}) {
+  const startRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    startRef.current?.focus();
+  }, []);
+  return (
+    <div
+      className="detection-prompt"
+      role="alertdialog"
+      aria-labelledby="detection-prompt-title"
+      aria-describedby="detection-prompt-sub"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          onDismiss();
+        }
+      }}
+    >
+      <div className="detection-prompt-body">
+        <span id="detection-prompt-title" className="detection-prompt-title">
+          检测到可能的会议
+        </span>
+        <span id="detection-prompt-sub" className="detection-prompt-sub">
+          {meetingAppLabel(bundleId)} 正在使用麦克风。是否开始记录本次会议？
+        </span>
+      </div>
+      <div className="detection-prompt-actions">
+        <button type="button" className="btn" ref={startRef} onClick={onStart}>
+          开始记录
+        </button>
+        <button type="button" className="btn ghost" onClick={onDismiss}>
+          忽略
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1271,6 +1396,8 @@ function SettingsPanel({
   const [promoteN, setPromoteN] = useState(3);
   const [postPaste, setPostPaste] = useState(true);
   const [postPasteSecs, setPostPasteSecs] = useState(20);
+  const [detectionEnabled, setDetectionEnabled] = useState(false);
+  const [detectionCapable, setDetectionCapable] = useState(false);
   // null = still loading, "error" = lookup failed (never stuck on loading).
   const [buildInfo, setBuildInfo] = useState<BuildInfo | "error" | null>(null);
   useEffect(() => {
@@ -1334,6 +1461,13 @@ function SettingsPanel({
         setPromoteN(ln.autoPromoteThreshold);
         setPostPaste(ln.postPasteCapture);
         setPostPasteSecs(ln.postPasteSeconds);
+        try {
+          const det = await api.getMeetingDetection();
+          setDetectionEnabled(det.enabled);
+          setDetectionCapable(det.capabilityAvailable);
+        } catch {
+          /* detection status is best-effort */
+        }
       } catch (e) {
         onError(String(e));
       }
@@ -1663,6 +1797,45 @@ function SettingsPanel({
         }}
         onSaved={onSaved}
       />
+
+      <section className="card settings-section">
+        <h2>会议自动检测</h2>
+        <p className="muted-text">
+          开启后，Lumen 会留意 Zoom、Teams、Slack、FaceTime
+          等会议 App 的麦克风活动，并在检测到时<strong>弹窗提示</strong>——
+          仅在你点击「开始记录」后才会录音，绝不自动录制。默认关闭。
+        </p>
+        <div className="form-row">
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={detectionEnabled}
+              disabled={busy || !detectionCapable}
+              onChange={(e) =>
+                void (async () => {
+                  onBusy(true);
+                  onError(null);
+                  try {
+                    const next = await api.setMeetingDetectionEnabled(e.target.checked);
+                    setDetectionEnabled(next.enabled);
+                    setDetectionCapable(next.capabilityAvailable);
+                  } catch (err) {
+                    onError(String(err));
+                  } finally {
+                    onBusy(false);
+                  }
+                })()
+              }
+            />{" "}
+            启用会议自动检测（弹窗提示，不自动录制）
+          </label>
+        </div>
+        {!detectionCapable && (
+          <p className="muted-text" style={{ fontSize: "0.85rem", marginTop: 8 }}>
+            当前系统不支持会议检测所需的系统能力（需要较新的 macOS），此开关已停用。
+          </p>
+        )}
+      </section>
 
       <section className="card settings-section">
         <h2>语音识别（ASR）</h2>
