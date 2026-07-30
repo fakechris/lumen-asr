@@ -2869,3 +2869,123 @@ button.meeting-index-item:hover {
 .meeting-config-llm {
   margin-top: 10px;
 }
+
+/* ---- meeting model install card (Paraformer) ------------------------- */
+.meeting-model-setup {
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.meeting-model-ready {
+  margin: 0 0 12px;
+  font-size: 0.78rem;
+}
+
+.meeting-model-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.meeting-model-head-note {
+  font-weight: 400;
+  font-size: 0.75rem;
+  margin-left: 4px;
+}
+
+.meeting-model-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.meeting-model-row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.meeting-model-row-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+.meeting-model-badge {
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.meeting-model-badge.ok {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+}
+
+.meeting-model-row-desc {
+  margin: 3px 0 0;
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+
+.meeting-model-row-actions {
+  flex-shrink: 0;
+}
+
+.meeting-model-done {
+  color: var(--ok);
+  font-weight: 700;
+}
+
+.meeting-model-progress {
+  margin-top: 8px;
+}
+
+.meeting-model-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border) 70%, transparent);
+  overflow: hidden;
+}
+
+.meeting-model-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+
+.meeting-model-bar-fill.indeterminate {
+  animation: mtg-pulse 1.4s ease-in-out infinite;
+}
+
+.meeting-model-progress-text {
+  display: block;
+  margin-top: 5px;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.meeting-model-error {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--error);
+  overflow-wrap: break-word;
+}
+
+.meeting-live-install {
+  margin-top: 8px;
+}
+
+.meeting-detail-recording {
+  margin-bottom: 14px;
+}
