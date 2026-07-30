@@ -3426,3 +3426,41 @@ button.meeting-seg-text.seekable:hover {
     min-height: 220px;
   }
 }
+
+/* Meeting-detection prompt: an app-level, non-blocking card that floats near the
+   top-center. Shown only when detection is enabled and a stable meeting-app
+   input is seen; it never records on its own (the user must click 开始记录). */
+.detection-prompt {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  max-width: min(560px, calc(100vw - 32px));
+  padding: 12px 16px;
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lift);
+}
+.detection-prompt-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.detection-prompt-title {
+  font-weight: 600;
+}
+.detection-prompt-sub {
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+.detection-prompt-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}

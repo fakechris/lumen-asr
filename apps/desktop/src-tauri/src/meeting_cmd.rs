@@ -233,6 +233,11 @@ pub fn stop_meeting_recording(
         "meeting recording stopped → processing"
     );
 
+    // Let meeting detection return to idle (harmless if this recording was not
+    // started from a detection prompt — the policy no-ops unless it is tracking
+    // an accepted recording).
+    state.meeting_detection.recording_finished();
+
     // Kick off transcription in the background so the stop command returns now.
     spawn_meeting_processing(app, id, summary.wav_path.clone());
 
@@ -243,6 +248,95 @@ pub fn stop_meeting_recording(
         sample_rate: summary.sample_rate,
         status: MeetingStatus::Processing.as_str().to_string(),
     })
+}
+
+/// Serialized meeting-detection status for the settings toggle.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingDetectionStatus {
+    /// The user's opt-in preference (persisted).
+    pub enabled: bool,
+    /// Whether this OS exposes the audio-activity capability at all. When
+    /// `false`, the toggle can explain the feature is unavailable here.
+    pub capability_available: bool,
+    /// Whether the detector poller is currently running.
+    pub active: bool,
+}
+
+/// Read the meeting-detection preference plus runtime capability/active state.
+#[tauri::command]
+pub fn get_meeting_detection(state: State<'_, AppState>) -> Result<MeetingDetectionStatus, String> {
+    let enabled = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| "config lock poisoned".to_string())?;
+        cfg.meeting.detection_enabled
+    };
+    Ok(MeetingDetectionStatus {
+        enabled,
+        capability_available: meeting_detection_capability(),
+        active: state.meeting_detection.is_active(),
+    })
+}
+
+/// Toggle the opt-in meeting-detection preference. Persists it and starts/stops
+/// the detector to match (starting only ever succeeds when the OS capability is
+/// present). Returns the resulting status.
+#[tauri::command]
+pub fn set_meeting_detection_enabled(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<MeetingDetectionStatus, String> {
+    {
+        let mut cfg = state
+            .config
+            .lock()
+            .map_err(|_| "config lock poisoned".to_string())?;
+        cfg.meeting.detection_enabled = enabled;
+        cfg.save()?;
+    }
+    if enabled {
+        state.meeting_detection.start(app);
+    } else {
+        state.meeting_detection.stop();
+    }
+    get_meeting_detection(state)
+}
+
+/// The user accepted a detection prompt: advance the policy and, if it says so,
+/// start a meeting recording via the *existing* start path. Returns the new
+/// meeting id, or an empty string if no recording was started (e.g. the prompt
+/// was already stale).
+#[tauri::command]
+pub fn accept_meeting_detection(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    if !state.meeting_detection.accept() {
+        return Ok(String::new());
+    }
+    // Reuse the proven start command (arbiter gate, hotkey suspend, recorder).
+    start_meeting_recording(app, state, None)
+}
+
+/// The user dismissed a detection prompt (arms the per-app cooldown).
+#[tauri::command]
+pub fn dismiss_meeting_detection(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    state.meeting_detection.dismiss(&app);
+    Ok(())
+}
+
+fn meeting_detection_capability() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        lumen_platform_macos::meeting_detection_capability_available()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 /// Pause the active meeting recording. Paused audio is dropped (no silent gap).

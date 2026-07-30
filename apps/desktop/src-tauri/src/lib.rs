@@ -17,6 +17,7 @@ mod hotkey_validate;
 mod inject_cmd;
 mod learning;
 mod meeting_cmd;
+mod meeting_detection;
 mod meeting_live;
 mod mod_chord;
 mod mode_arbiter;
@@ -66,6 +67,8 @@ pub struct AppState {
     pub meeting_live: meeting_live::MeetingLive,
     /// Mutual-exclusion arbiter between dictation and meeting recording.
     pub capture: CaptureArbiter,
+    /// Opt-in, capability-gated meeting activity detection + prompt policy.
+    pub meeting_detection: meeting_detection::MeetingDetectionService,
     pub engine: Mutex<EngineKind>,
     pub sensevoice: Mutex<SenseVoiceSherpaAsr>,
     pub qwen: Mutex<QwenAsr>,
@@ -291,6 +294,7 @@ pub fn run() {
             meeting_recorder: MeetingRecorder::new(),
             meeting_live: meeting_live::MeetingLive::default(),
             capture: CaptureArbiter::new(),
+            meeting_detection: meeting_detection::MeetingDetectionService::new(),
             engine: Mutex::new(initial_engine),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sv_dir)),
             qwen: Mutex::new(qwen),
@@ -357,6 +361,10 @@ pub fn run() {
             meeting_cmd::stop_meeting_recording,
             meeting_cmd::pause_meeting_recording,
             meeting_cmd::resume_meeting_recording,
+            meeting_cmd::get_meeting_detection,
+            meeting_cmd::set_meeting_detection_enabled,
+            meeting_cmd::accept_meeting_detection,
+            meeting_cmd::dismiss_meeting_detection,
             meeting_cmd::process_meeting_now,
             meeting_cmd::list_meetings,
             meeting_cmd::get_meeting_detail,
@@ -412,6 +420,21 @@ pub fn run() {
             // Salvage it (repair the header, transcribe the captured audio) or
             // mark it failed — off the launch path so the UI never blocks.
             meeting_cmd::recover_interrupted_meetings(app.handle().clone());
+
+            // Opt-in meeting detection: only start when the user enabled it AND
+            // the OS capability is present. Off by default; failure to start
+            // (unavailable capability) is silent — the feature just stays dark.
+            let detection_enabled = app
+                .state::<AppState>()
+                .config
+                .lock()
+                .map(|cfg| cfg.meeting.detection_enabled)
+                .unwrap_or(false);
+            if detection_enabled {
+                app.state::<AppState>()
+                    .meeting_detection
+                    .start(app.handle().clone());
+            }
             let qwen_selected = app
                 .state::<AppState>()
                 .engine
