@@ -729,19 +729,18 @@ function LiveTranscript({ models }: { models: MeetingModels }) {
       </div>
       <div className="meeting-live-body" ref={scrollRef}>
         {active ? (
-          <p className="meeting-live-text">
+          <div className="meeting-live-text">
             {finals.map((line, i) => (
-              <span key={i} className="meeting-live-final">
+              <p key={i} className="meeting-live-final">
                 {line}
-                {i < finals.length - 1 || partial ? " " : ""}
-              </span>
+              </p>
             ))}
             {partial ? (
-              <span className="meeting-live-partial">{partial}</span>
+              <p className="meeting-live-partial">{partial}</p>
             ) : finals.length === 0 ? (
-              <span className="muted-text">正在聆听…</span>
+              <p className="muted-text meeting-live-listening">正在聆听…</p>
             ) : null}
-          </p>
+          </div>
         ) : models.status?.paraformerStreamingReady ? (
           <p className="muted-text meeting-live-empty">正在聆听…</p>
         ) : (
