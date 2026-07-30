@@ -187,6 +187,20 @@ if [[ -n "$INSTALL_DEST" ]]; then
     rm -rf "$INSTALL_DEST"
     mv "$STAGE" "$INSTALL_DEST"
     FINAL_APP="$INSTALL_DEST"
+
+    # A stale same-bundle-id copy from an older install (classically
+    # ~/Applications/<name>.app) can outrank this one in Launch Services and make
+    # `--open` / the Dock show the PREVIOUS icon even though the bundle here is
+    # correct. Remove that known duplicate and force LS to (re)register the copy
+    # we just installed so it resolves the fresh one.
+    lsreg="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    stale_home="$HOME/Applications/$(basename "$INSTALL_DEST")"
+    if [[ -d "$stale_home" && "$stale_home" != "$INSTALL_DEST" ]]; then
+      echo "  removing stale duplicate that would shadow the icon: $stale_home"
+      [[ -x "$lsreg" ]] && "$lsreg" -u "$stale_home" 2>/dev/null || true
+      rm -rf "$stale_home"
+    fi
+    [[ -x "$lsreg" ]] && "$lsreg" -f "$INSTALL_DEST" 2>/dev/null || true
   else
     rm -rf "$STAGE"
     echo "WARNING: could not install into $INSTALL_DEST; run in place from" >&2
