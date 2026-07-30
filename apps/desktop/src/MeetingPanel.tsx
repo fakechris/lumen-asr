@@ -1,5 +1,5 @@
 import type { ChangeEvent, MutableRefObject, ReactNode } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { api } from "./api";
@@ -1493,6 +1493,7 @@ function MeetingDetailView({
               currentTime={currentTime}
               onTime={setCurrentTime}
               durationHint={detail.meeting.duration_seconds ?? null}
+              onError={onError}
             />
           )}
         </>
@@ -2034,8 +2035,14 @@ function autosizeTextarea(el: HTMLTextAreaElement) {
 
 /** One transcript sentence: click the text to seek the audio, click ✎ to edit
  * the words in place. Owns its own edit state so a keyed re-render (e.g. the
- * playback highlight ticking) never drops an in-progress edit. */
-function SegmentRow({
+ * playback highlight ticking) never drops an in-progress edit.
+ *
+ * Wrapped in `memo`: the playhead ticks ~4×/s during playback, but only the two
+ * rows whose `active` flips (leaving one sentence, entering the next) actually
+ * change props — every other row (and its edit state) is skipped. The callback
+ * props are stable (`useCallback`), and `segment` keeps its identity unless its
+ * own text was edited, so the memo comparison is cheap and correct. */
+const SegmentRow = memo(function SegmentRow({
   segment,
   playable,
   active,
@@ -2076,6 +2083,15 @@ function SegmentRow({
   const commit = useCallback(async () => {
     if (saving) return;
     const next = draft.trim();
+    // Refuse an empty save: a blank sentence would persist as "", render as a
+    // ~0-height row whose hover-only ✎ is unreachable, and be effectively
+    // unrecoverable. A transcript sentence should never be empty, so treat a
+    // cleared line as a cancel — restore the original text and leave edit mode.
+    if (next === "") {
+      setDraft(segment.text);
+      setEditing(false);
+      return;
+    }
     // Nothing changed → just leave edit mode without a round trip.
     if (next === segment.text.trim()) {
       setEditing(false);
@@ -2177,7 +2193,7 @@ function SegmentRow({
       </button>
     </div>
   );
-}
+});
 
 function TranscriptView({
   detail,
@@ -2321,12 +2337,14 @@ function MeetingAudioBar({
   currentTime,
   onTime,
   durationHint,
+  onError,
 }: {
   src: string;
   audioRef: MutableRefObject<HTMLAudioElement | null>;
   currentTime: number;
   onTime: (seconds: number) => void;
   durationHint: number | null;
+  onError: (e: string | null) => void;
 }) {
   const [duration, setDuration] = useState(durationHint ?? 0);
   const [playing, setPlaying] = useState(false);
@@ -2354,6 +2372,14 @@ function MeetingAudioBar({
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}
         onEnded={() => setPlaying(false)}
+        // The asset: URL can fail silently (scope/ACL reject, missing/renamed
+        // WAV) — surface it so the bar isn't a dead control that swallows the
+        // reason. `toggle`/`seekTo` also swallow play() rejections by design;
+        // this is the one visible signal.
+        onError={() => {
+          setPlaying(false);
+          onError("无法加载会议录音，音频可能缺失或无法访问。");
+        }}
       />
       <button
         type="button"

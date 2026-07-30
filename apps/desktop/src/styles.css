@@ -2896,11 +2896,16 @@ button.meeting-seg-text.seekable:hover {
 }
 
 .meeting-seg:hover .meeting-seg-edit-btn,
-.meeting-seg.active .meeting-seg-edit-btn {
+.meeting-seg.active .meeting-seg-edit-btn,
+/* Keep the button visible while it (or its row) holds focus, so a keyboard
+   user tabbing onto it isn't focusing an invisible control. */
+.meeting-seg:focus-within .meeting-seg-edit-btn,
+.meeting-seg-edit-btn:focus-visible {
   opacity: 1;
 }
 
-.meeting-seg-edit-btn:hover {
+.meeting-seg-edit-btn:hover,
+.meeting-seg-edit-btn:focus-visible {
   color: var(--accent);
 }
 
