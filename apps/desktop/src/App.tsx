@@ -9,6 +9,7 @@ import { Icon, type IconName } from "./Icons";
 import { ThemeToggle } from "./ThemeToggle";
 import { ChordCaptureChip } from "./ChordCaptureChip";
 import { MeetingPanel } from "./MeetingPanel";
+import { MeetingModelsProvider } from "./meetingModels";
 import {
   correctorFallbackNotice,
   correctorFallbackReasonLabel,
@@ -339,6 +340,7 @@ export default function App() {
   const nav = NAV.find((n) => n.id === tab) ?? NAV[0];
 
   return (
+    <MeetingModelsProvider>
     <div className="app-frame">
       {showOnboarding && (
         <OnboardingWizard
@@ -655,6 +657,7 @@ export default function App() {
         </span>
       </footer>
     </div>
+    </MeetingModelsProvider>
   );
 }
 

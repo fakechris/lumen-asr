@@ -2,6 +2,12 @@ import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
+import {
+  useMeetingModels,
+  type MeetingModels,
+  type ModelProgressState,
+  type ModelTarget,
+} from "./meetingModels";
 import { Icon } from "./Icons";
 import { diarGuidance, isNoLlmMarker } from "./meetingGuidance";
 import type {
@@ -164,6 +170,11 @@ export function MeetingPanel({
   onNavigate?: (tab: TabId) => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // App-level model state (from MeetingModelsProvider at the App root). It is
+  // not tied to this panel's lifetime, so a running (~1GB) download's
+  // progress/cancel survive switching tabs away and back, and the library and
+  // detail view always share one listener and one in-flight download.
+  const models = useMeetingModels();
 
   if (selectedId) {
     return (
@@ -172,10 +183,13 @@ export function MeetingPanel({
         onBack={() => setSelectedId(null)}
         onError={onError}
         onNavigate={onNavigate}
+        models={models}
       />
     );
   }
-  return <MeetingLibrary onOpen={setSelectedId} onError={onError} />;
+  return (
+    <MeetingLibrary onOpen={setSelectedId} onError={onError} models={models} />
+  );
 }
 
 // ---- library (high-density list, non-card) ------------------------------
@@ -205,9 +219,11 @@ function matchesFilter(status: MeetingStatus, filter: FilterId): boolean {
 function MeetingLibrary({
   onOpen,
   onError,
+  models,
 }: {
   onOpen: (id: string) => void;
   onError: (e: string | null) => void;
+  models: MeetingModels;
 }) {
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [filter, setFilter] = useState<FilterId>("all");
@@ -365,6 +381,7 @@ function MeetingLibrary({
               startedAtMs={recording.startedAtMs}
               onStopped={onStopped}
               onError={onError}
+              models={models}
             />
           ) : (
             <form
@@ -393,6 +410,7 @@ function MeetingLibrary({
             </form>
           )}
         </div>
+        <MeetingModelSetup models={models} />
         {visible.length === 0 ? (
           <div className="meeting-empty">
             <p className="empty-history-title">
@@ -425,6 +443,139 @@ function MeetingLibrary({
   );
 }
 
+// ---- meeting model install (Paraformer) --------------------------------
+// The download state lives app-level in `./meetingModels` (survives tab
+// switches); these are just the cards/rows that render it. Streaming =
+// record-time preview (~1GB); offline = word-timestamped final transcript +
+// speaker alignment (optional — dictation engine still produces a transcript
+// without it).
+
+const PHASE_LABEL: Record<string, string> = {
+  waiting: "排队中",
+  downloading: "下载中",
+  extracting: "解压中",
+  done: "完成",
+  error: "出错",
+};
+
+function ModelProgressBar({ progress }: { progress: ModelProgressState }) {
+  const pct = progress.percent;
+  const label = PHASE_LABEL[progress.phase] ?? progress.phase;
+  return (
+    <div className="meeting-model-progress">
+      <div className="meeting-model-bar" aria-hidden>
+        <div
+          className={`meeting-model-bar-fill ${pct == null ? "indeterminate" : ""}`}
+          style={{ width: pct == null ? "100%" : `${Math.min(100, pct)}%` }}
+        />
+      </div>
+      <span className="muted-text meeting-model-progress-text">
+        {label}
+        {progress.message ? ` · ${progress.message}` : ""}
+        {pct != null ? ` · ${pct.toFixed(0)}%` : ""}
+      </span>
+    </div>
+  );
+}
+
+function ModelRow({
+  title,
+  desc,
+  ready,
+  target,
+  models,
+}: {
+  title: string;
+  desc: string;
+  ready: boolean;
+  target: ModelTarget;
+  models: MeetingModels;
+}) {
+  const downloading = models.active === target;
+  const otherBusy = models.active !== null && !downloading;
+  return (
+    <div className="meeting-model-row">
+      <div className="meeting-model-row-main">
+        <div className="meeting-model-row-title">
+          <span>{title}</span>
+          <span className={`meeting-model-badge ${ready ? "ok" : ""}`}>
+            {ready ? "已安装" : "未安装"}
+          </span>
+        </div>
+        <p className="muted-text meeting-model-row-desc">{desc}</p>
+        {downloading && models.progress && (
+          <ModelProgressBar progress={models.progress} />
+        )}
+      </div>
+      <div className="meeting-model-row-actions">
+        {ready ? (
+          <span className="muted-text meeting-model-done">✓</span>
+        ) : downloading ? (
+          <button
+            type="button"
+            className="btn ghost small"
+            onClick={() => void models.cancel()}
+          >
+            取消
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="btn small"
+            disabled={otherBusy}
+            onClick={() => void models.download(target)}
+          >
+            下载模型
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Install card shown near the meeting start bar. Collapses to a one-line
+ * "ready" note once both models are installed; hidden entirely until status
+ * loads. */
+function MeetingModelSetup({ models }: { models: MeetingModels }) {
+  const { status } = models;
+  if (!status) return null;
+  const streamingReady = status.paraformerStreamingReady;
+  const offlineReady = status.paraformerOfflineReady;
+  if (streamingReady && offlineReady) {
+    return (
+      <p className="muted-text meeting-model-ready">会议模型已就绪</p>
+    );
+  }
+  return (
+    <div className="card meeting-model-setup">
+      <div className="meeting-model-head">
+        <Icon name="mic" size={14} />
+        <span>会议模型</span>
+        <span className="muted-text meeting-model-head-note">
+          会议转写需要 Paraformer 模型（听写无需）
+        </span>
+      </div>
+      <ModelRow
+        title="实时预览 · Paraformer streaming"
+        desc="录制中实时逐字稿预览。安装包较大（约 1GB），下载时可取消。"
+        ready={streamingReady}
+        target="streaming"
+        models={models}
+      />
+      <ModelRow
+        title="离线终稿 · Paraformer offline（可选）"
+        desc="带词级时间戳的离线终稿 + 说话人对齐；不装也能靠听写引擎出稿。"
+        ready={offlineReady}
+        target="offline"
+        models={models}
+      />
+      {models.error && (
+        <p className="meeting-model-error">{models.error}</p>
+      )}
+    </div>
+  );
+}
+
 // ---- inline recording state --------------------------------------------
 // A deliberately restrained recording strip: ● 正在录制 + elapsed timer + stop,
 // plus a rolling **live transcript** (P3) beneath it when the streaming
@@ -448,11 +599,13 @@ function RecordingBar({
   startedAtMs,
   onStopped,
   onError,
+  models,
 }: {
   meetingId: string;
   startedAtMs: number;
   onStopped: () => void;
   onError: (e: string | null) => void;
+  models: MeetingModels;
 }) {
   // Seconds elapsed since start. Seed from the (possibly reconstructed) start
   // time so a remount mid-recording shows the right clock.
@@ -491,7 +644,12 @@ function RecordingBar({
         <span className="meeting-rec-timer" aria-live="off">
           {formatClock(seconds)}
         </span>
-        <span className="meeting-rec-hint muted-text">听写已暂停</span>
+        <span
+          className="meeting-rec-hint muted-text"
+          title="会议模式独占麦克风，已暂挂全局听写热键以免录制时误触；停止后自动恢复。"
+        >
+          录制中 · 听写快捷键暂停
+        </span>
         <span className="meeting-rec-actions">
           <button
             type="button"
@@ -504,7 +662,7 @@ function RecordingBar({
           </button>
         </span>
       </div>
-      <LiveTranscript />
+      <LiveTranscript models={models} />
     </div>
   );
 }
@@ -517,7 +675,7 @@ function RecordingBar({
 // recording and the offline final transcript are unaffected either way.
 type LiveEvent = { text: string; isFinal: boolean; seq: number };
 
-function LiveTranscript() {
+function LiveTranscript({ models }: { models: MeetingModels }) {
   // Finalized segment lines, in order.
   const [finals, setFinals] = useState<string[]>([]);
   // The current rolling partial (not yet finalized).
@@ -580,10 +738,29 @@ function LiveTranscript() {
               <span className="muted-text">正在聆听…</span>
             ) : null}
           </p>
+        ) : models.status?.paraformerStreamingReady ? (
+          <p className="muted-text meeting-live-empty">正在聆听…</p>
         ) : (
-          <p className="muted-text meeting-live-empty">
-            安装 Paraformer streaming 模型可在录制中实时预览逐字稿（停止后仍会生成带说话人的最终稿）。
-          </p>
+          <div className="meeting-live-empty">
+            <p className="muted-text">
+              安装 Paraformer streaming 模型可在录制中实时预览逐字稿（停止后仍会生成带说话人的最终稿）。
+            </p>
+            {models.active === "streaming" && models.progress ? (
+              <ModelProgressBar progress={models.progress} />
+            ) : (
+              <button
+                type="button"
+                className="btn small meeting-live-install"
+                disabled={models.active !== null}
+                onClick={() => void models.download("streaming")}
+              >
+                下载模型
+              </button>
+            )}
+            {models.error && (
+              <p className="meeting-model-error">{models.error}</p>
+            )}
+          </div>
         )}
       </div>
     </div>
@@ -652,11 +829,13 @@ function MeetingDetailView({
   onBack,
   onError,
   onNavigate,
+  models,
 }: {
   meetingId: string;
   onBack: () => void;
   onError: (e: string | null) => void;
   onNavigate?: (tab: TabId) => void;
+  models: MeetingModels;
 }) {
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -802,7 +981,19 @@ function MeetingDetailView({
           <p className="muted-text">无法读取这场会议。</p>
         </div>
       ) : (
-        <div className="meeting-detail-body">
+        <>
+          {detail.meeting.status === "recording" && (
+            <div className="meeting-detail-recording">
+              <RecordingBar
+                meetingId={detail.meeting.id}
+                startedAtMs={Date.parse(detail.meeting.created_at)}
+                onStopped={() => void load()}
+                onError={onError}
+                models={models}
+              />
+            </div>
+          )}
+          <div className="meeting-detail-body">
           <aside className="card meeting-index">
             <MinutesIndex
               detail={detail}
@@ -813,7 +1004,8 @@ function MeetingDetailView({
             />
           </aside>
           <TranscriptView detail={detail} jump={jump} />
-        </div>
+          </div>
+        </>
       )}
 
       {fullOpen && detail && minutes && (
