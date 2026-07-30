@@ -164,6 +164,11 @@ export function MeetingPanel({
   onNavigate?: (tab: TabId) => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // One models instance for the whole meeting panel: a single
+  // `asr-download-progress` listener and one in-flight download shared across
+  // the library and the detail view, so navigating between them never spawns a
+  // second listener or loses a running (~1GB) download's progress/cancel.
+  const models = useMeetingModels();
 
   if (selectedId) {
     return (
@@ -172,10 +177,13 @@ export function MeetingPanel({
         onBack={() => setSelectedId(null)}
         onError={onError}
         onNavigate={onNavigate}
+        models={models}
       />
     );
   }
-  return <MeetingLibrary onOpen={setSelectedId} onError={onError} />;
+  return (
+    <MeetingLibrary onOpen={setSelectedId} onError={onError} models={models} />
+  );
 }
 
 // ---- library (high-density list, non-card) ------------------------------
@@ -205,9 +213,11 @@ function matchesFilter(status: MeetingStatus, filter: FilterId): boolean {
 function MeetingLibrary({
   onOpen,
   onError,
+  models,
 }: {
   onOpen: (id: string) => void;
   onError: (e: string | null) => void;
+  models: MeetingModels;
 }) {
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [filter, setFilter] = useState<FilterId>("all");
@@ -221,7 +231,6 @@ function MeetingLibrary({
   );
   const [titleDraft, setTitleDraft] = useState("");
   const [starting, setStarting] = useState(false);
-  const models = useMeetingModels();
 
   const refresh = useCallback(
     async (q: string) => {
@@ -913,11 +922,13 @@ function MeetingDetailView({
   onBack,
   onError,
   onNavigate,
+  models,
 }: {
   meetingId: string;
   onBack: () => void;
   onError: (e: string | null) => void;
   onNavigate?: (tab: TabId) => void;
+  models: MeetingModels;
 }) {
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -930,7 +941,6 @@ function MeetingDetailView({
   const [jump, setJump] = useState<{ seconds: number; token: number } | null>(
     null,
   );
-  const models = useMeetingModels();
 
   const load = useCallback(async () => {
     try {
