@@ -20,6 +20,7 @@
 //! integration test that needs model weights and a wav (see `tests/`).
 
 mod assemble;
+mod cleanup;
 mod correct;
 pub mod export;
 pub mod minutes;
@@ -29,6 +30,7 @@ mod process;
 pub use assemble::{
     assemble_meeting, new_meeting, speaker_label, turn_sample_range, AssembledMeeting, DiarTurn,
 };
+pub use cleanup::{cleanup_transcript, should_cleanup, CleanupStats};
 pub use correct::{correct_segment, correct_words, CorrectionDict};
 pub use export::{export_meeting, ExportError, ExportOutput, ExportPreset};
 pub use pipeline::{transcribe_meeting, DiarModels, MeetingError, MeetingOptions};
