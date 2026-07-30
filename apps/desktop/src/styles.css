@@ -2986,6 +2986,121 @@ button.meeting-index-item:hover {
   margin-top: 8px;
 }
 
-.meeting-detail-recording {
-  margin-bottom: 14px;
+/* ---- two-pane recording workspace (Granola-style) -------------------- */
+/* Left = live transcript (star, wider) + ● 录制 strip & stop; right = notes.
+   A bounded height gives each pane its own scroll region so the live
+   transcript and the notes editor fill the column instead of the page. */
+.meeting-rec {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: 14px;
+  align-items: stretch;
+  height: calc(100vh - 210px);
+  min-height: 360px;
+}
+
+.meeting-rec-left,
+.meeting-rec-right {
+  display: flex;
+  flex-direction: column;
+  min-height: 0; /* allow inner scroll areas to shrink below content size */
+}
+
+/* Make the reused RecordingBar's live transcript the star: the ● 录制 strip
+   stays fixed at the top; the transcript grows to fill and scrolls, with
+   slightly larger, more readable text. */
+.meeting-rec-left .meeting-recording-wrap {
+  flex: 1;
+  min-height: 0;
+}
+
+.meeting-rec-left .meeting-live {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.meeting-rec-left .meeting-live-body {
+  flex: 1;
+  max-height: none;
+}
+
+.meeting-rec-left .meeting-live-text {
+  font-size: 1.05rem;
+  line-height: 1.7;
+}
+
+/* Right pane: notes editor fills the column. */
+.meeting-rec-notes {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.meeting-rec-notes-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.meeting-rec-saved {
+  margin-left: auto;
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--accent, var(--muted));
+  animation: mtg-fade 1.5s ease forwards;
+}
+
+@keyframes mtg-fade {
+  0% {
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.5;
+  }
+}
+
+.meeting-rec-notes-input {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  resize: none;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card-soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+
+.meeting-rec-notes-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Narrow windows: stack the panes vertically. */
+@media (max-width: 900px) {
+  .meeting-rec {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+
+  .meeting-rec-left {
+    min-height: 320px;
+  }
+
+  .meeting-rec-right {
+    min-height: 220px;
+  }
 }
