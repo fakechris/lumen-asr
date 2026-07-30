@@ -122,6 +122,22 @@ impl MeetingDetectionService {
         self.active.store(false, Ordering::SeqCst);
     }
 
+    /// Disable path: stop the detector *and* reset the policy, retracting any
+    /// prompt that is currently on screen. Without the reset, turning the
+    /// setting off while a prompt is showing would leave the front-end prompt
+    /// stranded and the policy stuck in `prompted`.
+    pub fn stop_and_reset(&self, app: &AppHandle) {
+        self.stop();
+        let outputs = {
+            let mut policy = match self.policy.lock() {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            policy.reset()
+        };
+        apply_outputs(app, &outputs);
+    }
+
     /// The user accepted the prompt. Advances the policy (arming cooldown and
     /// moving to `recording`) and reports whether a recording should now begin.
     /// The caller performs the actual `start_meeting_recording`.
@@ -167,6 +183,22 @@ impl MeetingDetectionService {
         let now = self.now_ms();
         if let Ok(mut policy) = self.policy.lock() {
             let outputs = policy.handle(DetectionInput::RecordingFinished { now_ms: now });
+            for out in &outputs {
+                if let DetectionOutput::Decision(d) = out {
+                    log_decision(d);
+                }
+            }
+        }
+    }
+
+    /// The accepted recording failed to start (or died on an error path that
+    /// never reached a successful stop). Returns the policy to idle so future
+    /// candidates are not rejected as busy forever; the per-app cooldown armed
+    /// at accept stays in effect (see the policy for the rationale).
+    pub fn recording_failed(&self) {
+        let now = self.now_ms();
+        if let Ok(mut policy) = self.policy.lock() {
+            let outputs = policy.handle(DetectionInput::RecordingFailed { now_ms: now });
             for out in &outputs {
                 if let DetectionOutput::Decision(d) = out {
                     log_decision(d);

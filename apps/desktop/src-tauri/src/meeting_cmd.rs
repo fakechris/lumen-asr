@@ -202,6 +202,14 @@ pub fn stop_meeting_recording(
         Err(e) => tracing::warn!(error = %e, "arbiter end_meeting on stop"),
     }
 
+    // Same finally semantics for meeting detection: whether the recorder stop
+    // below succeeded or failed, the recording is over, so the policy must
+    // leave `recording` — otherwise a stop failure would strand it there and
+    // every future candidate would be rejected as busy. Harmless when this
+    // recording was not started from a detection prompt (the policy no-ops
+    // unless it is tracking an accepted recording).
+    state.meeting_detection.recording_finished();
+
     // Now that the mic and hotkey are restored, surface any recorder failure.
     // Mark the meeting Failed so it does not linger in `Recording`.
     let summary = match stop_result {
@@ -232,11 +240,6 @@ pub fn stop_meeting_recording(
         duration_seconds = summary.duration_seconds,
         "meeting recording stopped → processing"
     );
-
-    // Let meeting detection return to idle (harmless if this recording was not
-    // started from a detection prompt — the policy no-ops unless it is tracking
-    // an accepted recording).
-    state.meeting_detection.recording_finished();
 
     // Kick off transcription in the background so the stop command returns now.
     spawn_meeting_processing(app, id, summary.wav_path.clone());
@@ -300,7 +303,10 @@ pub fn set_meeting_detection_enabled(
     if enabled {
         state.meeting_detection.start(app);
     } else {
-        state.meeting_detection.stop();
+        // Stop the poller AND reset the policy: if a prompt is currently on
+        // screen this emits `meeting-detection-cancelled` so the front-end
+        // retracts it instead of leaving a stale prompt behind.
+        state.meeting_detection.stop_and_reset(&app);
     }
     get_meeting_detection(state)
 }
@@ -318,7 +324,15 @@ pub fn accept_meeting_detection(
         return Ok(String::new());
     }
     // Reuse the proven start command (arbiter gate, hotkey suspend, recorder).
-    start_meeting_recording(app, state, None)
+    // If it fails, tell the policy so it does not sit in `recording` forever
+    // (which would reject every future candidate as busy).
+    match start_meeting_recording(app, state.clone(), None) {
+        Ok(id) => Ok(id),
+        Err(e) => {
+            state.meeting_detection.recording_failed();
+            Err(e)
+        }
+    }
 }
 
 /// The user dismissed a detection prompt (arms the per-app cooldown).

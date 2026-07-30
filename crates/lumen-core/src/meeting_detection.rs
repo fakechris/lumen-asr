@@ -80,6 +80,12 @@ pub enum DetectionInput {
     UserDismissed { now_ms: u64 },
     /// An externally-started recording (that we prompted for) has finished.
     RecordingFinished { now_ms: u64 },
+    /// The recording the user accepted could not actually start (or aborted on
+    /// an error path that never reached a successful stop). Without this exit
+    /// the machine would sit in `recording` forever, rejecting every future
+    /// candidate as `busy_with_other_candidate` — silently disabling detection
+    /// until restart.
+    RecordingFailed { now_ms: u64 },
 }
 
 /// Side-effect requests the host should carry out. The policy itself performs
@@ -241,7 +247,36 @@ impl MeetingDetectionPolicy {
             DetectionInput::UserAccepted { now_ms } => self.on_user_accepted(now_ms),
             DetectionInput::UserDismissed { now_ms } => self.on_user_dismissed(now_ms),
             DetectionInput::RecordingFinished { now_ms } => self.on_recording_finished(now_ms),
+            DetectionInput::RecordingFailed { now_ms } => self.on_recording_failed(now_ms),
         }
+    }
+
+    /// Force the machine back to `Idle`, retracting any visible prompt. Used
+    /// when the user disables detection while a prompt is showing (otherwise the
+    /// prompt stays on screen and the policy stays `Prompted` after the detector
+    /// stops). Cooldowns are preserved on purpose: re-enabling shortly after
+    /// must not instantly re-nag about an app the user just dealt with.
+    pub fn reset(&mut self) -> Vec<DetectionOutput> {
+        let outputs = match &self.state {
+            State::Idle => Vec::new(),
+            State::Prompted { cand } => vec![
+                DetectionOutput::CancelPrompt,
+                DetectionOutput::Decision(DetectionDecision::new(
+                    cand.bundle_id.clone(),
+                    "detection_disabled",
+                    "prompt_cancelled_reset",
+                )),
+            ],
+            State::Candidate { cand, .. } | State::Recording { cand } => {
+                vec![DetectionOutput::Decision(DetectionDecision::new(
+                    cand.bundle_id.clone(),
+                    "detection_disabled",
+                    "reset_to_idle",
+                ))]
+            }
+        };
+        self.state = State::Idle;
+        outputs
     }
 
     fn on_candidate_added(&mut self, cand: Candidate, now_ms: u64) -> Vec<DetectionOutput> {
@@ -406,6 +441,27 @@ impl MeetingDetectionPolicy {
             return vec![DetectionOutput::Decision(DetectionDecision::new(
                 app,
                 "recording_ended",
+                "idle",
+            ))];
+        }
+        Vec::new()
+    }
+
+    /// The accepted recording never (successfully) happened: return to `Idle`
+    /// so future candidates are not rejected as busy forever.
+    ///
+    /// The cooldown armed at accept is deliberately *kept*: the user already
+    /// acted on this app's prompt and sees the start error in the UI, and the
+    /// cause of a start failure (mic busy, another capture active) usually
+    /// persists for a while — an instant re-prompt for the same app would nag
+    /// without helping. Other apps are unaffected either way.
+    fn on_recording_failed(&mut self, _now_ms: u64) -> Vec<DetectionOutput> {
+        if let State::Recording { cand } = &self.state {
+            let app = cand.bundle_id.clone();
+            self.state = State::Idle;
+            return vec![DetectionOutput::Decision(DetectionDecision::new(
+                app,
+                "recording_failed",
                 "idle",
             ))];
         }
@@ -751,6 +807,109 @@ mod tests {
             State::Prompted { cand } => assert_eq!(cand.bundle_id, "us.zoom.xos"),
             other => panic!("expected prompted zoom, got {other:?}"),
         }
+    }
+
+    // --- Recording-failure exit (no stuck Recording state) ------------------
+
+    #[test]
+    fn failed_start_returns_to_idle_and_detection_keeps_working() {
+        let mut p = MeetingDetectionPolicy::with_defaults();
+        p.handle(added(native("zoom#1"), 0));
+        p.handle(DetectionInput::Tick { now_ms: 3_000 });
+        assert!(has_start(
+            &p.handle(DetectionInput::UserAccepted { now_ms: 3_500 })
+        ));
+        assert_eq!(p.phase(), "recording");
+        // start_meeting_recording failed → policy must not stay stuck.
+        p.handle(DetectionInput::RecordingFailed { now_ms: 4_000 });
+        assert_eq!(p.phase(), "idle");
+        // A *different* app can become a candidate and prompt again — the
+        // machine is not permanently "busy_with_other_candidate".
+        let slack = Candidate {
+            app_class: AppClass::NativeMeeting,
+            bundle_id: "com.tinyspeck.slackmacgap".to_string(),
+            session_key: "slack#1".to_string(),
+        };
+        p.handle(DetectionInput::CandidateAdded {
+            candidate: slack,
+            now_ms: 5_000,
+        });
+        assert_eq!(p.phase(), "candidate");
+        assert!(has_show_prompt(
+            &p.handle(DetectionInput::Tick { now_ms: 8_000 })
+        ));
+    }
+
+    #[test]
+    fn failed_start_keeps_the_accept_cooldown_for_the_same_app() {
+        let mut p = MeetingDetectionPolicy::with_defaults();
+        p.handle(added(native("zoom#1"), 0));
+        p.handle(DetectionInput::Tick { now_ms: 3_000 });
+        p.handle(DetectionInput::UserAccepted { now_ms: 3_500 });
+        p.handle(DetectionInput::RecordingFailed { now_ms: 4_000 });
+        // Same app inside the cooldown window: suppressed (no nagging while the
+        // start-failure cause likely persists) …
+        let outs = p.handle(added(native("zoom#2"), 10_000));
+        assert!(!has_show_prompt(&outs));
+        assert_eq!(p.phase(), "idle");
+        // … but after the cooldown elapses it can be tracked again.
+        p.handle(added(native("zoom#3"), 3_500 + 120_000 + 1));
+        assert_eq!(p.phase(), "candidate");
+    }
+
+    #[test]
+    fn recording_failed_outside_recording_is_a_noop() {
+        let mut p = MeetingDetectionPolicy::with_defaults();
+        assert!(p
+            .handle(DetectionInput::RecordingFailed { now_ms: 0 })
+            .is_empty());
+        assert_eq!(p.phase(), "idle");
+        p.handle(added(native("zoom#1"), 0));
+        assert!(p
+            .handle(DetectionInput::RecordingFailed { now_ms: 100 })
+            .is_empty());
+        assert_eq!(p.phase(), "candidate");
+    }
+
+    // --- Reset (disable while active) ---------------------------------------
+
+    #[test]
+    fn reset_while_prompted_cancels_the_prompt() {
+        let mut p = MeetingDetectionPolicy::with_defaults();
+        p.handle(added(native("zoom#1"), 0));
+        assert!(has_show_prompt(
+            &p.handle(DetectionInput::Tick { now_ms: 3_000 })
+        ));
+        let outs = p.reset();
+        assert!(has_cancel(&outs), "visible prompt must be retracted");
+        assert_eq!(p.phase(), "idle");
+    }
+
+    #[test]
+    fn reset_while_idle_or_candidate_emits_no_cancel() {
+        let mut p = MeetingDetectionPolicy::with_defaults();
+        assert!(p.reset().is_empty());
+        p.handle(added(native("zoom#1"), 0));
+        let outs = p.reset();
+        assert!(!has_cancel(&outs), "no prompt was shown");
+        assert_eq!(p.phase(), "idle");
+    }
+
+    #[test]
+    fn reset_preserves_cooldowns() {
+        let mut p = MeetingDetectionPolicy::with_defaults();
+        p.handle(added(native("zoom#1"), 0));
+        p.handle(DetectionInput::Tick { now_ms: 3_000 });
+        p.handle(DetectionInput::UserDismissed { now_ms: 3_100 });
+        p.reset();
+        // Re-enabled shortly after: the dismissed app is still in cooldown.
+        let outs = p.handle(added(native("zoom#2"), 10_000));
+        assert!(!has_show_prompt(&outs));
+        assert_eq!(p.phase(), "idle");
+        assert!(outs.iter().any(|o| matches!(
+            o,
+            DetectionOutput::Decision(d) if d.reason == "cooldown"
+        )));
     }
 
     // --- User actions in wrong states are inert -----------------------------

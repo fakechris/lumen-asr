@@ -733,27 +733,31 @@ export default function App() {
 }
 
 // Friendly display name for a detected meeting app's bundle id. Falls back to
-// the raw id so an unmapped-but-allow-listed app still reads sensibly.
+// the raw id so an unmapped-but-allow-listed app still reads sensibly. Keys are
+// lowercase and the lookup lowercases too: the backend passes the OS-reported
+// bundle id, whose casing varies (e.g. `com.apple.FaceTime`).
 const MEETING_APP_LABELS: Record<string, string> = {
   "us.zoom.xos": "Zoom",
   "com.microsoft.teams": "Microsoft Teams",
   "com.microsoft.teams2": "Microsoft Teams",
   "com.tinyspeck.slackmacgap": "Slack",
-  "com.apple.FaceTime": "FaceTime",
+  "com.apple.facetime": "FaceTime",
   "com.cisco.webexmeetingsapp": "Webex",
   "com.webex.meetingmanager": "Webex",
-  "com.hnc.Discord": "Discord",
+  "com.hnc.discord": "Discord",
   "com.skype.skype": "Skype",
   "com.microsoft.skypeforbusiness": "Skype for Business",
   "com.google.meetings": "Google Meet",
 };
 
 function meetingAppLabel(bundleId: string): string {
-  return MEETING_APP_LABELS[bundleId] || bundleId;
+  return MEETING_APP_LABELS[bundleId.toLowerCase()] || bundleId;
 }
 
 // App-level, non-blocking prompt shown when the backend detects likely meeting
 // audio activity. It never records on its own — the user must click "开始记录".
+// Accessibility: labelled by its title, focus moves to the primary action on
+// open, and Esc dismisses (same as clicking 忽略).
 function DetectionPrompt({
   bundleId,
   onStart,
@@ -763,16 +767,33 @@ function DetectionPrompt({
   onStart: () => void;
   onDismiss: () => void;
 }) {
+  const startRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    startRef.current?.focus();
+  }, []);
   return (
-    <div className="detection-prompt" role="alertdialog" aria-live="polite">
+    <div
+      className="detection-prompt"
+      role="alertdialog"
+      aria-labelledby="detection-prompt-title"
+      aria-describedby="detection-prompt-sub"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          onDismiss();
+        }
+      }}
+    >
       <div className="detection-prompt-body">
-        <span className="detection-prompt-title">检测到可能的会议</span>
-        <span className="detection-prompt-sub">
+        <span id="detection-prompt-title" className="detection-prompt-title">
+          检测到可能的会议
+        </span>
+        <span id="detection-prompt-sub" className="detection-prompt-sub">
           {meetingAppLabel(bundleId)} 正在使用麦克风。是否开始记录本次会议？
         </span>
       </div>
       <div className="detection-prompt-actions">
-        <button type="button" className="btn" onClick={onStart}>
+        <button type="button" className="btn" ref={startRef} onClick={onStart}>
           开始记录
         </button>
         <button type="button" className="btn ghost" onClick={onDismiss}>
