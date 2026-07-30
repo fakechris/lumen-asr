@@ -1,7 +1,13 @@
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api, type AsrModelStatus } from "./api";
+import { api } from "./api";
+import {
+  useMeetingModels,
+  type MeetingModels,
+  type ModelProgressState,
+  type ModelTarget,
+} from "./meetingModels";
 import { Icon } from "./Icons";
 import { diarGuidance, isNoLlmMarker } from "./meetingGuidance";
 import type {
@@ -164,10 +170,10 @@ export function MeetingPanel({
   onNavigate?: (tab: TabId) => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // One models instance for the whole meeting panel: a single
-  // `asr-download-progress` listener and one in-flight download shared across
-  // the library and the detail view, so navigating between them never spawns a
-  // second listener or loses a running (~1GB) download's progress/cancel.
+  // App-level model state (from MeetingModelsProvider at the App root). It is
+  // not tied to this panel's lifetime, so a running (~1GB) download's
+  // progress/cancel survive switching tabs away and back, and the library and
+  // detail view always share one listener and one in-flight download.
   const models = useMeetingModels();
 
   if (selectedId) {
@@ -438,31 +444,11 @@ function MeetingLibrary({
 }
 
 // ---- meeting model install (Paraformer) --------------------------------
-// Meeting transcription needs the Paraformer models, which onboarding may have
-// skipped. This shared hook + card let users install them from inside the
-// meeting library (and, via the same state, from the live-transcript empty
-// state). Streaming = record-time preview (~1GB); offline = word-timestamped
-// final transcript + speaker alignment (optional — dictation engine still
-// produces a transcript without it). The backend commands and the
-// `asr-download-progress` event already exist; this is pure UI.
-
-type ModelTarget = "streaming" | "offline";
-
-type ModelProgressState = {
-  phase: string;
-  message: string;
-  percent: number | null;
-};
-
-type MeetingModels = {
-  status: AsrModelStatus | null;
-  active: ModelTarget | null;
-  progress: ModelProgressState | null;
-  error: string | null;
-  download: (target: ModelTarget) => Promise<void>;
-  cancel: () => Promise<void>;
-  refresh: () => Promise<void>;
-};
+// The download state lives app-level in `./meetingModels` (survives tab
+// switches); these are just the cards/rows that render it. Streaming =
+// record-time preview (~1GB); offline = word-timestamped final transcript +
+// speaker alignment (optional — dictation engine still produces a transcript
+// without it).
 
 const PHASE_LABEL: Record<string, string> = {
   waiting: "排队中",
@@ -471,85 +457,6 @@ const PHASE_LABEL: Record<string, string> = {
   done: "完成",
   error: "出错",
 };
-
-/** Owns Paraformer model status + a single in-flight download. Only one model
- * downloads at a time (the backend cancel command is global), so `active` marks
- * which target is running and disables the other. `download()` resolves with the
- * refreshed status; the `asr-download-progress` listener drives the progress bar
- * meanwhile (same pattern as OnboardingWizard). */
-function useMeetingModels(): MeetingModels {
-  const [status, setStatus] = useState<AsrModelStatus | null>(null);
-  const [active, setActive] = useState<ModelTarget | null>(null);
-  const [progress, setProgress] = useState<ModelProgressState | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const refresh = useCallback(async () => {
-    try {
-      setStatus(await api.checkAsrModelStatus());
-      setError(null);
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  useEffect(() => {
-    let un: (() => void) | undefined;
-    let disposed = false;
-    void listen<{
-      phase: string;
-      message: string;
-      bytes: number;
-      total: number | null;
-      percent?: number | null;
-    }>("asr-download-progress", (e) => {
-      const p = e.payload;
-      const pct =
-        p.percent ??
-        (p.total && p.total > 0 ? (p.bytes / p.total) * 100 : null);
-      setProgress({ phase: p.phase, message: p.message, percent: pct });
-    }).then((fn) => {
-      if (disposed) fn();
-      else un = fn;
-    });
-    return () => {
-      disposed = true;
-      un?.();
-    };
-  }, []);
-
-  const download = useCallback(async (target: ModelTarget) => {
-    setError(null);
-    setActive(target);
-    setProgress({ phase: "waiting", message: "准备下载…", percent: null });
-    try {
-      const next =
-        target === "streaming"
-          ? await api.downloadParaformerStreaming()
-          : await api.downloadParaformerOffline();
-      setStatus(next);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActive(null);
-      setProgress(null);
-    }
-  }, []);
-
-  const cancel = useCallback(async () => {
-    try {
-      await api.cancelAsrModelDownload();
-    } catch (e) {
-      setError(String(e));
-    }
-    // active/progress clear when the in-flight download() promise settles.
-  }, []);
-
-  return { status, active, progress, error, download, cancel, refresh };
-}
 
 function ModelProgressBar({ progress }: { progress: ModelProgressState }) {
   const pct = progress.percent;
