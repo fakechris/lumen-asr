@@ -39,11 +39,11 @@ pub use lumen_models::{
     default_whisper_dir_with_root, download_paraformer_offline_package,
     download_paraformer_streaming_package, download_sensevoice_package, legacy_model_roots,
     lumen_models_dir, lumen_models_dir_with_override, paraformer_streaming_ready, qwen_ready,
-    scan_model_candidates, scan_model_candidates_with_root, sensevoice_ready,
-    shared_sensevoice_dir, shared_whisper_dir, user_home_dir, whisper_ready, DownloadError,
-    DownloadProgress, ModelCandidate, ModelInstallLock, ENV_LUMEN_MODELS_DIR,
-    PARAFORMER_OFFLINE_ARCHIVE_URL, PARAFORMER_STREAMING_ARCHIVE_URL, SENSEVOICE_ARCHIVE_NAME,
-    SENSEVOICE_ARCHIVE_URL,
+    resolve_qwen_asr_dir, resolve_sensevoice_dir, scan_model_candidates,
+    scan_model_candidates_with_root, sensevoice_ready, shared_sensevoice_dir, shared_whisper_dir,
+    user_home_dir, whisper_ready, DownloadError, DownloadProgress, ModelCandidate,
+    ModelInstallLock, ENV_LUMEN_MODELS_DIR, PARAFORMER_OFFLINE_ARCHIVE_URL,
+    PARAFORMER_STREAMING_ARCHIVE_URL, SENSEVOICE_ARCHIVE_NAME, SENSEVOICE_ARCHIVE_URL,
 };
 
 /// Status of the default SenseVoice install (default dir + readiness probe).
