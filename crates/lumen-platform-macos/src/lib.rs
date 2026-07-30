@@ -3,6 +3,7 @@
 mod focused_field;
 mod hotkey_tap;
 mod inject;
+mod meeting_activity;
 mod permissions;
 
 pub use focused_field::{focused_text_field_snapshot, FocusedTextFieldSnapshot};
@@ -11,6 +12,10 @@ pub use hotkey_tap::{
     HotkeyMode, HotkeySpec,
 };
 pub use inject::MacTextInjectorBackend;
+pub use meeting_activity::{
+    capability_available as meeting_detection_capability_available, ActiveInput, DetectorSignal,
+    MeetingActivityDetector, DEFAULT_POLL as MEETING_DETECTION_DEFAULT_POLL,
+};
 pub use permissions::{
     ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,
 };

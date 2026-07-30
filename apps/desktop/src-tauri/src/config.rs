@@ -50,12 +50,19 @@ pub struct MeetingConfig {
     /// Defaults to `true` so a user with an LLM configured gets a cleaned
     /// transcript automatically.
     pub transcript_cleanup: bool,
+    /// Opt-in automatic meeting detection: watch for audio-input activity from
+    /// known meeting apps and *prompt* (never auto-record) to start a meeting.
+    /// Defaults to `false` — the feature ships off so users enable it
+    /// deliberately, keeping first-run false positives out of the default
+    /// experience. Only runs when this is on AND the OS capability is present.
+    pub detection_enabled: bool,
 }
 
 impl Default for MeetingConfig {
     fn default() -> Self {
         Self {
             transcript_cleanup: true,
+            detection_enabled: false,
         }
     }
 }
@@ -960,6 +967,31 @@ provider = "local_sensevoice"
         )
         .unwrap();
         assert!(config.meeting.transcript_cleanup);
+    }
+
+    #[test]
+    fn meeting_detection_defaults_off_and_opts_in() {
+        // Ships off by default…
+        assert!(!MeetingConfig::default().detection_enabled);
+        assert!(!AppConfig::default().meeting.detection_enabled);
+        // …absent from an existing config → still off…
+        let existing: AppConfig = toml::from_str(
+            r#"
+[asr]
+provider = "local_sensevoice"
+"#,
+        )
+        .unwrap();
+        assert!(!existing.meeting.detection_enabled);
+        // …and can be explicitly enabled.
+        let enabled: AppConfig = toml::from_str(
+            r#"
+[meeting]
+detection_enabled = true
+"#,
+        )
+        .unwrap();
+        assert!(enabled.meeting.detection_enabled);
     }
 
     #[test]

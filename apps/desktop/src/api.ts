@@ -110,6 +110,15 @@ export type HotkeyIntent = {
   enabled: boolean;
 };
 
+export type MeetingDetectionStatus = {
+  /** The user's opt-in preference (persisted). */
+  enabled: boolean;
+  /** Whether this OS exposes the audio-activity capability at all. */
+  capabilityAvailable: boolean;
+  /** Whether the detector poller is currently running. */
+  active: boolean;
+};
+
 export const api = {
   health: () => invoke<Health>("app_health"),
   buildInfo: () => invoke<BuildInfo>("build_info"),
@@ -439,6 +448,26 @@ export const api = {
       query: opts?.query ?? null,
       limit: opts?.limit ?? null,
     }),
+
+  // ---- Meeting detection (opt-in, capability-gated) ---------------------
+
+  /** Read the meeting-detection opt-in preference plus runtime
+   * capability/active state (for the settings toggle). */
+  getMeetingDetection: () =>
+    invoke<MeetingDetectionStatus>("get_meeting_detection"),
+
+  /** Toggle the opt-in preference; starts/stops the detector to match. */
+  setMeetingDetectionEnabled: (enabled: boolean) =>
+    invoke<MeetingDetectionStatus>("set_meeting_detection_enabled", { enabled }),
+
+  /** User accepted a detection prompt → start recording via the existing path.
+   * Resolves the new meeting id, or "" if nothing was started. */
+  acceptMeetingDetection: () =>
+    invoke<string>("accept_meeting_detection"),
+
+  /** User dismissed a detection prompt (arms a per-app cooldown). */
+  dismissMeetingDetection: () =>
+    invoke<void>("dismiss_meeting_detection"),
 
   /** Read one meeting with its speakers, seq-ordered segments, and summaries. */
   getMeetingDetail: (meetingId: string) =>
