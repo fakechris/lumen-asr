@@ -28,9 +28,16 @@ DOCS_IMG="$ROOT/docs/images"
 [[ -f "$SRC" ]] || { echo "ERROR: missing source SVG: $SRC" >&2; exit 1; }
 command -v rsvg-convert >/dev/null || { echo "ERROR: need rsvg-convert (brew install librsvg)" >&2; exit 1; }
 command -v iconutil >/dev/null || { echo "ERROR: need iconutil (macOS)" >&2; exit 1; }
-ICO_TOOL=""
-command -v magick >/dev/null && ICO_TOOL="magick"
-[[ -z "$ICO_TOOL" ]] && command -v convert >/dev/null && ICO_TOOL="convert"
+# icon.ico is a required output (tauri.conf.json references it), so a missing
+# converter must fail the run rather than silently skip it.
+if command -v magick >/dev/null; then
+  ICO_TOOL="magick"
+elif command -v convert >/dev/null; then
+  ICO_TOOL="convert"
+else
+  echo "ERROR: need magick or convert (brew install imagemagick) to regenerate icon.ico" >&2
+  exit 1
+fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -66,11 +73,7 @@ png 128 "$TAURI_ICONS/128x128.png"
 png 256 "$TAURI_ICONS/128x128@2x.png"
 cp "$TMP/icon.icns" "$TAURI_ICONS/icon.icns"
 cp "$TMP/icon.icns" "$TAURI_ICONS/Lumen.icns"
-if [[ -n "$ICO_TOOL" ]]; then
-  "$ICO_TOOL" "$TMP/master-1024.png" -define icon:auto-resize=256,128,64,48,32,16 "$TAURI_ICONS/icon.ico"
-else
-  echo "WARNING: no magick/convert — skipping icon.ico (Windows bundle icon)" >&2
-fi
+"$ICO_TOOL" "$TMP/master-1024.png" -define icon:auto-resize=256,128,64,48,32,16 "$TAURI_ICONS/icon.ico"
 
 echo "==> write app-icon masters → $APP_ICON"
 mkdir -p "$APP_ICON/Lumen.iconset"
