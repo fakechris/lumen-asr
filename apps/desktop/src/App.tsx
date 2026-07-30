@@ -143,6 +143,9 @@ const NAV: { id: TabId; label: string; icon: IconName; title: string; blurb: str
 export default function App() {
   const [tab, setTab] = useState<TabId>("record");
   const [health, setHealth] = useState<Health | null>(null);
+  // Build identity for the version chip (same source as Settings' build line):
+  // shows which git build is actually running next to the crate version.
+  const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [editFeedbackRevision, setEditFeedbackRevision] = useState(0);
@@ -306,6 +309,15 @@ export default function App() {
     })();
   }, [refreshHealth]);
 
+  // Build identity is static for the process; fetch once. A failure just leaves
+  // the chip showing the version alone (no sha), never blocking the header.
+  useEffect(() => {
+    api
+      .buildInfo()
+      .then(setBuildInfo)
+      .catch(() => setBuildInfo(null));
+  }, []);
+
   useEffect(() => {
     if (tab === "history" || tab === "overview") void refreshSessions();
     if (tab === "dictionary" || tab === "overview" || tab === "learn")
@@ -438,7 +450,13 @@ export default function App() {
               </div>
               {health && (
                 <div className="actions" style={{ marginTop: 0 }}>
-                  <span className="chip">v{health.version}</span>
+                  <span
+                    className="chip"
+                    title="版本 · git 短 sha（当前运行的构建）"
+                  >
+                    v{health.version}
+                    {buildInfo?.git_sha ? ` · ${buildInfo.git_sha}` : ""}
+                  </span>
                 </div>
               )}
             </div>

@@ -2149,21 +2149,73 @@ html:has(.capsule-root) body {
 .meeting-row {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 4px;
   width: 100%;
-  text-align: left;
   border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  transition: background 0.12s var(--ease), border-color 0.12s var(--ease);
+}
+
+.meeting-row:hover {
+  background: color-mix(in srgb, var(--text) 3.5%, transparent);
+}
+
+/* Clickable "open" area — everything except the trailing row actions. */
+.meeting-row-open {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  border: none;
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text);
   font: inherit;
   padding: 9px 12px;
   cursor: pointer;
-  transition: background 0.12s var(--ease), border-color 0.12s var(--ease);
 }
 
-.meeting-row:hover {
-  background: color-mix(in srgb, var(--text) 3.5%, transparent);
+/* Rename / delete actions: revealed on hover or keyboard focus so the row stays
+   calm at rest but the entries are one hover away (and always reachable by
+   keyboard). */
+.meeting-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 6px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.12s var(--ease);
+}
+
+.meeting-row:hover .meeting-row-actions,
+.meeting-row:focus-within .meeting-row-actions {
+  opacity: 1;
+}
+
+/* Inline rename editor replacing the row contents while editing. */
+.meeting-row-editing {
+  gap: 8px;
+  padding: 6px 8px 6px 12px;
+}
+
+.meeting-row-rename-input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.95rem;
+  padding: 6px 10px;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.meeting-row-rename-input:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent, var(--text)) 45%, var(--border));
 }
 
 .meeting-row-main {
@@ -2492,6 +2544,72 @@ button.meeting-index-item:hover {
 .meeting-modal-close {
   font-size: 1.3rem;
   line-height: 1;
+}
+
+/* Destructive-action confirmation dialog (centered, compact). */
+.meeting-confirm {
+  width: min(420px, 100%);
+  align-self: center;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+
+.meeting-confirm-title {
+  margin: 0 0 8px;
+  font-size: 1.02rem;
+}
+
+.meeting-confirm-message {
+  margin: 0 0 18px;
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+
+.meeting-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* Detail-header title editing. */
+.meeting-detail-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.meeting-detail-title-edit-btn {
+  width: 26px;
+  height: 26px;
+  opacity: 0;
+  transition: opacity 0.12s var(--ease);
+}
+
+.meeting-detail-titles:hover .meeting-detail-title-edit-btn,
+.meeting-detail-title:focus-within .meeting-detail-title-edit-btn {
+  opacity: 1;
+}
+
+.meeting-detail-title-edit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.meeting-detail-title-input {
+  font: inherit;
+  font-size: 1.25rem;
+  font-weight: 600;
+  padding: 4px 10px;
+  min-width: 240px;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.meeting-detail-title-input:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent, var(--text)) 45%, var(--border));
 }
 
 .meeting-sec {

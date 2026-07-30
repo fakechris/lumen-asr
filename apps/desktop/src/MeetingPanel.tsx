@@ -323,6 +323,39 @@ function MeetingLibrary({
     void refresh(query);
   }, [refresh, query]);
 
+  // Rename a meeting in place, then refresh so the row shows the new title.
+  const renameMeeting = useCallback(
+    async (id: string, title: string) => {
+      onError(null);
+      try {
+        await api.renameMeeting(id, title);
+        await refresh(query);
+      } catch (e) {
+        onError(String(e));
+      }
+    },
+    [refresh, query, onError],
+  );
+
+  // Delete flow: a row asks to delete → we hold the target here and render a
+  // confirmation dialog; only an explicit confirm calls the backend.
+  const [pendingDelete, setPendingDelete] = useState<Meeting | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    onError(null);
+    try {
+      await api.deleteMeeting(pendingDelete.id);
+      setPendingDelete(null);
+      await refresh(query);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setDeleting(false);
+    }
+  }, [pendingDelete, refresh, query, onError]);
+
   const visible = meetings.filter((m) => matchesFilter(m.status, filter));
 
   // Group by day, preserving the newest-first order the backend returns.
@@ -434,7 +467,12 @@ function MeetingLibrary({
                 <ul className="meeting-rows">
                   {g.items.map((m) => (
                     <li key={m.id}>
-                      <MeetingRow meeting={m} onOpen={() => onOpen(m.id)} />
+                      <MeetingRow
+                        meeting={m}
+                        onOpen={() => onOpen(m.id)}
+                        onRename={(title) => renameMeeting(m.id, title)}
+                        onRequestDelete={() => setPendingDelete(m)}
+                      />
                     </li>
                   ))}
                 </ul>
@@ -443,6 +481,17 @@ function MeetingLibrary({
           </div>
         )}
       </section>
+
+      {pendingDelete && (
+        <ConfirmDialog
+          title="删除会议？"
+          message={`「${meetingTitle(pendingDelete)}」将被永久删除，包括逐字稿、说话人、纪要与录音文件。此操作不可撤销。`}
+          confirmLabel="删除"
+          busy={deleting}
+          onConfirm={() => void confirmDelete()}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </div>
   );
 }
@@ -914,35 +963,206 @@ function StatusBadge({
 function MeetingRow({
   meeting,
   onOpen,
+  onRename,
+  onRequestDelete,
 }: {
   meeting: Meeting;
   onOpen: () => void;
+  /** Persist a new title. Resolves when the backend write + refresh finish. */
+  onRename: (title: string) => Promise<void>;
+  /** Ask the library to open the delete-confirmation dialog for this meeting. */
+  onRequestDelete: () => void;
 }) {
-  return (
-    <button type="button" className="meeting-row" onClick={onOpen}>
-      <div className="meeting-row-main">
-        <span className="meeting-row-title">{meetingTitle(meeting)}</span>
-        <span className="meeting-row-meta">
-          {formatTimeOfDay(meeting.created_at)}
-          <span className="dotsep">·</span>
-          {formatDuration(meeting.duration_seconds)}
-          {meeting.language ? (
-            <>
-              <span className="dotsep">·</span>
-              {meeting.language}
-            </>
-          ) : null}
-        </span>
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(meeting.title ?? "");
+  const [saving, setSaving] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // A recording meeting is still being captured; renaming/deleting it mid-flight
+  // is confusing, so hide the row actions until it leaves `recording`.
+  const locked = meeting.status === "recording";
+
+  const beginEdit = useCallback(() => {
+    setDraft(meeting.title ?? "");
+    setEditing(true);
+  }, [meeting.title]);
+
+  useEffect(() => {
+    if (editing) inputRef.current?.select();
+  }, [editing]);
+
+  const commit = useCallback(async () => {
+    const next = draft.trim();
+    // No change → just close the editor (empty ↔ untitled counts as no change).
+    if (next === (meeting.title ?? "").trim()) {
+      setEditing(false);
+      return;
+    }
+    setSaving(true);
+    try {
+      await onRename(next);
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }, [draft, meeting.title, onRename]);
+
+  if (editing) {
+    return (
+      <div className="meeting-row meeting-row-editing">
+        <input
+          ref={inputRef}
+          className="meeting-row-rename-input"
+          type="text"
+          value={draft}
+          placeholder="会议标题"
+          disabled={saving}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void commit();
+            else if (e.key === "Escape") setEditing(false);
+          }}
+        />
+        <div className="meeting-row-actions">
+          <button
+            type="button"
+            className="btn small"
+            disabled={saving}
+            onClick={() => void commit()}
+          >
+            {saving ? "保存中…" : "保存"}
+          </button>
+          <button
+            type="button"
+            className="btn ghost small"
+            disabled={saving}
+            onClick={() => setEditing(false)}
+          >
+            取消
+          </button>
+        </div>
       </div>
-      <StatusBadge
-        status={meeting.status}
-        title={
-          meeting.status === "failed"
-            ? (meeting.failure_reason ?? undefined)
-            : undefined
-        }
-      />
-    </button>
+    );
+  }
+
+  return (
+    <div className="meeting-row">
+      <button type="button" className="meeting-row-open" onClick={onOpen}>
+        <div className="meeting-row-main">
+          <span className="meeting-row-title">{meetingTitle(meeting)}</span>
+          <span className="meeting-row-meta">
+            {formatTimeOfDay(meeting.created_at)}
+            <span className="dotsep">·</span>
+            {formatDuration(meeting.duration_seconds)}
+            {meeting.language ? (
+              <>
+                <span className="dotsep">·</span>
+                {meeting.language}
+              </>
+            ) : null}
+          </span>
+        </div>
+        <StatusBadge
+          status={meeting.status}
+          title={
+            meeting.status === "failed"
+              ? (meeting.failure_reason ?? undefined)
+              : undefined
+          }
+        />
+      </button>
+      {!locked && (
+        <div className="meeting-row-actions">
+          <button
+            type="button"
+            className="icon-btn"
+            title="重命名"
+            aria-label="重命名会议"
+            onClick={beginEdit}
+          >
+            <Icon name="pencil" size={15} />
+          </button>
+          <button
+            type="button"
+            className="icon-btn danger"
+            title="删除"
+            aria-label="删除会议"
+            onClick={onRequestDelete}
+          >
+            <Icon name="delete" size={15} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A small centered confirmation dialog for destructive actions. Reuses the
+ * meeting modal chrome; Esc / overlay-click cancels, so an accidental open is
+ * cheap to back out of. The confirm button is `danger` and auto-focused. */
+function ConfirmDialog({
+  title,
+  message,
+  confirmLabel,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    confirmRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !busy) onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [busy, onCancel]);
+
+  return (
+    <div
+      className="meeting-modal-overlay"
+      role="presentation"
+      onClick={() => {
+        if (!busy) onCancel();
+      }}
+    >
+      <div
+        className="card meeting-confirm"
+        role="alertdialog"
+        aria-modal="true"
+        aria-label={title}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="meeting-confirm-title">{title}</h3>
+        <p className="meeting-confirm-message muted-text">{message}</p>
+        <div className="meeting-confirm-actions">
+          <button
+            type="button"
+            className="btn ghost small"
+            disabled={busy}
+            onClick={onCancel}
+          >
+            取消
+          </button>
+          <button
+            ref={confirmRef}
+            type="button"
+            className="btn small danger"
+            disabled={busy}
+            onClick={onConfirm}
+          >
+            {busy ? "处理中…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -976,6 +1196,11 @@ function MeetingDetailView({
   const [jump, setJump] = useState<{ seconds: number; token: number } | null>(
     null,
   );
+  // Inline title editing on the detail header.
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [savingTitle, setSavingTitle] = useState(false);
+  const titleInputRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async () => {
     try {
@@ -1009,6 +1234,35 @@ function MeetingDetailView({
     // Transcript is already visible; just (re)scroll it to the source turn.
     setJump({ seconds: src.start, token: Date.now() });
   }, []);
+
+  const beginTitleEdit = useCallback(() => {
+    setTitleDraft(detail?.meeting.title ?? "");
+    setEditingTitle(true);
+  }, [detail?.meeting.title]);
+
+  useEffect(() => {
+    if (editingTitle) titleInputRef.current?.select();
+  }, [editingTitle]);
+
+  const commitTitle = useCallback(async () => {
+    const next = titleDraft.trim();
+    const current = (detail?.meeting.title ?? "").trim();
+    if (next === current) {
+      setEditingTitle(false);
+      return;
+    }
+    setSavingTitle(true);
+    onError(null);
+    try {
+      await api.renameMeeting(meetingId, next);
+      setEditingTitle(false);
+      await load();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setSavingTitle(false);
+    }
+  }, [titleDraft, detail?.meeting.title, meetingId, load, onError]);
 
   async function doExport(preset: ExportPreset) {
     setExportOpen(false);
@@ -1050,9 +1304,54 @@ function MeetingDetailView({
           ← 会议库
         </button>
         <div className="meeting-detail-titles">
-          <h2 className="meeting-detail-title">
-            {meeting ? meetingTitle(meeting) : "加载中…"}
-          </h2>
+          {editingTitle && meeting ? (
+            <div className="meeting-detail-title-edit">
+              <input
+                ref={titleInputRef}
+                className="meeting-detail-title-input"
+                type="text"
+                value={titleDraft}
+                placeholder="会议标题"
+                disabled={savingTitle}
+                onChange={(e) => setTitleDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void commitTitle();
+                  else if (e.key === "Escape") setEditingTitle(false);
+                }}
+              />
+              <button
+                type="button"
+                className="btn small"
+                disabled={savingTitle}
+                onClick={() => void commitTitle()}
+              >
+                {savingTitle ? "保存中…" : "保存"}
+              </button>
+              <button
+                type="button"
+                className="btn ghost small"
+                disabled={savingTitle}
+                onClick={() => setEditingTitle(false)}
+              >
+                取消
+              </button>
+            </div>
+          ) : (
+            <h2 className="meeting-detail-title">
+              {meeting ? meetingTitle(meeting) : "加载中…"}
+              {meeting && meeting.status !== "recording" && (
+                <button
+                  type="button"
+                  className="icon-btn meeting-detail-title-edit-btn"
+                  title="重命名"
+                  aria-label="重命名会议"
+                  onClick={beginTitleEdit}
+                >
+                  <Icon name="pencil" size={15} />
+                </button>
+              )}
+            </h2>
+          )}
           {meeting && (
             <div className="meeting-detail-sub muted-text">
               {formatFullDate(meeting.created_at)}
