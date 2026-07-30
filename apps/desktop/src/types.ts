@@ -447,6 +447,9 @@ export type Meeting = {
   /** Why a `failed` meeting failed (missing diar models, unsupported platform,
    * …); absent on every non-failed meeting. */
   failure_reason?: string | null;
+  /** Free-form notes the user took during the meeting (empty until written).
+   * Fed to the minutes LLM pass as extra context. */
+  notes: string;
 };
 
 /** Result of `stop_meeting_recording` (camelCase DTO). */

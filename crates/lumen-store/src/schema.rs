@@ -5,8 +5,9 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 
 /// Current storage schema version. v6 added the meeting data model
 /// (`meetings`, `speakers`, `transcript_segments`, `meeting_summaries`); v7
-/// adds the additive `meetings.failure_reason` column.
-pub(crate) const SCHEMA_VERSION: i64 = 7;
+/// adds the additive `meetings.failure_reason` column; v8 adds the additive
+/// `meetings.notes` column (user notes taken during the meeting).
+pub(crate) const SCHEMA_VERSION: i64 = 8;
 
 /// Additive v6 migration: the meeting-mode tables. These sit alongside the
 /// dictation tables and never touch them. `speakers` is created before
@@ -269,6 +270,28 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     };
     if !has_failure_reason {
         conn.execute("ALTER TABLE meetings ADD COLUMN failure_reason TEXT", [])?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (7)",
+        [],
+    )?;
+    // v8: additive `notes` column on `meetings` (free-form user notes taken
+    // during the meeting). Guarded by a column check (SQLite has no `ADD COLUMN
+    // IF NOT EXISTS`) so re-running is a no-op. The `NOT NULL DEFAULT ''` back-
+    // fills every existing row with an empty string.
+    let has_notes = {
+        let mut statement = conn.prepare("PRAGMA table_info(meetings)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "notes")
+    };
+    if !has_notes {
+        conn.execute(
+            "ALTER TABLE meetings ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
     }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
@@ -621,6 +644,66 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, "ready");
+
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_eight_adds_notes_column_defaulting_empty_without_touching_v7_meetings() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Stand up a v7 database (schema recorded up to 7, meetings table with
+        // failure_reason but without notes) holding one meeting row.
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (1),(2),(3),(4),(5),(6),(7);
+                CREATE TABLE meetings (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  title TEXT,
+                  audio_path TEXT,
+                  duration_seconds REAL,
+                  status TEXT NOT NULL DEFAULT 'recording',
+                  language TEXT,
+                  failure_reason TEXT
+                );
+                INSERT INTO meetings (id, created_at, status, title)
+                VALUES ('m1', '2026-07-25T00:00:00Z', 'ready', '旧会议');
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        // The new column exists and every pre-existing row defaults to ''.
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(meetings)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"notes".to_owned()));
+
+        let notes: String = connection
+            .query_row("SELECT notes FROM meetings WHERE id='m1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(notes, "");
+        // The pre-existing meeting row is otherwise untouched.
+        let title: String = connection
+            .query_row("SELECT title FROM meetings WHERE id='m1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "旧会议");
 
         let version: i64 = connection
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {

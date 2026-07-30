@@ -14,7 +14,7 @@
 
 use lumen_core::{MeetingSummary, Speaker, SummaryKind, TranscriptSegment};
 use lumen_corrector::{CorrectRequest, Corrector, DictionaryContext};
-use lumen_prompts::{build_minutes_system_prompt, minutes_user_message};
+use lumen_prompts::{build_minutes_system_prompt, minutes_user_message_with_notes};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -196,13 +196,19 @@ pub fn minutes_summaries(
 /// Builds the minutes system prompt + user message, calls the LLM (OpenAI-compat
 /// client behind the trait), then parses the JSON. `max_tokens` overrides the
 /// output budget ([`DEFAULT_MINUTES_MAX_TOKENS`] when `None`).
+///
+/// `notes` are the free-form notes the user took during the meeting: when
+/// present and non-blank they are fused into the prompt as extra context so the
+/// structured minutes reflect what the user flagged as important (Granola-style).
+/// Passing `None` (or blank notes) yields the transcript-only behaviour.
 pub async fn generate_minutes(
     corrector: &dyn Corrector,
     transcript: &str,
+    notes: Option<&str>,
     max_tokens: Option<u32>,
 ) -> Result<Minutes, MinutesError> {
     let request = CorrectRequest {
-        text: minutes_user_message(transcript),
+        text: minutes_user_message_with_notes(transcript, notes),
         dictionary: DictionaryContext::default(),
         context_json: None,
         system_prompt: build_minutes_system_prompt(),
@@ -344,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn generate_minutes_parses_canned_llm_output() {
         let corrector = CannedCorrector(Ok(SAMPLE_JSON.to_string()));
-        let minutes = generate_minutes(&corrector, "[0-2] S1：你好", None)
+        let minutes = generate_minutes(&corrector, "[0-2] S1：你好", None, None)
             .await
             .unwrap();
         assert_eq!(minutes.decisions.len(), 1);
@@ -354,14 +360,54 @@ mod tests {
     async fn generate_minutes_surfaces_llm_and_parse_failures() {
         let failed = CannedCorrector(Err(()));
         assert!(matches!(
-            generate_minutes(&failed, "x", None).await,
+            generate_minutes(&failed, "x", None, None).await,
             Err(MinutesError::Llm(_))
         ));
 
         let garbage = CannedCorrector(Ok("no json here".to_string()));
         assert!(matches!(
-            generate_minutes(&garbage, "x", None).await,
+            generate_minutes(&garbage, "x", None, None).await,
             Err(MinutesError::NoJson)
         ));
+    }
+
+    /// Corrector that records the prompt text it was asked to correct, so a test
+    /// can assert the user's notes were fused into the minutes request.
+    struct CapturingCorrector(std::sync::Mutex<Option<String>>);
+
+    #[async_trait]
+    impl Corrector for CapturingCorrector {
+        fn id(&self) -> CorrectorEngineId {
+            CorrectorEngineId::OpenAiCompatible
+        }
+        async fn correct(&self, req: CorrectRequest) -> Result<CorrectResult, CorrectorError> {
+            *self.0.lock().unwrap() = Some(req.text.clone());
+            Ok(CorrectResult {
+                text: SAMPLE_JSON.to_string(),
+                engine: CorrectorEngineId::OpenAiCompatible,
+                model_applied: true,
+                fallback_reason: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_minutes_fuses_user_notes_into_the_prompt() {
+        let corrector = CapturingCorrector(std::sync::Mutex::new(None));
+        let minutes = generate_minutes(&corrector, "[0-2] S1：你好", Some("跟进预算问题"), None)
+            .await
+            .unwrap();
+        assert_eq!(minutes.decisions.len(), 1);
+        let sent = corrector.0.lock().unwrap().clone().unwrap();
+        assert!(sent.contains("USER_NOTES_BEGIN"));
+        assert!(sent.contains("跟进预算问题"));
+
+        // Blank notes leave the prompt in its transcript-only shape.
+        let corrector = CapturingCorrector(std::sync::Mutex::new(None));
+        generate_minutes(&corrector, "[0-2] S1：你好", Some("  "), None)
+            .await
+            .unwrap();
+        let sent = corrector.0.lock().unwrap().clone().unwrap();
+        assert!(!sent.contains("USER_NOTES_BEGIN"));
     }
 }

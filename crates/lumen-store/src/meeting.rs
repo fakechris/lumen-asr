@@ -24,8 +24,8 @@ impl Store {
             r#"
             INSERT INTO meetings (
               id, created_at, title, audio_path, duration_seconds, status,
-              language, failure_reason
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+              language, failure_reason, notes
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
             "#,
             params![
                 meeting.id.to_string(),
@@ -36,6 +36,7 @@ impl Store {
                 meeting.status.as_str(),
                 meeting.language,
                 meeting.failure_reason,
+                meeting.notes,
             ],
         )?;
         Ok(())
@@ -99,12 +100,24 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Overwrite a meeting's free-form user notes. The caller (front-end)
+    /// debounces; this is a plain last-write-wins update of just the `notes`
+    /// column, leaving every other field untouched. Returns `true` if a row was
+    /// updated.
+    pub fn set_meeting_notes(&self, id: Uuid, notes: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE meetings SET notes=?2 WHERE id=?1",
+            params![id.to_string(), notes],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn get_meeting(&self, id: Uuid) -> Result<Option<Meeting>> {
         self.conn
             .query_row(
                 r#"
                 SELECT id, created_at, title, audio_path, duration_seconds, status,
-                       language, failure_reason
+                       language, failure_reason, notes
                 FROM meetings WHERE id=?1
                 "#,
                 params![id.to_string()],
@@ -119,7 +132,7 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, created_at, title, audio_path, duration_seconds, status,
-                   language, failure_reason
+                   language, failure_reason, notes
             FROM meetings
             ORDER BY created_at DESC
             LIMIT ?1
@@ -152,7 +165,7 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, created_at, title, audio_path, duration_seconds, status,
-                   language, failure_reason
+                   language, failure_reason, notes
             FROM meetings
             WHERE (?1 IS NULL OR status = ?1)
               AND (?2 IS NULL OR instr(title, ?2) > 0)
@@ -440,6 +453,7 @@ fn map_meeting(row: &rusqlite::Row<'_>) -> rusqlite::Result<Meeting> {
         status: MeetingStatus::from_str_or_recording(&row.get::<_, String>(5)?),
         language: row.get(6)?,
         failure_reason: row.get(7)?,
+        notes: row.get(8)?,
     })
 }
 
@@ -538,6 +552,52 @@ mod tests {
         let listed = store.list_meetings(10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, meeting.id);
+    }
+
+    #[test]
+    fn set_meeting_notes_updates_only_notes_and_defaults_empty() {
+        let (_dir, store) = open_store();
+        let mut meeting = Meeting::new();
+        meeting.title = Some("Standup".into());
+        // A fresh meeting starts with empty notes.
+        assert_eq!(meeting.notes, "");
+        store.create_meeting(&meeting).unwrap();
+
+        // The persisted row reads back empty notes.
+        let fresh = store.get_meeting(meeting.id).unwrap().unwrap();
+        assert_eq!(fresh.notes, "");
+
+        // Writing notes updates only that field.
+        assert!(store
+            .set_meeting_notes(meeting.id, "记得跟进预算\n- 张三负责上线")
+            .unwrap());
+        let updated = store.get_meeting(meeting.id).unwrap().unwrap();
+        assert_eq!(updated.notes, "记得跟进预算\n- 张三负责上线");
+        assert_eq!(updated.title.as_deref(), Some("Standup"));
+        assert_eq!(updated.status, MeetingStatus::Recording);
+
+        // Last-write-wins overwrite, including clearing back to empty.
+        assert!(store.set_meeting_notes(meeting.id, "").unwrap());
+        assert_eq!(store.get_meeting(meeting.id).unwrap().unwrap().notes, "");
+
+        // Notes come through the aggregate detail read as well.
+        assert!(store.set_meeting_notes(meeting.id, "重点A").unwrap());
+        let detail = store.get_meeting_detail(meeting.id).unwrap().unwrap();
+        assert_eq!(detail.meeting.notes, "重点A");
+
+        // No row for an unknown id.
+        assert!(!store.set_meeting_notes(Uuid::new_v4(), "x").unwrap());
+    }
+
+    #[test]
+    fn create_meeting_persists_initial_notes() {
+        let (_dir, store) = open_store();
+        let mut meeting = Meeting::new();
+        meeting.notes = "开场要点".into();
+        store.create_meeting(&meeting).unwrap();
+        let fetched = store.get_meeting(meeting.id).unwrap().unwrap();
+        assert_eq!(fetched, meeting);
+        assert_eq!(fetched.notes, "开场要点");
     }
 
     #[test]

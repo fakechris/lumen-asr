@@ -99,6 +99,12 @@ pub struct Meeting {
     /// known (e.g. missing diarization models, or diarization unsupported on
     /// this platform). Absent on every non-failed meeting.
     pub failure_reason: Option<String>,
+    /// Free-form notes the user jots down while the meeting is being recorded.
+    /// Empty (never absent) until the user writes something. These are fed to
+    /// the minutes LLM pass as extra context so the structured summary reflects
+    /// what the user themselves flagged as important, alongside the transcript.
+    #[serde(default)]
+    pub notes: String,
 }
 
 impl Meeting {
@@ -113,6 +119,7 @@ impl Meeting {
             status: MeetingStatus::Recording,
             language: None,
             failure_reason: None,
+            notes: String::new(),
         }
     }
 }
