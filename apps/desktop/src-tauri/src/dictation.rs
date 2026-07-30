@@ -11,8 +11,8 @@ use crate::pipeline_attempt::{
 use crate::session_debug;
 use crate::AppState;
 use lumen_asr::{
-    lumen_models_dir, paraformer_offline_ready, prepare_for_asr, probe_status, AsrEngine,
-    AsrRequest, AsrResult, AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr,
+    lumen_models_dir, paraformer_offline_ready, prepare_for_asr, probe_status, sensevoice_ready,
+    AsrEngine, AsrRequest, AsrResult, AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr,
     OpenAiAudioConfig, ParaformerAsr, QwenShadowRequest, QwenShadowTerm,
 };
 use lumen_core::{DictEntryKind, FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
@@ -1426,45 +1426,60 @@ pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
 
 /// Build the offline meeting-transcription ASR engine.
 ///
-/// Meetings persist **per-turn word timestamps** (M4c click-to-seek) and apply
-/// **hotword biasing** from the user's dictionary — both of which only the
-/// offline Paraformer engine provides. So the meeting engine is Paraformer-first
-/// and independent of the *dictation* ASR provider selection (dictation keeps
-/// SenseVoice/Whisper/Qwen/cloud as configured; this is the meeting path only).
+/// Meeting transcription is **diarization-first**: the audio is segmented into
+/// speaker turns and each turn is transcribed independently, so speaker
+/// attribution comes from the diarizer and does not depend on Paraformer's
+/// word-level timestamps. Given that, SenseVoice is preferred for the final
+/// transcript — it produces punctuation and handles multiple languages, so its
+/// quality is higher, and it is the same model dictation already provisions
+/// (shared via the cluster resolver). Post-ASR dictionary correction still runs
+/// afterward. This is the meeting path only; dictation keeps its own configured
+/// provider (SenseVoice/Whisper/Qwen/cloud).
 ///
 /// Resolution:
-/// 1. If the Paraformer offline model is provisioned under
-///    `<lumen_models_dir>/paraformer/offline/`, use [`ParaformerAsr`].
-/// 2. Otherwise fall back to the already-provisioned SenseVoice engine and log a
-///    warning — the meeting still transcribes, just without word-level
-///    timestamps or hotwords.
+/// 1. Use the already-provisioned SenseVoice engine (`state.sensevoice`), whose
+///    model dir was resolved at startup via the shared cluster resolver (shared
+///    root + legacy dirs incl. Shandianshuo). Preferred when ready.
+/// 2. Legacy fallback: if SenseVoice is somehow unprovisioned but an offline
+///    Paraformer model exists under `<lumen_models_dir>/paraformer/offline/`,
+///    transcribe with [`ParaformerAsr`] rather than fail.
+/// 3. Otherwise return an error — no usable meeting ASR model is installed.
 ///
 /// The returned engine is `Send + Sync` (trait requirement), so it can be moved
 /// into the background meeting-processing task.
 pub(crate) fn build_meeting_asr_engine(state: &AppState) -> Result<Box<dyn AsrEngine>, String> {
-    // Directory convention shared with lumen-models: `<root>/paraformer/offline/`.
-    let paraformer_dir = lumen_models_dir().join("paraformer").join("offline");
-    if paraformer_offline_ready(&paraformer_dir) {
-        tracing::info!(
-            dir = %paraformer_dir.display(),
-            "meeting ASR engine: Paraformer (offline, word timestamps + hotwords)"
-        );
-        return Ok(Box::new(ParaformerAsr::new(paraformer_dir)));
-    }
-
-    // Robustness: no Paraformer model installed -> use the provisioned SenseVoice
-    // engine so meetings still work (without word-level timestamps / hotwords).
-    tracing::warn!(
-        dir = %paraformer_dir.display(),
-        "Paraformer offline model not installed; meeting falls back to SenseVoice \
-         (no word-level timestamps / hotwords)"
-    );
-    let engine = state
+    // Preferred: the shared SenseVoice engine (punctuation + multilingual),
+    // resolved at startup from the shared cluster root / legacy dirs.
+    let sensevoice = state
         .sensevoice
         .lock()
         .map_err(|_| "asr lock poisoned".to_string())?
         .clone();
-    Ok(Box::new(engine))
+    if sensevoice_ready(&sensevoice.model_dir()) {
+        tracing::info!(
+            dir = %sensevoice.model_dir().display(),
+            "meeting ASR engine: SenseVoice (punctuation + multilingual, shared with dictation)"
+        );
+        return Ok(Box::new(sensevoice));
+    }
+
+    // Legacy fallback: SenseVoice not provisioned, but an offline Paraformer model
+    // is installed under the shared convention `<root>/paraformer/offline/`. Kept
+    // so meetings still transcribe rather than fail; no longer the preferred path.
+    let paraformer_dir = lumen_models_dir().join("paraformer").join("offline");
+    if paraformer_offline_ready(&paraformer_dir) {
+        tracing::warn!(
+            dir = %paraformer_dir.display(),
+            "SenseVoice model not provisioned; meeting falls back to offline Paraformer"
+        );
+        return Ok(Box::new(ParaformerAsr::new(paraformer_dir)));
+    }
+
+    Err(
+        "meeting transcription needs a provisioned SenseVoice model, but none was found \
+         (install SenseVoice or select an existing model dir)"
+            .to_string(),
+    )
 }
 
 async fn run_asr(
@@ -1974,10 +1989,56 @@ mod attempt_metric_tests {
     use super::*;
     use crate::config::AppConfig;
     use crate::{AppState, QwenRuntimeStatus};
-    use lumen_asr::{AudioCapture, SenseVoiceSherpaAsr, WhisperAsr};
+    use lumen_asr::{AsrEngineId, AudioCapture, SenseVoiceSherpaAsr, WhisperAsr};
     use lumen_dictionary::DictionaryEntry;
     use lumen_store::{Store, MAX_ATTEMPT_PAGE_SIZE};
+    use std::path::Path;
     use std::sync::Mutex;
+
+    /// Minimal `AppState` for meeting-engine selection tests, pointing SenseVoice
+    /// at `sensevoice_dir`. All other engines/dirs are placeholders under `dir`.
+    fn test_state_with_sensevoice(dir: &Path, sensevoice_dir: std::path::PathBuf) -> AppState {
+        let config = AppConfig::default();
+        let context = crate::context_capture::ContextRecorder::new(&config.context, dir);
+        let qwen = crate::qwen_engine_from_config(&config.asr);
+        let qwen_executable = qwen.python_executable().to_path_buf();
+        AppState {
+            store: Mutex::new(Some(Store::open(dir.join("capture.sqlite")).unwrap())),
+            audio: AudioCapture::new(),
+            meeting_recorder: lumen_asr::MeetingRecorder::new(),
+            meeting_live: crate::meeting_live::MeetingLive::default(),
+            capture: crate::mode_arbiter::CaptureArbiter::new(),
+            engine: Mutex::new(EngineKind::SenseVoice),
+            sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sensevoice_dir)),
+            qwen: Mutex::new(qwen),
+            qwen_runtime: Mutex::new(QwenRuntimeStatus {
+                executable: qwen_executable,
+                ready: false,
+                checking: false,
+                generation: 0,
+            }),
+            whisper: Mutex::new(WhisperAsr::new(dir.join("whisper"))),
+            config: Mutex::new(config),
+            context,
+        }
+    }
+
+    #[test]
+    fn meeting_engine_prefers_sensevoice_when_provisioned() {
+        let dir = tempfile::tempdir().unwrap();
+        // Make the SenseVoice dir "ready": model + tokens files present.
+        let sensevoice_dir = dir.path().join("sensevoice");
+        std::fs::create_dir_all(&sensevoice_dir).unwrap();
+        std::fs::write(sensevoice_dir.join("model.int8.onnx"), b"model").unwrap();
+        std::fs::write(sensevoice_dir.join("tokens.txt"), b"tokens").unwrap();
+
+        let state = test_state_with_sensevoice(dir.path(), sensevoice_dir);
+        let engine = build_meeting_asr_engine(&state).unwrap();
+        // Meeting final transcript now uses SenseVoice (punctuation + multilingual),
+        // not Paraformer offline. SenseVoice being ready short-circuits before any
+        // real shared-root Paraformer lookup, so this stays environment-isolated.
+        assert_eq!(engine.id(), AsrEngineId::SenseVoiceSherpa);
+    }
 
     #[test]
     fn insertion_strategies_map_to_distinct_metric_outcomes() {

@@ -33,9 +33,9 @@ pub(crate) static MACOS_LIVE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mu
 
 use config::AppConfig;
 use lumen_asr::{
-    default_qwen_dir, default_sensevoice_dir, default_whisper_dir, qwen_ready, sensevoice_ready,
-    whisper_ready, AudioCapture, EngineKind, MeetingRecorder, QwenAsr, QwenAsrConfig,
-    SenseVoiceSherpaAsr, WhisperAsr,
+    default_qwen_dir, default_sensevoice_dir, default_whisper_dir, qwen_ready,
+    resolve_qwen_asr_dir, resolve_sensevoice_dir, sensevoice_ready, whisper_ready, AudioCapture,
+    EngineKind, MeetingRecorder, QwenAsr, QwenAsrConfig, SenseVoiceSherpaAsr, WhisperAsr,
 };
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
@@ -75,13 +75,33 @@ pub struct AppState {
     pub context: context_capture::ContextRecorder,
 }
 
-fn qwen_engine_from_config(config: &config::AsrServiceConfig) -> QwenAsr {
-    let selected = config.model_dir_for(EngineKind::Qwen);
-    let model_dir = if !selected.as_os_str().is_empty() && qwen_ready(&selected) {
-        selected
+/// Shared model-dir resolution policy for local engines (dictation + startup).
+///
+/// Backward compatible: a non-empty, valid `configured` override always wins.
+/// When the user's config is empty or points at an unready dir, defer to the
+/// shared cluster resolver (`shared` — shared root plus read-only legacy dirs),
+/// and finally to the shared-root `default` (which may not exist yet) so
+/// "not installed" reporting and downloads keep targeting the right place.
+fn resolve_local_model_dir(
+    configured: PathBuf,
+    ready: impl Fn(&Path) -> bool,
+    shared: impl FnOnce() -> Option<PathBuf>,
+    default: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    if !configured.as_os_str().is_empty() && ready(&configured) {
+        configured
     } else {
-        default_qwen_dir()
-    };
+        shared().unwrap_or_else(default)
+    }
+}
+
+fn qwen_engine_from_config(config: &config::AsrServiceConfig) -> QwenAsr {
+    let model_dir = resolve_local_model_dir(
+        config.model_dir_for(EngineKind::Qwen),
+        qwen_ready,
+        || resolve_qwen_asr_dir(None),
+        default_qwen_dir,
+    );
     QwenAsr::new(QwenAsrConfig::product(
         config.qwen_python_executable(),
         model_dir,
@@ -231,11 +251,16 @@ pub fn run() {
 
     let initial_engine = dictation::engine_kind_for_provider(&app_config.asr.provider)
         .unwrap_or(EngineKind::SenseVoice);
-    let selected_sensevoice_dir = app_config.asr.model_dir_for(EngineKind::SenseVoice);
-    let sv_dir = (!selected_sensevoice_dir.as_os_str().is_empty()
-        && sensevoice_ready(&selected_sensevoice_dir))
-    .then_some(selected_sensevoice_dir)
-    .unwrap_or_else(default_sensevoice_dir);
+    // Backward compatible: an explicit, valid config override wins; otherwise the
+    // shared resolver finds the first ready SenseVoice across the shared cluster
+    // root and legacy dirs (incl. Shandianshuo `sensevoice-small`, read-only), and
+    // finally the shared-root default so "not installed" reporting / downloads work.
+    let sv_dir = resolve_local_model_dir(
+        app_config.asr.model_dir_for(EngineKind::SenseVoice),
+        sensevoice_ready,
+        || resolve_sensevoice_dir(None),
+        default_sensevoice_dir,
+    );
     let selected_whisper_dir = app_config.asr.model_dir_for(EngineKind::Whisper);
     let wh_dir = (!selected_whisper_dir.as_os_str().is_empty()
         && whisper_ready(&selected_whisper_dir))
@@ -499,5 +524,69 @@ mod tests {
             dictation::ensure_active_asr_ready("local_qwen", "Qwen", false, true).unwrap_err();
         assert!(checking.contains("正在检查"));
         assert!(dictation::ensure_active_asr_ready("local_qwen", "Qwen", true, false).is_ok());
+    }
+}
+
+/// Cross-platform (incl. Windows) unit tests for the shared model-dir resolution
+/// policy that backs both dictation-engine startup and Qwen construction.
+#[cfg(test)]
+mod resolution_tests {
+    use super::resolve_local_model_dir;
+    use std::path::PathBuf;
+
+    #[test]
+    fn valid_config_override_wins_over_shared_and_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir.path().join("user-model");
+        let picked = resolve_local_model_dir(
+            configured.clone(),
+            |_| true, // configured dir is "ready"
+            || panic!("shared resolver must not run when config override is valid"),
+            || panic!("default must not run when config override is valid"),
+        );
+        assert_eq!(picked, configured);
+    }
+
+    #[test]
+    fn empty_config_falls_back_to_shared_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared-root-model");
+        let shared_for_closure = shared.clone();
+        let picked = resolve_local_model_dir(
+            PathBuf::new(), // no config override
+            |_| true,
+            move || Some(shared_for_closure),
+            || panic!("default must not run when shared resolution succeeds"),
+        );
+        assert_eq!(picked, shared);
+    }
+
+    #[test]
+    fn unready_config_override_is_ignored_for_shared_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir.path().join("stale-user-model");
+        let shared = dir.path().join("shared-root-model");
+        let shared_for_closure = shared.clone();
+        let picked = resolve_local_model_dir(
+            configured,
+            |_| false, // configured dir exists in config but is not ready
+            move || Some(shared_for_closure),
+            || panic!("default must not run when shared resolution succeeds"),
+        );
+        assert_eq!(picked, shared);
+    }
+
+    #[test]
+    fn nothing_installed_falls_back_to_default_for_not_installed_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = dir.path().join("shared-download-target");
+        let default_for_closure = default.clone();
+        let picked = resolve_local_model_dir(
+            PathBuf::new(),
+            |_| true,
+            || None, // shared resolver finds nothing ready anywhere
+            move || default_for_closure,
+        );
+        assert_eq!(picked, default);
     }
 }
