@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { ChangeEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
@@ -307,12 +307,16 @@ function MeetingLibrary({
       setActive({ id, startedAtMs: Date.now() });
       setTitleDraft("");
       await refresh(query);
+      // Land the user straight in the two-pane recording view. The library
+      // still derives its own "录制中" indicator from the meeting row, so
+      // navigating back (← 会议库) shows the recording and can re-open it.
+      onOpen(id);
     } catch (e) {
       onError(String(e));
     } finally {
       setStarting(false);
     }
-  }, [titleDraft, refresh, query, onError]);
+  }, [titleDraft, refresh, query, onError, onOpen]);
 
   const onStopped = useCallback(() => {
     setActive(null);
@@ -767,6 +771,131 @@ function LiveTranscript({ models }: { models: MeetingModels }) {
   );
 }
 
+// ---- two-pane recording workspace (Granola-style) ----------------------
+// While a meeting is `recording`, the detail page becomes a two-pane
+// workspace. Left (the star, wider): the live transcript — reusing
+// `RecordingBar`, which already stacks the ● 录制 strip + stop button on top of
+// the auto-scrolling `LiveTranscript`. Right: a free-form notes editor whose
+// text autosaves and is fused into the minutes LLM pass after stop, so what the
+// user jots here shapes the generated 纪要.
+function RecordingWorkspace({
+  meeting,
+  onStopped,
+  onError,
+  models,
+}: {
+  meeting: Meeting;
+  onStopped: () => void;
+  onError: (e: string | null) => void;
+  models: MeetingModels;
+}) {
+  return (
+    <div className="meeting-rec">
+      <div className="meeting-rec-left">
+        <RecordingBar
+          meetingId={meeting.id}
+          startedAtMs={Date.parse(meeting.created_at)}
+          onStopped={onStopped}
+          onError={onError}
+          models={models}
+        />
+      </div>
+      <div className="meeting-rec-right">
+        <MeetingNotesEditor
+          meetingId={meeting.id}
+          initialNotes={meeting.notes}
+          onError={onError}
+        />
+      </div>
+    </div>
+  );
+}
+
+// Free-form notes editor with debounced autosave. The latest typed value is
+// mirrored into a ref so `blur` and unmount (e.g. when the recording stops and
+// this view is torn down) can flush the final value even if the debounce timer
+// has not yet fired — no lost characters. Saves are last-write-wins on the
+// backend; a failed save rolls the "persisted" marker back so a later edit
+// retries.
+const NOTES_DEBOUNCE_MS = 800;
+
+function MeetingNotesEditor({
+  meetingId,
+  initialNotes,
+  onError,
+}: {
+  meetingId: string;
+  initialNotes: string;
+  onError: (e: string | null) => void;
+}) {
+  const [value, setValue] = useState(initialNotes);
+  const [saved, setSaved] = useState(false);
+  // Latest typed value (for flush) and the value last persisted (to skip
+  // no-op saves and to detect what still needs writing).
+  const latestRef = useRef(initialNotes);
+  const savedValueRef = useRef(initialNotes);
+  const timerRef = useRef<number | null>(null);
+  const savedFadeRef = useRef<number | null>(null);
+
+  const flush = useCallback(async () => {
+    if (timerRef.current != null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    const next = latestRef.current;
+    if (next === savedValueRef.current) return;
+    const prev = savedValueRef.current;
+    savedValueRef.current = next; // optimistic — blocks a duplicate concurrent save
+    try {
+      await api.saveMeetingNotes(meetingId, next);
+      setSaved(true);
+      if (savedFadeRef.current != null) window.clearTimeout(savedFadeRef.current);
+      savedFadeRef.current = window.setTimeout(() => setSaved(false), 1500);
+    } catch (e) {
+      savedValueRef.current = prev; // let a later flush retry the failed write
+      onError(String(e));
+    }
+  }, [meetingId, onError]);
+
+  const onChange = useCallback(
+    (e: ChangeEvent<HTMLTextAreaElement>) => {
+      const next = e.target.value;
+      setValue(next);
+      latestRef.current = next;
+      setSaved(false);
+      if (timerRef.current != null) window.clearTimeout(timerRef.current);
+      timerRef.current = window.setTimeout(() => void flush(), NOTES_DEBOUNCE_MS);
+    },
+    [flush],
+  );
+
+  // Flush the final value on unmount (covers the recording→processing teardown
+  // when the user hits stop). `flush` is stable, so this runs only on unmount.
+  useEffect(() => {
+    return () => {
+      if (savedFadeRef.current != null) window.clearTimeout(savedFadeRef.current);
+      void flush();
+    };
+  }, [flush]);
+
+  return (
+    <div className="card meeting-rec-notes">
+      <div className="meeting-rec-notes-head">
+        <Icon name="clipboard" size={13} />
+        <span>我的笔记</span>
+        {saved && <span className="meeting-rec-saved">已保存</span>}
+      </div>
+      <textarea
+        className="meeting-rec-notes-input"
+        value={value}
+        onChange={onChange}
+        onBlur={() => void flush()}
+        placeholder="随手记要点…（停止后 AI 会结合逐字稿整理成纪要）"
+      />
+    </div>
+  );
+}
+
 function StatusBadge({
   status,
   title,
@@ -980,20 +1109,19 @@ function MeetingDetailView({
         <div className="card meeting-empty">
           <p className="muted-text">无法读取这场会议。</p>
         </div>
+      ) : detail.meeting.status === "recording" ? (
+        // Granola-style two-pane recording view: live transcript (star, left)
+        // + free-form notes editor (right). Replaces the old recording banner;
+        // once stopped the status leaves `recording` and the review body below
+        // renders instead.
+        <RecordingWorkspace
+          meeting={detail.meeting}
+          onStopped={() => void load()}
+          onError={onError}
+          models={models}
+        />
       ) : (
-        <>
-          {detail.meeting.status === "recording" && (
-            <div className="meeting-detail-recording">
-              <RecordingBar
-                meetingId={detail.meeting.id}
-                startedAtMs={Date.parse(detail.meeting.created_at)}
-                onStopped={() => void load()}
-                onError={onError}
-                models={models}
-              />
-            </div>
-          )}
-          <div className="meeting-detail-body">
+        <div className="meeting-detail-body">
           <aside className="card meeting-index">
             <MinutesIndex
               detail={detail}
@@ -1004,8 +1132,7 @@ function MeetingDetailView({
             />
           </aside>
           <TranscriptView detail={detail} jump={jump} />
-          </div>
-        </>
+        </div>
       )}
 
       {fullOpen && detail && minutes && (
