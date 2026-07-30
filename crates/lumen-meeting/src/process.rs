@@ -159,7 +159,22 @@ async fn run(
             .update_meeting_status(meeting_id, MeetingStatus::Summarizing)
             .map_err(ProcessError::Store)?;
         let transcript = render_transcript_for_minutes(&assembled.segments, &assembled.speakers);
-        let doc = generate_minutes(cfg.corrector, &transcript, cfg.max_tokens).await?;
+        // Fuse in the notes the user took during the meeting (Granola-style): the
+        // minutes LLM sees both the transcript and the user's own highlights, so
+        // the structured summary reflects what the user flagged as important. A
+        // meeting with no notes falls back to transcript-only summarization.
+        let notes = store
+            .get_meeting(meeting_id)
+            .map_err(ProcessError::Store)?
+            .map(|m| m.notes)
+            .unwrap_or_default();
+        let doc = generate_minutes(
+            cfg.corrector,
+            &transcript,
+            Some(notes.as_str()),
+            cfg.max_tokens,
+        )
+        .await?;
         for row in minutes_summaries(meeting_id, &doc, cfg.model.as_deref())? {
             store.save_summary(&row).map_err(ProcessError::Store)?;
         }

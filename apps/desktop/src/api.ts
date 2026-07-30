@@ -444,6 +444,12 @@ export const api = {
   getMeetingDetail: (meetingId: string) =>
     invoke<MeetingDetail>("get_meeting_detail", { meetingId }),
 
+  /** Overwrite the user's free-form notes for a meeting (last-write-wins;
+   * debounce on the caller side). These notes are fused into the minutes LLM
+   * pass as extra context. Resolves `true` if the meeting row was updated. */
+  saveMeetingNotes: (meetingId: string, notes: string) =>
+    invoke<boolean>("save_meeting_notes", { meetingId, notes }),
+
   /** Render a meeting into one of the four export presets. */
   exportMeeting: (meetingId: string, preset: ExportPreset) =>
     invoke<ExportOutput>("export_meeting", { meetingId, preset }),

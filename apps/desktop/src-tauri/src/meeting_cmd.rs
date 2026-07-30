@@ -645,6 +645,22 @@ pub fn get_meeting_detail(
     .ok_or_else(|| "meeting not found".to_string())
 }
 
+/// Save (overwrite) the user's free-form notes for a meeting. The front-end
+/// debounces writes; the backend does a plain last-write-wins update of the
+/// `notes` column. Returns `true` if the meeting row was updated. These notes
+/// are later fused into the minutes LLM pass as extra context.
+#[tauri::command]
+pub fn save_meeting_notes(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    notes: String,
+) -> Result<bool, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    with_store(&state, |s| {
+        s.set_meeting_notes(id, &notes).map_err(|e| e.to_string())
+    })
+}
+
 /// Rename a speaker cluster (Speaker 3 → 李明). Returns `true` if updated.
 #[tauri::command]
 pub fn rename_speaker(
