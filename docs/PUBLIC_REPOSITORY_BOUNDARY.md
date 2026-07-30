@@ -45,9 +45,15 @@ list, changed-file count, or line count exceeds the declared scope must stop and
 be rebuilt from `origin/main`; mergeability alone is not approval.
 
 The automated scope gate rejects a branch whose pull-request base is not its
-merge base. By default it also rejects more than 5 commits, 30 changed files, or
-3,000 added lines. There is no label or agent-controlled override; split larger
-changes before publishing.
+merge base. By default it also rejects more than 5 commits, 30 changed files,
+3,000 added lines, or any binary addition. There is no label or agent-controlled
+override; split larger changes before publishing.
+
+**Brand-asset exception:** binary files under `apps/desktop/src-tauri/icons/`,
+`apps/desktop/src/assets/icon/`, `apps/desktop/src/assets/product-icons/`, and
+`docs/images/` are exempt from the binary-addition gate — they are publishable
+first-party icons regenerated from a tracked SVG via
+`scripts/macos/regen-icons.sh`. Binary additions anywhere else still fail.
 
 ## Enforcement
 
