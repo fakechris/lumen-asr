@@ -661,6 +661,54 @@ pub fn save_meeting_notes(
     })
 }
 
+/// Rename a meeting (edit its title). A blank title clears back to untitled so
+/// the library shows the "未命名会议" fallback. Returns `true` if the meeting row
+/// was updated.
+#[tauri::command]
+pub fn rename_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    title: String,
+) -> Result<bool, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    with_store(&state, |s| {
+        s.set_meeting_title(id, &title).map_err(|e| e.to_string())
+    })
+}
+
+/// Delete a meeting and everything attached to it. The store cascade removes the
+/// segments, speakers, and summaries; this command additionally deletes the
+/// meeting's recorded WAV from disk (best-effort — a missing file is fine, and a
+/// remove error is logged but does not fail the delete, since the row is already
+/// gone). Returns `true` if a meeting row was deleted.
+#[tauri::command]
+pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<bool, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    // Read the audio path before deleting the row so we know which WAV to remove.
+    let audio_path = with_store(&state, |s| {
+        Ok(s.get_meeting(id)
+            .map_err(|e| e.to_string())?
+            .and_then(|m| m.audio_path))
+    })?;
+    let deleted = with_store(&state, |s| s.delete_meeting(id).map_err(|e| e.to_string()))?;
+    if deleted {
+        if let Some(path) = audio_path {
+            let wav = Path::new(&path);
+            if wav.exists() {
+                if let Err(e) = std::fs::remove_file(wav) {
+                    tracing::warn!(
+                        meeting_id = %id,
+                        path = %wav.display(),
+                        error = %e,
+                        "could not delete meeting audio file"
+                    );
+                }
+            }
+        }
+    }
+    Ok(deleted)
+}
+
 /// Rename a speaker cluster (Speaker 3 → 李明). Returns `true` if updated.
 #[tauri::command]
 pub fn rename_speaker(

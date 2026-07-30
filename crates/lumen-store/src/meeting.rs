@@ -100,6 +100,21 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Rename a meeting: update only its `title`, leaving every other field
+    /// untouched. A blank (empty/whitespace) `title` is stored as `NULL` so the
+    /// meeting reads back as untitled — matching how untitled meetings are
+    /// created and how the title search treats them. Returns `true` if a row was
+    /// updated.
+    pub fn set_meeting_title(&self, id: Uuid, title: &str) -> Result<bool> {
+        let trimmed = title.trim();
+        let value = (!trimmed.is_empty()).then_some(trimmed);
+        let changed = self.conn.execute(
+            "UPDATE meetings SET title=?2 WHERE id=?1",
+            params![id.to_string(), value],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Overwrite a meeting's free-form user notes. The caller (front-end)
     /// debounces; this is a plain last-write-wins update of just the `notes`
     /// column, leaving every other field untouched. Returns `true` if a row was
@@ -587,6 +602,44 @@ mod tests {
 
         // No row for an unknown id.
         assert!(!store.set_meeting_notes(Uuid::new_v4(), "x").unwrap());
+    }
+
+    #[test]
+    fn set_meeting_title_updates_only_title_and_blanks_to_untitled() {
+        let (_dir, store) = open_store();
+        let mut meeting = Meeting::new();
+        meeting.title = Some("Kickoff".into());
+        meeting.notes = "开场要点".into();
+        meeting.language = Some("zh-CN".into());
+        store.create_meeting(&meeting).unwrap();
+
+        // Rename updates only the title; notes/language/status are untouched.
+        assert!(store.set_meeting_title(meeting.id, "季度复盘").unwrap());
+        let renamed = store.get_meeting(meeting.id).unwrap().unwrap();
+        assert_eq!(renamed.title.as_deref(), Some("季度复盘"));
+        assert_eq!(renamed.notes, "开场要点");
+        assert_eq!(renamed.language.as_deref(), Some("zh-CN"));
+        assert_eq!(renamed.status, MeetingStatus::Recording);
+
+        // Surrounding whitespace is trimmed.
+        assert!(store.set_meeting_title(meeting.id, "  周会  ").unwrap());
+        assert_eq!(
+            store
+                .get_meeting(meeting.id)
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("周会")
+        );
+
+        // A blank title clears back to untitled (NULL) so the UI shows the
+        // "未命名会议" fallback and the title search excludes it.
+        assert!(store.set_meeting_title(meeting.id, "   ").unwrap());
+        assert_eq!(store.get_meeting(meeting.id).unwrap().unwrap().title, None);
+
+        // No row for an unknown id.
+        assert!(!store.set_meeting_title(Uuid::new_v4(), "x").unwrap());
     }
 
     #[test]
