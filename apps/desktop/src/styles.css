@@ -2828,6 +2828,143 @@ button.meeting-index-item:hover {
   line-height: 1.6;
 }
 
+/* ---- transcript segments (seek + highlight + inline edit) ------------- */
+.meeting-turn-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* One sentence row. Restrained: no chrome until hovered/active. */
+.meeting-seg {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  border-radius: var(--radius-sm);
+  padding: 1px 4px;
+  margin: 0 -4px;
+  transition: background 0.2s var(--ease);
+}
+
+.meeting-seg:hover {
+  background: var(--surface-2, rgba(127, 127, 127, 0.08));
+}
+
+/* The sentence the playhead is currently inside. */
+.meeting-seg.active {
+  background: var(--accent-dim);
+}
+
+/* Brief flash when a minutes-index jump lands on this sentence. */
+.meeting-seg.flash {
+  background: var(--accent-dim);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.meeting-seg-text {
+  margin: 0;
+  line-height: 1.6;
+  flex: 1;
+  text-align: left;
+}
+
+/* Seekable sentence: a text-only button so it reads as prose, not a control. */
+button.meeting-seg-text.seekable {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+button.meeting-seg-text.seekable:hover {
+  color: var(--accent);
+}
+
+.meeting-seg-edit-btn {
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  padding: 0 2px;
+  opacity: 0;
+  transition: opacity 0.15s var(--ease), color 0.15s var(--ease);
+}
+
+.meeting-seg:hover .meeting-seg-edit-btn,
+.meeting-seg.active .meeting-seg-edit-btn {
+  opacity: 1;
+}
+
+.meeting-seg-edit-btn:hover {
+  color: var(--accent);
+}
+
+.meeting-seg.editing {
+  display: block;
+  background: none;
+}
+
+.meeting-seg-edit {
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  overflow: hidden;
+  min-height: calc(1.6em + 12px);
+  padding: 6px 8px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--surface, transparent);
+  color: inherit;
+  font: inherit;
+  line-height: 1.6;
+}
+
+.meeting-seg-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* ---- bottom audio playback bar --------------------------------------- */
+.meeting-audiobar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface, var(--bg));
+  backdrop-filter: blur(6px);
+}
+
+.meeting-audio-toggle {
+  flex: none;
+  min-width: 56px;
+}
+
+.meeting-audio-time {
+  flex: none;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 44px;
+  text-align: center;
+}
+
+.meeting-audio-scrub {
+  flex: 1;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
 /* ---- start / inline recording bar ------------------------------------ */
 .meeting-start-bar {
   margin-bottom: 14px;

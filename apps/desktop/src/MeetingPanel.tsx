@@ -1,6 +1,7 @@
-import type { ChangeEvent, ReactNode } from "react";
+import type { ChangeEvent, MutableRefObject, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { api } from "./api";
 import {
   useMeetingModels,
@@ -1235,6 +1236,51 @@ function MeetingDetailView({
     setJump({ seconds: src.start, token: Date.now() });
   }, []);
 
+  // ---- audio playback (review mode) --------------------------------------
+  // A single <audio> element (rendered by the bottom player bar) is shared with
+  // the transcript so clicking a sentence can seek it and playback can highlight
+  // the current sentence. `currentTime` is the playhead in seconds.
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+
+  // Only expose a player when the meeting is done and has a recorded WAV. The
+  // asset: URL is produced by Tauri's asset protocol (scoped to the meetings
+  // dir in tauri.conf.json) so <audio> can stream + seek the file directly
+  // without shuttling megabytes of PCM over IPC.
+  const audioSrc = useMemo(() => {
+    const path = detail?.meeting.audio_path;
+    if (!path || detail?.meeting.status !== "ready") return null;
+    return convertFileSrc(path);
+  }, [detail?.meeting.audio_path, detail?.meeting.status]);
+
+  // Reset the playhead when the audio source changes (switching meetings reuses
+  // this component instance, so state would otherwise carry over).
+  useEffect(() => {
+    setCurrentTime(0);
+  }, [audioSrc]);
+
+  const seekTo = useCallback((seconds: number) => {
+    const el = audioRef.current;
+    if (!el) return;
+    el.currentTime = seconds;
+    void el.play().catch(() => {});
+  }, []);
+
+  // Patch one segment's text in place after an inline edit — cheaper (and less
+  // jarring) than a full reload, which would reset scroll and the playhead.
+  const applySegmentText = useCallback((segmentId: string, text: string) => {
+    setDetail((prev) =>
+      prev
+        ? {
+            ...prev,
+            segments: prev.segments.map((s) =>
+              s.id === segmentId ? { ...s, text } : s,
+            ),
+          }
+        : prev,
+    );
+  }, []);
+
   const beginTitleEdit = useCallback(() => {
     setTitleDraft(detail?.meeting.title ?? "");
     setEditingTitle(true);
@@ -1419,18 +1465,37 @@ function MeetingDetailView({
           models={models}
         />
       ) : (
-        <div className="meeting-detail-body">
-          <aside className="card meeting-index">
-            <MinutesIndex
+        <>
+          <div className="meeting-detail-body">
+            <aside className="card meeting-index">
+              <MinutesIndex
+                detail={detail}
+                minutes={minutes}
+                onJump={jumpToSource}
+                onNavigate={onNavigate}
+                onOpenFull={() => setFullOpen(true)}
+              />
+            </aside>
+            <TranscriptView
               detail={detail}
-              minutes={minutes}
-              onJump={jumpToSource}
-              onNavigate={onNavigate}
-              onOpenFull={() => setFullOpen(true)}
+              jump={jump}
+              currentTime={currentTime}
+              playable={audioSrc != null}
+              onSeek={seekTo}
+              onSegmentEdited={applySegmentText}
+              onError={onError}
             />
-          </aside>
-          <TranscriptView detail={detail} jump={jump} />
-        </div>
+          </div>
+          {audioSrc && (
+            <MeetingAudioBar
+              src={audioSrc}
+              audioRef={audioRef}
+              currentTime={currentTime}
+              onTime={setCurrentTime}
+              durationHint={detail.meeting.duration_seconds ?? null}
+            />
+          )}
+        </>
       )}
 
       {fullOpen && detail && minutes && (
@@ -1933,16 +1998,15 @@ function ActionMeta({ item }: { item: ActionItem }) {
   return <span className="meeting-item-sub muted-text">{parts.join(" · ")}</span>;
 }
 
-// ---- transcript view (read-only, turn-merged) ---------------------------
-// M4b ships the minimal read-only reader: consecutive same-speaker segments
-// merge into one turn with a single timestamp, and minutes items can scroll
-// here. The bottom player + speaker-correction UI are M4c (not in this stage).
+// ---- transcript view (segment-level: seek + highlight + inline edit) -----
+// Consecutive same-speaker segments merge into one turn (one avatar/timestamp),
+// but each segment stays its own row so it can be clicked to seek the audio,
+// highlighted while it plays, and edited in place. The minutes index still
+// scrolls here via `jump`.
 
 type Turn = {
   speakerId: string | null;
-  startSeconds: number;
-  endSeconds: number;
-  text: string;
+  segments: TranscriptSegment[];
 };
 
 function buildTurns(segments: TranscriptSegment[]): Turn[] {
@@ -1954,26 +2018,185 @@ function buildTurns(segments: TranscriptSegment[]): Turn[] {
     // Unattributed segments (no speaker id) each stand alone — merging them
     // would wrongly collapse distinct unknown speakers into one turn.
     if (last && sid !== null && last.speakerId === sid) {
-      last.text = `${last.text} ${seg.text}`.trim();
-      last.endSeconds = seg.end_seconds;
+      last.segments.push(seg);
     } else {
-      turns.push({
-        speakerId: sid,
-        startSeconds: seg.start_seconds,
-        endSeconds: seg.end_seconds,
-        text: seg.text,
-      });
+      turns.push({ speakerId: sid, segments: [seg] });
     }
   }
   return turns;
 }
 
+/** Grow a textarea to fit its content so an edited sentence is fully visible. */
+function autosizeTextarea(el: HTMLTextAreaElement) {
+  el.style.height = "auto";
+  el.style.height = `${el.scrollHeight}px`;
+}
+
+/** One transcript sentence: click the text to seek the audio, click ✎ to edit
+ * the words in place. Owns its own edit state so a keyed re-render (e.g. the
+ * playback highlight ticking) never drops an in-progress edit. */
+function SegmentRow({
+  segment,
+  playable,
+  active,
+  flash,
+  onSeek,
+  onEdited,
+  onError,
+  registerRef,
+}: {
+  segment: TranscriptSegment;
+  playable: boolean;
+  active: boolean;
+  flash: boolean;
+  onSeek: (seconds: number) => void;
+  onEdited: (segmentId: string, text: string) => void;
+  onError: (e: string | null) => void;
+  registerRef: (segmentId: string, el: HTMLElement | null) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(segment.text);
+  const [saving, setSaving] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const begin = useCallback(() => {
+    setDraft(segment.text);
+    setEditing(true);
+  }, [segment.text]);
+
+  useEffect(() => {
+    if (!editing) return;
+    const el = textareaRef.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+    autosizeTextarea(el);
+  }, [editing]);
+
+  const commit = useCallback(async () => {
+    if (saving) return;
+    const next = draft.trim();
+    // Nothing changed → just leave edit mode without a round trip.
+    if (next === segment.text.trim()) {
+      setEditing(false);
+      return;
+    }
+    setSaving(true);
+    onError(null);
+    try {
+      await api.editMeetingSegment(segment.id, next);
+      onEdited(segment.id, next);
+      setEditing(false);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [draft, saving, segment.id, segment.text, onEdited, onError]);
+
+  const cancel = useCallback(() => {
+    setDraft(segment.text);
+    setEditing(false);
+  }, [segment.text]);
+
+  if (editing) {
+    return (
+      <div
+        className="meeting-seg editing"
+        ref={(el) => registerRef(segment.id, el)}
+      >
+        <textarea
+          ref={textareaRef}
+          className="meeting-seg-edit"
+          value={draft}
+          disabled={saving}
+          onChange={(e) => {
+            setDraft(e.currentTarget.value);
+            autosizeTextarea(e.currentTarget);
+          }}
+          // Blur saves (per spec). Cancel/Save buttons preventDefault on
+          // mousedown so they don't blur-save before their click runs.
+          onBlur={() => void commit()}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              cancel();
+            } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              void commit();
+            }
+          }}
+        />
+        <div className="meeting-seg-actions">
+          <button
+            type="button"
+            className="btn small"
+            disabled={saving}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => void commit()}
+          >
+            保存
+          </button>
+          <button
+            type="button"
+            className="btn ghost small"
+            disabled={saving}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={cancel}
+          >
+            取消
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const cls = `meeting-seg${active ? " active" : ""}${flash ? " flash" : ""}`;
+  return (
+    <div className={cls} ref={(el) => registerRef(segment.id, el)}>
+      {playable ? (
+        <button
+          type="button"
+          className="meeting-seg-text seekable"
+          title="跳到此处播放"
+          onClick={() => onSeek(segment.start_seconds)}
+        >
+          {segment.text}
+        </button>
+      ) : (
+        <span className="meeting-seg-text">{segment.text}</span>
+      )}
+      <button
+        type="button"
+        className="meeting-seg-edit-btn"
+        title="编辑这句"
+        aria-label="编辑这句"
+        onClick={begin}
+      >
+        ✎
+      </button>
+    </div>
+  );
+}
+
 function TranscriptView({
   detail,
   jump,
+  currentTime,
+  playable,
+  onSeek,
+  onSegmentEdited,
+  onError,
 }: {
   detail: MeetingDetail;
   jump: { seconds: number; token: number } | null;
+  /** Current audio playhead (seconds) used to highlight the playing sentence. */
+  currentTime: number;
+  /** Whether an audio player is available (ready meeting with a recording). */
+  playable: boolean;
+  onSeek: (seconds: number) => void;
+  onSegmentEdited: (segmentId: string, text: string) => void;
+  onError: (e: string | null) => void;
 }) {
   const turns = useMemo(() => buildTurns(detail.segments), [detail.segments]);
   const speakerById = useMemo(() => {
@@ -1982,35 +2205,51 @@ function TranscriptView({
     return map;
   }, [detail.speakers]);
 
-  const rowRefs = useRef<(HTMLLIElement | null)[]>([]);
-  const [highlight, setHighlight] = useState<number | null>(null);
+  // Per-segment DOM refs, so a minutes-index jump can scroll to the right line.
+  const segRefs = useRef<Map<string, HTMLElement>>(new Map());
+  const registerRef = useCallback((id: string, el: HTMLElement | null) => {
+    if (el) segRefs.current.set(id, el);
+    else segRefs.current.delete(id);
+  }, []);
+  const [flashSegId, setFlashSegId] = useState<string | null>(null);
 
-  // Scroll to the turn covering the requested seconds when a jump arrives.
+  // The sentence the playhead is currently inside (start ≤ t < end). Linear
+  // scan is fine for a meeting's segment count and keeps the mapping obvious.
+  const activeSegId = useMemo(() => {
+    if (!playable) return null;
+    for (const s of detail.segments) {
+      if (currentTime >= s.start_seconds && currentTime < s.end_seconds) {
+        return s.id;
+      }
+    }
+    return null;
+  }, [detail.segments, currentTime, playable]);
+
+  // Scroll to (and briefly flash) the segment covering the requested seconds
+  // when a jump arrives from the minutes index.
   useEffect(() => {
     if (!jump) return;
-    const idx = turns.findIndex(
-      (t) => jump.seconds >= t.startSeconds && jump.seconds < t.endSeconds,
+    const segs = detail.segments;
+    let target = segs.find(
+      (s) => jump.seconds >= s.start_seconds && jump.seconds < s.end_seconds,
     );
-    const target =
-      idx >= 0
-        ? idx
-        : // fall back to the last turn that starts at/before the target
-          (() => {
-            let best = -1;
-            for (let i = 0; i < turns.length; i += 1) {
-              if (turns[i].startSeconds <= jump.seconds) best = i;
-            }
-            return best;
-          })();
-    if (target < 0) return;
-    rowRefs.current[target]?.scrollIntoView({
+    if (!target) {
+      // Fall back to the last segment that starts at/before the target.
+      let best: TranscriptSegment | undefined;
+      for (const s of segs) {
+        if (s.start_seconds <= jump.seconds) best = s;
+      }
+      target = best;
+    }
+    if (!target) return;
+    segRefs.current.get(target.id)?.scrollIntoView({
       behavior: "smooth",
       block: "center",
     });
-    setHighlight(target);
-    const t = window.setTimeout(() => setHighlight(null), 1600);
+    setFlashSegId(target.id);
+    const t = window.setTimeout(() => setFlashSegId(null), 1600);
     return () => window.clearTimeout(t);
-  }, [jump, turns]);
+  }, [jump, detail.segments]);
 
   if (turns.length === 0) {
     return (
@@ -2023,22 +2262,19 @@ function TranscriptView({
   return (
     <div className="card meeting-transcript">
       <p className="muted-text meeting-transcript-note">
-        只读逐字稿（按说话轮次分段）。播放器与说话人修正在下一阶段（M4c）加入。
+        {playable
+          ? "逐字稿（按说话轮次分段）。点句子跳到对应录音位置，点 ✎ 修改文字。"
+          : "逐字稿（按说话轮次分段）。点 ✎ 修改文字。"}
       </p>
       <ul className="meeting-turns">
-        {turns.map((turn, i) => {
+        {turns.map((turn) => {
           const speaker = turn.speakerId
             ? speakerById.get(turn.speakerId)
             : null;
           const { name, confirmed } = speakerDisplay(speaker);
+          const head = turn.segments[0];
           return (
-            <li
-              key={i}
-              ref={(el) => {
-                rowRefs.current[i] = el;
-              }}
-              className={`meeting-turn ${highlight === i ? "flash" : ""}`}
-            >
+            <li key={head.id} className="meeting-turn">
               <div className="meeting-turn-head">
                 <span className="meeting-avatar sm" aria-hidden>
                   {name.slice(0, 1)}
@@ -2048,14 +2284,101 @@ function TranscriptView({
                   <span className="meeting-unconfirmed">未确认</span>
                 )}
                 <span className="meeting-turn-time">
-                  {formatClock(turn.startSeconds)}
+                  {formatClock(head.start_seconds)}
                 </span>
               </div>
-              <p className="meeting-turn-text">{turn.text}</p>
+              <div className="meeting-turn-body">
+                {turn.segments.map((seg) => (
+                  <SegmentRow
+                    key={seg.id}
+                    segment={seg}
+                    playable={playable}
+                    active={activeSegId === seg.id}
+                    flash={flashSegId === seg.id}
+                    onSeek={onSeek}
+                    onEdited={onSegmentEdited}
+                    onError={onError}
+                    registerRef={registerRef}
+                  />
+                ))}
+              </div>
             </li>
           );
         })}
       </ul>
+    </div>
+  );
+}
+
+/** Bottom playback bar for the review page: play/pause, scrubber, current /
+ * total time. Owns the single shared <audio>; its `onTime` lifts the playhead
+ * up to the detail view so the transcript can highlight the playing sentence.
+ * The WAV loads over Tauri's asset protocol, so scrubbing is a real range seek
+ * rather than a full download. */
+function MeetingAudioBar({
+  src,
+  audioRef,
+  currentTime,
+  onTime,
+  durationHint,
+}: {
+  src: string;
+  audioRef: MutableRefObject<HTMLAudioElement | null>;
+  currentTime: number;
+  onTime: (seconds: number) => void;
+  durationHint: number | null;
+}) {
+  const [duration, setDuration] = useState(durationHint ?? 0);
+  const [playing, setPlaying] = useState(false);
+
+  const total = duration > 0 ? duration : durationHint ?? 0;
+
+  const toggle = useCallback(() => {
+    const a = audioRef.current;
+    if (!a) return;
+    if (a.paused) void a.play().catch(() => {});
+    else a.pause();
+  }, [audioRef]);
+
+  return (
+    <div className="meeting-audiobar">
+      <audio
+        ref={audioRef}
+        src={src}
+        preload="metadata"
+        onLoadedMetadata={(e) => {
+          const d = e.currentTarget.duration;
+          if (Number.isFinite(d) && d > 0) setDuration(d);
+        }}
+        onTimeUpdate={(e) => onTime(e.currentTarget.currentTime)}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => setPlaying(false)}
+      />
+      <button
+        type="button"
+        className="btn small meeting-audio-toggle"
+        onClick={toggle}
+      >
+        {playing ? "暂停" : "播放"}
+      </button>
+      <span className="meeting-audio-time">{formatClock(currentTime)}</span>
+      <input
+        type="range"
+        className="meeting-audio-scrub"
+        min={0}
+        max={total || 0}
+        step={0.1}
+        value={Math.min(currentTime, total || 0)}
+        aria-label="播放进度"
+        onChange={(e) => {
+          const t = Number(e.currentTarget.value);
+          onTime(t);
+          const a = audioRef.current;
+          if (a) a.currentTime = t;
+        }}
+      />
+      <span className="meeting-audio-time">{formatClock(total)}</span>
     </div>
   );
 }

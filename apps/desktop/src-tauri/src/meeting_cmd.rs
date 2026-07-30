@@ -727,6 +727,21 @@ pub fn rename_speaker(
     })
 }
 
+/// Edit the text of one transcript segment (manual correction from the review
+/// page). Only the words change — the segment's timing and speaker attribution
+/// are left untouched. Returns `true` if the segment row was updated.
+#[tauri::command]
+pub fn edit_meeting_segment(
+    state: State<'_, AppState>,
+    segment_id: String,
+    text: String,
+) -> Result<bool, String> {
+    let id = parse_id(&segment_id, "segment")?;
+    with_store(&state, |s| {
+        s.update_segment_text(id, &text).map_err(|e| e.to_string())
+    })
+}
+
 /// Reassign a single mis-attributed segment to another speaker.
 #[tauri::command]
 pub fn reassign_segment_speaker(

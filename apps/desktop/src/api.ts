@@ -467,6 +467,12 @@ export const api = {
 
   // Speaker-correction commands (backend ready in M4a; the correction UI is
   // wired in M4c, these bindings are provided for that stage).
+  /** Edit the text of one transcript segment (manual correction on the review
+   * page). Only the words change; the segment's timing and speaker are left
+   * untouched. Resolves `true` if the segment row was updated. */
+  editMeetingSegment: (segmentId: string, text: string) =>
+    invoke<boolean>("edit_meeting_segment", { segmentId, text }),
+
   renameSpeaker: (speakerId: string, displayName: string) =>
     invoke<boolean>("rename_speaker", { speakerId, displayName }),
   reassignSegmentSpeaker: (segmentId: string, speakerId: string) =>
