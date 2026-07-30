@@ -2828,6 +2828,16 @@ button.meeting-index-item:hover {
   font-size: 0.9rem;
   line-height: 1.55;
   overflow-wrap: break-word;
+  /* One finalized segment per line, with clear separation between them. */
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.meeting-live-final,
+.meeting-live-partial,
+.meeting-live-listening {
+  margin: 0;
 }
 
 .meeting-live-final {
