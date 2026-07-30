@@ -284,11 +284,22 @@ impl Store {
         Ok(())
     }
 
-    /// Set a speaker's user-assigned display name. Returns `true` if updated.
+    /// Set a speaker's user-assigned display name — the "this cluster is really
+    /// 李明" edit from the review page. This is the single "name + confirm" path:
+    /// a speaker with a non-empty `display_name` reads back as **confirmed**, and
+    /// a blank (empty/whitespace) name is stored as `NULL` so the speaker reverts
+    /// to **unconfirmed** — matching how a freshly diarized speaker starts, how
+    /// [`MeetingDetail::speaker_name`](lumen_core::MeetingDetail::speaker_name)
+    /// falls back to the engine label, and how `set_meeting_title` blanks an
+    /// untitled meeting. Confirmation is derived from the name rather than a
+    /// separate column, so there is a single source of truth. Returns `true` if a
+    /// row was updated.
     pub fn rename_speaker(&self, id: Uuid, display_name: &str) -> Result<bool> {
+        let trimmed = display_name.trim();
+        let value = (!trimmed.is_empty()).then_some(trimmed);
         let changed = self.conn.execute(
             "UPDATE speakers SET display_name=?2 WHERE id=?1",
-            params![id.to_string(), display_name],
+            params![id.to_string(), value],
         )?;
         Ok(changed > 0)
     }
@@ -825,6 +836,39 @@ mod tests {
         let speakers = store.list_speakers(meeting.id).unwrap();
         assert_eq!(speakers.len(), 1);
         assert_eq!(speakers[0].embedding_ref.as_deref(), Some("identity/chris"));
+    }
+
+    #[test]
+    fn rename_speaker_confirms_by_name_and_blank_clears_to_unconfirmed() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        let speaker = Speaker::new(meeting.id, "S1");
+        store.upsert_speaker(&speaker).unwrap();
+
+        // A freshly diarized speaker has no name → unconfirmed.
+        let fresh = &store.list_speakers(meeting.id).unwrap()[0];
+        assert_eq!(fresh.display_name, None);
+
+        // Setting a real name confirms the speaker (surrounding whitespace is
+        // trimmed) and the aggregate read surfaces the display name.
+        assert!(store.rename_speaker(speaker.id, "  李明  ").unwrap());
+        let named = &store.list_speakers(meeting.id).unwrap()[0];
+        assert_eq!(named.display_name.as_deref(), Some("李明"));
+        assert_eq!(named.label, "S1");
+        let detail = store.get_meeting_detail(meeting.id).unwrap().unwrap();
+        assert_eq!(detail.speaker_name(Some(speaker.id)), "李明");
+
+        // Clearing the name (blank/whitespace) stores NULL, reverting the speaker
+        // to unconfirmed so it falls back to the engine label again.
+        assert!(store.rename_speaker(speaker.id, "   ").unwrap());
+        let cleared = &store.list_speakers(meeting.id).unwrap()[0];
+        assert_eq!(cleared.display_name, None);
+        let detail = store.get_meeting_detail(meeting.id).unwrap().unwrap();
+        assert_eq!(detail.speaker_name(Some(speaker.id)), "S1");
+
+        // Unknown speaker id is a no-op.
+        assert!(!store.rename_speaker(Uuid::new_v4(), "X").unwrap());
     }
 
     #[test]

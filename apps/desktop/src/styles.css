@@ -2735,6 +2735,47 @@ button.meeting-index-item:hover {
   font-size: 0.9rem;
 }
 
+/* The name doubles as the "click to set a real name" affordance: a text-styled
+ * button with a subtle dashed underline that firms up on hover. */
+.meeting-participant-edit {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-bottom: 1px dashed transparent;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meeting-participant-edit:hover {
+  border-bottom-color: var(--border-strong);
+}
+
+.meeting-participant-input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 2px 8px;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.meeting-participant-input:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent, var(--text)) 45%, var(--border));
+}
+
 .meeting-unconfirmed {
   font-size: 0.68rem;
   font-weight: 600;
@@ -2742,6 +2783,17 @@ button.meeting-index-item:hover {
   border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
   border-radius: 999px;
   padding: 0 6px;
+  flex-shrink: 0;
+}
+
+.meeting-confirmed {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--ok);
+  border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
+  border-radius: 999px;
+  padding: 0 6px;
+  flex-shrink: 0;
 }
 
 .meeting-info {

@@ -1281,6 +1281,32 @@ function MeetingDetailView({
     );
   }, []);
 
+  // Patch one speaker's display name in place after a rename. Because the
+  // transcript turns and the participant list both read the speaker off
+  // `detail.speakers`, this one update re-labels the speaker everywhere at once
+  // (participants → "已确认", every attributed turn shows the real name) without
+  // a reload that would reset scroll and the playhead. A blank name clears back
+  // to `null` so the speaker reverts to its engine label / "未确认" — mirroring
+  // how the store normalizes it.
+  const applySpeakerName = useCallback(
+    (speakerId: string, displayName: string) => {
+      const trimmed = displayName.trim();
+      setDetail((prev) =>
+        prev
+          ? {
+              ...prev,
+              speakers: prev.speakers.map((s) =>
+                s.id === speakerId
+                  ? { ...s, display_name: trimmed.length > 0 ? trimmed : null }
+                  : s,
+              ),
+            }
+          : prev,
+      );
+    },
+    [],
+  );
+
   const beginTitleEdit = useCallback(() => {
     setTitleDraft(detail?.meeting.title ?? "");
     setEditingTitle(true);
@@ -1474,6 +1500,8 @@ function MeetingDetailView({
                 onJump={jumpToSource}
                 onNavigate={onNavigate}
                 onOpenFull={() => setFullOpen(true)}
+                onSpeakerRenamed={applySpeakerName}
+                onError={onError}
               />
             </aside>
             <TranscriptView
@@ -1673,12 +1701,16 @@ function MinutesIndex({
   onJump,
   onNavigate,
   onOpenFull,
+  onSpeakerRenamed,
+  onError,
 }: {
   detail: MeetingDetail;
   minutes: Minutes | null;
   onJump: (src: SourceRef) => void;
   onNavigate?: (tab: TabId) => void;
   onOpenFull: () => void;
+  onSpeakerRenamed: (speakerId: string, displayName: string) => void;
+  onError: (e: string | null) => void;
 }) {
   const hasMinutes = minutes != null && !minutesEmpty(minutes);
   const status = detail.meeting.status;
@@ -1818,14 +1850,73 @@ function MinutesIndex({
         </>
       )}
 
-      <MeetingSideInfo detail={detail} />
+      <MeetingSideInfo
+        detail={detail}
+        onRenamed={onSpeakerRenamed}
+        onError={onError}
+      />
     </div>
   );
 }
 
 /** Participants + meeting facts, folded into the left column bottom (kept
- * compact so it never competes with the minutes index above it). */
-function MeetingSideInfo({ detail }: { detail: MeetingDetail }) {
+ * compact so it never competes with the minutes index above it).
+ *
+ * Each diarized speaker can be given a real name inline: click the name to edit,
+ * Enter/保存 to commit (calls `rename_speaker`), Escape to cancel. A speaker with
+ * a name reads as "已确认"; a blank name reverts it to the engine label + "未确认".
+ * The commit patches the parent detail in place (`onRenamed`) so the transcript
+ * and this list re-label the speaker at once, without a reload. */
+function MeetingSideInfo({
+  detail,
+  onRenamed,
+  onError,
+}: {
+  detail: MeetingDetail;
+  onRenamed: (speakerId: string, displayName: string) => void;
+  onError: (e: string | null) => void;
+}) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editingId) inputRef.current?.select();
+  }, [editingId]);
+
+  const beginEdit = useCallback((speaker: Speaker) => {
+    setDraft(speaker.display_name?.trim() ?? "");
+    setEditingId(speaker.id);
+  }, []);
+
+  const commit = useCallback(
+    async (speakerId: string) => {
+      const next = draft.trim();
+      const current =
+        detail.speakers.find((s) => s.id === speakerId)?.display_name?.trim() ??
+        "";
+      // No change (including opening then closing an already-blank name) → just
+      // leave edit mode without a needless write.
+      if (next === current) {
+        setEditingId(null);
+        return;
+      }
+      setSaving(true);
+      onError(null);
+      try {
+        await api.renameSpeaker(speakerId, next);
+        onRenamed(speakerId, next);
+        setEditingId(null);
+      } catch (e) {
+        onError(String(e));
+      } finally {
+        setSaving(false);
+      }
+    },
+    [draft, detail.speakers, onRenamed, onError],
+  );
+
   return (
     <div className="meeting-index-info">
       <section className="meeting-side-sec">
@@ -1836,14 +1927,52 @@ function MeetingSideInfo({ detail }: { detail: MeetingDetail }) {
           <ul className="meeting-participants">
             {detail.speakers.map((s) => {
               const { name, confirmed } = speakerDisplay(s);
+              const editing = editingId === s.id;
               return (
                 <li key={s.id} className="meeting-participant">
                   <span className="meeting-avatar sm" aria-hidden>
                     {name.slice(0, 1)}
                   </span>
-                  <span className="meeting-participant-name">{name}</span>
-                  {!confirmed && (
-                    <span className="meeting-unconfirmed">未确认</span>
+                  {editing ? (
+                    <>
+                      <input
+                        ref={inputRef}
+                        className="meeting-participant-input"
+                        type="text"
+                        value={draft}
+                        placeholder={s.label}
+                        disabled={saving}
+                        onChange={(e) => setDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") void commit(s.id);
+                          else if (e.key === "Escape") setEditingId(null);
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="btn small"
+                        disabled={saving}
+                        onClick={() => void commit(s.id)}
+                      >
+                        {saving ? "…" : "保存"}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className="meeting-participant-name meeting-participant-edit"
+                        title="点击设置真实姓名"
+                        onClick={() => beginEdit(s)}
+                      >
+                        {name}
+                      </button>
+                      {confirmed ? (
+                        <span className="meeting-confirmed">已确认</span>
+                      ) : (
+                        <span className="meeting-unconfirmed">未确认</span>
+                      )}
+                    </>
                   )}
                 </li>
               );
