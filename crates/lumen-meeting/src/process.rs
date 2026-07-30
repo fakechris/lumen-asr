@@ -138,6 +138,30 @@ async fn run(
         }
     }
 
+    // Batched LLM transcript cleanup (fillers / punctuation / Chinese-English
+    // code-switch), applied *after* dictionary correction and *before* assembly
+    // so both the stored verbatim transcript AND the minutes summary below see
+    // the cleaned text. Gated on the caller opting in (`opts.cleanup_transcript`)
+    // AND an LLM corrector being available (carried by `minutes`): with no LLM
+    // the transcript stays raw ASR. Best-effort and boundary-preserving — any
+    // LLM failure or a marker/count mismatch keeps that chunk's original text, so
+    // it can never drop/reorder/misattribute a segment or fail the pipeline. Only
+    // segment *text* is cleaned; word-level `words` timings are left untouched
+    // (beta trade-off, see `cleanup`), so click-to-seek is unaffected.
+    if crate::cleanup::should_cleanup(opts.cleanup_transcript, minutes.is_some()) {
+        if let Some(cfg) = minutes {
+            let stats = crate::cleanup::cleanup_transcript(cfg.corrector, &mut texts, None).await;
+            tracing::info!(
+                meeting_id = %meeting_id,
+                chunks = stats.chunks,
+                cleaned = stats.cleaned,
+                kept_original = stats.kept_original,
+                skipped_empty = stats.skipped_empty,
+                "meeting transcript llm cleanup done"
+            );
+        }
+    }
+
     let assembled = assemble_meeting(
         meeting_id,
         &diar.turns,

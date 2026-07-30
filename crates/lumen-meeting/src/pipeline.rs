@@ -77,6 +77,13 @@ pub struct MeetingOptions {
     /// Upper bound on speaker count for clustering (maps to diar-rs
     /// `ahc_max_speakers`). `None` keeps the diar-rs default.
     pub max_speakers: Option<usize>,
+    /// Run the batched LLM transcript-cleanup pass (fillers / punctuation /
+    /// code-switch) after dictionary correction. Only effective when an LLM
+    /// corrector is also supplied to [`process_meeting`](crate::process_meeting)
+    /// (via `MinutesConfig`); with no corrector the pass is skipped. `Default` is
+    /// `false` — the app layer sets it from config, where it defaults **on** so a
+    /// user with an LLM configured gets a cleaned transcript automatically.
+    pub cleanup_transcript: bool,
 }
 
 /// Failure modes of [`transcribe_meeting`].

@@ -368,14 +368,14 @@ async fn process_meeting_pipeline(
     // Build the ASR engine and (optional) minutes corrector from the user's
     // settings under brief locks, then drop the app-state handle before the long
     // async run below.
-    let (asr_engine, corrector, minutes_model) = {
+    let (asr_engine, corrector, minutes_model, cleanup_transcript) = {
         let state = app.state::<AppState>();
-        let corrector_cfg = {
+        let (corrector_cfg, cleanup_transcript) = {
             let cfg = state
                 .config
                 .lock()
                 .map_err(|_| "config lock poisoned".to_string())?;
-            cfg.corrector.clone()
+            (cfg.corrector.clone(), cfg.meeting.transcript_cleanup)
         };
         let asr_engine = crate::dictation::build_meeting_asr_engine(state.inner())?;
         // Only build a corrector when an LLM is actually configured. With none,
@@ -390,7 +390,7 @@ async fn process_meeting_pipeline(
             let model = corrector_cfg.model.trim();
             (!model.is_empty()).then(|| model.to_string())
         });
-        (asr_engine, corrector, minutes_model)
+        (asr_engine, corrector, minutes_model, cleanup_transcript)
     };
 
     // Diarization models under `<lumen_models_dir>/diar/{seg.onnx,emb.onnx,plda}`.
@@ -409,9 +409,13 @@ async fn process_meeting_pipeline(
     // mis-recognitions of the user's names/jargon are repaired in the transcript
     // (and thus in the minutes). Read from the background worker's own store
     // connection; a read failure just yields no correction rather than aborting.
+    // The batched LLM transcript-cleanup pass runs only when the user opted in
+    // AND an LLM corrector is available (no corrector → the pass is skipped inside
+    // `process_meeting` regardless of this flag).
     let opts = MeetingOptions {
         max_speakers: Some(DEFAULT_MAX_SPEAKERS),
         correction: meeting_correction_dict(&store),
+        cleanup_transcript,
         ..MeetingOptions::default()
     };
 

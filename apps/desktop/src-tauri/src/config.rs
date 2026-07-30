@@ -19,6 +19,8 @@ pub struct AppConfig {
     pub asr: AsrServiceConfig,
     /// Local, encrypted context capture used for replay and pipeline provenance.
     pub context: ContextCaptureConfig,
+    /// Meeting recording / processing options.
+    pub meeting: MeetingConfig,
 }
 
 impl Default for AppConfig {
@@ -33,6 +35,27 @@ impl Default for AppConfig {
             audio: AudioConfig::default(),
             asr: AsrServiceConfig::default(),
             context: ContextCaptureConfig::default(),
+            meeting: MeetingConfig::default(),
+        }
+    }
+}
+
+/// Meeting-specific processing options.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MeetingConfig {
+    /// Run the batched LLM cleanup of the verbatim transcript (fillers /
+    /// punctuation / Chinese-English code-switch), boundary-preserving. Requires
+    /// an LLM corrector; when none is configured the pass is skipped regardless.
+    /// Defaults to `true` so a user with an LLM configured gets a cleaned
+    /// transcript automatically.
+    pub transcript_cleanup: bool,
+}
+
+impl Default for MeetingConfig {
+    fn default() -> Self {
+        Self {
+            transcript_cleanup: true,
         }
     }
 }
@@ -919,6 +942,36 @@ provider = "local_qwen"
             output.cleanup_level_for_asr_provider("local_qwen"),
             lumen_prompts::CleanupLevel::Strong
         );
+    }
+
+    #[test]
+    fn meeting_transcript_cleanup_defaults_on() {
+        assert!(MeetingConfig::default().transcript_cleanup);
+        assert!(AppConfig::default().meeting.transcript_cleanup);
+    }
+
+    #[test]
+    fn existing_config_without_meeting_section_defaults_cleanup_on() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[asr]
+provider = "local_sensevoice"
+"#,
+        )
+        .unwrap();
+        assert!(config.meeting.transcript_cleanup);
+    }
+
+    #[test]
+    fn meeting_transcript_cleanup_can_be_disabled() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[meeting]
+transcript_cleanup = false
+"#,
+        )
+        .unwrap();
+        assert!(!config.meeting.transcript_cleanup);
     }
 
     #[test]
