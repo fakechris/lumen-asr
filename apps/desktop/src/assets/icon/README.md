@@ -1,18 +1,28 @@
 # Lumen ASR — App Icon assets
 
-## Files
-- `AppIcon.svg` — master vector (1024, full detail)
-- `AppIcon-small.svg` — simplified variant for 16/32px (fewer wave rings, larger core)
+> **Single source of truth:** `../product-icons/lumen-asr.svg` (Lumen Design
+> System mark). Everything in this folder and in `src-tauri/icons/` is generated
+> from it by `scripts/macos/regen-icons.sh` — never hand-edit the PNGs/.icns.
+
+## Files (all generated)
+- `AppIcon.svg`, `AppIcon-small.svg` — copies of the DS mark (the mark is one
+  flat glyph, so there is no separate "full detail" / small variant anymore)
 - `AppIcon-512.png`, `AppIcon-1024.png` — standalone marketing PNGs
 - `Lumen.iconset/` — full macOS iconset (16→512 + @2x)
+- `Lumen.icns` — built from the iconset
 
-## Build .icns (macOS)
+## Regenerate everything
 ```sh
-iconutil -c icns assets/icon/Lumen.iconset -o Lumen.icns
+./scripts/macos/regen-icons.sh
 ```
-Then point Tauri at it in `tauri.conf.json` → `bundle.icon`.
+This rewrites the Tauri bundle icons (`src-tauri/icons/*`), these app-icon
+masters, and `docs/images/app-icon*.png` from the one SVG. Commit the results
+together.
 
-## Notes
-- Squircle corner radius ≈ 22.4% (rx 229 @ 1024).
-- Palette: bg gradient #3B86FF→#0E4ECB→#082C82; warm glow #FFD27A→#FFB020; core #FFFDF5.
-- 16/32px use the simplified variant so the core + waves stay legible.
+## Brand (Lumen Design System)
+- Tile: rounded square r≈23%, **flat espresso `#231a13`**, identical on every
+  product. Keyline: 1.5px inset stroke, white @ 8%. **No gradient, no glow.**
+- Glyph: one geometric mark, categorical hue per product — ASR = waveform in
+  `#e08a4f`.
+- The old blue gradient/glow "sound-wave" icon is **deprecated** — do not
+  reintroduce it.

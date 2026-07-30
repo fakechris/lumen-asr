@@ -15,14 +15,23 @@ fi
 commit_count="$(git rev-list --count "$base..$head")"
 changed_files="$(git diff --name-only "$base...$head" | sed '/^$/d' | wc -l | tr -d ' ')"
 added_lines="$(git diff --numstat "$base...$head" | awk '$1 ~ /^[0-9]+$/ { total += $1 } END { print total + 0 }')"
-binary_files="$(git diff --numstat "$base...$head" | awk '$1 == "-" || $2 == "-" { count += 1 } END { print count + 0 }')"
 
-printf 'PR scope: %s commits, %s files, %s added lines, %s binary files\n' \
-  "$commit_count" "$changed_files" "$added_lines" "$binary_files"
+# First-party brand/icon assets are publishable and legitimately binary; they are
+# exempt from the binary-addition gate (regenerated via scripts/macos/regen-icons.sh
+# from a tracked SVG). Everything else binary still fails. Keep these anchored to
+# real asset directories so stray blobs elsewhere are still caught.
+asset_allow='^(apps/desktop/src-tauri/icons/|apps/desktop/src/assets/icon/|apps/desktop/src/assets/product-icons/|docs/images/)'
+binary_total="$(git diff --numstat "$base...$head" | awk '$1 == "-" || $2 == "-" { count += 1 } END { print count + 0 }')"
+binary_files="$(git diff --numstat "$base...$head" \
+  | awk -v allow="$asset_allow" '($1 == "-" || $2 == "-") && $3 !~ allow { count += 1 } END { print count + 0 }')"
+binary_exempt=$((binary_total - binary_files))
+
+printf 'PR scope: %s commits, %s files, %s added lines, %s binary files (%s exempt asset binaries)\n' \
+  "$commit_count" "$changed_files" "$added_lines" "$binary_files" "$binary_exempt"
 
 if ((commit_count > 5 || changed_files > 30 || added_lines > 3000 || binary_files > 0)); then
   printf 'PR exceeds the default scope boundary (5 commits / 30 files / 3000 additions).\n' >&2
-  printf 'Binary additions are not allowed. Split the PR before publishing.\n' >&2
+  printf 'Binary additions outside the brand-asset allowlist are not allowed. Split the PR before publishing.\n' >&2
   exit 1
 fi
 
