@@ -361,6 +361,8 @@ pub fn run() {
             meeting_cmd::list_meetings,
             meeting_cmd::get_meeting_detail,
             meeting_cmd::save_meeting_notes,
+            meeting_cmd::rename_meeting,
+            meeting_cmd::delete_meeting,
             meeting_cmd::rename_speaker,
             meeting_cmd::reassign_segment_speaker,
             meeting_cmd::merge_speakers,

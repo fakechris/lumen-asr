@@ -450,6 +450,17 @@ export const api = {
   saveMeetingNotes: (meetingId: string, notes: string) =>
     invoke<boolean>("save_meeting_notes", { meetingId, notes }),
 
+  /** Rename a meeting (edit its title). A blank title clears back to untitled
+   * ("未命名会议"). Resolves `true` if the meeting row was updated. */
+  renameMeeting: (meetingId: string, title: string) =>
+    invoke<boolean>("rename_meeting", { meetingId, title }),
+
+  /** Delete a meeting and all attached data (segments/speakers/summaries cascade)
+   * plus its recorded WAV on disk. Irreversible. Resolves `true` if a row was
+   * deleted. */
+  deleteMeeting: (meetingId: string) =>
+    invoke<boolean>("delete_meeting", { meetingId }),
+
   /** Render a meeting into one of the four export presets. */
   exportMeeting: (meetingId: string, preset: ExportPreset) =>
     invoke<ExportOutput>("export_meeting", { meetingId, preset }),

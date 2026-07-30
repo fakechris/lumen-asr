@@ -25,6 +25,7 @@ export type IconName =
   | "translate"
   | "wave"
   | "clipboard"
+  | "pencil"
   | "sun"
   | "moon";
 
@@ -163,6 +164,12 @@ const PATHS: Record<IconName, ReactNode> = {
       <rect x="9" y="2.9" width="6" height="3.3" rx="1.2" />
       <rect x="5" y="4.5" width="14" height="16" rx="2.6" />
       <path d="M8.5 12h7M8.5 15.5h5" />
+    </>
+  ),
+  pencil: (
+    <>
+      <path d="M14.5 5.5l4 4" />
+      <path d="M4 20l1-4L16 5a1.6 1.6 0 0 1 2.3 0l.7.7a1.6 1.6 0 0 1 0 2.3L8 19z" />
     </>
   ),
   sun: (
