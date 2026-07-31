@@ -69,6 +69,26 @@ pub const CONSENSUS_THRESHOLD: f32 = 0.60;
 /// better, and the cap keeps per-speaker matching cost bounded.
 pub const MAX_SAMPLES_PER_IDENTITY: usize = 10;
 
+/// Minimum voiced audio (ms) for a **live** utterance to earn even a
+/// provisional label. Below ~2 s a single-utterance embedding is too noisy to
+/// suggest anyone (the offline path keeps the stricter [`MIN_VOICED_MS`]).
+pub const LIVE_PROVISIONAL_MIN_VOICED_MS: u64 = 2000;
+
+/// Minimum voiced audio (ms) for a live utterance to be auto-verified. Same
+/// floor as enrollment/offline matching ([`MIN_VOICED_MS`]): 2–3 s utterances
+/// stay provisional, ≥ 3 s ones may upgrade when the score evidence agrees.
+pub const LIVE_VERIFIED_MIN_VOICED_MS: u64 = MIN_VOICED_MS;
+
+/// Minimum margin (`best_score − runner_up_score`) for a live auto-verify.
+///
+/// Trade-off: two enrolled people with similar voices can both score past
+/// [`AUTO_TAG_THRESHOLD`] on one utterance; requiring the best identity to
+/// beat the runner-up by ≥ 0.08 keeps ambiguous "could be either" utterances
+/// at provisional instead of silently committing to the wrong person. 0.08 is
+/// roughly the intra-speaker session-to-session score jitter, so a genuine
+/// same-person hit clears it comfortably.
+pub const LIVE_VERIFIED_MIN_MARGIN: f32 = 0.08;
+
 /// Minimum total voiced audio (milliseconds) required to enroll a voiceprint.
 ///
 /// Centroids averaged over less speech than this are too noisy to be worth
@@ -157,6 +177,67 @@ impl PersistedIdentity {
             samples,
         })
     }
+}
+
+/// Full match evidence for one enrolled identity against a probe embedding —
+/// the "deep" verification interface. It reports *who the best candidate is
+/// and how strong the evidence is* without making any accept/reject decision;
+/// decisions live in the policies layered on top ([`live_decision`] for the
+/// real-time path, [`IdentityStore::match_speaker`] for the offline path).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerificationReport {
+    /// Id of the best-matching enrolled identity.
+    pub identity_id: Uuid,
+    /// That identity's current real name.
+    pub display_name: String,
+    /// Highest cosine similarity across the identity's stored samples.
+    pub best_score: f32,
+    /// Best-sample score of the strongest *other* enrolled identity, or `-1.0`
+    /// (the cosine floor) when this is the only identity — so `margin` is then
+    /// maximally permissive rather than undefined.
+    pub runner_up_score: f32,
+    /// `best_score - runner_up_score`: how clearly the winner beats the field.
+    pub margin: f32,
+    /// Samples of the winning identity scoring ≥ [`CONSENSUS_THRESHOLD`].
+    pub consensus_votes: usize,
+    /// Total stored samples of the winning identity.
+    pub sample_count: usize,
+}
+
+/// Decision of the **real-time** policy ([`live_decision`]) for one finalized
+/// live utterance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveDecision {
+    /// Strong evidence: show the name as auto-verified.
+    VerifiedAuto,
+    /// Plausible but not conclusive: show the name tentatively ("李明?").
+    Provisional,
+    /// Not enough evidence to suggest anyone.
+    NoMatch,
+}
+
+/// Real-time decision policy over a [`VerificationReport`] (deliberately
+/// separate from the offline consensus policy in
+/// [`IdentityStore::match_speaker`]: live utterances are single short spans,
+/// so the tiers lean on duration + margin instead of multi-sample consensus):
+///
+/// - `voiced_ms ≥ 3000` **and** `best_score ≥` [`AUTO_TAG_THRESHOLD`] **and**
+///   `margin ≥` [`LIVE_VERIFIED_MIN_MARGIN`] → [`LiveDecision::VerifiedAuto`];
+/// - otherwise `voiced_ms ≥ 2000` and `best_score ≥` [`CONSENSUS_THRESHOLD`]
+///   → [`LiveDecision::Provisional`] (grey-zone score, or a verified-grade
+///   score on a 2–3 s utterance that is too short to trust outright);
+/// - otherwise [`LiveDecision::NoMatch`].
+pub fn live_decision(report: &VerificationReport, voiced_ms: u64) -> LiveDecision {
+    if voiced_ms >= LIVE_VERIFIED_MIN_VOICED_MS
+        && report.best_score >= AUTO_TAG_THRESHOLD
+        && report.margin >= LIVE_VERIFIED_MIN_MARGIN
+    {
+        return LiveDecision::VerifiedAuto;
+    }
+    if voiced_ms >= LIVE_PROVISIONAL_MIN_VOICED_MS && report.best_score >= CONSENSUS_THRESHOLD {
+        return LiveDecision::Provisional;
+    }
+    LiveDecision::NoMatch
 }
 
 /// Failure modes of the identity store.
@@ -298,30 +379,94 @@ impl IdentityStore {
 
     /// [`match_speaker`](Self::match_speaker) with explicit thresholds
     /// (`auto_tag` for the single-sample rule, `consensus` for the
-    /// half-of-samples rule).
+    /// half-of-samples rule). A thin decision policy over the shared scoring
+    /// pass ([`score_identities`](Self::score_identities)): candidates must
+    /// qualify by threshold/consensus, then the highest best-sample score wins.
     pub fn match_speaker_with_thresholds(
         &self,
         embedding: &[f32],
         auto_tag: f32,
         consensus: f32,
     ) -> Option<(&str, f32)> {
-        let mut best: Option<(&str, f32)> = None;
-        for identity in &self.identities {
-            let mut top = f32::NEG_INFINITY;
-            let mut votes = 0usize;
-            for sample in &identity.samples {
-                let score = cosine_similarity(embedding, &sample.embedding);
-                top = top.max(score);
-                if score >= consensus {
-                    votes += 1;
+        self.score_identities(embedding, consensus)
+            .into_iter()
+            .filter(|s| s.qualifies(auto_tag))
+            .max_by(|a, b| a.best.total_cmp(&b.best))
+            .map(|s| (self.identities[s.index].name.as_str(), s.best))
+    }
+
+    /// [`match_speaker`](Self::match_speaker) (same offline decision policy),
+    /// but returning the winner's full [`VerificationReport`] so callers can
+    /// persist provenance (identity id + confidence) alongside the name.
+    pub fn match_speaker_report(&self, embedding: &[f32]) -> Option<VerificationReport> {
+        let scored = self.score_identities(embedding, CONSENSUS_THRESHOLD);
+        let winner = scored
+            .iter()
+            .filter(|s| s.qualifies(AUTO_TAG_THRESHOLD))
+            .max_by(|a, b| a.best.total_cmp(&b.best))?;
+        Some(self.report_for(winner, &scored))
+    }
+
+    /// The deep verification interface: score the probe `embedding` against
+    /// **every** enrolled identity and return the best candidate's full
+    /// evidence — no thresholds, no decision (see [`VerificationReport`]).
+    /// `None` only when the store is empty.
+    pub fn verify_speaker(&self, embedding: &[f32]) -> Option<VerificationReport> {
+        let scored = self.score_identities(embedding, CONSENSUS_THRESHOLD);
+        let winner = scored.iter().max_by(|a, b| a.best.total_cmp(&b.best))?;
+        Some(self.report_for(winner, &scored))
+    }
+
+    /// One scoring pass shared by every matching entry point: per identity,
+    /// the best sample score plus the number of samples ≥ `consensus`.
+    fn score_identities(&self, embedding: &[f32], consensus: f32) -> Vec<IdentityScore> {
+        self.identities
+            .iter()
+            .enumerate()
+            .map(|(index, identity)| {
+                let mut best = f32::NEG_INFINITY;
+                let mut votes = 0usize;
+                for sample in &identity.samples {
+                    let score = cosine_similarity(embedding, &sample.embedding);
+                    best = best.max(score);
+                    if score >= consensus {
+                        votes += 1;
+                    }
                 }
-            }
-            let qualifies = top >= auto_tag || (votes >= 2 && votes * 2 >= identity.samples.len());
-            if qualifies && best.is_none_or(|(_, b)| top > b) {
-                best = Some((identity.name.as_str(), top));
-            }
+                IdentityScore {
+                    index,
+                    best,
+                    votes,
+                    sample_count: identity.samples.len(),
+                }
+            })
+            .collect()
+    }
+
+    /// Assemble the [`VerificationReport`] for `winner`, deriving the
+    /// runner-up score from the best of every *other* identity (`-1.0`, the
+    /// cosine floor, when there is none).
+    fn report_for(&self, winner: &IdentityScore, scored: &[IdentityScore]) -> VerificationReport {
+        let runner_up_score = scored
+            .iter()
+            .filter(|s| s.index != winner.index)
+            .map(|s| s.best)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let runner_up_score = if runner_up_score.is_finite() {
+            runner_up_score
+        } else {
+            -1.0
+        };
+        let identity = &self.identities[winner.index];
+        VerificationReport {
+            identity_id: identity.id,
+            display_name: identity.name.clone(),
+            best_score: winner.best,
+            runner_up_score,
+            margin: winner.best - runner_up_score,
+            consensus_votes: winner.votes,
+            sample_count: winner.sample_count,
         }
-        best
     }
 
     /// All enrolled identities, name-ordered.
@@ -364,6 +509,24 @@ impl IdentityStore {
         restrict_permissions(&tmp, 0o600)?;
         fs::rename(&tmp, &path)?;
         Ok(())
+    }
+}
+
+/// Per-identity outcome of one scoring pass (internal; indexes into
+/// `IdentityStore::identities`).
+struct IdentityScore {
+    index: usize,
+    /// Highest cosine similarity across the identity's samples.
+    best: f32,
+    /// Samples scoring ≥ the consensus threshold of the pass.
+    votes: usize,
+    sample_count: usize,
+}
+
+impl IdentityScore {
+    /// The offline qualification rule (see [`IdentityStore::match_speaker`]).
+    fn qualifies(&self, auto_tag: f32) -> bool {
+        self.best >= auto_tag || (self.votes >= 2 && self.votes * 2 >= self.sample_count)
     }
 }
 
@@ -827,6 +990,141 @@ mod tests {
         let latest = store.list()[0].latest_sample().unwrap();
         assert_eq!(latest.voiced_ms, VOICED_OK + 1);
         assert_eq!(latest.source_meeting_id, Some(meeting));
+    }
+
+    // ---- verify_speaker (deep interface, no decision) --------------------
+
+    #[test]
+    fn verify_speaker_reports_full_evidence_for_the_best_identity() {
+        let (_dir, mut store) = store();
+        // 甲: two samples (0.72 best, 0.61 also above consensus).
+        store
+            .enroll("甲", &directed(0.72, 1), VOICED_OK, None)
+            .unwrap();
+        store
+            .enroll("甲", &directed(0.61, 2), VOICED_OK, None)
+            .unwrap();
+        // 乙: one weaker sample — becomes the runner-up.
+        store
+            .enroll("乙", &directed(0.55, 3), VOICED_OK, None)
+            .unwrap();
+
+        let report = store.verify_speaker(&query()).expect("non-empty store");
+        let jia = store.list().iter().find(|i| i.name == "甲").unwrap();
+        assert_eq!(report.identity_id, jia.id);
+        assert_eq!(report.display_name, "甲");
+        assert!((report.best_score - 0.72).abs() < 1e-3, "{report:?}");
+        assert!((report.runner_up_score - 0.55).abs() < 1e-3, "{report:?}");
+        assert!((report.margin - 0.17).abs() < 1e-2, "{report:?}");
+        assert_eq!(report.consensus_votes, 2);
+        assert_eq!(report.sample_count, 2);
+    }
+
+    #[test]
+    fn verify_speaker_makes_no_decision_and_single_identity_margin_uses_floor() {
+        let (_dir, mut store) = store();
+        // Far below every threshold — verify still reports the evidence.
+        store
+            .enroll("甲", &directed(0.20, 1), VOICED_OK, None)
+            .unwrap();
+        let report = store
+            .verify_speaker(&query())
+            .expect("evidence, not decision");
+        assert!((report.best_score - 0.20).abs() < 1e-3);
+        // Only identity → runner-up pinned at the cosine floor.
+        assert_eq!(report.runner_up_score, -1.0);
+        assert!((report.margin - 1.20).abs() < 1e-3);
+
+        let empty = IdentityStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+        assert!(empty.verify_speaker(&query()).is_none());
+    }
+
+    #[test]
+    fn match_speaker_report_applies_the_offline_policy() {
+        let (_dir, mut store) = store();
+        // Below auto-tag with a single sample → offline policy rejects, while
+        // the deep interface still reports it.
+        store
+            .enroll("甲", &directed(0.65, 1), VOICED_OK, None)
+            .unwrap();
+        assert!(store.match_speaker_report(&query()).is_none());
+        assert!(store.verify_speaker(&query()).is_some());
+
+        store
+            .enroll("乙", &directed(0.75, 2), VOICED_OK, None)
+            .unwrap();
+        let report = store
+            .match_speaker_report(&query())
+            .expect("0.75 ≥ auto-tag");
+        assert_eq!(report.display_name, "乙");
+        assert!((report.best_score - 0.75).abs() < 1e-3);
+        assert!((report.runner_up_score - 0.65).abs() < 1e-3);
+        // And it agrees with the thin (name, score) wrapper.
+        let (name, score) = store.match_speaker(&query()).unwrap();
+        assert_eq!(name, report.display_name);
+        assert_eq!(score, report.best_score);
+    }
+
+    // ---- live decision policy --------------------------------------------
+
+    fn report(best: f32, margin: f32) -> VerificationReport {
+        VerificationReport {
+            identity_id: Uuid::new_v4(),
+            display_name: "甲".into(),
+            best_score: best,
+            runner_up_score: best - margin,
+            margin,
+            consensus_votes: 1,
+            sample_count: 1,
+        }
+    }
+
+    #[test]
+    fn live_policy_verifies_only_long_confident_wide_margin_hits() {
+        // ≥3 s + best ≥ 0.70 + margin ≥ 0.08 → auto-verified (inclusive bounds).
+        assert_eq!(
+            live_decision(&report(0.70, 0.08), LIVE_VERIFIED_MIN_VOICED_MS),
+            LiveDecision::VerifiedAuto
+        );
+        assert_eq!(
+            live_decision(&report(0.9, 0.5), 10_000),
+            LiveDecision::VerifiedAuto
+        );
+        // Any failed verify criterion degrades to provisional (score allows it)…
+        assert_eq!(
+            live_decision(&report(0.69, 0.5), 5000),
+            LiveDecision::Provisional,
+            "score below auto-tag"
+        );
+        assert_eq!(
+            live_decision(&report(0.9, 0.07), 5000),
+            LiveDecision::Provisional,
+            "margin too narrow"
+        );
+        assert_eq!(
+            live_decision(&report(0.9, 0.5), LIVE_VERIFIED_MIN_VOICED_MS - 1),
+            LiveDecision::Provisional,
+            "2–3 s utterance stays provisional however strong the score"
+        );
+    }
+
+    #[test]
+    fn live_policy_rejects_short_or_weak_utterances() {
+        // Below the provisional duration floor → nothing, even at score 0.9.
+        assert_eq!(
+            live_decision(&report(0.9, 0.5), LIVE_PROVISIONAL_MIN_VOICED_MS - 1),
+            LiveDecision::NoMatch
+        );
+        // Below the consensus score floor → nothing, however long.
+        assert_eq!(
+            live_decision(&report(0.59, 0.5), 60_000),
+            LiveDecision::NoMatch
+        );
+        // At the provisional floor exactly → provisional (inclusive).
+        assert_eq!(
+            live_decision(&report(0.60, 0.0), LIVE_PROVISIONAL_MIN_VOICED_MS),
+            LiveDecision::Provisional
+        );
     }
 
     #[test]
