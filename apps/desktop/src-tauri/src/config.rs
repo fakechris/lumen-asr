@@ -56,6 +56,12 @@ pub struct MeetingConfig {
     /// deliberately, keeping first-run false positives out of the default
     /// experience. Only runs when this is on AND the OS capability is present.
     pub detection_enabled: bool,
+    /// Record the system audio output (remote participants) as a second,
+    /// synchronized meeting track via a Core Audio process tap. Defaults to
+    /// `true` but only takes effect when the OS capability (macOS 14.2+) and
+    /// the system-audio permission are present — otherwise recording degrades
+    /// to mic-only, never fails.
+    pub system_audio: bool,
 }
 
 impl Default for MeetingConfig {
@@ -63,6 +69,7 @@ impl Default for MeetingConfig {
         Self {
             transcript_cleanup: true,
             detection_enabled: false,
+            system_audio: true,
         }
     }
 }
@@ -955,6 +962,31 @@ provider = "local_qwen"
     fn meeting_transcript_cleanup_defaults_on() {
         assert!(MeetingConfig::default().transcript_cleanup);
         assert!(AppConfig::default().meeting.transcript_cleanup);
+    }
+
+    #[test]
+    fn meeting_system_audio_defaults_on_and_can_opt_out() {
+        // Defaults on (capability-gated at runtime)…
+        assert!(MeetingConfig::default().system_audio);
+        assert!(AppConfig::default().meeting.system_audio);
+        // …absent from an existing config → still on…
+        let existing: AppConfig = toml::from_str(
+            r#"
+[meeting]
+transcript_cleanup = true
+"#,
+        )
+        .unwrap();
+        assert!(existing.meeting.system_audio);
+        // …and an explicit opt-out is honored.
+        let off: AppConfig = toml::from_str(
+            r#"
+[meeting]
+system_audio = false
+"#,
+        )
+        .unwrap();
+        assert!(!off.meeting.system_audio);
     }
 
     #[test]

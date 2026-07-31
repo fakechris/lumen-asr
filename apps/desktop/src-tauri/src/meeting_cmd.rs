@@ -155,7 +155,38 @@ pub fn start_meeting_recording(
         }
     };
 
-    // 5. Recording is live — spawn the live-transcript worker (if streaming) and
+    // 5. Optional second track: system audio output (remote participants) via
+    //    the macOS Core Audio process tap. Strictly best-effort and
+    //    capability-gated — if the config opts out, the OS is too old
+    //    (< 14.2), the permission is denied, or anything else fails, the
+    //    session logs a warning and the meeting records mic-only exactly as
+    //    before. The mic path above is already live and is never touched.
+    let system_audio_enabled = state
+        .config
+        .lock()
+        .map(|cfg| cfg.meeting.system_audio)
+        .unwrap_or(true);
+    if system_audio_enabled {
+        let system_path = dir.join(format!("{meeting_id}.system.wav"));
+        if state
+            .meeting_system_audio
+            .start(system_path.clone())
+            .is_some()
+        {
+            // Record the path up front so crash recovery can salvage the
+            // system track too. Best-effort: a store failure only loses the
+            // system track, never the recording.
+            let system_path = system_path.to_string_lossy().to_string();
+            if let Err(e) = with_store(&state, |s| {
+                s.set_meeting_system_audio_path(meeting_id, Some(&system_path))
+                    .map_err(|e| e.to_string())
+            }) {
+                tracing::warn!(meeting_id = %meeting_id, error = %e, "could not record system audio path");
+            }
+        }
+    }
+
+    // 6. Recording is live — spawn the live-transcript worker (if streaming) and
     //    suspend the dictation hotkey. A live-worker failure never fails the
     //    recording: the worker itself degrades to "no live text" on any error.
     if let (Some(dir), Some(rx)) = (streaming_dir, sample_rx) {
@@ -185,6 +216,11 @@ pub fn stop_meeting_recording(
     // failure. This is finally/defer semantics: whatever happens to the
     // recorder or the store write, "the mic and hotkey always come back".
     let stop_result = state.meeting_recorder.stop();
+
+    // Stop the system-audio track (no-op when none is running): tears down the
+    // tap and finalizes the second WAV. Best-effort — `None` here just means
+    // the meeting is mic-only.
+    let system_summary = state.meeting_system_audio.stop();
 
     // Stop the real-time worker (no-op if none was running). The recorder stop
     // above already dropped the audio fan-out sender, which ends the worker's
@@ -235,14 +271,32 @@ pub fn stop_meeting_recording(
         .map_err(|e| e.to_string())
     })?;
 
+    // Reconcile the system track: keep it only when it finalized with real
+    // audio; an empty or failed track is removed and its path cleared so the
+    // meeting reads back as plain mic-only.
+    let system_wav = match system_summary {
+        Some(system) if system.duration_seconds > 0.0 => Some(system.wav_path),
+        other => {
+            if let Some(system) = other {
+                let _ = std::fs::remove_file(&system.wav_path);
+            }
+            let _ = with_store(&state, |s| {
+                s.set_meeting_system_audio_path(id, None)
+                    .map_err(|e| e.to_string())
+            });
+            None
+        }
+    };
+
     tracing::info!(
         meeting_id = %id,
         duration_seconds = summary.duration_seconds,
+        dual_track = system_wav.is_some(),
         "meeting recording stopped → processing"
     );
 
     // Kick off transcription in the background so the stop command returns now.
-    spawn_meeting_processing(app, id, summary.wav_path.clone());
+    spawn_meeting_processing(app, id, summary.wav_path.clone(), system_wav);
 
     Ok(MeetingRecordingDto {
         id: meeting_id,
@@ -356,13 +410,18 @@ fn meeting_detection_capability() -> bool {
 /// Pause the active meeting recording. Paused audio is dropped (no silent gap).
 #[tauri::command]
 pub fn pause_meeting_recording(state: State<'_, AppState>) -> Result<(), String> {
-    state.meeting_recorder.pause().map_err(|e| e.to_string())
+    state.meeting_recorder.pause().map_err(|e| e.to_string())?;
+    // Keep the system track's timeline in lockstep with the mic's.
+    state.meeting_system_audio.set_paused(true);
+    Ok(())
 }
 
 /// Resume a paused meeting recording.
 #[tauri::command]
 pub fn resume_meeting_recording(state: State<'_, AppState>) -> Result<(), String> {
-    state.meeting_recorder.resume().map_err(|e| e.to_string())
+    state.meeting_recorder.resume().map_err(|e| e.to_string())?;
+    state.meeting_system_audio.set_paused(false);
+    Ok(())
 }
 
 /// Manually (re)run the offline transcription + minutes pipeline for a recorded
@@ -376,14 +435,20 @@ pub fn process_meeting_now(
     meeting_id: String,
 ) -> Result<(), String> {
     let id = parse_id(&meeting_id, "meeting")?;
-    let audio_path = with_store(&state, |s| {
-        s.get_meeting(id)
+    let (audio_path, system_audio_path) = with_store(&state, |s| {
+        let meeting = s
+            .get_meeting(id)
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| "meeting not found".to_string())?
+            .ok_or_else(|| "meeting not found".to_string())?;
+        let audio = meeting
             .audio_path
-            .ok_or_else(|| "meeting has no recorded audio".to_string())
+            .ok_or_else(|| "meeting has no recorded audio".to_string())?;
+        Ok((audio, meeting.system_audio_path))
     })?;
-    spawn_meeting_processing(app, id, PathBuf::from(audio_path));
+    // The system track is optional even when recorded: reprocess with it only
+    // if the file is still on disk.
+    let system_wav = system_audio_path.map(PathBuf::from).filter(|p| p.exists());
+    spawn_meeting_processing(app, id, PathBuf::from(audio_path), system_wav);
     Ok(())
 }
 
@@ -401,7 +466,12 @@ pub fn process_meeting_now(
 /// `process_meeting` advances the meeting status itself and marks it `failed` on
 /// any in-pipeline error; this wrapper additionally covers pre-flight failures
 /// (engine/model/config) that never reach it.
-fn spawn_meeting_processing(app: AppHandle, meeting_id: Uuid, wav: PathBuf) {
+fn spawn_meeting_processing(
+    app: AppHandle,
+    meeting_id: Uuid,
+    wav: PathBuf,
+    system_wav: Option<PathBuf>,
+) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -420,7 +490,7 @@ fn spawn_meeting_processing(app: AppHandle, meeting_id: Uuid, wav: PathBuf) {
         };
         runtime.block_on(async move {
             tracing::info!(meeting_id = %meeting_id, "meeting processing started");
-            match process_meeting_pipeline(&app, meeting_id, &wav).await {
+            match process_meeting_pipeline(&app, meeting_id, &wav, system_wav.as_deref()).await {
                 Ok(()) => tracing::info!(meeting_id = %meeting_id, "meeting processing finished"),
                 Err(reason) => {
                     tracing::warn!(meeting_id = %meeting_id, error = %reason, "meeting processing failed");
@@ -466,6 +536,7 @@ async fn process_meeting_pipeline(
     app: &AppHandle,
     meeting_id: Uuid,
     wav: &Path,
+    system_wav: Option<&Path>,
 ) -> Result<(), String> {
     // A dedicated SQLite connection for the background worker. `process_meeting`
     // holds `&Store` across many `.await`s, which the UI's `std::sync::Mutex`
@@ -536,6 +607,7 @@ async fn process_meeting_pipeline(
         &store,
         meeting_id,
         wav,
+        system_wav,
         &diar_models,
         asr_engine.as_ref(),
         minutes_cfg.as_ref(),
@@ -667,12 +739,14 @@ fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
                 tracing::warn!(meeting_id = %id, error = %e, "crash recovery: could not update recovered meeting");
                 return;
             }
+            let system_wav = recover_system_track(store, meeting);
             tracing::info!(
                 meeting_id = %id,
                 duration_seconds = repaired.duration_seconds,
+                dual_track = system_wav.is_some(),
                 "crash recovery: salvaged recording, header repaired → processing"
             );
-            spawn_meeting_processing(app.clone(), id, wav);
+            spawn_meeting_processing(app.clone(), id, wav, system_wav);
         }
         // Header-only WAV: repaired to a valid 0-length take — no audio to keep.
         Ok(_) => fail_interrupted(store, id),
@@ -685,6 +759,39 @@ fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
             }
         }
     }
+}
+
+/// Best-effort crash recovery for a salvaged meeting's optional **system**
+/// track: repair its WAV header the same way as the mic track's. Any problem
+/// (no path, missing/empty file, unrepairable header) clears the stored path
+/// and drops the track — the meeting still recovers mic-only, mirroring the
+/// live degrade contract.
+fn recover_system_track(store: &Store, meeting: &Meeting) -> Option<PathBuf> {
+    let path = meeting.system_audio_path.clone()?;
+    let wav = PathBuf::from(&path);
+    let recovered = match lumen_asr::repair_wav_header(&wav) {
+        Ok(repaired) if repaired.data_bytes > 0 => Some(wav),
+        Ok(_) => {
+            // Header-only: nothing captured; remove the empty shell.
+            let _ = std::fs::remove_file(&wav);
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                meeting_id = %meeting.id,
+                path = %wav.display(),
+                error = %e,
+                "crash recovery: system track unrepairable, continuing mic-only"
+            );
+            None
+        }
+    };
+    if recovered.is_none() {
+        if let Err(e) = store.set_meeting_system_audio_path(meeting.id, None) {
+            tracing::warn!(meeting_id = %meeting.id, error = %e, "crash recovery: could not clear system audio path");
+        }
+    }
+    recovered
 }
 
 /// Mark an interrupted meeting `failed` with the standard "no audio" reason.
@@ -796,15 +903,18 @@ pub fn rename_meeting(
 #[tauri::command]
 pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<bool, String> {
     let id = parse_id(&meeting_id, "meeting")?;
-    // Read the audio path before deleting the row so we know which WAV to remove.
-    let audio_path = with_store(&state, |s| {
-        Ok(s.get_meeting(id)
-            .map_err(|e| e.to_string())?
-            .and_then(|m| m.audio_path))
+    // Read the audio paths (mic + optional system track) before deleting the
+    // row so we know which WAVs to remove.
+    let (audio_path, system_audio_path) = with_store(&state, |s| {
+        let meeting = s.get_meeting(id).map_err(|e| e.to_string())?;
+        Ok((
+            meeting.as_ref().and_then(|m| m.audio_path.clone()),
+            meeting.and_then(|m| m.system_audio_path),
+        ))
     })?;
     let deleted = with_store(&state, |s| s.delete_meeting(id).map_err(|e| e.to_string()))?;
     if deleted {
-        if let Some(path) = audio_path {
+        for path in [audio_path, system_audio_path].into_iter().flatten() {
             let wav = Path::new(&path);
             if wav.exists() {
                 if let Err(e) = std::fs::remove_file(wav) {

@@ -482,6 +482,8 @@ export type TranscriptSegment = {
   confidence?: number | null;
   /** Optional word-level timing; not rendered in M4b. */
   words?: unknown[] | null;
+  /** Capture track: "mic" (我) / "system" (对方). Absent on legacy meetings. */
+  channel?: "mic" | "system" | null;
 };
 
 export type SummaryKind = "summary" | "action_items" | "decisions";

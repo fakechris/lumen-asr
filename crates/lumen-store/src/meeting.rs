@@ -8,7 +8,8 @@
 use anyhow::Result;
 use lumen_core::transcript::Word;
 use lumen_core::{
-    Meeting, MeetingDetail, MeetingStatus, MeetingSummary, Speaker, SummaryKind, TranscriptSegment,
+    Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SegmentChannel, Speaker, SummaryKind,
+    TranscriptSegment,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
@@ -24,8 +25,8 @@ impl Store {
             r#"
             INSERT INTO meetings (
               id, created_at, title, audio_path, duration_seconds, status,
-              language, failure_reason, notes
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+              language, failure_reason, notes, system_audio_path
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
             "#,
             params![
                 meeting.id.to_string(),
@@ -37,6 +38,7 @@ impl Store {
                 meeting.language,
                 meeting.failure_reason,
                 meeting.notes,
+                meeting.system_audio_path,
             ],
         )?;
         Ok(())
@@ -100,6 +102,19 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Record (or clear, with `None`) the path of the meeting's second,
+    /// synchronized system-audio WAV. Written at recording start so crash
+    /// recovery can find the file, and cleared at stop when the system track
+    /// turned out empty/unusable. Only this column changes. Returns `true` if a
+    /// row was updated.
+    pub fn set_meeting_system_audio_path(&self, id: Uuid, path: Option<&str>) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE meetings SET system_audio_path=?2 WHERE id=?1",
+            params![id.to_string(), path],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Rename a meeting: update only its `title`, leaving every other field
     /// untouched. A blank (empty/whitespace) `title` is stored as `NULL` so the
     /// meeting reads back as untitled — matching how untitled meetings are
@@ -132,7 +147,7 @@ impl Store {
             .query_row(
                 r#"
                 SELECT id, created_at, title, audio_path, duration_seconds, status,
-                       language, failure_reason, notes
+                       language, failure_reason, notes, system_audio_path
                 FROM meetings WHERE id=?1
                 "#,
                 params![id.to_string()],
@@ -147,7 +162,7 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, created_at, title, audio_path, duration_seconds, status,
-                   language, failure_reason, notes
+                   language, failure_reason, notes, system_audio_path
             FROM meetings
             ORDER BY created_at DESC
             LIMIT ?1
@@ -180,7 +195,7 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, created_at, title, audio_path, duration_seconds, status,
-                   language, failure_reason, notes
+                   language, failure_reason, notes, system_audio_path
             FROM meetings
             WHERE (?1 IS NULL OR status = ?1)
               AND (?2 IS NULL OR instr(title, ?2) > 0)
@@ -250,7 +265,7 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, meeting_id, seq, start_seconds, end_seconds, text,
-                   speaker_id, confidence, words_json
+                   speaker_id, confidence, words_json, channel
             FROM transcript_segments
             WHERE meeting_id=?1
             ORDER BY seq ASC
@@ -466,8 +481,8 @@ fn add_segment_on(conn: &Connection, segment: &TranscriptSegment) -> Result<()> 
         r#"
         INSERT INTO transcript_segments (
           id, meeting_id, seq, start_seconds, end_seconds, text,
-          speaker_id, confidence, words_json
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+          speaker_id, confidence, words_json, channel
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
         "#,
         params![
             segment.id.to_string(),
@@ -479,6 +494,7 @@ fn add_segment_on(conn: &Connection, segment: &TranscriptSegment) -> Result<()> 
             segment.speaker_id.map(|id| id.to_string()),
             segment.confidence,
             words_json,
+            segment.channel.map(|c| c.as_str()),
         ],
     )?;
     Ok(())
@@ -495,6 +511,7 @@ fn map_meeting(row: &rusqlite::Row<'_>) -> rusqlite::Result<Meeting> {
         language: row.get(6)?,
         failure_reason: row.get(7)?,
         notes: row.get(8)?,
+        system_audio_path: row.get(9)?,
     })
 }
 
@@ -529,6 +546,9 @@ fn map_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptSegment> {
         speaker_id,
         confidence: row.get(7)?,
         words,
+        channel: row
+            .get::<_, Option<String>>(9)?
+            .map(|token| SegmentChannel::from_str_or_mic(&token)),
     })
 }
 
@@ -593,6 +613,82 @@ mod tests {
         let listed = store.list_meetings(10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, meeting.id);
+    }
+
+    #[test]
+    fn system_audio_path_round_trips_and_clears() {
+        let (_dir, store) = open_store();
+        let mut meeting = Meeting::new();
+        meeting.audio_path = Some("/store/m.wav".into());
+        // Fresh meetings have no system track.
+        assert_eq!(meeting.system_audio_path, None);
+        store.create_meeting(&meeting).unwrap();
+        assert_eq!(
+            store
+                .get_meeting(meeting.id)
+                .unwrap()
+                .unwrap()
+                .system_audio_path,
+            None
+        );
+
+        // Recording start writes the path; only that column changes.
+        assert!(store
+            .set_meeting_system_audio_path(meeting.id, Some("/store/m.system.wav"))
+            .unwrap());
+        let updated = store.get_meeting(meeting.id).unwrap().unwrap();
+        assert_eq!(
+            updated.system_audio_path.as_deref(),
+            Some("/store/m.system.wav")
+        );
+        assert_eq!(updated.audio_path.as_deref(), Some("/store/m.wav"));
+        assert_eq!(updated.status, MeetingStatus::Recording);
+
+        // An empty/unusable system track clears back to NULL at stop.
+        assert!(store
+            .set_meeting_system_audio_path(meeting.id, None)
+            .unwrap());
+        assert_eq!(
+            store
+                .get_meeting(meeting.id)
+                .unwrap()
+                .unwrap()
+                .system_audio_path,
+            None
+        );
+
+        // No row for an unknown id.
+        assert!(!store
+            .set_meeting_system_audio_path(Uuid::new_v4(), Some("/x.wav"))
+            .unwrap());
+    }
+
+    #[test]
+    fn segment_channel_round_trips_and_legacy_rows_read_none() {
+        use lumen_core::SegmentChannel;
+
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+
+        let mut mic = TranscriptSegment::new(meeting.id, 0, 0.0, 1.0, "我这边说");
+        mic.channel = Some(SegmentChannel::Mic);
+        let mut system = TranscriptSegment::new(meeting.id, 1, 1.0, 2.0, "对方在说");
+        system.channel = Some(SegmentChannel::System);
+        let legacy = TranscriptSegment::new(meeting.id, 2, 2.0, 3.0, "旧单轨");
+        store
+            .add_segments(&[mic.clone(), system.clone(), legacy.clone()])
+            .unwrap();
+
+        let segments = store.list_segments(meeting.id).unwrap();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], mic);
+        assert_eq!(segments[0].channel, Some(SegmentChannel::Mic));
+        assert_eq!(segments[1], system);
+        assert_eq!(segments[1].channel, Some(SegmentChannel::System));
+        // A segment stored without a channel (legacy single-track) reads None.
+        assert_eq!(segments[2], legacy);
+        assert_eq!(segments[2].channel, None);
     }
 
     #[test]

@@ -6,8 +6,10 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// Current storage schema version. v6 added the meeting data model
 /// (`meetings`, `speakers`, `transcript_segments`, `meeting_summaries`); v7
 /// adds the additive `meetings.failure_reason` column; v8 adds the additive
-/// `meetings.notes` column (user notes taken during the meeting).
-pub(crate) const SCHEMA_VERSION: i64 = 8;
+/// `meetings.notes` column (user notes taken during the meeting); v9 adds the
+/// additive `meetings.system_audio_path` and `transcript_segments.channel`
+/// columns for dual-track (mic + system audio) meetings.
+pub(crate) const SCHEMA_VERSION: i64 = 9;
 
 /// Additive v6 migration: the meeting-mode tables. These sit alongside the
 /// dictation tables and never touch them. `speakers` is created before
@@ -290,6 +292,40 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     if !has_notes {
         conn.execute(
             "ALTER TABLE meetings ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (8)",
+        [],
+    )?;
+    // v9: additive dual-track columns — `meetings.system_audio_path` (path of
+    // the optional second, synchronized system-audio WAV) and
+    // `transcript_segments.channel` ('mic' / 'system'; NULL for legacy
+    // single-track meetings, which reads as mic). Guarded by column checks
+    // (SQLite has no `ADD COLUMN IF NOT EXISTS`) so re-running is a no-op.
+    let has_system_audio_path = {
+        let mut statement = conn.prepare("PRAGMA table_info(meetings)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "system_audio_path")
+    };
+    if !has_system_audio_path {
+        conn.execute("ALTER TABLE meetings ADD COLUMN system_audio_path TEXT", [])?;
+    }
+    let has_channel = {
+        let mut statement = conn.prepare("PRAGMA table_info(transcript_segments)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "channel")
+    };
+    if !has_channel {
+        conn.execute(
+            "ALTER TABLE transcript_segments ADD COLUMN channel TEXT",
             [],
         )?;
     }
@@ -704,6 +740,107 @@ mod tests {
             })
             .unwrap();
         assert_eq!(title, "旧会议");
+
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_nine_adds_dual_track_columns_without_touching_v8_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Stand up a v8 database (schema recorded up to 8: meetings with
+        // failure_reason + notes, segments without channel) holding one meeting
+        // and one segment.
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (1),(2),(3),(4),(5),(6),(7),(8);
+                CREATE TABLE meetings (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  title TEXT,
+                  audio_path TEXT,
+                  duration_seconds REAL,
+                  status TEXT NOT NULL DEFAULT 'recording',
+                  language TEXT,
+                  failure_reason TEXT,
+                  notes TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO meetings (id, created_at, status, title, audio_path)
+                VALUES ('m1', '2026-07-25T00:00:00Z', 'ready', '旧会议', '/tmp/m1.wav');
+                CREATE TABLE transcript_segments (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  meeting_id TEXT NOT NULL,
+                  seq INTEGER NOT NULL,
+                  start_seconds REAL NOT NULL,
+                  end_seconds REAL NOT NULL,
+                  text TEXT NOT NULL,
+                  speaker_id TEXT,
+                  confidence REAL,
+                  words_json TEXT
+                );
+                INSERT INTO transcript_segments (id, meeting_id, seq, start_seconds, end_seconds, text)
+                VALUES ('seg1', 'm1', 0, 0.0, 1.0, '旧句子');
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        // Both new columns exist; pre-existing rows default them to NULL.
+        let meeting_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(meetings)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(meeting_columns.contains(&"system_audio_path".to_owned()));
+        let segment_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(transcript_segments)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(segment_columns.contains(&"channel".to_owned()));
+
+        let system_path: Option<String> = connection
+            .query_row(
+                "SELECT system_audio_path FROM meetings WHERE id='m1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(system_path, None);
+        let channel: Option<String> = connection
+            .query_row(
+                "SELECT channel FROM transcript_segments WHERE id='seg1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(channel, None);
+        // The pre-existing rows are otherwise untouched.
+        let title: String = connection
+            .query_row("SELECT title FROM meetings WHERE id='m1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "旧会议");
+        let text: String = connection
+            .query_row(
+                "SELECT text FROM transcript_segments WHERE id='seg1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text, "旧句子");
 
         let version: i64 = connection
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {

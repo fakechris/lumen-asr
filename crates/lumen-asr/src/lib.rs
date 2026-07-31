@@ -14,7 +14,7 @@ mod meeting_recorder;
 pub use audio::{AudioCapture, AudioDeviceInfo, AudioError, CaptureResult};
 pub use meeting_recorder::{
     repair_wav_header, MeetingRecorder, MeetingRecorderError, RecordingSummary, RepairedWav,
-    SampleSink, WavSink,
+    SampleSink, SystemTrackRecorder, SystemTrackSender, WavSink,
 };
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).
