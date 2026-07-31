@@ -1231,10 +1231,12 @@ pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<
 /// annotation row (repeat annotations on the same range are resolved
 /// last-write-wins by `created_at` at reconciliation time) and returns it.
 /// `segment_id` is the transient live segment id (e.g. `mic-3`) — used for
-/// tracing only, never persisted. `end_seconds` may be absent when the live
-/// line has not finalized yet. `identity_id` links an enrolled identity from
-/// the local voiceprint library; `display_name` is the name snapshot shown on
-/// the chip (required either way).
+/// tracing only, never persisted. `end_seconds` absent stores an
+/// **open-ended** annotation ("此句及之后"): it applies from `start_seconds`
+/// until the next open-ended annotation begins on the same track (also used
+/// when the live line has not finalized yet). `identity_id` links an enrolled
+/// identity from the local voiceprint library; `display_name` is the name
+/// snapshot shown on the chip (required either way).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // the IPC payload is exactly these fields
 pub fn annotate_live_segment(

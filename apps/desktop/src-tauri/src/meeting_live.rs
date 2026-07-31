@@ -289,6 +289,60 @@ impl SegmentTracker {
     }
 }
 
+/// Sample-anchored track clock: converts each fan-out packet's wall-clock
+/// arrival stamp into the time its **first sample** holds on the unified
+/// meeting timeline.
+///
+/// Why not use the arrival stamps directly? They diverge from the recorded
+/// WAV — which is what the offline pipeline (and therefore annotation
+/// reconciliation) measures segments against — in two ways:
+///
+/// - every arrival stamp trails the audio it carries by that chunk's
+///   duration plus callback latency (the chunk is stamped when the capture
+///   callback *delivers* it, i.e. after it was recorded);
+/// - a paused recording drops samples from the WAV while wall-clock time
+///   keeps running, so after a pause the arrival stamps lead the WAV
+///   timeline by the whole paused interval, forever.
+///
+/// Instead, the first packet anchors the track (its arrival minus its own
+/// duration ≈ the track's first captured frame on the unified timeline) and
+/// every later packet is placed at `anchor + samples_fed_so_far / rate` —
+/// glued to the same sample count the WAV holds, so live stamps and offline
+/// WAV-time-plus-sidecar-offset segments agree. (Packets dropped by a full
+/// fan-out channel are not counted here; they are rare, bounded by the
+/// channel capacity, and only occur when the preview is already degraded.)
+struct SampleClock {
+    /// Unified-timeline time of the track's first captured frame; `None`
+    /// until the first packet arrives.
+    anchor_seconds: Option<f64>,
+    /// Samples fed so far (at the track's native capture rate).
+    samples_fed: u64,
+    capture_rate: u32,
+}
+
+impl SampleClock {
+    fn new(capture_rate: u32) -> Self {
+        Self {
+            anchor_seconds: None,
+            samples_fed: 0,
+            capture_rate: capture_rate.max(1),
+        }
+    }
+
+    /// Place one packet on the unified timeline. Returns
+    /// `(chunk_start_seconds, chunk_end_seconds)` for its first/last sample.
+    fn observe(&mut self, arrival_seconds: f64, samples: usize) -> (f64, f64) {
+        let rate = f64::from(self.capture_rate);
+        let chunk_seconds = samples as f64 / rate;
+        let anchor = *self
+            .anchor_seconds
+            .get_or_insert((arrival_seconds - chunk_seconds).max(0.0));
+        let start = anchor + self.samples_fed as f64 / rate;
+        self.samples_fed += samples as u64;
+        (start, start + chunk_seconds)
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // L3: live speaker verification — recent-audio ring window, bounded embedder
 // hand-off, and the streak upgrade rule. The pure parts (window, streak) are
@@ -319,10 +373,13 @@ const EMBED_QUEUE_CAPACITY: usize = 4;
 const STREAK_UPGRADE_AFTER: u32 = 2;
 
 /// Rolling window of a track's recent audio (model-rate mono), stamped on the
-/// meeting's unified timeline. Chunks arrive with their fan-out packet stamps
-/// and are evicted oldest-first past [`WINDOW_CAPACITY_SECONDS`]; extraction
-/// slices every chunk overlapping the requested span (gaps — e.g. pauses —
-/// simply contribute nothing). Pure and unit-testable.
+/// meeting's unified timeline. Chunks are stamped with the track's
+/// [`SampleClock`] chunk-start times — the same source the segment events use
+/// — so an utterance's `[start, end]` span extracts exactly the audio the
+/// recognizer saw for it (arrival stamps would drift by a chunk's duration
+/// and by any paused interval). Evicted oldest-first past
+/// [`WINDOW_CAPACITY_SECONDS`]; extraction slices every chunk overlapping the
+/// requested span (gaps simply contribute nothing). Pure and unit-testable.
 struct AudioWindow {
     sample_rate: u32,
     chunks: VecDeque<(f64, Vec<f32>)>,
@@ -569,8 +626,10 @@ struct TrackState {
     tracker: SegmentTracker,
     feed: LiveTrackFeed,
     stream: StreamingStream,
-    /// End (unified timeline) of the audio fed so far: last packet's arrival
-    /// stamp plus its duration. Used as the finalized segment's `end_seconds`.
+    /// Sample-anchored unified-timeline clock for this track's packets.
+    sample_clock: SampleClock,
+    /// End (unified timeline) of the audio fed so far. Used as the finalized
+    /// segment's `end_seconds`.
     clock: f64,
     disconnected: bool,
     /// Recent model-rate audio for utterance extraction (L3). `None` when the
@@ -585,10 +644,12 @@ impl TrackState {
         stream: StreamingStream,
         keep_window: bool,
     ) -> Self {
+        let sample_clock = SampleClock::new(feed.capture_rate);
         Self {
             tracker: SegmentTracker::new(track),
             feed,
             stream,
+            sample_clock,
             clock: 0.0,
             disconnected: false,
             window: keep_window.then(|| AudioWindow::new(STREAMING_TARGET_RATE)),
@@ -604,9 +665,11 @@ impl TrackState {
             match self.feed.rx.try_recv() {
                 Ok(packet) => {
                     got_audio = true;
-                    self.tracker.note_audio(packet.start_seconds);
-                    self.clock = packet.start_seconds
-                        + packet.samples.len() as f64 / f64::from(self.feed.capture_rate.max(1));
+                    let (chunk_start, chunk_end) = self
+                        .sample_clock
+                        .observe(packet.start_seconds, packet.samples.len());
+                    self.tracker.note_audio(chunk_start);
+                    self.clock = chunk_end;
                     let samples = if self.feed.capture_rate == STREAMING_TARGET_RATE {
                         packet.samples
                     } else {
@@ -616,8 +679,13 @@ impl TrackState {
                             STREAMING_TARGET_RATE,
                         )
                     };
+                    // The ring window must share the segment events' time
+                    // source (the sample-anchored clock), or utterance
+                    // [start, end] extraction would misalign with the spans
+                    // the tracker reports — by a chunk's duration always, and
+                    // by the whole paused interval after a pause.
                     if let Some(window) = &mut self.window {
-                        window.push(packet.start_seconds, &samples);
+                        window.push(chunk_start, &samples);
                     }
                     self.stream.accept_waveform(&samples, STREAMING_TARGET_RATE);
                 }
@@ -928,6 +996,46 @@ mod tests {
         // And its id is burned — the next utterance gets a new one.
         tracker.note_audio(2.0);
         assert_eq!(tracker.on_partial("好").unwrap().segment_id, "mic-1");
+    }
+
+    #[test]
+    fn sample_clock_anchors_at_the_first_captured_frame() {
+        let mut clock = SampleClock::new(16_000);
+        // First chunk: 1600 samples (0.1 s) arriving 0.30 s after t0 — its
+        // first frame was captured at ≈0.20 s.
+        let (start, end) = clock.observe(0.30, 1600);
+        assert!((start - 0.20).abs() < 1e-9);
+        assert!((end - 0.30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sample_clock_glues_to_sample_count_not_arrival_jitter() {
+        let mut clock = SampleClock::new(16_000);
+        clock.observe(0.30, 1600);
+        // The next chunk arrives late (scheduling jitter): its placement
+        // still follows the fed sample count, not the arrival stamp.
+        let (start, end) = clock.observe(0.55, 1600);
+        assert!((start - 0.30).abs() < 1e-9);
+        assert!((end - 0.40).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sample_clock_is_immune_to_pause_gaps() {
+        let mut clock = SampleClock::new(16_000);
+        clock.observe(0.30, 1600);
+        // A 10 s pause: no packets flow (the recorder drops paused audio from
+        // both the WAV and the fan-out). The first post-resume chunk must
+        // continue the *WAV* timeline (0.30 s in), not jump by wall-clock.
+        let (start, _) = clock.observe(10.40, 1600);
+        assert!((start - 0.30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sample_clock_anchor_never_goes_negative() {
+        let mut clock = SampleClock::new(16_000);
+        // Degenerate stamp (arrival before its own duration): clamp to t0.
+        let (start, _) = clock.observe(0.05, 1600);
+        assert!(start >= 0.0);
     }
 
     // Off macOS the real-time layer is never engaged (no model gating even

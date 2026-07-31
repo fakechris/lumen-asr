@@ -49,7 +49,7 @@ pub use merge::{merge_tracks, system_speaker_offset, MergedTake, TrackTake};
 #[cfg(all(target_os = "macos", feature = "diarize"))]
 pub use pipeline::LiveVoiceprintEmbedder;
 pub use pipeline::{transcribe_meeting, DiarModels, MeetingError, MeetingOptions};
-pub use process::{process_meeting, MinutesConfig, ProcessError};
+pub use process::{process_meeting, reconcile_stored_annotations, MinutesConfig, ProcessError};
 
 /// The engine speaker-count hint passed to diarization by default.
 pub const DEFAULT_MAX_SPEAKERS: usize = 6;

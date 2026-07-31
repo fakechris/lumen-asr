@@ -3343,8 +3343,7 @@ button.meeting-seg-text.seekable:hover {
 }
 
 /* Per-line speaker-annotation chip (L2). Unannotated lines show a faint
- * 标注 affordance that firms up on hover; an annotated line shows the name.
- * The menu opens upward (the newest lines sit at the scroll bottom). */
+ * 标注 affordance that firms up on hover; an annotated line shows the name. */
 .meeting-live-annotate {
   position: relative;
   display: inline-block;
@@ -3390,11 +3389,14 @@ button.meeting-seg-text.seekable:hover {
   color: var(--text-muted, #8a8a8a);
 }
 
+/* Positioned `fixed` from the chip's viewport rect at open time (inline
+ * left/top or left/bottom), so the scroll container's overflow can never
+ * clip it: it opens downward by default and flips upward only when the
+ * space below is too tight — the first and the last line both stay fully
+ * visible and clickable. Any scroll of the live body closes it. */
 .meeting-live-annotate-menu {
-  position: absolute;
-  left: 0;
-  bottom: calc(100% + 4px);
-  z-index: 10;
+  position: fixed;
+  z-index: 40;
   display: flex;
   flex-direction: column;
   min-width: 130px;
@@ -3405,6 +3407,29 @@ button.meeting-seg-text.seekable:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+}
+
+/* Scope choice row (P3): 此句及之后 (default, consecutive-speech case) vs
+ * 仅此句. Rendered as a compact segmented pair above the name list. */
+.meeting-live-annotate-scope {
+  display: flex;
+  gap: 3px;
+  padding: 2px;
+  margin-bottom: 3px;
+  border-bottom: 1px solid var(--border);
+}
+
+.meeting-live-annotate-scope button {
+  flex: 1;
+  text-align: center;
+  font-size: 0.74rem;
+  padding: 4px 6px;
+  color: var(--text-muted, #8a8a8a);
+}
+
+.meeting-live-annotate-scope button.active {
+  color: var(--accent, #4a7dbd);
+  background: color-mix(in srgb, var(--accent, #4a7dbd) 12%, transparent);
 }
 
 .meeting-live-annotate-menu button {

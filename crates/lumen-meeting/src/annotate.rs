@@ -14,6 +14,15 @@
 //! pass assigned. Priority order: manual > verified (voiceprint) >
 //! offline_diarization > unknown.
 //!
+//! ## Annotation kinds
+//! A **closed** annotation ("仅此句") carries a time range and applies to
+//! segments it overlaps enough (symmetric ratio, see
+//! [`ANNOTATION_MIN_OVERLAP_RATIO`]). An **open-ended** annotation
+//! ("此句及之后", `end_seconds` NULL) means "this person speaks from here on":
+//! it applies to every segment from its start until the next open-ended
+//! annotation begins on the same track. A closed annotation is more specific
+//! and wins for the segments it covers without ending the open range.
+//!
 //! ## Timeline conversion
 //! Offline segments carry times in their own track's WAV timeline; each
 //! track's WAV starts a little after `t0` (the offsets live in the
@@ -42,8 +51,15 @@ use lumen_core::{LiveAnnotation, SegmentChannel, Speaker, TranscriptSegment};
 use lumen_identity::IdentityStore;
 use uuid::Uuid;
 
-/// Minimum fraction of a segment's duration that must be covered by an
-/// annotation's time range for the segment to adopt the manual name.
+/// Minimum overlap fraction for a closed annotation to cover a segment. The
+/// ratio is **symmetric**: the overlap must reach this fraction of the
+/// segment's duration *or* of the annotation's own duration. The second
+/// branch is essential: live caption lines split on streaming-ASR endpoints
+/// (~1 s silences), while the offline diarizer merges continuous speech into
+/// much longer speaker turns — so a correct annotation on one live line often
+/// covers only a small slice of the diarized segment it belongs to. Requiring
+/// the overlap to reach half of the *segment* alone silently dropped every
+/// such annotation.
 pub const ANNOTATION_MIN_OVERLAP_RATIO: f64 = 0.5;
 
 /// Label prefix for speaker rows created by reconciliation for manual names.
@@ -151,10 +167,19 @@ pub fn reconcile_annotations(
         return outcome;
     }
 
-    // 1. Per segment: the newest annotation (created_at; list order breaks
-    //    ties) on the same channel whose range covers it enough. Keep the
-    //    winning annotation's identity link alongside the name so the manual
-    //    attribution can be persisted with full provenance (v13).
+    // 1. Per segment: the manual name attributed to it, if any.
+    //    - **Closed** annotations ("仅此句") are range marks: the newest one
+    //      (created_at; list order breaks ties) on the same channel whose
+    //      range overlaps the segment enough wins.
+    //    - **Open-ended** annotations ("此句及之后", `end_seconds` NULL) mean
+    //      "this person speaks from here until the next open-ended mark on
+    //      this track": the one with the greatest start not after the segment
+    //      applies, i.e. a later open-ended mark supersedes an earlier one
+    //      from its own start onward. A closed annotation is more specific
+    //      than an inherited open-ended range, so it wins for the segments it
+    //      covers without terminating the open-ended range for later ones.
+    //    The winning annotation's identity link is kept alongside the name so
+    //    the manual attribution persists with full provenance (v13).
     let manual_names: Vec<Option<(String, Option<Uuid>)>> = segments
         .iter()
         .map(|segment| {
@@ -165,10 +190,28 @@ pub fn reconcile_annotations(
             };
             let start = segment.start_seconds + offset;
             let end = segment.end_seconds + offset;
+            let closed = annotations
+                .iter()
+                .filter(|a| {
+                    a.channel == channel
+                        && a.end_seconds.is_some()
+                        && annotation_covers(a, start, end)
+                })
+                .max_by(|a, b| a.created_at.cmp(&b.created_at));
+            if let Some(a) = closed {
+                return Some((a.display_name.clone(), a.identity_id));
+            }
             annotations
                 .iter()
-                .filter(|a| a.channel == channel && annotation_covers(a, start, end))
-                .max_by(|a, b| a.created_at.cmp(&b.created_at))
+                .filter(|a| {
+                    a.channel == channel && a.end_seconds.is_none() && a.start_seconds <= end
+                })
+                .max_by(|a, b| {
+                    a.start_seconds
+                        .partial_cmp(&b.start_seconds)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.created_at.cmp(&b.created_at))
+                })
                 .map(|a| (a.display_name.clone(), a.identity_id))
         })
         .collect();
@@ -253,24 +296,31 @@ pub fn reconcile_annotations(
     outcome
 }
 
-/// Does this annotation's range cover the segment span `[start, end]` (both on
-/// the unified timeline) enough to adopt the manual name? A closed annotation
-/// must overlap at least [`ANNOTATION_MIN_OVERLAP_RATIO`] of the segment's
-/// duration; an open-ended one (the live line had not finalized at annotate
-/// time) counts when its start point falls inside the segment.
+/// Does this **closed** annotation's range cover the segment span
+/// `[start, end]` (both on the unified timeline) enough to adopt the manual
+/// name? The overlap must reach [`ANNOTATION_MIN_OVERLAP_RATIO`] of the
+/// segment's duration **or** of the annotation's own duration (symmetric):
+/// the second branch keeps a short live-line annotation effective when the
+/// offline diarizer merged that speech into a much longer turn, while a mere
+/// edge graze (small against both spans) still never matches. Open-ended
+/// annotations are handled by the caller's nearest-preceding rule instead.
 fn annotation_covers(annotation: &LiveAnnotation, start: f64, end: f64) -> bool {
-    match annotation.end_seconds {
-        Some(annotation_end) => {
-            let length = end - start;
-            // Zero-length, inverted, or NaN spans can never be covered.
-            if !length.is_finite() || length <= 0.0 {
-                return false;
-            }
-            let overlap = annotation_end.min(end) - annotation.start_seconds.max(start);
-            overlap / length >= ANNOTATION_MIN_OVERLAP_RATIO
-        }
-        None => annotation.start_seconds >= start && annotation.start_seconds <= end,
+    let Some(annotation_end) = annotation.end_seconds else {
+        return false;
+    };
+    let segment_length = end - start;
+    // Zero-length, inverted, or NaN spans can never be covered.
+    if !segment_length.is_finite() || segment_length <= 0.0 {
+        return false;
     }
+    let overlap = annotation_end.min(end) - annotation.start_seconds.max(start);
+    if overlap <= 0.0 {
+        return false;
+    }
+    // The corrupt-bounds filter guarantees annotation_end > start_seconds.
+    let annotation_length = annotation_end - annotation.start_seconds;
+    overlap / segment_length >= ANNOTATION_MIN_OVERLAP_RATIO
+        || overlap / annotation_length >= ANNOTATION_MIN_OVERLAP_RATIO
 }
 
 /// Write a manual attribution onto a speaker row: the name, the annotation's
@@ -355,10 +405,11 @@ mod tests {
         let meeting_id = Uuid::new_v4();
         let (speaker, mut segments) = cluster(meeting_id, "S1", &[(0.0, 4.0), (10.0, 14.0)], 0);
         let mut speakers = vec![speaker];
-        // Covers only 1s of the 4s first segment (25% < 50%): no match. Covers
-        // exactly 2s of the 4s second segment (50% = threshold): match.
+        // An edge graze that is small against BOTH spans never matches: 1s of
+        // the 4s first segment (25%) and 1s of the 10s annotation (10%).
+        // Covers exactly 2s of the 4s second segment (50% = threshold): match.
         let annotations = vec![
-            annotation(meeting_id, 3.0, Some(4.0), SegmentChannel::Mic, "李明", 0),
+            annotation(meeting_id, 3.0, Some(13.0), SegmentChannel::Mic, "李明", 0),
             annotation(meeting_id, 12.0, Some(14.0), SegmentChannel::Mic, "李明", 1),
         ];
 
@@ -567,6 +618,126 @@ mod tests {
             0.0,
         );
         assert_eq!(outcome2, AnnotationReconciliation::default());
+    }
+
+    /// P1 regression: a live caption line is one streaming-ASR utterance
+    /// (a few seconds), but the offline diarizer merges continuous speech
+    /// into far longer turns. The annotation's overlap is small against the
+    /// *segment* but total against the *annotation* — it must still apply.
+    #[test]
+    fn short_line_annotation_covers_a_much_longer_diarized_turn() {
+        let meeting_id = Uuid::new_v4();
+        // One 40s diarized turn; the user annotated a single ~6.5s live line
+        // inside it (12.4–18.9 unified, arrival-stamped).
+        let (speaker, mut segments) = cluster(meeting_id, "S1", &[(10.0, 50.0)], 0);
+        let mut speakers = vec![speaker];
+        let annotations = vec![annotation(
+            meeting_id,
+            12.4,
+            Some(18.9),
+            SegmentChannel::Mic,
+            "张三",
+            0,
+        )];
+
+        let outcome = reconcile_annotations(
+            meeting_id,
+            &mut speakers,
+            &mut segments,
+            &annotations,
+            0.0,
+            0.0,
+        );
+
+        // 6.5s / 40s = 16% of the segment — the old segment-only rule dropped
+        // this. 6.5s / 6.5s = 100% of the annotation — the symmetric rule keeps it.
+        assert_eq!(
+            outcome.renamed_speakers,
+            vec![(speakers[0].id, "张三".to_string())]
+        );
+        assert_eq!(speakers[0].display_name.as_deref(), Some("张三"));
+    }
+
+    /// P3: "此句及之后" — an open-ended annotation applies from its start
+    /// until the next open-ended annotation begins on the same track.
+    #[test]
+    fn open_ended_annotations_partition_the_track_by_start_order() {
+        let meeting_id = Uuid::new_v4();
+        let (speaker, mut segments) = cluster(
+            meeting_id,
+            "S1",
+            &[(30.0, 35.0), (90.0, 95.0), (120.0, 125.0)],
+            0,
+        );
+        let mut speakers = vec![speaker];
+        // Open A (0s, 张三) then open B (60s, 李四): 30s belongs to 张三,
+        // 90s and 120s to 李四 (B supersedes A from its own start onward).
+        let annotations = vec![
+            annotation(meeting_id, 0.0, None, SegmentChannel::Mic, "张三", 0),
+            annotation(meeting_id, 60.0, None, SegmentChannel::Mic, "李四", 1),
+        ];
+
+        reconcile_annotations(
+            meeting_id,
+            &mut speakers,
+            &mut segments,
+            &annotations,
+            0.0,
+            0.0,
+        );
+
+        let name_of = |segment: &TranscriptSegment, speakers: &[Speaker]| {
+            speakers
+                .iter()
+                .find(|s| Some(s.id) == segment.speaker_id)
+                .and_then(|s| s.display_name.clone())
+        };
+        assert_eq!(name_of(&segments[0], &speakers).as_deref(), Some("张三"));
+        assert_eq!(name_of(&segments[1], &speakers).as_deref(), Some("李四"));
+        assert_eq!(name_of(&segments[2], &speakers).as_deref(), Some("李四"));
+    }
+
+    /// A closed annotation is more specific than an inherited open-ended
+    /// range: it wins for the segment it covers, and the open-ended range
+    /// resumes for later segments. Segments before the open start are
+    /// untouched.
+    #[test]
+    fn closed_annotation_overrides_open_range_only_where_it_covers() {
+        let meeting_id = Uuid::new_v4();
+        let (speaker, mut segments) = cluster(
+            meeting_id,
+            "S1",
+            &[(0.0, 5.0), (20.0, 25.0), (40.0, 45.0), (60.0, 65.0)],
+            0,
+        );
+        let mut speakers = vec![speaker];
+        let annotations = vec![
+            // 李四 from 10s onward…
+            annotation(meeting_id, 10.0, None, SegmentChannel::Mic, "李四", 0),
+            // …except the 40–45s line, which the user marked 王五 "仅此句".
+            annotation(meeting_id, 40.0, Some(45.0), SegmentChannel::Mic, "王五", 1),
+        ];
+
+        reconcile_annotations(
+            meeting_id,
+            &mut speakers,
+            &mut segments,
+            &annotations,
+            0.0,
+            0.0,
+        );
+
+        let name_of = |segment: &TranscriptSegment, speakers: &[Speaker]| {
+            speakers
+                .iter()
+                .find(|s| Some(s.id) == segment.speaker_id)
+                .and_then(|s| s.display_name.clone())
+        };
+        // Before the open start: no manual attribution.
+        assert_eq!(name_of(&segments[0], &speakers), None);
+        assert_eq!(name_of(&segments[1], &speakers).as_deref(), Some("李四"));
+        assert_eq!(name_of(&segments[2], &speakers).as_deref(), Some("王五"));
+        assert_eq!(name_of(&segments[3], &speakers).as_deref(), Some("李四"));
     }
 
     #[test]

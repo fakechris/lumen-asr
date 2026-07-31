@@ -109,6 +109,48 @@ pub async fn process_meeting(
     result
 }
 
+/// Apply a meeting's stored recording-time live annotations (L2) to its
+/// assembled speakers/segments — the exact chain the offline pipeline runs:
+/// load the `live_annotations` rows, resolve display names against the
+/// identity library, lift each track's WAV-time segments onto the unified
+/// timeline with the `<meeting-id>.timeline.json` sidecar offsets (read from
+/// next to `mic_wav`), and reconcile (manual always wins). Mutates
+/// `speakers`/`segments` in place *before* persistence. Public so an
+/// integration test can drive the very same code path the pipeline uses.
+pub fn reconcile_stored_annotations(
+    store: &Store,
+    meeting_id: Uuid,
+    mic_wav: &Path,
+    identity_dir: Option<&Path>,
+    speakers: &mut Vec<lumen_core::Speaker>,
+    segments: &mut [lumen_core::TranscriptSegment],
+) -> Result<crate::annotate::AnnotationReconciliation, anyhow::Error> {
+    let annotations = store.list_live_annotations(meeting_id)?;
+    if annotations.is_empty() {
+        return Ok(crate::annotate::AnnotationReconciliation::default());
+    }
+    let (mic_offset, system_offset) = crate::echo::read_timeline_offsets(mic_wav);
+    let resolved = crate::annotate::resolve_annotation_names(&annotations, identity_dir);
+    let outcome = crate::annotate::reconcile_annotations(
+        meeting_id,
+        speakers,
+        segments,
+        &resolved,
+        mic_offset,
+        system_offset.unwrap_or(0.0),
+    );
+    // Counts only — the manual names are PII.
+    tracing::info!(
+        meeting_id = %meeting_id,
+        annotations = annotations.len(),
+        renamed_clusters = outcome.renamed_speakers.len(),
+        new_speakers = outcome.new_speakers.len(),
+        reassigned_segments = outcome.reassigned_segments.len(),
+        "live speaker annotations reconciled (manual-first)"
+    );
+    Ok(outcome)
+}
+
 /// Diarize + transcribe one WAV into a positional [`TrackTake`], plus this
 /// track's per-speaker centroid voiceprints (keyed by the track's own engine
 /// speaker ids) and the decoded duration (`None` when the sample rate is
@@ -355,34 +397,16 @@ async fn run(
     // auto-identification so a manual name always overrides the voiceprint
     // guess (manual > verified > offline_diarization), and *before* the
     // persists/minutes below so every downstream consumer sees the manual
-    // attribution. The annotation ranges live on the meeting's unified
-    // timeline; each track's WAV-time segments are lifted onto it with the
-    // timeline-sidecar offsets. No annotations → byte-for-byte no-op.
-    let annotations = store
-        .list_live_annotations(meeting_id)
-        .map_err(ProcessError::Store)?;
-    if !annotations.is_empty() {
-        let (mic_offset, system_offset) = crate::echo::read_timeline_offsets(wav);
-        let resolved =
-            crate::annotate::resolve_annotation_names(&annotations, opts.identity_dir.as_deref());
-        let outcome = crate::annotate::reconcile_annotations(
-            meeting_id,
-            &mut assembled.speakers,
-            &mut assembled.segments,
-            &resolved,
-            mic_offset,
-            system_offset.unwrap_or(0.0),
-        );
-        // Counts only — the manual names are PII.
-        tracing::info!(
-            meeting_id = %meeting_id,
-            annotations = annotations.len(),
-            renamed_clusters = outcome.renamed_speakers.len(),
-            new_speakers = outcome.new_speakers.len(),
-            reassigned_segments = outcome.reassigned_segments.len(),
-            "live speaker annotations reconciled (manual-first)"
-        );
-    }
+    // attribution. No annotations → byte-for-byte no-op.
+    reconcile_stored_annotations(
+        store,
+        meeting_id,
+        wav,
+        opts.identity_dir.as_deref(),
+        &mut assembled.speakers,
+        &mut assembled.segments,
+    )
+    .map_err(ProcessError::Store)?;
     for speaker in &assembled.speakers {
         store.upsert_speaker(speaker).map_err(ProcessError::Store)?;
     }
