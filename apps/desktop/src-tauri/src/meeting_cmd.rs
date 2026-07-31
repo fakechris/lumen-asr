@@ -968,13 +968,12 @@ pub fn enroll_speaker(
         .or_else(|| speaker.display_name.clone())
         .ok_or_else(|| "请先为该说话人设置真实姓名再注册声纹".to_string())?;
 
-    let mut identities = open_identity_store()?;
-    let enrolled = identities
-        .enroll(&name, &embedding, Some(meeting))
-        .map_err(|e| format!("enroll: {e}"))?;
-
     // Keep the speaker row consistent when the enroll call supplied the name
-    // (e.g. enrolling an unnamed speaker directly).
+    // (e.g. enrolling an unnamed speaker directly). Done *before* the identity
+    // write: every fallible step precedes the enrollment persist, so a
+    // reported error always means "not enrolled" — the command can no longer
+    // fail after the voiceprint is already stored. (A confirmed-but-not-yet-
+    // enrolled speaker is a normal state; the user just retries the enroll.)
     if speaker.display_name.as_deref() != Some(name.as_str()) {
         with_store(&state, |s| {
             s.rename_speaker(speaker_uuid, &name)
@@ -982,7 +981,13 @@ pub fn enroll_speaker(
         })?;
     }
 
-    tracing::info!(meeting_id = %meeting, speaker_id = %speaker_uuid, name = %enrolled.name, "speaker voiceprint enrolled");
+    let mut identities = open_identity_store()?;
+    let enrolled = identities
+        .enroll(&name, &embedding, Some(meeting))
+        .map_err(|e| format!("enroll: {e}"))?;
+
+    // The enrolled name is PII — log only the ids.
+    tracing::info!(meeting_id = %meeting, speaker_id = %speaker_uuid, "speaker voiceprint enrolled");
     Ok(EnrolledSpeakerDto::from(&enrolled))
 }
 

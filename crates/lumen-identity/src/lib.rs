@@ -84,6 +84,9 @@ impl IdentityStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, IdentityError> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
+        // Voiceprints are biometric data: keep the library owner-only (0700
+        // dir / 0600 files; no-op on non-unix).
+        restrict_permissions(&dir, 0o700)?;
         let mut identities = Vec::new();
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
@@ -170,17 +173,22 @@ impl IdentityStore {
         &self.identities
     }
 
-    /// Remove an identity by id (memory + disk). Returns `true` if it existed.
+    /// Remove an identity by id (disk, then memory). Returns `true` if it
+    /// existed. Disk first — mirroring [`enroll`](Self::enroll) — so a failed
+    /// file deletion leaves memory and disk consistent (the identity stays
+    /// listed and enrolled) instead of resurrecting on the next open.
     pub fn remove(&mut self, id: Uuid) -> Result<bool, IdentityError> {
-        let before = self.identities.len();
-        self.identities.retain(|i| i.id != id);
-        if self.identities.len() == before {
+        if !self.identities.iter().any(|i| i.id == id) {
             return Ok(false);
         }
-        let path = self.identity_path(id);
-        if path.exists() {
-            fs::remove_file(path)?;
+        match fs::remove_file(self.identity_path(id)) {
+            Ok(()) => {}
+            // Already gone on disk (e.g. deleted externally): still drop it
+            // from memory below.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
+        self.identities.retain(|i| i.id != id);
         Ok(true)
     }
 
@@ -189,14 +197,30 @@ impl IdentityStore {
     }
 
     /// Atomic write: serialize to `<id>.json.tmp`, then rename over the final
-    /// path, so a crash mid-write never leaves a truncated identity file.
+    /// path, so a crash mid-write never leaves a truncated identity file. The
+    /// file is made owner-only *before* the rename so the voiceprint is never
+    /// visible at the final path with looser permissions.
     fn write_identity(&self, identity: &EnrolledIdentity) -> Result<(), IdentityError> {
         let path = self.identity_path(identity.id);
         let tmp = path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(identity)?)?;
+        restrict_permissions(&tmp, 0o600)?;
         fs::rename(&tmp, &path)?;
         Ok(())
     }
+}
+
+/// Restrict `path` to owner-only access (unix `chmod`; no-op elsewhere).
+#[cfg(unix)]
+fn restrict_permissions(path: &Path, mode: u32) -> Result<(), IdentityError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path, _mode: u32) -> Result<(), IdentityError> {
+    Ok(())
 }
 
 /// Cosine similarity of two vectors; `0.0` for mismatched lengths or zero
@@ -365,6 +389,54 @@ mod tests {
         assert_eq!(files, 0);
         // And it stays gone across reopen.
         let store = IdentityStore::open(dir.path()).unwrap();
+        assert!(store.list().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_dir_and_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("identity");
+        let mut store = IdentityStore::open(&library).unwrap();
+        let identity = store.enroll("李明", &emb(0.1), None).unwrap();
+
+        let dir_mode = std::fs::metadata(&library).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "identity dir should be 0700");
+        let file = library.join(format!("{}.json", identity.id));
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "identity file should be 0600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_file_deletion_keeps_remove_consistent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = IdentityStore::open(dir.path()).unwrap();
+        let identity = store.enroll("李明", &emb(0.1), None).unwrap();
+
+        // Make the directory non-writable so the unlink fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = store.remove(identity.id);
+        // Restore before asserting so the tempdir can be cleaned up either way.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(result, Err(IdentityError::Io(_))));
+        // Memory and disk stayed consistent: still enrolled, file still there.
+        assert_eq!(store.list().len(), 1);
+        assert!(dir.path().join(format!("{}.json", identity.id)).exists());
+        // And with the permission restored, removal succeeds normally.
+        assert!(store.remove(identity.id).unwrap());
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn remove_drops_memory_even_when_file_already_gone() {
+        let (dir, mut store) = store();
+        let identity = store.enroll("李明", &emb(0.1), None).unwrap();
+        std::fs::remove_file(dir.path().join(format!("{}.json", identity.id))).unwrap();
+        assert!(store.remove(identity.id).unwrap());
         assert!(store.list().is_empty());
     }
 

@@ -70,8 +70,9 @@ pub fn auto_identify_speakers(
 }
 
 /// Open the identity library at `identity_dir` (when configured) and run
-/// [`auto_identify_speakers`], logging each hit (`name` + `score`). Failures
-/// to open the library degrade to "no auto-identification" — they must never
+/// [`auto_identify_speakers`], logging each hit (cluster label + score; the
+/// matched real name is PII and deliberately kept out of logs). Failures to
+/// open the library degrade to "no auto-identification" — they must never
 /// fail the transcription pipeline.
 pub(crate) fn apply_auto_identification(
     speakers: &mut [Speaker],
@@ -90,9 +91,10 @@ pub(crate) fn apply_auto_identification(
     };
     let assigned = auto_identify_speakers(speakers, embeddings, &identities);
     for hit in &assigned {
+        // The matched name is PII; log only which cluster matched and how
+        // confidently.
         tracing::info!(
             label = %hit.label,
-            name = %hit.name,
             score = hit.score,
             "speaker auto-identified from enrolled voiceprint"
         );

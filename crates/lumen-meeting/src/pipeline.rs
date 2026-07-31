@@ -312,13 +312,16 @@ pub(crate) fn diarize_wav(
 /// already saw the whole file; for a stable voiceprint an average over the
 /// speaker's longest ~30 s of speech is plenty, and capping keeps the extra
 /// embedding passes cheap on long meetings.
-#[cfg(all(target_os = "macos", feature = "diarize"))]
 const CENTROID_MAX_SECONDS_PER_SPEAKER: f64 = 30.0;
 
 /// Skip turns shorter than this when building centroids: sub-second snippets
 /// yield noisy x-vectors (and too few fbank frames to embed at all).
-#[cfg(all(target_os = "macos", feature = "diarize"))]
 const CENTROID_MIN_TURN_SECONDS: f64 = 0.5;
+
+/// Injected embedding forward pass for [`accumulate_centroids`]: pcm slice →
+/// `Ok(Some(x-vector))`, `Ok(None)` when the slice is too short to embed
+/// reliably, `Err` when the forward itself failed.
+type EmbedFn<'a> = &'a mut dyn FnMut(&[f32]) -> Result<Option<Vec<f64>>, String>;
 
 /// Compute one centroid voiceprint per diarized speaker: embed each of the
 /// speaker's (longest-first, up to [`CENTROID_MAX_SECONDS_PER_SPEAKER`]) turns
@@ -336,25 +339,63 @@ fn speaker_centroids(
 ) -> Result<BTreeMap<u32, Vec<f32>>, String> {
     use diar_rs::fbank::{compute_fbank, FbankOptions};
     use diar_rs::onnx_emb::EmbModel;
-    use lumen_identity::EMBEDDING_DIM;
 
-    // Group turn indices per speaker, longest turns first.
-    let mut by_speaker: BTreeMap<u32, Vec<&DiarTurn>> = BTreeMap::new();
-    for turn in turns {
-        if turn.end - turn.start >= CENTROID_MIN_TURN_SECONDS {
-            by_speaker.entry(turn.speaker).or_default().push(turn);
-        }
-    }
-    if by_speaker.is_empty() {
+    if !turns
+        .iter()
+        .any(|t| t.end - t.start >= CENTROID_MIN_TURN_SECONDS)
+    {
         return Ok(BTreeMap::new());
     }
-
     let mut model = EmbModel::load(embedding_model, 2).map_err(|e| e.to_string())?;
     let fb_opts = FbankOptions {
         sample_rate,
         subtract_mean: true,
         ..FbankOptions::default()
     };
+    let mut embed = |chunk: &[f32]| -> Result<Option<Vec<f64>>, String> {
+        let (fb, t_fb) = compute_fbank(chunk, &fb_opts).map_err(|e| e.to_string())?;
+        if t_fb < 10 {
+            return Ok(None); // too short to embed reliably
+        }
+        model
+            .embed_fbank(&fb, t_fb)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    };
+    Ok(accumulate_centroids(
+        samples,
+        sample_rate,
+        turns,
+        &mut embed,
+    ))
+}
+
+/// Pure centroid accumulation over diarized turns, with the embedding forward
+/// pass injected (`embed`: slice → `Ok(Some(x-vector))`, `Ok(None)` for
+/// "too short to embed", `Err` for a failed forward). Failure tolerance is
+/// per-turn: a failing (or wrong-dimension) turn is skipped with a warning and
+/// never poisons the speaker's other turns or the other speakers — a speaker
+/// ends up without a centroid only when *none* of its turns embed.
+///
+/// Kept un-gated (the real caller is the macOS `diarize` path) so this policy
+/// is unit-testable everywhere with a mock `embed`.
+#[cfg_attr(not(all(target_os = "macos", feature = "diarize")), allow(dead_code))]
+fn accumulate_centroids(
+    samples: &[f32],
+    sample_rate: u32,
+    turns: &[DiarTurn],
+    embed: EmbedFn<'_>,
+) -> BTreeMap<u32, Vec<f32>> {
+    use lumen_identity::EMBEDDING_DIM;
+
+    // Group turns per speaker, longest first (most reliable audio first, so
+    // the duration budget is spent on the best material).
+    let mut by_speaker: BTreeMap<u32, Vec<&DiarTurn>> = BTreeMap::new();
+    for turn in turns {
+        if turn.end - turn.start >= CENTROID_MIN_TURN_SECONDS {
+            by_speaker.entry(turn.speaker).or_default().push(turn);
+        }
+    }
 
     let mut centroids = BTreeMap::new();
     for (speaker, mut speaker_turns) in by_speaker {
@@ -376,15 +417,22 @@ fn speaker_centroids(
                 continue;
             };
             let seconds = (end - start) as f64 / sample_rate as f64;
-            let (fb, t_fb) =
-                compute_fbank(&samples[start..end], &fb_opts).map_err(|e| e.to_string())?;
-            if t_fb < 10 {
-                continue; // too short to embed reliably
-            }
-            let xvec = model.embed_fbank(&fb, t_fb).map_err(|e| e.to_string())?;
-            if xvec.len() != EMBEDDING_DIM {
-                return Err(format!("unexpected embedding dim {}", xvec.len()));
-            }
+            let xvec = match embed(&samples[start..end]) {
+                Ok(Some(xvec)) if xvec.len() == EMBEDDING_DIM => xvec,
+                Ok(Some(xvec)) => {
+                    tracing::warn!(
+                        speaker,
+                        dim = xvec.len(),
+                        "skipping turn with unexpected embedding dimension"
+                    );
+                    continue;
+                }
+                Ok(None) => continue, // too short to embed reliably
+                Err(error) => {
+                    tracing::warn!(speaker, error = %error, "skipping turn whose embedding failed");
+                    continue;
+                }
+            };
             for (accumulator, value) in sum.iter_mut().zip(xvec.iter()) {
                 *accumulator += value * seconds;
             }
@@ -396,7 +444,7 @@ fn speaker_centroids(
             centroids.insert(speaker, centroid);
         }
     }
-    Ok(centroids)
+    centroids
 }
 
 /// Stub for every non-diarizing build (Windows CI, or macOS without the
@@ -476,6 +524,74 @@ mod tests {
         assert!(approx(words[0].end, 1.3));
         assert!(approx(words[1].start, 1.3));
         assert!(approx(words[1].end, 1.6));
+    }
+
+    #[test]
+    fn accumulate_centroids_skips_failing_turn_without_poisoning_others() {
+        use lumen_identity::EMBEDDING_DIM;
+        // 16 kHz, 4 s of audio; marker values tell the mock embedder which
+        // turn's slice it received.
+        let sr = 16_000u32;
+        let mut samples = vec![0.0f32; 4 * sr as usize];
+        for (second, marker) in [(0, 1.0f32), (1, 2.0), (2, 3.0), (3, 4.0)] {
+            let start = second * sr as usize;
+            samples[start..start + sr as usize].fill(marker);
+        }
+        // Speaker 0: turns at [0,1) (marker 1, will FAIL) and [1,2) (marker 2).
+        // Speaker 1: turn at [2,3) (marker 3). Speaker 2: only [3,4) (marker 4,
+        // will FAIL) → no centroid at all.
+        let turns = vec![
+            DiarTurn::new(0.0, 1.0, 0),
+            DiarTurn::new(1.0, 2.0, 0),
+            DiarTurn::new(2.0, 3.0, 1),
+            DiarTurn::new(3.0, 4.0, 2),
+        ];
+        let mut embed = |chunk: &[f32]| -> Result<Option<Vec<f64>>, String> {
+            match chunk[0] {
+                m if m == 1.0 || m == 4.0 => Err("onnx forward failed".to_string()),
+                m => Ok(Some(vec![f64::from(m); EMBEDDING_DIM])),
+            }
+        };
+
+        let centroids = accumulate_centroids(&samples, sr, &turns, &mut embed);
+
+        // Speaker 0 still gets a centroid from its surviving turn (marker 2).
+        let s0 = centroids.get(&0).expect("speaker 0 centroid survives");
+        assert!(approx(f64::from(s0[0]), 2.0), "{s0:?}");
+        // Speaker 1 is untouched by the other speakers' failures.
+        let s1 = centroids.get(&1).expect("speaker 1 centroid");
+        assert!(approx(f64::from(s1[0]), 3.0));
+        // Speaker 2 had no usable turn → no centroid, and nothing else broke.
+        assert!(!centroids.contains_key(&2));
+        assert_eq!(centroids.len(), 2);
+    }
+
+    #[test]
+    fn accumulate_centroids_weights_by_duration_and_skips_short_turns() {
+        use lumen_identity::EMBEDDING_DIM;
+        let sr = 16_000u32;
+        let mut samples = vec![0.0f32; 4 * sr as usize];
+        samples[..sr as usize].fill(1.0); // [0,1) marker 1
+        samples[sr as usize..3 * sr as usize].fill(4.0); // [1,3) marker 4
+                                                         // Speaker 0: 1 s of "1" + 2 s of "4" → weighted mean (1*1 + 4*2)/3 = 3.
+                                                         // The 0.2 s turn is below CENTROID_MIN_TURN_SECONDS and never embedded.
+        let turns = vec![
+            DiarTurn::new(0.0, 1.0, 0),
+            DiarTurn::new(1.0, 3.0, 0),
+            DiarTurn::new(3.0, 3.2, 0),
+        ];
+        let mut calls = 0usize;
+        let mut embed = |chunk: &[f32]| -> Result<Option<Vec<f64>>, String> {
+            calls += 1;
+            Ok(Some(vec![f64::from(chunk[0]); EMBEDDING_DIM]))
+        };
+
+        let centroids = accumulate_centroids(&samples, sr, &turns, &mut embed);
+
+        assert_eq!(calls, 2, "sub-threshold turn is not embedded");
+        let s0 = centroids.get(&0).expect("centroid");
+        assert!(approx(f64::from(s0[0]), 3.0), "{:?}", &s0[..2]);
+        assert_eq!(s0.len(), EMBEDDING_DIM);
     }
 
     #[tokio::test]
