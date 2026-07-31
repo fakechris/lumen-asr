@@ -1,0 +1,17 @@
+[package]
+name = "lumen-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local speaker-identity library: enroll voiceprint embeddings from confirmed meeting speakers and match new speakers against them (cosine similarity). Pure logic + local JSON storage; no network, no platform gating."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
