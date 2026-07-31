@@ -160,7 +160,17 @@ fn discover_pane_target(
     generation: u64,
 ) {
     std::thread::spawn(move || {
-        let pane = target.and_then(crate::pane_observer::identify_pane);
+        let pane = match target.map(crate::pane_observer::identify_pane) {
+            Some(Ok(pane)) => pane,
+            Some(Err(reason)) => {
+                tracing::warn!(
+                    %reason,
+                    "terminal pane discovery failed; edit observation may use Accessibility fallback"
+                );
+                None
+            }
+            None => None,
+        };
         if let Some(pane) = pane.as_ref() {
             tracing::info!(
                 observer = pane.observer_id(),

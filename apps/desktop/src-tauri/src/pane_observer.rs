@@ -122,8 +122,7 @@ struct OuterTerminalGuard {
 enum OuterTerminalSurface {
     Ghostty {
         terminal_id: String,
-        working_directory: String,
-        title: String,
+        provider_title: String,
     },
 }
 
@@ -143,8 +142,7 @@ impl OuterTerminalGuard {
             }
             Some(OuterTerminalSurface::Ghostty {
                 terminal_id: identity.terminal_id,
-                working_directory: identity.working_directory,
-                title: identity.title,
+                provider_title: identity.title,
             })
         } else {
             if read_frontmost_process_id(runner)? != process_id {
@@ -170,19 +168,12 @@ impl OuterTerminalGuard {
 
     fn verify(&self, runner: &dyn CommandRunner) -> Result<(), String> {
         match self.surface.as_ref() {
-            Some(OuterTerminalSurface::Ghostty {
-                terminal_id,
-                working_directory,
-                title,
-            }) => {
+            Some(OuterTerminalSurface::Ghostty { terminal_id, .. }) => {
                 let current = read_ghostty_focused_terminal(runner)?;
                 if current.frontmost_process_id != self.process_id {
                     return Err("outer_terminal_changed".to_owned());
                 }
-                if current.terminal_id != *terminal_id
-                    || current.working_directory != *working_directory
-                    || current.title != *title
-                {
+                if current.terminal_id != *terminal_id {
                     return Err("outer_terminal_surface_changed".to_owned());
                 }
                 Ok(())
@@ -197,17 +188,11 @@ impl OuterTerminalGuard {
         process_tree: &ProcessTree,
         client_process_id: u32,
         provider: &str,
-        working_directory: &str,
         title: &str,
     ) -> bool {
         match self.surface.as_ref() {
-            Some(OuterTerminalSurface::Ghostty {
-                working_directory: expected_directory,
-                title: expected_title,
-                ..
-            }) => {
-                expected_directory == working_directory
-                    && expected_title.eq_ignore_ascii_case(title)
+            Some(OuterTerminalSurface::Ghostty { provider_title, .. }) => {
+                provider_title.eq_ignore_ascii_case(title)
                     && process_tree.unique_tty_provider_process(self.process_id, provider)
                         == Some(client_process_id)
             }
@@ -215,30 +200,6 @@ impl OuterTerminalGuard {
                 process_tree.ttys.get(&client_process_id) == Some(expected)
             }),
         }
-    }
-
-    fn verify_provider_candidate(
-        &self,
-        runner: &dyn CommandRunner,
-        client_process_id: u32,
-        provider: &str,
-        working_directory: &str,
-        title: &str,
-    ) -> Result<(), String> {
-        self.verify(runner)?;
-        let process_tree = ProcessTree::collect(runner)?;
-        if !process_tree.is_descendant_of(client_process_id, self.process_id)
-            || !self.accepts_provider_candidate(
-                &process_tree,
-                client_process_id,
-                provider,
-                working_directory,
-                title,
-            )
-        {
-            return Err("outer_terminal_provider_changed".to_owned());
-        }
-        Ok(())
     }
 
     fn fingerprint_material(&self) -> String {
@@ -255,11 +216,54 @@ impl OuterTerminalGuard {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ProviderClientGuard {
+    outer: OuterTerminalGuard,
+    process_id: u32,
+    provider: &'static str,
+}
+
+impl ProviderClientGuard {
+    fn bind(
+        outer: OuterTerminalGuard,
+        process_tree: &ProcessTree,
+        process_id: u32,
+        provider: &'static str,
+        provider_title: &str,
+    ) -> Result<Self, String> {
+        if !process_tree.is_descendant_of(process_id, outer.process_id)
+            || !outer.accepts_provider_candidate(process_tree, process_id, provider, provider_title)
+        {
+            return Err("outer_terminal_provider_unmatched".to_owned());
+        }
+        Ok(Self {
+            outer,
+            process_id,
+            provider,
+        })
+    }
+
+    fn verify(&self, runner: &dyn CommandRunner) -> Result<(), String> {
+        self.outer.verify(runner)?;
+        let process_tree = ProcessTree::collect(runner)?;
+        if !process_tree.is_descendant_of(self.process_id, self.outer.process_id)
+            || process_tree.unique_tty_provider_process(self.outer.process_id, self.provider)
+                != Some(self.process_id)
+        {
+            return Err("outer_terminal_provider_changed".to_owned());
+        }
+        Ok(())
+    }
+
+    fn fingerprint_material(&self) -> String {
+        self.outer.fingerprint_material()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GhosttyTerminalIdentity {
     frontmost_process_id: u32,
     terminal_id: String,
-    working_directory: String,
     title: String,
 }
 
@@ -302,10 +306,8 @@ tell application "Ghostty"
   end tell
   set focusedTerminal to focused terminal of selected tab of front window
   set terminalId to (id of focusedTerminal as text)
-  set focusedDirectory to (working directory of focusedTerminal as text)
   set focusedTitle to (name of focusedTerminal as text)
-  set matchingCount to (count of (terminals whose working directory is focusedDirectory and name is focusedTitle)) as text
-  return frontProcessId & linefeed & terminalId & linefeed & focusedDirectory & linefeed & focusedTitle & linefeed & matchingCount
+  return frontProcessId & linefeed & terminalId & linefeed & focusedTitle
 end tell
 "#;
     let output = runner.run(
@@ -316,23 +318,18 @@ end tell
     let mut lines = text.lines();
     let frontmost_process_id = lines.next().and_then(|value| value.trim().parse().ok());
     let terminal_id = lines.next().unwrap_or_default().trim().to_owned();
-    let working_directory = lines.next().unwrap_or_default().trim().to_owned();
     let title = lines.next().unwrap_or_default().trim().to_owned();
-    let matching_count = lines.next().and_then(|value| value.trim().parse().ok());
     if lines.next().is_some()
         || terminal_id.is_empty()
         || terminal_id.len() > 256
-        || working_directory.is_empty()
         || title.is_empty()
         || frontmost_process_id.is_none()
-        || matching_count != Some(1_u32)
     {
         return Err("ghostty_terminal_id_invalid".to_owned());
     }
     Ok(GhosttyTerminalIdentity {
         frontmost_process_id: frontmost_process_id.expect("validated above"),
         terminal_id,
-        working_directory,
         title,
     })
 }
@@ -530,7 +527,17 @@ impl ProcessTree {
     }
 
     fn unique_tty_provider_process(&self, ancestor_id: u32, provider: &str) -> Option<u32> {
-        let matches = self
+        match self
+            .tty_provider_processes(ancestor_id, provider)
+            .as_slice()
+        {
+            [single] => Some(*single),
+            _ => None,
+        }
+    }
+
+    fn tty_provider_processes(&self, ancestor_id: u32, provider: &str) -> Vec<u32> {
+        let mut matches = self
             .descendants_of(ancestor_id)
             .into_iter()
             .filter(|process_id| self.ttys.contains_key(process_id))
@@ -540,10 +547,8 @@ impl ProcessTree {
                     .is_some_and(|command| command_is_provider(command, provider))
             })
             .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [single] => Some(*single),
-            _ => None,
-        }
+        matches.sort_unstable();
+        matches
     }
 }
 
@@ -597,36 +602,34 @@ pub(crate) fn capture_pane_target(
 /// Herdr is preferred because its rendered buffer already includes any nested
 /// terminal UI. tmux and Zellij are used when their clients can be
 /// proven to belong to the same outer terminal process.
-pub(crate) fn identify_pane(target: PaneDiscoveryTarget) -> Option<LockedPane> {
+pub(crate) fn identify_pane(target: PaneDiscoveryTarget) -> Result<Option<LockedPane>, String> {
     let runner = SystemCommandRunner::for_discovery(target.deadline, target.cancellation);
     if runner.cancelled() {
-        return None;
+        return Err("pane_discovery_cancelled".to_owned());
     }
 
-    target
+    match target
         .process_tree
-        .unique_tty_provider_process(target.outer_process_id, "herdr")
-        .and_then(|_| {
-            identify_herdr(
-                target.outer_process_id,
+        .tty_provider_processes(target.outer_process_id, "herdr")
+        .as_slice()
+    {
+        [client_process_id] => {
+            return identify_herdr(
                 &target.process_tree,
                 target.outer_guard.clone(),
+                *client_process_id,
                 &runner,
             )
-        })
-        .or_else(|| {
-            target
-                .process_tree
-                .unique_tty_provider_process(target.outer_process_id, "tmux")
-                .and_then(|_| {
-                    identify_tmux(
-                        target.outer_process_id,
-                        &target.process_tree,
-                        target.outer_guard.clone(),
-                        &runner,
-                    )
-                })
-        })
+            .map(Some);
+        }
+        [] => {}
+        _ => return Err("herdr_client_ambiguous".to_owned()),
+    }
+
+    Ok(target
+        .process_tree
+        .unique_tty_provider_process(target.outer_process_id, "tmux")
+        .and_then(|_| identify_tmux(&target.process_tree, target.outer_guard.clone(), &runner))
         .or_else(|| {
             target
                 .process_tree
@@ -639,7 +642,7 @@ pub(crate) fn identify_pane(target: PaneDiscoveryTarget) -> Option<LockedPane> {
                         &runner,
                     )
                 })
-        })
+        }))
 }
 
 fn looks_like_terminal(target: &FrontmostTarget) -> bool {
@@ -686,7 +689,6 @@ fn resolve_executable(name: &str) -> Option<PathBuf> {
 struct HerdrIdentity {
     pane_id: String,
     shell_pid: u32,
-    working_directory: String,
 }
 
 fn parse_herdr_identity(current: &str, process_info: &str) -> Option<HerdrIdentity> {
@@ -701,47 +703,30 @@ fn parse_herdr_identity(current: &str, process_info: &str) -> Option<HerdrIdenti
         return None;
     }
     let shell_pid = u32::try_from(process_info.get("shell_pid")?.as_u64()?).ok()?;
-    let working_directories = process_info
-        .get("foreground_processes")?
-        .as_array()?
-        .iter()
-        .filter_map(|process| process.get("cwd")?.as_str())
-        .filter(|cwd| !cwd.is_empty())
-        .collect::<HashSet<_>>();
-    let working_directory = match working_directories
-        .into_iter()
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [single] => (*single).to_owned(),
-        _ => return None,
-    };
-    Some(HerdrIdentity {
-        pane_id,
-        shell_pid,
-        working_directory,
-    })
+    Some(HerdrIdentity { pane_id, shell_pid })
 }
 
 fn identify_herdr(
-    outer_process_id: u32,
     process_tree: &ProcessTree,
     outer_guard: OuterTerminalGuard,
+    client_process_id: u32,
     runner: &dyn CommandRunner,
-) -> Option<LockedPane> {
-    let executable = resolve_executable("herdr")?;
-    let client_process_id = process_tree.unique_tty_provider_process(outer_process_id, "herdr")?;
+) -> Result<LockedPane, String> {
+    let executable =
+        resolve_executable("herdr").ok_or_else(|| "herdr_executable_unavailable".to_owned())?;
     let current = runner
         .run(
             &executable,
             &[OsString::from("pane"), OsString::from("current")],
         )
-        .ok()?
+        .map_err(|reason| format!("herdr_current_unavailable:{reason}"))?
         .stdout_text();
-    let current_json: serde_json::Value = serde_json::from_str(&current).ok()?;
+    let current_json: serde_json::Value =
+        serde_json::from_str(&current).map_err(|_| "herdr_current_invalid".to_owned())?;
     let pane_id = current_json
-        .pointer("/result/pane/pane_id")?
-        .as_str()?
+        .pointer("/result/pane/pane_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "herdr_current_pane_unavailable".to_owned())?
         .to_owned();
     let process_info = runner
         .run(
@@ -753,27 +738,26 @@ fn identify_herdr(
                 OsString::from(&pane_id),
             ],
         )
-        .ok()?
+        .map_err(|reason| format!("herdr_process_info_unavailable:{reason}"))?
         .stdout_text();
-    let identity = parse_herdr_identity(&current, &process_info)?;
-    if !process_tree.is_descendant_of(identity.shell_pid, client_process_id)
-        || !outer_guard.accepts_provider_candidate(
-            process_tree,
-            client_process_id,
-            "herdr",
-            &identity.working_directory,
-            "herdr",
-        )
-    {
-        return None;
+    let identity = parse_herdr_identity(&current, &process_info)
+        .ok_or_else(|| "herdr_identity_invalid".to_owned())?;
+    if !process_tree.is_descendant_of(identity.shell_pid, client_process_id) {
+        return Err("herdr_shell_not_in_client_tree".to_owned());
     }
-    Some(LockedPane {
+    let client_guard = ProviderClientGuard::bind(
+        outer_guard,
+        process_tree,
+        client_process_id,
+        "herdr",
+        "herdr",
+    )
+    .map_err(|_| "herdr_client_not_bound_to_outer_surface".to_owned())?;
+    Ok(LockedPane {
         inner: Arc::new(HerdrPane {
             executable,
             pane_id: identity.pane_id,
-            client_process_id,
-            working_directory: identity.working_directory,
-            outer_guard,
+            client_guard,
             runner: Arc::new(SystemCommandRunner::default()),
         }),
     })
@@ -782,9 +766,7 @@ fn identify_herdr(
 struct HerdrPane {
     executable: PathBuf,
     pane_id: String,
-    client_process_id: u32,
-    working_directory: String,
-    outer_guard: OuterTerminalGuard,
+    client_guard: ProviderClientGuard,
     runner: Arc<dyn CommandRunner>,
 }
 
@@ -797,7 +779,7 @@ impl PaneHandle for HerdrPane {
         format!(
             "herdr\u{001f}{}\u{001f}{}",
             self.pane_id,
-            self.outer_guard.fingerprint_material()
+            self.client_guard.fingerprint_material()
         )
     }
 
@@ -826,13 +808,7 @@ impl PaneHandle for HerdrPane {
 
 impl HerdrPane {
     fn verify_provider(&self) -> Result<(), String> {
-        self.outer_guard.verify_provider_candidate(
-            self.runner.as_ref(),
-            self.client_process_id,
-            "herdr",
-            &self.working_directory,
-            "herdr",
-        )
+        self.client_guard.verify(self.runner.as_ref())
     }
 
     fn ensure_current_pane(&self) -> Result<(), String> {
@@ -863,7 +839,6 @@ struct TmuxClient {
     process_id: u32,
     pane_id: String,
     session_id: String,
-    current_path: String,
     pane_title: String,
 }
 
@@ -871,25 +846,19 @@ fn parse_tmux_clients(output: &str) -> Vec<TmuxClient> {
     output
         .lines()
         .filter_map(|line| {
-            let mut fields = line.splitn(6, '\t');
+            let mut fields = line.splitn(5, '\t');
             let _client_name = fields.next()?;
             let process_id = fields.next()?.parse().ok()?;
             let pane_id = fields.next()?.to_owned();
             let session_id = fields.next()?.to_owned();
-            let current_path = fields.next()?.to_owned();
             let pane_title = fields.next()?.to_owned();
-            if !pane_id.starts_with('%')
-                || session_id.is_empty()
-                || current_path.is_empty()
-                || pane_title.is_empty()
-            {
+            if !pane_id.starts_with('%') || session_id.is_empty() || pane_title.is_empty() {
                 return None;
             }
             Some(TmuxClient {
                 process_id,
                 pane_id,
                 session_id,
-                current_path,
                 pane_title,
             })
         })
@@ -897,7 +866,6 @@ fn parse_tmux_clients(output: &str) -> Vec<TmuxClient> {
 }
 
 fn identify_tmux(
-    outer_process_id: u32,
     process_tree: &ProcessTree,
     outer_guard: OuterTerminalGuard,
     runner: &dyn CommandRunner,
@@ -916,23 +884,21 @@ fn identify_tmux(
             OsString::from("list-clients"),
             OsString::from("-F"),
             OsString::from(
-                "#{client_name}\t#{client_pid}\t#{pane_id}\t#{client_session}\t#{pane_current_path}\t#{pane_title}",
+                "#{client_name}\t#{client_pid}\t#{pane_id}\t#{client_session}\t#{pane_title}",
             ),
         ]);
         let Ok(output) = runner.run(&executable, &arguments) else {
             continue;
         };
         for client in parse_tmux_clients(&output.stdout_text()) {
-            if process_tree.is_descendant_of(client.process_id, outer_process_id)
-                && outer_guard.accepts_provider_candidate(
-                    process_tree,
-                    client.process_id,
-                    "tmux",
-                    &client.current_path,
-                    &client.pane_title,
-                )
-            {
-                matches.push((socket.clone(), client));
+            if let Ok(client_guard) = ProviderClientGuard::bind(
+                outer_guard.clone(),
+                process_tree,
+                client.process_id,
+                "tmux",
+                &client.pane_title,
+            ) {
+                matches.push((socket.clone(), client, client_guard));
             }
         }
     }
@@ -951,18 +917,17 @@ fn identify_tmux(
     matches.dedup_by(|left, right| {
         left.1.process_id == right.1.process_id && left.1.pane_id == right.1.pane_id
     });
-    let (socket, client) = match matches.as_slice() {
-        [single] => single.clone(),
+    let (socket, client, client_guard) = match matches.as_slice() {
+        [(socket, client, client_guard)] => (socket.clone(), client.clone(), client_guard.clone()),
         _ => return None,
     };
     Some(LockedPane {
         inner: Arc::new(TmuxPane {
             executable,
             socket,
-            client_process_id: client.process_id,
             pane_id: client.pane_id,
             session_id: client.session_id,
-            outer_guard,
+            client_guard,
             runner: Arc::new(SystemCommandRunner::default()),
         }),
     })
@@ -1012,10 +977,9 @@ fn file_type_is_socket(_file_type: fs::FileType) -> bool {
 struct TmuxPane {
     executable: PathBuf,
     socket: Option<PathBuf>,
-    client_process_id: u32,
     pane_id: String,
     session_id: String,
-    outer_guard: OuterTerminalGuard,
+    client_guard: ProviderClientGuard,
     runner: Arc<dyn CommandRunner>,
 }
 
@@ -1033,7 +997,7 @@ impl PaneHandle for TmuxPane {
                 .unwrap_or_else(|| "default".into()),
             self.session_id,
             self.pane_id,
-            self.outer_guard.fingerprint_material()
+            self.client_guard.fingerprint_material()
         )
     }
 
@@ -1068,14 +1032,14 @@ impl TmuxPane {
             OsString::from("list-clients"),
             OsString::from("-F"),
             OsString::from(
-                "#{client_name}\t#{client_pid}\t#{pane_id}\t#{client_session}\t#{pane_current_path}\t#{pane_title}",
+                "#{client_name}\t#{client_pid}\t#{pane_id}\t#{client_session}\t#{pane_title}",
             ),
         ]);
         let output = self.runner.run(&self.executable, &arguments)?;
         let clients = parse_tmux_clients(&output.stdout_text());
-        let client = match clients
+        let _client = match clients
             .iter()
-            .filter(|client| client.process_id == self.client_process_id)
+            .filter(|client| client.process_id == self.client_guard.process_id)
             .collect::<Vec<_>>()
             .as_slice()
         {
@@ -1084,13 +1048,7 @@ impl TmuxPane {
             }
             _ => return Err("tmux_focused_pane_changed".to_owned()),
         };
-        self.outer_guard.verify_provider_candidate(
-            self.runner.as_ref(),
-            client.process_id,
-            "tmux",
-            &client.current_path,
-            &client.pane_title,
-        )
+        self.client_guard.verify(self.runner.as_ref())
     }
 }
 
@@ -1145,7 +1103,6 @@ fn zellij_snapshot_mode(version: &str) -> Option<ZellijSnapshotMode> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ZellijPaneMetadata {
     pane_id: String,
-    working_directory: String,
     title: String,
 }
 
@@ -1164,13 +1121,8 @@ fn parse_zellij_panes(output: &str) -> Vec<ZellijPaneMetadata> {
                 serde_json::Value::String(id) if id.starts_with("terminal_") => id.clone(),
                 _ => return None,
             };
-            let working_directory = pane.get("pane_cwd")?.as_str()?.trim().to_owned();
             let title = pane.get("title")?.as_str()?.trim().to_owned();
-            (!working_directory.is_empty() && !title.is_empty()).then_some(ZellijPaneMetadata {
-                pane_id,
-                working_directory,
-                title,
-            })
+            (!title.is_empty()).then_some(ZellijPaneMetadata { pane_id, title })
         })
         .collect()
 }
@@ -1308,29 +1260,26 @@ fn identify_zellij(
         [single] => single.clone(),
         _ => return None,
     };
-    let provider_binding_title = [pane_metadata.title.as_str(), session.as_str()]
+    let client_guard = [pane_metadata.title.as_str(), session.as_str()]
         .into_iter()
-        .find(|title| {
-            outer_guard.accepts_provider_candidate(
+        .find_map(|title| {
+            ProviderClientGuard::bind(
+                outer_guard.clone(),
                 process_tree,
                 client_process_id,
                 "zellij",
-                &pane_metadata.working_directory,
                 title,
             )
-        })?
-        .to_owned();
+            .ok()
+        })?;
     Some(LockedPane {
         inner: Arc::new(ZellijPane {
             executable,
             session,
             client_id: client.client_id,
             pane_id: client.pane_id,
-            client_process_id,
-            working_directory: pane_metadata.working_directory,
-            provider_binding_title,
             snapshot_mode,
-            outer_guard,
+            client_guard,
             runner: Arc::new(SystemCommandRunner::default()),
         }),
     })
@@ -1360,11 +1309,8 @@ struct ZellijPane {
     session: String,
     client_id: String,
     pane_id: String,
-    client_process_id: u32,
-    working_directory: String,
-    provider_binding_title: String,
     snapshot_mode: ZellijSnapshotMode,
-    outer_guard: OuterTerminalGuard,
+    client_guard: ProviderClientGuard,
     runner: Arc<dyn CommandRunner>,
 }
 
@@ -1378,7 +1324,7 @@ impl PaneHandle for ZellijPane {
             "zellij\u{001f}{}\u{001f}{}\u{001f}{}",
             self.session,
             self.pane_id,
-            self.outer_guard.fingerprint_material()
+            self.client_guard.fingerprint_material()
         )
     }
 
@@ -1412,20 +1358,10 @@ impl ZellijPane {
             .into_iter()
             .filter(|pane| pane.pane_id == self.pane_id)
             .collect::<Vec<_>>();
-        let metadata = match matches.as_slice() {
-            [single] => single,
-            _ => return Err("zellij_pane_metadata_changed".to_owned()),
-        };
-        if metadata.working_directory != self.working_directory {
-            return Err("zellij_working_directory_changed".to_owned());
+        match matches.as_slice() {
+            [_] => self.client_guard.verify(self.runner.as_ref()),
+            _ => Err("zellij_pane_metadata_changed".to_owned()),
         }
-        self.outer_guard.verify_provider_candidate(
-            self.runner.as_ref(),
-            self.client_process_id,
-            "zellij",
-            &metadata.working_directory,
-            &self.provider_binding_title,
-        )
     }
 
     fn ensure_only_client_still_targets_pane(&self) -> Result<(), String> {
@@ -1450,6 +1386,59 @@ impl ZellijPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StaticSystemRunner {
+        ghostty_identity: &'static str,
+        process_list: &'static str,
+    }
+
+    impl CommandRunner for StaticSystemRunner {
+        fn run(&self, program: &Path, _arguments: &[OsString]) -> Result<CommandOutput, String> {
+            let output = if program == Path::new(OSASCRIPT_PROGRAM) {
+                self.ghostty_identity
+            } else if program == Path::new(PROCESS_LIST_PROGRAM) {
+                self.process_list
+            } else {
+                return Err("unexpected_test_command".to_owned());
+            };
+            Ok(CommandOutput {
+                stdout: output.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    struct ConstantOutputRunner(&'static str);
+
+    impl CommandRunner for ConstantOutputRunner {
+        fn run(&self, _program: &Path, _arguments: &[OsString]) -> Result<CommandOutput, String> {
+            Ok(CommandOutput {
+                stdout: self.0.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    fn single_herdr_process_list() -> &'static str {
+        "659 1 ?? /Applications/Ghostty.app/Contents/MacOS/ghostty\n\
+         755 659 ttys030 /usr/bin/login\n\
+         762 755 ttys030 -/bin/zsh\n\
+         19794 762 ttys030 herdr\n"
+    }
+
+    fn ghostty_outer_guard() -> OuterTerminalGuard {
+        OuterTerminalGuard {
+            process_id: 659,
+            surface: Some(OuterTerminalSurface::Ghostty {
+                terminal_id: "terminal-1".into(),
+                provider_title: "herdr".into(),
+            }),
+            terminal_tty: None,
+        }
+    }
+
+    fn bound_herdr_client_guard() -> ProviderClientGuard {
+        let tree = ProcessTree::parse(single_herdr_process_list());
+        ProviderClientGuard::bind(ghostty_outer_guard(), &tree, 19794, "herdr", "herdr").unwrap()
+    }
 
     #[test]
     fn pane_process_must_belong_to_the_frontmost_terminal_tree() {
@@ -1481,8 +1470,134 @@ mod tests {
             Some(HerdrIdentity {
                 pane_id: "w7:p2".into(),
                 shell_pid: 19799,
-                working_directory: "/work".into(),
             })
+        );
+    }
+
+    #[test]
+    fn herdr_binding_does_not_conflate_outer_and_inner_working_directories() {
+        let identity = parse_herdr_identity(
+            r#"{"result":{"pane":{"pane_id":"w7:p2"}}}"#,
+            r#"{"result":{"process_info":{"pane_id":"w7:p2","shell_pid":19799,"foreground_processes":[{"pid":19799,"cwd":"/current-herdr-workspace","name":"zsh"},{"pid":19800,"cwd":"/a-child-process-directory","name":"codex"}]}}}"#,
+        )
+        .expect("Herdr pane identity must not depend on mutable working directories");
+        let tree = ProcessTree::parse(
+            "659 1 ?? /Applications/Ghostty.app/Contents/MacOS/ghostty\n\
+             755 659 ttys030 /usr/bin/login\n\
+             762 755 ttys030 -/bin/zsh\n\
+             19794 762 ttys030 herdr\n\
+             19796 19794 ?? herdr-server\n\
+             19799 19796 ?? -zsh\n",
+        );
+        let outer_guard = OuterTerminalGuard {
+            process_id: 659,
+            surface: Some(OuterTerminalSurface::Ghostty {
+                terminal_id: "terminal-1".into(),
+                provider_title: "herdr".into(),
+            }),
+            terminal_tty: None,
+        };
+
+        assert!(tree.is_descendant_of(identity.shell_pid, 19794));
+        assert!(ProviderClientGuard::bind(outer_guard, &tree, 19794, "herdr", "herdr").is_ok());
+    }
+
+    #[test]
+    fn provider_guard_uses_stable_surface_id_after_binding() {
+        let client_guard = bound_herdr_client_guard();
+        let runner = StaticSystemRunner {
+            ghostty_identity: "659\nterminal-1\na changed dynamic title\n",
+            process_list: single_herdr_process_list(),
+        };
+
+        assert!(client_guard.verify(&runner).is_ok());
+    }
+
+    #[test]
+    fn provider_guard_rejects_a_different_outer_surface() {
+        let client_guard = bound_herdr_client_guard();
+        let runner = StaticSystemRunner {
+            ghostty_identity: "659\nterminal-2\nherdr\n",
+            process_list: single_herdr_process_list(),
+        };
+
+        assert_eq!(
+            client_guard.verify(&runner),
+            Err("outer_terminal_surface_changed".to_owned())
+        );
+    }
+
+    #[test]
+    fn provider_guard_rejects_a_replaced_client_process() {
+        let client_guard = bound_herdr_client_guard();
+        let runner = StaticSystemRunner {
+            ghostty_identity: "659\nterminal-1\nherdr\n",
+            process_list: "659 1 ?? /Applications/Ghostty.app/Contents/MacOS/ghostty\n\
+                 755 659 ttys030 /usr/bin/login\n\
+                 762 755 ttys030 -/bin/zsh\n\
+                 19795 762 ttys030 herdr\n",
+        };
+
+        assert_eq!(
+            client_guard.verify(&runner),
+            Err("outer_terminal_provider_changed".to_owned())
+        );
+    }
+
+    #[test]
+    fn herdr_guard_rejects_a_different_current_pane() {
+        let pane = HerdrPane {
+            executable: PathBuf::from("herdr"),
+            pane_id: "w7:p2".into(),
+            client_guard: ProviderClientGuard {
+                outer: OuterTerminalGuard {
+                    process_id: 659,
+                    surface: None,
+                    terminal_tty: Some("ttys030".into()),
+                },
+                process_id: 19794,
+                provider: "herdr",
+            },
+            runner: Arc::new(ConstantOutputRunner(
+                r#"{"result":{"pane":{"pane_id":"w7:p3"}}}"#,
+            )),
+        };
+
+        assert_eq!(
+            pane.ensure_current_pane(),
+            Err("herdr_focused_pane_changed".to_owned())
+        );
+    }
+
+    #[test]
+    fn ambiguous_herdr_clients_fail_closed_before_other_provider_probes() {
+        let process_tree = ProcessTree::parse(
+            "659 1 ?? /Applications/Ghostty.app/Contents/MacOS/ghostty\n\
+             755 659 ttys003 /usr/bin/login\n\
+             762 755 ttys003 -/bin/zsh\n\
+             19794 762 ttys003 herdr\n\
+             756 659 ttys004 /usr/bin/login\n\
+             763 756 ttys004 -/bin/zsh\n\
+             19795 763 ttys004 herdr\n",
+        );
+        let target = PaneDiscoveryTarget {
+            outer_process_id: 659,
+            process_tree,
+            outer_guard: OuterTerminalGuard {
+                process_id: 659,
+                surface: Some(OuterTerminalSurface::Ghostty {
+                    terminal_id: "terminal-1".into(),
+                    provider_title: "herdr".into(),
+                }),
+                terminal_tty: None,
+            },
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancellation: Arc::new(AtomicBool::new(false)),
+        };
+
+        assert_eq!(
+            identify_pane(target).err().as_deref(),
+            Some("herdr_client_ambiguous")
         );
     }
 
@@ -1495,7 +1610,7 @@ mod tests {
 
     #[test]
     fn tmux_client_format_keeps_process_pane_and_session_identity() {
-        let clients = parse_tmux_clients("/dev/ttys001\t421\t%7\twork\t/work\tproject shell\n");
+        let clients = parse_tmux_clients("/dev/ttys001\t421\t%7\twork\tproject shell\n");
 
         assert_eq!(
             clients,
@@ -1503,7 +1618,6 @@ mod tests {
                 process_id: 421,
                 pane_id: "%7".into(),
                 session_id: "work".into(),
-                current_path: "/work".into(),
                 pane_title: "project shell".into(),
             }]
         );
@@ -1570,7 +1684,6 @@ mod tests {
             panes,
             vec![ZellijPaneMetadata {
                 pane_id: "terminal_3".into(),
-                working_directory: "/work".into(),
                 title: "editor".into(),
             }]
         );
@@ -1617,13 +1730,68 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Ghostty running a single Herdr client"]
+    fn live_herdr_identity_binds_without_working_directory_equality() {
+        let runner = SystemCommandRunner::default();
+        let ghostty_process_id = String::from_utf8_lossy(
+            &Command::new(OSASCRIPT_PROGRAM)
+                .args([
+                    "-e",
+                    "tell application \"System Events\" to get unix id of application process \"Ghostty\"",
+                ])
+                .output()
+                .expect("read Ghostty process")
+                .stdout,
+        )
+        .trim()
+        .parse::<u32>()
+        .expect("valid Ghostty process id");
+        let process_tree = ProcessTree::collect(&runner).expect("live process tree");
+        let client_process_id = process_tree
+            .unique_tty_provider_process(ghostty_process_id, "herdr")
+            .expect("single Herdr client");
+        let ghostty = read_ghostty_focused_terminal(&runner).expect("Ghostty surface metadata");
+        let outer_guard = OuterTerminalGuard {
+            process_id: ghostty_process_id,
+            surface: Some(OuterTerminalSurface::Ghostty {
+                terminal_id: ghostty.terminal_id,
+                provider_title: ghostty.title,
+            }),
+            terminal_tty: None,
+        };
+
+        let pane = identify_herdr(&process_tree, outer_guard, client_process_id, &runner)
+            .expect("Herdr identity must bind");
+
+        assert_eq!(pane.observer_id(), "herdr_pane_v1");
+    }
+
+    #[test]
     #[ignore = "requires a frontmost Ghostty surface running a single Herdr client"]
     fn live_frontmost_herdr_surface_is_locked_before_reading() {
         let runner = SystemCommandRunner::default();
+        let ghostty_process_id = String::from_utf8_lossy(
+            &Command::new(OSASCRIPT_PROGRAM)
+                .args([
+                    "-e",
+                    "tell application \"System Events\" to get unix id of application process \"Ghostty\"",
+                ])
+                .output()
+                .expect("read Ghostty process")
+                .stdout,
+        )
+            .trim()
+            .parse::<u32>()
+            .expect("valid Ghostty process id");
+        assert_eq!(
+            read_frontmost_process_id(&runner),
+            Ok(ghostty_process_id),
+            "Ghostty must be frontmost before the live probe"
+        );
         let target = FrontmostTarget {
             name: Some("Ghostty".into()),
             bundle_id: Some("com.mitchellh.ghostty".into()),
-            process_id: Some(read_frontmost_process_id(&runner).expect("frontmost process")),
+            process_id: Some(ghostty_process_id),
         };
         let cancellation = Arc::new(AtomicBool::new(false));
         let discovery = capture_pane_target(
@@ -1632,7 +1800,9 @@ mod tests {
             cancellation,
         )
         .expect("frontmost surface");
-        let pane = identify_pane(discovery).expect("unambiguous Herdr pane");
+        let pane = identify_pane(discovery)
+            .expect("Herdr discovery must be diagnosable")
+            .expect("unambiguous Herdr pane");
         assert_eq!(pane.observer_id(), "herdr_pane_v1");
         assert!(!pane.snapshot().expect("Herdr snapshot").text.is_empty());
     }
