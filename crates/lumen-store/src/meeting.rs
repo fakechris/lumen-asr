@@ -8,8 +8,8 @@
 use anyhow::Result;
 use lumen_core::transcript::Word;
 use lumen_core::{
-    Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SegmentChannel, Speaker, SummaryKind,
-    TranscriptSegment,
+    LiveAnnotation, Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SegmentChannel, Speaker,
+    SummaryKind, TranscriptSegment,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
@@ -426,6 +426,61 @@ impl Store {
         Ok(moved as u64)
     }
 
+    // ----- live annotations -------------------------------------------------
+
+    /// Append one recording-time "who is speaking" annotation (v12
+    /// `live_annotations`). Annotations are append-only while recording;
+    /// overlapping ranges are resolved last-write-wins (`created_at`) by the
+    /// offline reconciliation, so no dedup happens here.
+    pub fn add_live_annotation(&self, annotation: &LiveAnnotation) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO live_annotations (
+              id, meeting_id, start_seconds, end_seconds, channel,
+              identity_id, display_name, created_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+            "#,
+            params![
+                annotation.id.to_string(),
+                annotation.meeting_id.to_string(),
+                annotation.start_seconds,
+                annotation.end_seconds,
+                annotation.channel.as_str(),
+                annotation.identity_id.map(|id| id.to_string()),
+                annotation.display_name,
+                annotation.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List a meeting's live annotations, oldest first (`created_at`, then id
+    /// as a stable tiebreak) — the order reconciliation's last-write-wins
+    /// resolution expects.
+    pub fn list_live_annotations(&self, meeting_id: Uuid) -> Result<Vec<LiveAnnotation>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, meeting_id, start_seconds, end_seconds, channel,
+                   identity_id, display_name, created_at
+            FROM live_annotations
+            WHERE meeting_id=?1
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![meeting_id.to_string()], map_live_annotation)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Delete one live annotation (the "清除" action on an annotated caption
+    /// line). Returns `true` if a row was deleted.
+    pub fn delete_live_annotation(&self, id: Uuid) -> Result<bool> {
+        let changed = self.conn.execute(
+            "DELETE FROM live_annotations WHERE id=?1",
+            params![id.to_string()],
+        )?;
+        Ok(changed > 0)
+    }
+
     // ----- summaries --------------------------------------------------------
 
     /// Persist a generated summary.
@@ -610,6 +665,29 @@ fn map_speaker(row: &rusqlite::Row<'_>) -> rusqlite::Result<Speaker> {
         label: row.get(2)?,
         display_name: row.get(3)?,
         embedding_ref: row.get(4)?,
+    })
+}
+
+fn map_live_annotation(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveAnnotation> {
+    let identity_id = match row.get::<_, Option<String>>(5)? {
+        Some(value) => Some(Uuid::parse_str(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?),
+        None => None,
+    };
+    Ok(LiveAnnotation {
+        id: parse_uuid_column(row, 0)?,
+        meeting_id: parse_uuid_column(row, 1)?,
+        start_seconds: row.get(2)?,
+        end_seconds: row.get(3)?,
+        channel: SegmentChannel::from_str_or_mic(&row.get::<_, String>(4)?),
+        identity_id,
+        display_name: row.get(6)?,
+        created_at: parse_dt(&row.get::<_, String>(7)?),
     })
 }
 
@@ -1053,6 +1131,76 @@ mod tests {
 
         // Unknown speaker id is a no-op.
         assert!(!store.rename_speaker(Uuid::new_v4(), "X").unwrap());
+    }
+
+    #[test]
+    fn live_annotations_round_trip_ordered_and_delete() {
+        use lumen_core::{LiveAnnotation, SegmentChannel};
+
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+
+        // Fresh meetings have no annotations.
+        assert!(store.list_live_annotations(meeting.id).unwrap().is_empty());
+
+        // One enrolled-identity annotation and one ad-hoc typed name (open
+        // ended: the live segment had not finalized yet).
+        let identity = Uuid::new_v4();
+        let mut first = LiveAnnotation::new(
+            meeting.id,
+            3.0,
+            Some(6.5),
+            SegmentChannel::Mic,
+            Some(identity),
+            "李明",
+        );
+        first.created_at = crate::parse_dt("2026-07-30T00:00:01Z");
+        let mut second =
+            LiveAnnotation::new(meeting.id, 8.0, None, SegmentChannel::System, None, "客户A");
+        second.created_at = crate::parse_dt("2026-07-30T00:00:02Z");
+        // Insert newest first to prove the list orders by created_at.
+        store.add_live_annotation(&second).unwrap();
+        store.add_live_annotation(&first).unwrap();
+
+        let listed = store.list_live_annotations(meeting.id).unwrap();
+        assert_eq!(listed, vec![first.clone(), second.clone()]);
+        assert_eq!(listed[0].identity_id, Some(identity));
+        assert_eq!(listed[0].end_seconds, Some(6.5));
+        assert_eq!(listed[1].identity_id, None);
+        assert_eq!(listed[1].end_seconds, None);
+        assert_eq!(listed[1].channel, SegmentChannel::System);
+
+        // Clearing one annotation removes only that row.
+        assert!(store.delete_live_annotation(second.id).unwrap());
+        assert_eq!(
+            store.list_live_annotations(meeting.id).unwrap(),
+            vec![first]
+        );
+        // Deleting a missing annotation is a no-op.
+        assert!(!store.delete_live_annotation(Uuid::new_v4()).unwrap());
+    }
+
+    #[test]
+    fn delete_meeting_cascades_live_annotations() {
+        use lumen_core::{LiveAnnotation, SegmentChannel};
+
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        store
+            .add_live_annotation(&LiveAnnotation::new(
+                meeting.id,
+                0.0,
+                Some(2.0),
+                SegmentChannel::Mic,
+                None,
+                "张三",
+            ))
+            .unwrap();
+
+        assert!(store.delete_meeting(meeting.id).unwrap());
+        assert!(store.list_live_annotations(meeting.id).unwrap().is_empty());
     }
 
     #[test]

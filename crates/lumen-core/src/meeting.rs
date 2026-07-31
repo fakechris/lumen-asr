@@ -248,6 +248,60 @@ impl Speaker {
     }
 }
 
+/// A manual "who is speaking" annotation made on the **live** caption view
+/// while a meeting is still recording (maps to the `live_annotations` table).
+///
+/// Recording-time speaker rows do not exist yet (the offline pipeline creates
+/// them after stop), so a live annotation is anchored to a *time range on the
+/// meeting's unified timeline* plus the capture track it was made on. After
+/// stop, offline reconciliation matches these ranges against the diarized
+/// segments and applies the manual names (manual attribution always wins).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveAnnotation {
+    pub id: Uuid,
+    pub meeting_id: Uuid,
+    /// Annotated range start, seconds on the meeting's unified timeline (`t0`).
+    pub start_seconds: f64,
+    /// Annotated range end on the unified timeline. Absent when the live
+    /// segment had not finalized yet at annotate time; reconciliation then
+    /// treats the annotation as the point `start_seconds`.
+    pub end_seconds: Option<f64>,
+    /// Capture track the annotated caption line came from.
+    pub channel: SegmentChannel,
+    /// The enrolled identity this range was attributed to, when the user
+    /// picked one from the local library; `None` for an ad-hoc typed name.
+    pub identity_id: Option<Uuid>,
+    /// Name snapshot at annotate time. Reconciliation prefers the identity's
+    /// current name (via `identity_id`) and falls back to this snapshot.
+    pub display_name: String,
+    /// When the annotation was made. Overlapping annotations on the same
+    /// range are resolved last-write-wins by this timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+impl LiveAnnotation {
+    /// A fresh annotation with a new id and `created_at = now`.
+    pub fn new(
+        meeting_id: Uuid,
+        start_seconds: f64,
+        end_seconds: Option<f64>,
+        channel: SegmentChannel,
+        identity_id: Option<Uuid>,
+        display_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            meeting_id,
+            start_seconds,
+            end_seconds,
+            channel,
+            identity_id,
+            display_name: display_name.into(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
 /// Kind of generated meeting summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

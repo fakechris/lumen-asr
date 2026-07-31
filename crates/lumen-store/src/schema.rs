@@ -13,8 +13,10 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// little-endian bytes) for cross-meeting speaker enrollment; v11 adds the
 /// `ux_meetings_single_active` partial unique index enforcing the
 /// single-active-recording invariant (at most one `meetings` row in status
-/// `recording` at any time).
-pub(crate) const SCHEMA_VERSION: i64 = 11;
+/// `recording` at any time); v12 adds the additive `live_annotations` table
+/// (manual "who is speaking" marks made on the live captions while recording,
+/// reconciled into speaker attribution by the offline pipeline).
+pub(crate) const SCHEMA_VERSION: i64 = 12;
 
 /// Failure reason written by the v11 migration onto surplus stale `recording`
 /// rows (older duplicates that would violate the new single-active index).
@@ -393,6 +395,37 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_meetings_single_active
          ON meetings((1)) WHERE status = 'recording'",
         [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (11)",
+        [],
+    )?;
+    // v12: additive `live_annotations` table — manual "who is speaking" marks
+    // made on the live caption view while a meeting is still recording. Speaker
+    // rows do not exist at that point (the offline pipeline creates them after
+    // stop), so each annotation is anchored to a time range on the meeting's
+    // unified timeline plus its capture track; the offline pipeline reconciles
+    // them into speaker attribution (manual wins). `identity_id` points into
+    // the local voiceprint library for enrolled people (NULL for ad-hoc typed
+    // names); `display_name` is the name snapshot at annotate time. Re-running
+    // is a no-op (CREATE ... IF NOT EXISTS).
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS live_annotations (
+          id TEXT PRIMARY KEY NOT NULL,
+          meeting_id TEXT NOT NULL,
+          start_seconds REAL NOT NULL,
+          end_seconds REAL,
+          channel TEXT NOT NULL,
+          identity_id TEXT,
+          display_name TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_live_annotations_meeting
+          ON live_annotations(meeting_id, created_at);
+        "#,
     )?;
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
@@ -1115,6 +1148,91 @@ mod tests {
             .unwrap();
         assert_eq!(status, "recording");
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn version_twelve_adds_live_annotations_without_touching_v11_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Stand up a v11 database (schema recorded up to 11, no
+        // live_annotations table) holding one finished meeting.
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11);
+                CREATE TABLE meetings (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  title TEXT,
+                  audio_path TEXT,
+                  duration_seconds REAL,
+                  status TEXT NOT NULL DEFAULT 'recording',
+                  language TEXT,
+                  failure_reason TEXT,
+                  notes TEXT NOT NULL DEFAULT '',
+                  system_audio_path TEXT
+                );
+                INSERT INTO meetings (id, created_at, status, title)
+                VALUES ('m1', '2026-07-29T00:00:00Z', 'ready', '旧会议');
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        // The table and its lookup index now exist.
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='live_annotations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+        let indexes: Vec<String> = connection
+            .prepare("PRAGMA index_list(live_annotations)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(indexes.contains(&"idx_live_annotations_meeting".to_owned()));
+
+        // All expected columns are present.
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(live_annotations)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for column in [
+            "id",
+            "meeting_id",
+            "start_seconds",
+            "end_seconds",
+            "channel",
+            "identity_id",
+            "display_name",
+            "created_at",
+        ] {
+            assert!(columns.contains(&column.to_owned()), "missing {column}");
+        }
+
+        // The pre-existing meeting row is untouched.
+        let title: String = connection
+            .query_row("SELECT title FROM meetings WHERE id='m1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "旧会议");
+
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
