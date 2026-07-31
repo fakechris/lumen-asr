@@ -221,6 +221,18 @@ impl TranscriptSegment {
     }
 }
 
+/// How a speaker's `display_name` was attributed (persisted as
+/// `speakers.attribution_origin`, schema v13). Stable tokens; the priority
+/// order for conflicts is manual > verification > offline_diarization.
+pub mod attribution_origin {
+    /// A human named this speaker (rename command, live annotation chip).
+    pub const MANUAL: &str = "manual";
+    /// Voiceprint verification against the enrolled identity library.
+    pub const VERIFICATION: &str = "verification";
+    /// Plain diarization clustering with no name evidence (reserved).
+    pub const OFFLINE_DIARIZATION: &str = "offline_diarization";
+}
+
 /// A speaker within one meeting (maps to the `speakers` table).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Speaker {
@@ -233,6 +245,19 @@ pub struct Speaker {
     /// Reference to a stored voiceprint embedding. Reserved for cross-meeting
     /// speaker enrollment (M5); left empty in v1.
     pub embedding_ref: Option<String>,
+    /// The enrolled identity behind `display_name`, when attribution came from
+    /// the voiceprint library (verification hit or a library-picked manual
+    /// chip). Absent for ad-hoc typed names and unnamed speakers.
+    #[serde(default)]
+    pub identity_id: Option<Uuid>,
+    /// Provenance of `display_name` (one of the [`attribution_origin`]
+    /// tokens). Absent when the speaker is unnamed or was written before v13.
+    #[serde(default)]
+    pub attribution_origin: Option<String>,
+    /// Match confidence backing a `verification` attribution (best-sample
+    /// cosine similarity). Absent for manual attributions.
+    #[serde(default)]
+    pub attribution_confidence: Option<f64>,
 }
 
 impl Speaker {
@@ -244,6 +269,9 @@ impl Speaker {
             label: label.into(),
             display_name: None,
             embedding_ref: None,
+            identity_id: None,
+            attribution_origin: None,
+            attribution_confidence: None,
         }
     }
 }

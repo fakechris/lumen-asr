@@ -15,8 +15,13 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// single-active-recording invariant (at most one `meetings` row in status
 /// `recording` at any time); v12 adds the additive `live_annotations` table
 /// (manual "who is speaking" marks made on the live captions while recording,
-/// reconciled into speaker attribution by the offline pipeline).
-pub(crate) const SCHEMA_VERSION: i64 = 12;
+/// reconciled into speaker attribution by the offline pipeline); v13 adds the
+/// additive speaker-provenance columns `speakers.identity_id` (enrolled
+/// identity behind the name), `speakers.attribution_origin`
+/// ('manual' | 'verification' | 'offline_diarization'), and
+/// `speakers.attribution_confidence` (verification match score) — the ground
+/// for conflict handling between manual/verified/offline attribution.
+pub(crate) const SCHEMA_VERSION: i64 = 13;
 
 /// Failure reason written by the v11 migration onto surplus stale `recording`
 /// rows (older duplicates that would violate the new single-active index).
@@ -427,6 +432,40 @@ pub fn migrate(conn: &Connection) -> Result<()> {
           ON live_annotations(meeting_id, created_at);
         "#,
     )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (12)",
+        [],
+    )?;
+    // v13: additive speaker-provenance columns on `speakers` — who/what named
+    // this speaker. `identity_id` links the enrolled voiceprint identity,
+    // `attribution_origin` records the source ('manual' | 'verification' |
+    // 'offline_diarization'), `attribution_confidence` records the match score
+    // behind a verification hit. All NULL for pre-v13 rows and unnamed
+    // speakers. Guarded by column checks (SQLite has no `ADD COLUMN IF NOT
+    // EXISTS`) so re-running is a no-op.
+    let speaker_columns: Vec<String> = {
+        let mut statement = conn.prepare("PRAGMA table_info(speakers)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns.collect::<Result<Vec<_>, _>>()?
+    };
+    if !speaker_columns.iter().any(|c| c == "identity_id") {
+        conn.execute("ALTER TABLE speakers ADD COLUMN identity_id TEXT", [])?;
+    }
+    if !speaker_columns.iter().any(|c| c == "attribution_origin") {
+        conn.execute(
+            "ALTER TABLE speakers ADD COLUMN attribution_origin TEXT",
+            [],
+        )?;
+    }
+    if !speaker_columns
+        .iter()
+        .any(|c| c == "attribution_confidence")
+    {
+        conn.execute(
+            "ALTER TABLE speakers ADD COLUMN attribution_confidence REAL",
+            [],
+        )?;
+    }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
         [SCHEMA_VERSION],
@@ -1226,6 +1265,90 @@ mod tests {
             })
             .unwrap();
         assert_eq!(title, "旧会议");
+
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_thirteen_adds_speaker_provenance_without_touching_v12_speakers() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Stand up a v12 database (speakers table through v10's embedding
+        // column, no provenance columns) holding one confirmed speaker.
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12);
+                CREATE TABLE meetings (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  title TEXT,
+                  audio_path TEXT,
+                  duration_seconds REAL,
+                  status TEXT NOT NULL DEFAULT 'recording',
+                  language TEXT,
+                  failure_reason TEXT,
+                  notes TEXT NOT NULL DEFAULT '',
+                  system_audio_path TEXT
+                );
+                CREATE TABLE speakers (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  meeting_id TEXT NOT NULL,
+                  label TEXT NOT NULL,
+                  display_name TEXT,
+                  embedding_ref TEXT,
+                  embedding BLOB,
+                  FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+                INSERT INTO meetings (id, created_at, status) VALUES ('m1', '2026-07-30T00:00:00Z', 'ready');
+                INSERT INTO speakers (id, meeting_id, label, display_name) VALUES ('s1', 'm1', 'S1', '李明');
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        // All three provenance columns exist and pre-existing rows default to
+        // NULL (provenance unknown for pre-v13 attributions).
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(speakers)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for column in [
+            "identity_id",
+            "attribution_origin",
+            "attribution_confidence",
+        ] {
+            assert!(columns.contains(&column.to_owned()), "missing {column}");
+        }
+        let (identity, origin, confidence): (Option<String>, Option<String>, Option<f64>) =
+            connection
+                .query_row(
+                    "SELECT identity_id, attribution_origin, attribution_confidence FROM speakers WHERE id='s1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(identity, None);
+        assert_eq!(origin, None);
+        assert_eq!(confidence, None);
+        // The pre-existing speaker row is otherwise untouched.
+        let name: Option<String> = connection
+            .query_row(
+                "SELECT display_name FROM speakers WHERE id='s1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("李明"));
 
         let version: i64 = connection
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {

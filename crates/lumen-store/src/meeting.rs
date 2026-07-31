@@ -277,16 +277,23 @@ impl Store {
 
     // ----- speakers ---------------------------------------------------------
 
-    /// Insert or update a speaker by id.
+    /// Insert or update a speaker by id (including its v13 provenance columns:
+    /// identity link, attribution origin, and verification confidence).
     pub fn upsert_speaker(&self, speaker: &Speaker) -> Result<()> {
         self.conn.execute(
             r#"
-            INSERT INTO speakers (id, meeting_id, label, display_name, embedding_ref)
-            VALUES (?1,?2,?3,?4,?5)
+            INSERT INTO speakers (
+              id, meeting_id, label, display_name, embedding_ref,
+              identity_id, attribution_origin, attribution_confidence
+            )
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
             ON CONFLICT(id) DO UPDATE SET
               label=excluded.label,
               display_name=excluded.display_name,
-              embedding_ref=excluded.embedding_ref
+              embedding_ref=excluded.embedding_ref,
+              identity_id=excluded.identity_id,
+              attribution_origin=excluded.attribution_origin,
+              attribution_confidence=excluded.attribution_confidence
             "#,
             params![
                 speaker.id.to_string(),
@@ -294,6 +301,9 @@ impl Store {
                 speaker.label,
                 speaker.display_name,
                 speaker.embedding_ref,
+                speaker.identity_id.map(|id| id.to_string()),
+                speaker.attribution_origin,
+                speaker.attribution_confidence,
             ],
         )?;
         Ok(())
@@ -309,12 +319,20 @@ impl Store {
     /// untitled meeting. Confirmation is derived from the name rather than a
     /// separate column, so there is a single source of truth. Returns `true` if a
     /// row was updated.
+    /// Provenance (v13): a human typed this name, so the attribution origin is
+    /// recorded as `manual` (the top of the manual > verification >
+    /// offline_diarization priority) with no confidence score; blanking the
+    /// name clears the provenance too, since an unnamed speaker has none. Any
+    /// previous identity link is cleared either way — a typed name is an
+    /// ad-hoc string, not a library pick.
     pub fn rename_speaker(&self, id: Uuid, display_name: &str) -> Result<bool> {
         let trimmed = display_name.trim();
         let value = (!trimmed.is_empty()).then_some(trimmed);
+        let origin = value.map(|_| lumen_core::attribution_origin::MANUAL);
         let changed = self.conn.execute(
-            "UPDATE speakers SET display_name=?2 WHERE id=?1",
-            params![id.to_string(), value],
+            "UPDATE speakers SET display_name=?2, identity_id=NULL,
+             attribution_origin=?3, attribution_confidence=NULL WHERE id=?1",
+            params![id.to_string(), value, origin],
         )?;
         Ok(changed > 0)
     }
@@ -323,7 +341,8 @@ impl Store {
     pub fn list_speakers(&self, meeting_id: Uuid) -> Result<Vec<Speaker>> {
         let mut statement = self.conn.prepare(
             r#"
-            SELECT id, meeting_id, label, display_name, embedding_ref
+            SELECT id, meeting_id, label, display_name, embedding_ref,
+                   identity_id, attribution_origin, attribution_confidence
             FROM speakers
             WHERE meeting_id=?1
             ORDER BY label ASC
@@ -659,12 +678,20 @@ fn map_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptSegment> {
 }
 
 fn map_speaker(row: &rusqlite::Row<'_>) -> rusqlite::Result<Speaker> {
+    // `identity_id` is best-effort provenance: a corrupt uuid reads as None
+    // rather than failing the whole speaker list.
+    let identity_id = row
+        .get::<_, Option<String>>(5)?
+        .and_then(|value| Uuid::parse_str(&value).ok());
     Ok(Speaker {
         id: parse_uuid_column(row, 0)?,
         meeting_id: parse_uuid_column(row, 1)?,
         label: row.get(2)?,
         display_name: row.get(3)?,
         embedding_ref: row.get(4)?,
+        identity_id,
+        attribution_origin: row.get(6)?,
+        attribution_confidence: row.get(7)?,
     })
 }
 
@@ -1098,6 +1125,48 @@ mod tests {
         let speakers = store.list_speakers(meeting.id).unwrap();
         assert_eq!(speakers.len(), 1);
         assert_eq!(speakers[0].embedding_ref.as_deref(), Some("identity/chris"));
+    }
+
+    #[test]
+    fn speaker_provenance_round_trips_and_rename_marks_manual() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+
+        // A verification-attributed speaker persists its full provenance.
+        let identity = Uuid::new_v4();
+        let mut speaker = Speaker::new(meeting.id, "S1");
+        speaker.display_name = Some("李明".into());
+        speaker.identity_id = Some(identity);
+        speaker.attribution_origin = Some(lumen_core::attribution_origin::VERIFICATION.into());
+        speaker.attribution_confidence = Some(0.82);
+        store.upsert_speaker(&speaker).unwrap();
+
+        let read = &store.list_speakers(meeting.id).unwrap()[0];
+        assert_eq!(read.identity_id, Some(identity));
+        assert_eq!(
+            read.attribution_origin.as_deref(),
+            Some(lumen_core::attribution_origin::VERIFICATION)
+        );
+        assert_eq!(read.attribution_confidence, Some(0.82));
+
+        // A manual rename (#67 path) overrides: origin becomes manual, the
+        // identity link and confidence are cleared (typed name ≠ library pick).
+        assert!(store.rename_speaker(speaker.id, "张三").unwrap());
+        let renamed = &store.list_speakers(meeting.id).unwrap()[0];
+        assert_eq!(renamed.display_name.as_deref(), Some("张三"));
+        assert_eq!(
+            renamed.attribution_origin.as_deref(),
+            Some(lumen_core::attribution_origin::MANUAL)
+        );
+        assert_eq!(renamed.identity_id, None);
+        assert_eq!(renamed.attribution_confidence, None);
+
+        // Blanking the name clears the provenance with it.
+        assert!(store.rename_speaker(speaker.id, " ").unwrap());
+        let cleared = &store.list_speakers(meeting.id).unwrap()[0];
+        assert_eq!(cleared.display_name, None);
+        assert_eq!(cleared.attribution_origin, None);
     }
 
     #[test]

@@ -152,8 +152,10 @@ pub fn reconcile_annotations(
     }
 
     // 1. Per segment: the newest annotation (created_at; list order breaks
-    //    ties) on the same channel whose range covers it enough.
-    let manual_names: Vec<Option<String>> = segments
+    //    ties) on the same channel whose range covers it enough. Keep the
+    //    winning annotation's identity link alongside the name so the manual
+    //    attribution can be persisted with full provenance (v13).
+    let manual_names: Vec<Option<(String, Option<Uuid>)>> = segments
         .iter()
         .map(|segment| {
             let channel = segment.channel.unwrap_or(SegmentChannel::Mic);
@@ -167,7 +169,7 @@ pub fn reconcile_annotations(
                 .iter()
                 .filter(|a| a.channel == channel && annotation_covers(a, start, end))
                 .max_by(|a, b| a.created_at.cmp(&b.created_at))
-                .map(|a| a.display_name.clone())
+                .map(|a| (a.display_name.clone(), a.identity_id))
         })
         .collect();
     if manual_names.iter().all(Option::is_none) {
@@ -188,19 +190,19 @@ pub fn reconcile_annotations(
         let Some(speaker_id) = speaker_id else {
             continue; // unattributed segments are handled by the split pass
         };
-        let names: Vec<&String> = indexes
+        let names: Vec<&(String, Option<Uuid>)> = indexes
             .iter()
             .filter_map(|&i| manual_names[i].as_ref())
             .collect();
         if names.len() != indexes.len() {
             continue; // not fully covered → split below
         }
-        let name = names[0];
-        if !names.iter().all(|n| *n == name) {
+        let (name, identity) = names[0];
+        if !names.iter().all(|(n, _)| n == name) {
             continue; // two different manual names → split below
         }
         if let Some(speaker) = speakers.iter_mut().find(|s| s.id == *speaker_id) {
-            speaker.display_name = Some(name.clone());
+            apply_manual_attribution(speaker, name, *identity);
             outcome.renamed_speakers.push((*speaker_id, name.clone()));
             speaker_for_name.entry(name.clone()).or_insert(*speaker_id);
         }
@@ -218,7 +220,7 @@ pub fn reconcile_annotations(
         .collect();
     let mut next_manual_label = 1usize;
     for index in 0..segments.len() {
-        let Some(name) = manual_names[index].as_ref() else {
+        let Some((name, identity)) = manual_names[index].as_ref() else {
             continue;
         };
         if let Some(speaker_id) = segments[index].speaker_id {
@@ -233,7 +235,7 @@ pub fn reconcile_annotations(
                     meeting_id,
                     next_manual_label_for(speakers, &mut next_manual_label),
                 );
-                speaker.display_name = Some(name.clone());
+                apply_manual_attribution(&mut speaker, name, *identity);
                 let id = speaker.id;
                 speakers.push(speaker);
                 speaker_for_name.insert(name.clone(), id);
@@ -269,6 +271,17 @@ fn annotation_covers(annotation: &LiveAnnotation, start: f64, end: f64) -> bool 
         }
         None => annotation.start_seconds >= start && annotation.start_seconds <= end,
     }
+}
+
+/// Write a manual attribution onto a speaker row: the name, the annotation's
+/// identity link (when the chip picked an enrolled person), and `manual`
+/// provenance (v13). Any earlier verification confidence is cleared — manual
+/// always wins and carries no score.
+fn apply_manual_attribution(speaker: &mut Speaker, name: &str, identity: Option<Uuid>) {
+    speaker.display_name = Some(name.to_string());
+    speaker.identity_id = identity;
+    speaker.attribution_origin = Some(lumen_core::attribution_origin::MANUAL.to_string());
+    speaker.attribution_confidence = None;
 }
 
 /// The next free `M{k}` label (skipping any label already taken, defensively).
@@ -630,6 +643,62 @@ mod tests {
             0.0,
         );
         assert_eq!(outcome2, AnnotationReconciliation::default());
+    }
+
+    #[test]
+    fn manual_attribution_records_provenance_and_overrides_verification() {
+        let meeting_id = Uuid::new_v4();
+        let (speaker, mut segments) = cluster(meeting_id, "S1", &[(0.0, 2.0), (5.0, 7.0)], 0);
+        let mut speakers = vec![speaker];
+        // The voiceprint pass had auto-identified this cluster…
+        speakers[0].display_name = Some("王五".into());
+        speakers[0].identity_id = Some(Uuid::new_v4());
+        speakers[0].attribution_origin = Some(lumen_core::attribution_origin::VERIFICATION.into());
+        speakers[0].attribution_confidence = Some(0.8);
+        // …but the user marked both lines as an enrolled 李明.
+        let enrolled = Uuid::new_v4();
+        let mut a1 = annotation(meeting_id, 0.0, Some(2.0), SegmentChannel::Mic, "李明", 0);
+        a1.identity_id = Some(enrolled);
+        let mut a2 = annotation(meeting_id, 5.0, Some(7.0), SegmentChannel::Mic, "李明", 1);
+        a2.identity_id = Some(enrolled);
+
+        let outcome = reconcile_annotations(
+            meeting_id,
+            &mut speakers,
+            &mut segments,
+            &[a1, a2],
+            0.0,
+            0.0,
+        );
+
+        assert_eq!(outcome.renamed_speakers.len(), 1);
+        // Manual wins wholesale: name, identity link, origin; the stale
+        // verification confidence is cleared.
+        assert_eq!(speakers[0].display_name.as_deref(), Some("李明"));
+        assert_eq!(speakers[0].identity_id, Some(enrolled));
+        assert_eq!(
+            speakers[0].attribution_origin.as_deref(),
+            Some(lumen_core::attribution_origin::MANUAL)
+        );
+        assert_eq!(speakers[0].attribution_confidence, None);
+
+        // Split-created manual speakers carry provenance too (ad-hoc name →
+        // no identity link).
+        let (s2, mut segs2) = cluster(meeting_id, "S1", &[(0.0, 4.0), (10.0, 14.0)], 0);
+        let mut speakers2 = vec![s2];
+        let adhoc = annotation(meeting_id, 0.0, Some(4.0), SegmentChannel::Mic, "张三", 0);
+        let outcome2 =
+            reconcile_annotations(meeting_id, &mut speakers2, &mut segs2, &[adhoc], 0.0, 0.0);
+        let manual = speakers2
+            .iter()
+            .find(|s| s.id == outcome2.new_speakers[0])
+            .unwrap();
+        assert_eq!(manual.display_name.as_deref(), Some("张三"));
+        assert_eq!(manual.identity_id, None);
+        assert_eq!(
+            manual.attribution_origin.as_deref(),
+            Some(lumen_core::attribution_origin::MANUAL)
+        );
     }
 
     #[test]
