@@ -46,6 +46,8 @@ pub use identify::{
     auto_identify_speakers, speaker_voiced_ms, AutoIdentification, IDENTIFY_MIN_VOICED_MS,
 };
 pub use merge::{merge_tracks, system_speaker_offset, MergedTake, TrackTake};
+#[cfg(all(target_os = "macos", feature = "diarize"))]
+pub use pipeline::LiveVoiceprintEmbedder;
 pub use pipeline::{transcribe_meeting, DiarModels, MeetingError, MeetingOptions};
 pub use process::{process_meeting, reconcile_stored_annotations, MinutesConfig, ProcessError};
 

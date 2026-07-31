@@ -592,6 +592,15 @@ export const api = {
   removeEnrolledSpeaker: (identityId: string) =>
     invoke<boolean>("remove_enrolled_speaker", { identityId }),
 
+  /** Read the enrolled identity marked as the user themself ("这是我"), or
+   * null. Rendering hint: attribution matching it displays as "我". */
+  getSelfIdentity: () => invoke<string | null>("get_self_identity"),
+
+  /** Set (identityId) or clear (null) which enrolled identity is the user
+   * themself. Resolves the stored value. */
+  setSelfIdentity: (identityId: string | null) =>
+    invoke<string | null>("set_self_identity", { identityId }),
+
   /** Which of a meeting's speakers have a stored voiceprint (enrollable). */
   getMeetingVoiceprints: (meetingId: string) =>
     invoke<import("./types").SpeakerVoiceprint[]>("get_meeting_voiceprints", {

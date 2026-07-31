@@ -392,6 +392,8 @@ pub fn run() {
             meeting_cmd::list_enrolled_speakers,
             meeting_cmd::remove_enrolled_speaker,
             meeting_cmd::get_meeting_voiceprints,
+            meeting_cmd::get_self_identity,
+            meeting_cmd::set_self_identity,
             meeting_cmd::export_meeting,
             learning::get_learning_config,
             learning::save_learning_config,

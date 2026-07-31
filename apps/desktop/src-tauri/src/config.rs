@@ -84,6 +84,11 @@ pub struct MeetingConfig {
     /// headphone meetings and uncertain pairs are untouched. Defaults to
     /// `true`; only meaningful when a system track was recorded.
     pub echo_suppression: bool,
+    /// The enrolled voiceprint identity that is *the user themself* ("这是我").
+    /// Purely a rendering hint: when live/offline attribution matches this
+    /// identity, the UI shows "我" instead of the enrolled name. `None` until
+    /// the user marks an identity as self in the voiceprint library.
+    pub self_identity_id: Option<String>,
 }
 
 impl Default for MeetingConfig {
@@ -95,6 +100,7 @@ impl Default for MeetingConfig {
             system_audio: true,
             system_live_preview: true,
             echo_suppression: true,
+            self_identity_id: None,
         }
     }
 }
@@ -1074,6 +1080,32 @@ provider = "local_sensevoice"
         )
         .unwrap();
         assert!(config.meeting.transcript_cleanup);
+    }
+
+    #[test]
+    fn meeting_self_identity_defaults_none_and_round_trips() {
+        // Unset by default and for existing configs without the field…
+        assert_eq!(MeetingConfig::default().self_identity_id, None);
+        let existing: AppConfig = toml::from_str(
+            r#"
+[meeting]
+transcript_cleanup = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(existing.meeting.self_identity_id, None);
+        // …and an explicit value is honored.
+        let set: AppConfig = toml::from_str(
+            r#"
+[meeting]
+self_identity_id = "11111111-2222-3333-4444-555555555555"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            set.meeting.self_identity_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
     }
 
     #[test]

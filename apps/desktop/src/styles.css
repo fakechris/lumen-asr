@@ -2948,6 +2948,17 @@ button.meeting-index-item:hover {
   white-space: nowrap;
 }
 
+/* "这是我" marker on the enrolled identity that is the user themself. */
+.meeting-voiceprint-self {
+  margin-left: 6px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--accent, #4a7dbd);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 6px;
+}
+
 .meeting-info {
   margin: 0;
   display: grid;
@@ -3363,6 +3374,19 @@ button.meeting-seg-text.seekable:hover {
   border-color: var(--border);
   color: var(--accent, #4a7dbd);
   background: var(--accent-dim, transparent);
+}
+
+/* Voiceprint attribution (L3): auto-verified reads like a confirmed name;
+ * provisional ("李明?") stays visibly tentative. Manual `.named` wins. */
+.meeting-live-chip.voiceprint {
+  opacity: 1;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.meeting-live-chip.voiceprint.provisional {
+  opacity: 0.6;
+  color: var(--muted);
 }
 
 /* Positioned `fixed` from the chip's viewport rect at open time (inline

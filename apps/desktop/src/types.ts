@@ -468,6 +468,15 @@ export type Speaker = {
   label: string;
   display_name?: string | null;
   embedding_ref?: string | null;
+  /** Enrolled identity behind the name, when attribution came from the
+   * voiceprint library (v13 provenance). */
+  identity_id?: string | null;
+  /** How the name was attributed: "manual" | "verification" |
+   * "offline_diarization" (v13 provenance). */
+  attribution_origin?: string | null;
+  /** Verification match confidence, when attribution_origin is
+   * "verification". */
+  attribution_confidence?: number | null;
 };
 
 /** An identity enrolled in the local voiceprint library (camelCase DTO; the

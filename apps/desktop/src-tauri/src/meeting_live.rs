@@ -37,9 +37,10 @@
 //! The recognizer is created *inside* the worker thread; the worker is a plain
 //! synchronous loop, no Tokio runtime needed.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -50,6 +51,7 @@ use lumen_asr::{
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
+use uuid::Uuid;
 
 /// Sample rate the streaming Paraformer model expects. Each track captures at
 /// its own native rate, so chunks are resampled to this before decoding.
@@ -88,10 +90,28 @@ struct LiveTranscriptEvent {
     text: String,
     /// `true` once the segment is finalized (endpoint reached).
     is_final: bool,
-    /// Speaker attribution placeholder — never set by this layer. Kept in the
-    /// contract so the payload shape stays stable if attribution is added.
+    /// Live speaker attribution (L3): filled only by the voiceprint
+    /// verification revision of a finalized segment; absent on every
+    /// transcription-only event, so without an identity library / diar model
+    /// the payload is byte-identical to the L1 contract.
     #[serde(skip_serializing_if = "Option::is_none")]
-    speaker: Option<String>,
+    speaker: Option<LiveSpeaker>,
+}
+
+/// Speaker attribution attached to a live segment revision by the voiceprint
+/// verifier. `provisional: true` renders tentatively ("李明?"); manual chip
+/// annotations (L2) always take display precedence in the UI.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveSpeaker {
+    /// Enrolled identity id (the UI translates `self_identity_id` to "我").
+    identity_id: String,
+    /// The identity's current real name.
+    display_name: String,
+    /// Attribution source; always `"voiceprint"` from this layer.
+    source: &'static str,
+    /// `true` = suggest tentatively; `false` = auto-verified.
+    provisional: bool,
 }
 
 /// Return the streaming Paraformer model directory **iff** the real-time layer
@@ -323,6 +343,288 @@ impl SampleClock {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// L3: live speaker verification — recent-audio ring window, bounded embedder
+// hand-off, and the streak upgrade rule. The pure parts (window, streak) are
+// cross-platform and unit-tested; only the embedder thread itself is gated on
+// macOS + the installed diar embedding model + a non-empty identity library.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How much recent audio each track retains for utterance extraction. Live
+/// utterances are endpointed well under this, so 30 s comfortably covers the
+/// finalize-then-verify hand-off while bounding memory (~1.9 MB/track @16k).
+const WINDOW_CAPACITY_SECONDS: f64 = 30.0;
+
+/// Only utterances at least this long are worth an embedding attempt — the
+/// live policy cannot label anything shorter anyway
+/// ([`lumen_identity::LIVE_PROVISIONAL_MIN_VOICED_MS`]).
+const VERIFY_MIN_UTTERANCE_SECONDS: f64 =
+    lumen_identity::LIVE_PROVISIONAL_MIN_VOICED_MS as f64 / 1000.0;
+
+/// Bound of the worker → embedder job queue. Verification is an enhancement:
+/// when the embedder falls behind, jobs are dropped (utterances simply stay
+/// unlabeled) rather than ever back-pressuring the transcription loop.
+const EMBED_QUEUE_CAPACITY: usize = 4;
+
+/// Consecutive same-identity hits a track needs before *later* provisional
+/// hits may display as verified (the streak upgrade). Two agreeing utterances
+/// establish the streak; from the next hit on, the person is evidently the
+/// one talking on that track, so a grey-zone score stops re-adding the "?".
+const STREAK_UPGRADE_AFTER: u32 = 2;
+
+/// Rolling window of a track's recent audio (model-rate mono), stamped on the
+/// meeting's unified timeline. Chunks are stamped with the track's
+/// [`SampleClock`] chunk-start times — the same source the segment events use
+/// — so an utterance's `[start, end]` span extracts exactly the audio the
+/// recognizer saw for it (arrival stamps would drift by a chunk's duration
+/// and by any paused interval). Evicted oldest-first past
+/// [`WINDOW_CAPACITY_SECONDS`]; extraction slices every chunk overlapping the
+/// requested span (gaps simply contribute nothing). Pure and unit-testable.
+struct AudioWindow {
+    sample_rate: u32,
+    chunks: VecDeque<(f64, Vec<f32>)>,
+    total_samples: usize,
+}
+
+impl AudioWindow {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            sample_rate: sample_rate.max(1),
+            chunks: VecDeque::new(),
+            total_samples: 0,
+        }
+    }
+
+    fn push(&mut self, start_seconds: f64, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        self.total_samples += samples.len();
+        self.chunks.push_back((start_seconds, samples.to_vec()));
+        let capacity = (WINDOW_CAPACITY_SECONDS * f64::from(self.sample_rate)) as usize;
+        while self.total_samples > capacity && self.chunks.len() > 1 {
+            if let Some((_, evicted)) = self.chunks.pop_front() {
+                self.total_samples -= evicted.len();
+            }
+        }
+    }
+
+    /// Concatenate the audio overlapping `[start, end)` on the unified
+    /// timeline. Spans beyond the retained window (or fully in a gap) yield
+    /// fewer (or zero) samples — callers treat "too little audio" as skip.
+    fn extract(&self, start: f64, end: f64) -> Vec<f32> {
+        if !start.is_finite() || !end.is_finite() || end <= start {
+            return Vec::new();
+        }
+        let rate = f64::from(self.sample_rate);
+        let mut out = Vec::new();
+        for (chunk_start, samples) in &self.chunks {
+            let chunk_end = chunk_start + samples.len() as f64 / rate;
+            if chunk_end <= start || *chunk_start >= end {
+                continue;
+            }
+            let from = (((start - chunk_start).max(0.0)) * rate) as usize;
+            let to = ((((end - chunk_start) * rate) as usize).min(samples.len())).max(from);
+            out.extend_from_slice(&samples[from..to]);
+        }
+        out
+    }
+}
+
+/// One finalized utterance handed to the embedder thread: everything needed to
+/// re-emit the segment with a speaker attribution appended as revision + 1.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct EmbedJob {
+    segment_id: String,
+    /// Revision of the finalizing event; the attribution event uses `+ 1`.
+    revision: u64,
+    track: &'static str,
+    start_seconds: f64,
+    end_seconds: f64,
+    text: String,
+    /// Utterance audio at the model rate (16 kHz mono).
+    samples: Vec<f32>,
+}
+
+/// Handle to the long-lived embedder thread; dropping `tx` ends its loop and
+/// `handle` is joined so trailing attributions flush before the worker exits.
+struct LiveVerifier {
+    tx: SyncSender<EmbedJob>,
+    handle: JoinHandle<()>,
+}
+
+impl LiveVerifier {
+    /// Hand a finalized utterance over; drops the job when the queue is full
+    /// or the thread is gone — verification never delays transcription.
+    fn enqueue(&self, job: EmbedJob) {
+        match self.tx.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) => {
+                tracing::debug!(
+                    segment = %job.segment_id,
+                    "live verifier busy; skipping speaker verification for this utterance"
+                );
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    fn finish(self) {
+        drop(self.tx);
+        let _ = self.handle.join();
+    }
+}
+
+/// Per-track consecutive-hit bookkeeping for the streak upgrade rule: after
+/// [`STREAK_UPGRADE_AFTER`] consecutive hits (provisional or verified) on the
+/// same identity, *subsequent* provisional hits on that track may display as
+/// verified. Only actually-matched segments are ever revised; a differing
+/// identity resets the streak, while skipped/short utterances (no report)
+/// leave it untouched. Pure and unit-testable — kept un-gated (like
+/// [`EmbedJob`]) so the rule is tested on every platform; its only non-test
+/// caller is the macOS embedder thread, hence the dead-code allowance
+/// elsewhere.
+#[derive(Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct VerificationStreak {
+    by_track: std::collections::HashMap<&'static str, (Uuid, u32)>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl VerificationStreak {
+    /// Record a hit for `identity` on `track`; returns `true` when a
+    /// provisional hit may display as verified (streak established *before*
+    /// this hit).
+    fn observe_hit(&mut self, track: &'static str, identity: Uuid) -> bool {
+        let entry = self.by_track.entry(track).or_insert((identity, 0));
+        if entry.0 != identity {
+            *entry = (identity, 0);
+        }
+        let upgraded = entry.1 >= STREAK_UPGRADE_AFTER;
+        entry.1 += 1;
+        upgraded
+    }
+
+    /// A confident-enough report pointed at a *different* person (or the
+    /// policy rejected it): the run of agreement is broken.
+    fn observe_miss(&mut self, track: &'static str) {
+        self.by_track.remove(track);
+    }
+}
+
+/// Spawn the embedder thread when the whole layer should run: macOS, the diar
+/// embedding model installed, and at least one enrolled identity. Anywhere
+/// else `None` — the worker then behaves exactly like L1/L2 (no ring pushes,
+/// no jobs, no speaker events).
+#[cfg(target_os = "macos")]
+fn spawn_live_verifier(app: AppHandle, meeting_id: String) -> Option<LiveVerifier> {
+    let emb_model = lumen_asr::lumen_models_dir().join("diar").join("emb.onnx");
+    if !emb_model.is_file() {
+        return None;
+    }
+    let identity_dir = lumen_identity::default_identity_dir();
+    match lumen_identity::IdentityStore::open(&identity_dir) {
+        Ok(store) if !store.list().is_empty() => {}
+        _ => return None, // empty/unreadable library → layer stays inert
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<EmbedJob>(EMBED_QUEUE_CAPACITY);
+    let handle = std::thread::Builder::new()
+        .name("lumen-meeting-live-verify".into())
+        .spawn(move || run_verifier(app, meeting_id, emb_model, identity_dir, rx))
+        .ok()?;
+    Some(LiveVerifier { tx, handle })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_live_verifier(_app: AppHandle, _meeting_id: String) -> Option<LiveVerifier> {
+    None
+}
+
+/// Embedder thread body: load the WeSpeaker model once, then for each queued
+/// utterance embed → verify → apply the live decision policy (+ streak
+/// upgrade) → append a `revision + 1` event carrying the speaker attribution.
+/// Every failure path skips the utterance; nothing here can affect the
+/// transcription loop.
+#[cfg(target_os = "macos")]
+fn run_verifier(
+    app: AppHandle,
+    meeting_id: String,
+    emb_model: PathBuf,
+    identity_dir: PathBuf,
+    rx: Receiver<EmbedJob>,
+) {
+    use lumen_identity::{live_decision, IdentityStore, LiveDecision};
+
+    let mut embedder = match lumen_meeting::LiveVoiceprintEmbedder::load(&emb_model) {
+        Ok(embedder) => embedder,
+        Err(error) => {
+            tracing::warn!(error = %error, "live speaker verification disabled: embedding model failed to load");
+            return;
+        }
+    };
+    tracing::info!("live speaker verification started (WeSpeaker embedder thread)");
+    let mut streak = VerificationStreak::default();
+    while let Ok(job) = rx.recv() {
+        // Reopen per utterance so enrollments made mid-recording are picked up
+        // (the library is a handful of small JSON files).
+        let identities = match IdentityStore::open(&identity_dir) {
+            Ok(identities) if !identities.list().is_empty() => identities,
+            _ => continue,
+        };
+        let embedding = match embedder.embed(&job.samples, STREAMING_TARGET_RATE) {
+            Ok(Some(embedding)) => embedding,
+            Ok(None) => continue, // too short to embed reliably
+            Err(error) => {
+                tracing::warn!(error = %error, "live embedding failed; skipping utterance");
+                continue;
+            }
+        };
+        let Some(report) = identities.verify_speaker(&embedding) else {
+            continue;
+        };
+        let voiced_ms = ((job.end_seconds - job.start_seconds).max(0.0) * 1000.0).round() as u64;
+        let provisional = match live_decision(&report, voiced_ms) {
+            LiveDecision::NoMatch => {
+                streak.observe_miss(job.track);
+                continue;
+            }
+            LiveDecision::VerifiedAuto => {
+                streak.observe_hit(job.track, report.identity_id);
+                false
+            }
+            LiveDecision::Provisional => !streak.observe_hit(job.track, report.identity_id),
+        };
+        // Ids and scores only — the matched name is PII.
+        tracing::info!(
+            segment = %job.segment_id,
+            score = report.best_score,
+            margin = report.margin,
+            provisional,
+            "live speaker verification hit"
+        );
+        emit(
+            &app,
+            &meeting_id,
+            job.track,
+            SegmentUpdate {
+                segment_id: job.segment_id,
+                revision: job.revision + 1,
+                start_seconds: job.start_seconds,
+                end_seconds: Some(job.end_seconds),
+                text: job.text,
+                is_final: true,
+            },
+            Some(LiveSpeaker {
+                identity_id: report.identity_id.to_string(),
+                display_name: report.display_name,
+                source: "voiceprint",
+                provisional,
+            }),
+        );
+    }
+    tracing::info!("live speaker verification stopped");
+}
+
 /// One live track inside the worker: its fan-out receiver, its decoding stream
 /// on the shared recognizer, and its segment bookkeeping.
 struct TrackState {
@@ -335,10 +637,18 @@ struct TrackState {
     /// segment's `end_seconds`.
     clock: f64,
     disconnected: bool,
+    /// Recent model-rate audio for utterance extraction (L3). `None` when the
+    /// verifier is not engaged — zero extra work or memory then.
+    window: Option<AudioWindow>,
 }
 
 impl TrackState {
-    fn new(track: &'static str, feed: LiveTrackFeed, stream: StreamingStream) -> Self {
+    fn new(
+        track: &'static str,
+        feed: LiveTrackFeed,
+        stream: StreamingStream,
+        keep_window: bool,
+    ) -> Self {
         let sample_clock = SampleClock::new(feed.capture_rate);
         Self {
             tracker: SegmentTracker::new(track),
@@ -347,6 +657,7 @@ impl TrackState {
             sample_clock,
             clock: 0.0,
             disconnected: false,
+            window: keep_window.then(|| AudioWindow::new(STREAMING_TARGET_RATE)),
         }
     }
 
@@ -373,6 +684,14 @@ impl TrackState {
                             STREAMING_TARGET_RATE,
                         )
                     };
+                    // The ring window must share the segment events' time
+                    // source (the sample-anchored clock), or utterance
+                    // [start, end] extraction would misalign with the spans
+                    // the tracker reports — by a chunk's duration always, and
+                    // by the whole paused interval after a pause.
+                    if let Some(window) = &mut self.window {
+                        window.push(chunk_start, &samples);
+                    }
                     self.stream.accept_waveform(&samples, STREAMING_TARGET_RATE);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -383,6 +702,40 @@ impl TrackState {
             }
         }
         got_audio
+    }
+
+    /// After a segment finalized: hand its audio span to the verifier when the
+    /// layer is engaged and the utterance is long enough to ever earn a label.
+    fn maybe_enqueue_verification(&self, verifier: &Option<LiveVerifier>, update: &SegmentUpdate) {
+        let (Some(verifier), Some(window)) = (verifier, &self.window) else {
+            return;
+        };
+        let Some(end_seconds) = update.end_seconds else {
+            return;
+        };
+        if !update.is_final
+            || update.text.trim().is_empty()
+            || end_seconds - update.start_seconds < VERIFY_MIN_UTTERANCE_SECONDS
+        {
+            return;
+        }
+        let samples = window.extract(update.start_seconds, end_seconds);
+        // The window may have already evicted part of a very old span; only
+        // verify when we still hold (nearly) the whole utterance.
+        let wanted =
+            ((end_seconds - update.start_seconds) * f64::from(STREAMING_TARGET_RATE)) as usize;
+        if samples.len() * 10 < wanted * 9 {
+            return;
+        }
+        verifier.enqueue(EmbedJob {
+            segment_id: update.segment_id.clone(),
+            revision: update.revision,
+            track: self.tracker.track,
+            start_seconds: update.start_seconds,
+            end_seconds,
+            text: update.text.clone(),
+            samples,
+        });
     }
 
     /// After a decode pass: finalize on an endpoint (then reset for the next
@@ -427,12 +780,24 @@ fn run_worker(
         }
     };
 
-    let mut tracks = vec![TrackState::new(TRACK_MIC, mic, recognizer.new_stream())];
+    // L3: live speaker verification (macOS + diar embedding model + non-empty
+    // identity library, otherwise `None` and everything below degrades to the
+    // exact L1/L2 behaviour — no ring buffers, no jobs, no speaker events).
+    let verifier = spawn_live_verifier(app.clone(), meeting_id.clone());
+    let keep_window = verifier.is_some();
+
+    let mut tracks = vec![TrackState::new(
+        TRACK_MIC,
+        mic,
+        recognizer.new_stream(),
+        keep_window,
+    )];
     if let Some(system) = system {
         tracks.push(TrackState::new(
             TRACK_SYSTEM,
             system,
             recognizer.new_stream(),
+            keep_window,
         ));
     }
 
@@ -469,7 +834,8 @@ fn run_worker(
         }
         for track in &mut tracks {
             if let Some(update) = track.poll_result() {
-                emit(&app, &meeting_id, track.tracker.track, update);
+                track.maybe_enqueue_verification(&verifier, &update);
+                emit(&app, &meeting_id, track.tracker.track, update, None);
             }
         }
     }
@@ -482,13 +848,25 @@ fn run_worker(
         let text = track.stream.result().text;
         let clock = track.clock;
         if let Some(update) = track.tracker.on_endpoint(&text, clock) {
-            emit(&app, &meeting_id, track.tracker.track, update);
+            track.maybe_enqueue_verification(&verifier, &update);
+            emit(&app, &meeting_id, track.tracker.track, update, None);
         }
+    }
+    // Close the job queue and wait for in-flight verifications so a trailing
+    // attribution still reaches the UI before the worker reports done.
+    if let Some(verifier) = verifier {
+        verifier.finish();
     }
     tracing::info!("live meeting transcript stopped");
 }
 
-fn emit(app: &AppHandle, meeting_id: &str, track: &'static str, update: SegmentUpdate) {
+fn emit(
+    app: &AppHandle,
+    meeting_id: &str,
+    track: &'static str,
+    update: SegmentUpdate,
+    speaker: Option<LiveSpeaker>,
+) {
     let _ = app.emit(
         "meeting-live-transcript",
         LiveTranscriptEvent {
@@ -500,7 +878,7 @@ fn emit(app: &AppHandle, meeting_id: &str, track: &'static str, update: SegmentU
             end_seconds: update.end_seconds,
             text: update.text,
             is_final: update.is_final,
-            speaker: None,
+            speaker,
         },
     );
 }
@@ -683,5 +1061,116 @@ mod tests {
         // stop() on an idle instance is a harmless no-op.
         live.stop();
         assert!(live.inner.lock().unwrap().is_none());
+    }
+
+    // ---- L3: speaker attribution payload ---------------------------------
+
+    #[test]
+    fn speaker_attribution_serializes_camel_case() {
+        let ev = LiveTranscriptEvent {
+            meeting_id: "m1".into(),
+            segment_id: "mic-2".into(),
+            revision: 5,
+            track: TRACK_MIC,
+            start_seconds: 1.0,
+            end_seconds: Some(4.5),
+            text: "你好".into(),
+            is_final: true,
+            speaker: Some(LiveSpeaker {
+                identity_id: "11111111-2222-3333-4444-555555555555".into(),
+                display_name: "李明".into(),
+                source: "voiceprint",
+                provisional: true,
+            }),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains(
+                "\"speaker\":{\"identityId\":\"11111111-2222-3333-4444-555555555555\",\
+             \"displayName\":\"李明\",\"source\":\"voiceprint\",\"provisional\":true}"
+            ) || json.contains("\"identityId\":\"11111111-2222-3333-4444-555555555555\"")
+        );
+        assert!(json.contains("\"displayName\":\"李明\""));
+        assert!(json.contains("\"source\":\"voiceprint\""));
+        assert!(json.contains("\"provisional\":true"));
+    }
+
+    // ---- L3: audio ring window -------------------------------------------
+
+    #[test]
+    fn audio_window_extracts_the_requested_span_across_chunks() {
+        let mut window = AudioWindow::new(10); // 10 Hz keeps the math readable
+        window.push(0.0, &[0.0; 10]); // [0, 1)
+        window.push(1.0, &[1.0; 10]); // [1, 2)
+        window.push(2.0, &[2.0; 10]); // [2, 3)
+
+        // A span crossing two chunks concatenates the right halves.
+        let got = window.extract(0.5, 1.5);
+        assert_eq!(got.len(), 10);
+        assert_eq!(&got[..5], &[0.0; 5]);
+        assert_eq!(&got[5..], &[1.0; 5]);
+
+        // A span fully inside one chunk slices only it.
+        assert_eq!(window.extract(2.0, 3.0), vec![2.0; 10]);
+        // A span in a gap / before retained audio yields nothing.
+        assert!(window.extract(5.0, 6.0).is_empty());
+        assert!(window.extract(1.0, 1.0).is_empty(), "empty span");
+    }
+
+    #[test]
+    fn audio_window_evicts_oldest_beyond_capacity() {
+        let rate = 100u32;
+        let mut window = AudioWindow::new(rate);
+        // Push 40 one-second chunks; capacity is 30 s.
+        for second in 0..40 {
+            window.push(f64::from(second), &vec![second as f32; rate as usize]);
+        }
+        assert!(window.total_samples <= (WINDOW_CAPACITY_SECONDS * f64::from(rate)) as usize);
+        // The oldest seconds are gone; the newest are intact.
+        assert!(window.extract(0.0, 1.0).is_empty());
+        assert_eq!(window.extract(39.0, 40.0), vec![39.0f32; rate as usize]);
+    }
+
+    #[test]
+    fn audio_window_tolerates_gaps_between_chunks() {
+        let mut window = AudioWindow::new(10);
+        window.push(0.0, &[1.0; 10]); // [0, 1)
+        window.push(5.0, &[2.0; 10]); // [5, 6) — a pause in between
+        let got = window.extract(0.0, 6.0);
+        // Only real audio is returned; the gap contributes nothing.
+        assert_eq!(got.len(), 20);
+        assert_eq!(&got[..10], &[1.0; 10]);
+        assert_eq!(&got[10..], &[2.0; 10]);
+    }
+
+    // ---- L3: streak upgrade rule -----------------------------------------
+
+    #[test]
+    fn streak_upgrades_provisional_only_after_two_consecutive_hits() {
+        let a = Uuid::new_v4();
+        let mut streak = VerificationStreak::default();
+        // Hits 1 and 2 establish the streak but do not upgrade themselves.
+        assert!(!streak.observe_hit(TRACK_MIC, a));
+        assert!(!streak.observe_hit(TRACK_MIC, a));
+        // From the 3rd consecutive hit on, provisional may display verified.
+        assert!(streak.observe_hit(TRACK_MIC, a));
+        assert!(streak.observe_hit(TRACK_MIC, a));
+    }
+
+    #[test]
+    fn streak_is_per_track_and_resets_on_identity_change_or_miss() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut streak = VerificationStreak::default();
+        assert!(!streak.observe_hit(TRACK_MIC, a));
+        assert!(!streak.observe_hit(TRACK_MIC, a));
+        // The system track has its own independent streak.
+        assert!(!streak.observe_hit(TRACK_SYSTEM, a));
+        assert!(streak.observe_hit(TRACK_MIC, a));
+        // A different identity on the same track resets the run.
+        assert!(!streak.observe_hit(TRACK_MIC, b));
+        assert!(!streak.observe_hit(TRACK_MIC, b));
+        // A rejected/differing report breaks it too.
+        streak.observe_miss(TRACK_MIC);
+        assert!(!streak.observe_hit(TRACK_MIC, b));
     }
 }

@@ -460,6 +460,57 @@ fn accumulate_centroids(
     centroids
 }
 
+/// Long-lived single-utterance voiceprint embedder for the **real-time**
+/// meeting layer (L3): the live worker's dedicated embedder thread loads it
+/// once and feeds it each finalized utterance's PCM. Exactly the same forward
+/// pass as the offline [`speaker_centroids`] (diar-rs kaldi fbank → WeSpeaker
+/// ONNX), so live verification and offline enrollment score in the same
+/// embedding space. macOS + `diarize` only, like every diar-rs touchpoint.
+#[cfg(all(target_os = "macos", feature = "diarize"))]
+pub struct LiveVoiceprintEmbedder {
+    model: diar_rs::onnx_emb::EmbModel,
+}
+
+#[cfg(all(target_os = "macos", feature = "diarize"))]
+impl LiveVoiceprintEmbedder {
+    /// Load the WeSpeaker embedding model (`emb.onnx` under the diar model
+    /// root). One ONNX session; keep the instance alive across utterances.
+    /// Two intra-op threads, matching the offline centroid pass.
+    pub fn load(embedding_model: &Path) -> Result<Self, String> {
+        let model =
+            diar_rs::onnx_emb::EmbModel::load(embedding_model, 2).map_err(|e| e.to_string())?;
+        Ok(Self { model })
+    }
+
+    /// Embed one utterance's mono PCM into a 256-d x-vector. `Ok(None)` when
+    /// the audio is too short to embed reliably (same 10-frame floor as the
+    /// offline pass) or the model yields an unexpected dimension; `Err` when
+    /// the fbank/forward itself failed.
+    pub fn embed(&mut self, samples: &[f32], sample_rate: u32) -> Result<Option<Vec<f32>>, String> {
+        use diar_rs::fbank::{compute_fbank, FbankOptions};
+        use lumen_identity::EMBEDDING_DIM;
+
+        let fb_opts = FbankOptions {
+            sample_rate,
+            subtract_mean: true,
+            ..FbankOptions::default()
+        };
+        let (fb, t_fb) = compute_fbank(samples, &fb_opts).map_err(|e| e.to_string())?;
+        if t_fb < 10 {
+            return Ok(None); // too short to embed reliably
+        }
+        let xvec = self
+            .model
+            .embed_fbank(&fb, t_fb)
+            .map_err(|e| e.to_string())?;
+        if xvec.len() != EMBEDDING_DIM {
+            tracing::warn!(dim = xvec.len(), "live embedding has unexpected dimension");
+            return Ok(None);
+        }
+        Ok(Some(xvec.iter().map(|&v| v as f32).collect()))
+    }
+}
+
 /// Stub for every non-diarizing build (Windows CI, or macOS without the
 /// `diarize` feature). Keeps the crate compiling and callable everywhere while
 /// never referencing `diar-rs`.
@@ -605,6 +656,37 @@ mod tests {
         let s0 = centroids.get(&0).expect("centroid");
         assert!(approx(f64::from(s0[0]), 3.0), "{:?}", &s0[..2]);
         assert_eq!(s0.len(), EMBEDDING_DIM);
+    }
+
+    /// Real-model smoke test for the live embedder (needs the WeSpeaker
+    /// `emb.onnx` installed under the shared Lumen models root). Run with:
+    /// `cargo test -p lumen-meeting --features diarize -- --ignored`.
+    #[cfg(all(target_os = "macos", feature = "diarize"))]
+    #[test]
+    #[ignore = "requires the installed diar embedding model"]
+    fn live_embedder_produces_stable_embeddings_with_the_real_model() {
+        let home = std::env::var_os("HOME").expect("HOME set");
+        let model = std::path::PathBuf::from(home)
+            .join("Library/Application Support/Lumen/models/diar/emb.onnx");
+        assert!(model.is_file(), "diar embedding model not installed");
+        let mut embedder = LiveVoiceprintEmbedder::load(&model).unwrap();
+
+        // 3 s of a synthetic voiced-ish signal at 16 kHz.
+        let sr = 16_000u32;
+        let samples: Vec<f32> = (0..3 * sr as usize)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                (2.0 * std::f32::consts::PI * 180.0 * t).sin() * 0.4
+                    + (2.0 * std::f32::consts::PI * 610.0 * t).sin() * 0.2
+            })
+            .collect();
+        let a = embedder.embed(&samples, sr).unwrap().expect("long enough");
+        assert_eq!(a.len(), lumen_identity::EMBEDDING_DIM);
+        // Deterministic: same audio → (near-)identical embedding.
+        let b = embedder.embed(&samples, sr).unwrap().unwrap();
+        assert!(lumen_identity::cosine_similarity(&a, &b) > 0.999);
+        // Too-short audio declines to embed instead of guessing.
+        assert_eq!(embedder.embed(&samples[..800], sr).unwrap(), None);
     }
 
     #[tokio::test]

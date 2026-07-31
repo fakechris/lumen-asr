@@ -40,6 +40,8 @@ pub struct AutoIdentification {
     pub label: String,
     /// The enrolled identity's real name that was assigned.
     pub name: String,
+    /// Id of the matched enrolled identity (persisted as speaker provenance).
+    pub identity_id: uuid::Uuid,
     /// Best-sample cosine similarity of the consensus match (see
     /// [`lumen_identity::IdentityStore::match_speaker`]).
     pub score: f32,
@@ -96,12 +98,21 @@ pub fn auto_identify_speakers(
             );
             continue;
         }
-        if let Some((name, score)) = identities.match_speaker(embedding) {
-            speaker.display_name = Some(name.to_string());
+        if let Some(report) = identities.match_speaker_report(embedding) {
+            speaker.display_name = Some(report.display_name.clone());
+            // Provenance (v13): a voiceprint hit is a `verification`
+            // attribution — record which enrolled identity matched and how
+            // confidently, so later conflict handling can weigh it against
+            // manual marks (manual > verification > offline_diarization).
+            speaker.identity_id = Some(report.identity_id);
+            speaker.attribution_origin =
+                Some(lumen_core::attribution_origin::VERIFICATION.to_string());
+            speaker.attribution_confidence = Some(f64::from(report.best_score));
             assigned.push(AutoIdentification {
                 label,
-                name: name.to_string(),
-                score,
+                name: report.display_name,
+                identity_id: report.identity_id,
+                score: report.best_score,
             });
         }
     }
@@ -208,8 +219,19 @@ mod tests {
         assert_eq!(assigned[0].name, "李明");
         assert!(assigned[0].score > 0.999);
         assert_eq!(speakers[0].display_name.as_deref(), Some("李明"));
-        // The dissimilar speaker stays unnamed (说话人2 in the UI).
+        // Provenance (v13): the hit records identity link + origin + score.
+        let enrolled_id = identities.list()[0].id;
+        assert_eq!(assigned[0].identity_id, enrolled_id);
+        assert_eq!(speakers[0].identity_id, Some(enrolled_id));
+        assert_eq!(
+            speakers[0].attribution_origin.as_deref(),
+            Some(lumen_core::attribution_origin::VERIFICATION)
+        );
+        assert!(speakers[0].attribution_confidence.unwrap() > 0.999);
+        // The dissimilar speaker stays unnamed (说话人2 in the UI) with no
+        // provenance written.
         assert_eq!(speakers[1].display_name, None);
+        assert_eq!(speakers[1].attribution_origin, None);
     }
 
     #[test]
