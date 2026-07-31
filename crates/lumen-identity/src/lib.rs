@@ -9,15 +9,29 @@
 //!
 //! ## Storage
 //! One JSON file per identity under the identity directory
-//! (`~/Library/Application Support/Lumen/identity/` on macOS): name, 256-d
-//! vector, enrollment time, source meeting. Everything stays local — nothing
-//! here talks to the network.
+//! (`~/Library/Application Support/Lumen/identity/` on macOS): name plus a
+//! list of voiceprint **samples** (one 256-d vector each, with enrollment time,
+//! voiced duration, and source meeting). Re-enrolling the same person appends a
+//! sample instead of overwriting, so the identity accumulates the person's
+//! voice across microphones/rooms/days — capped at
+//! [`MAX_SAMPLES_PER_IDENTITY`], evicting the oldest. Files written before the
+//! multi-sample format (a single top-level `embedding`) still load: they read
+//! as an identity with one sample and are rewritten in the new format on the
+//! next enrollment. Everything stays local — nothing here talks to the network.
 //!
 //! ## Matching
-//! Cosine similarity between L2-normalizable centroids. The default threshold
-//! ([`MATCH_THRESHOLD`]) is deliberately conservative: a false positive
-//! (silently mislabeling a stranger as an enrolled person) is worse than a
-//! false negative (leaving "说话人N" for the user to confirm manually).
+//! Cosine similarity against **every** stored sample, combined with a
+//! two-threshold consensus rule (see [`IdentityStore::match_speaker`]):
+//!
+//! - any single sample ≥ [`AUTO_TAG_THRESHOLD`] is a confident hit on its own;
+//! - otherwise, at least half of the person's samples (and no fewer than two)
+//!   must reach [`CONSENSUS_THRESHOLD`] — several independent recordings
+//!   agreeing "sounds like this person" substitutes for one high-confidence
+//!   score, while one lukewarm sample alone never tags anyone.
+//!
+//! The thresholds stay deliberately conservative: a false positive (silently
+//! mislabeling a stranger as an enrolled person) is worse than a false negative
+//! (leaving "说话人N" for the user to confirm manually).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,28 +45,118 @@ use uuid::Uuid;
 /// ResNet34-LM x-vectors as produced by diar-rs).
 pub const EMBEDDING_DIM: usize = 256;
 
-/// Minimum cosine similarity for an automatic identity match.
+/// Minimum cosine similarity for a **single sample** to auto-tag on its own.
 ///
 /// Trade-off: raw WeSpeaker cosine similarity for the *same* speaker across
 /// recording sessions typically lands around 0.55–0.85, while different
-/// speakers usually score below ~0.4. `0.65` sits at the conservative end of
-/// the useful 0.6–0.7 band: it favors "no match" (speaker stays `说话人N`,
-/// user confirms manually) over a wrong auto-assigned name. Tune here if field
+/// speakers usually score below ~0.4. `0.70` is the high-confidence end of
+/// that band: one sample this close is enough evidence by itself. Scores in
+/// the grey zone below rely on the consensus rule instead. Tune here if field
 /// data shows it is too strict/loose.
-pub const MATCH_THRESHOLD: f32 = 0.65;
+pub const AUTO_TAG_THRESHOLD: f32 = 0.70;
 
-/// One enrolled identity: a real name bound to a voiceprint centroid.
+/// Minimum cosine similarity for a sample to count as one **consensus vote**.
+///
+/// A single sample at `0.60–0.70` is ambiguous (same speaker on a different
+/// microphone, or just a similar voice). But when at least half of a person's
+/// samples — recorded in different meetings/conditions — independently score
+/// ≥ this value, the agreement itself is the evidence, so the match is
+/// accepted without any sample reaching [`AUTO_TAG_THRESHOLD`].
+pub const CONSENSUS_THRESHOLD: f32 = 0.60;
+
+/// Upper bound on stored samples per identity. Enrolling beyond it evicts the
+/// oldest sample: recent recordings track the person's current voice/devices
+/// better, and the cap keeps per-speaker matching cost bounded.
+pub const MAX_SAMPLES_PER_IDENTITY: usize = 10;
+
+/// Minimum total voiced audio (milliseconds) required to enroll a voiceprint.
+///
+/// Centroids averaged over less speech than this are too noisy to be worth
+/// storing — a 2-second snippet can land anywhere in embedding space and then
+/// mislabels people forever. The meeting pipeline applies the same floor
+/// before *matching* a diarized speaker (`IDENTIFY_MIN_VOICED_MS` in
+/// `lumen-meeting` reuses this constant), so both sides of the comparison are
+/// backed by enough material.
+pub const MIN_VOICED_MS: u64 = 3000;
+
+/// One stored voiceprint sample: a centroid embedding from a single meeting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceprintSample {
+    /// Centroid voiceprint embedding ([`EMBEDDING_DIM`] floats).
+    pub embedding: Vec<f32>,
+    /// Total voiced milliseconds that backed this centroid. `0` for samples
+    /// migrated from the legacy single-embedding format (duration was not
+    /// recorded then); informational only — matching never reads it.
+    #[serde(default)]
+    pub voiced_ms: u64,
+    pub enrolled_at: DateTime<Utc>,
+    /// The meeting this sample was enrolled from, when known.
+    pub source_meeting_id: Option<Uuid>,
+}
+
+/// One enrolled identity: a real name bound to one or more voiceprint samples.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EnrolledIdentity {
     pub id: Uuid,
     /// The person's real name, e.g. "李明". Unique within the store (re-enroll
-    /// with the same name replaces the stored embedding).
+    /// with the same name appends a sample to the same identity).
     pub name: String,
-    /// Centroid voiceprint embedding ([`EMBEDDING_DIM`] floats).
-    pub embedding: Vec<f32>,
-    pub enrolled_at: DateTime<Utc>,
-    /// The meeting this voiceprint was enrolled from, when known.
-    pub source_meeting_id: Option<Uuid>,
+    /// Voiceprint samples, oldest first; never empty, at most
+    /// [`MAX_SAMPLES_PER_IDENTITY`].
+    pub samples: Vec<VoiceprintSample>,
+}
+
+impl EnrolledIdentity {
+    /// The most recently enrolled sample (identities always hold ≥ 1 sample,
+    /// so this is `None` only for a hand-built empty value).
+    pub fn latest_sample(&self) -> Option<&VoiceprintSample> {
+        self.samples.iter().max_by_key(|s| s.enrolled_at)
+    }
+}
+
+/// On-disk identity shape covering both formats: the current multi-`samples`
+/// layout and the legacy single-`embedding` layout (pre-multi-sample files).
+/// Legacy fields are only read — [`IdentityStore`] always writes the new
+/// format.
+#[derive(Deserialize)]
+struct PersistedIdentity {
+    id: Uuid,
+    name: String,
+    #[serde(default)]
+    samples: Vec<VoiceprintSample>,
+    // Legacy single-embedding format (one sample inlined at the top level).
+    #[serde(default)]
+    embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    enrolled_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    source_meeting_id: Option<Uuid>,
+}
+
+impl PersistedIdentity {
+    /// Normalize into the in-memory shape, lifting a legacy single embedding
+    /// into one sample. Returns `None` when no valid-dimension sample remains.
+    fn into_identity(self) -> Option<EnrolledIdentity> {
+        let mut samples = self.samples;
+        if samples.is_empty() {
+            samples.push(VoiceprintSample {
+                embedding: self.embedding?,
+                voiced_ms: 0, // unknown for legacy records
+                enrolled_at: self.enrolled_at?,
+                source_meeting_id: self.source_meeting_id,
+            });
+        }
+        samples.retain(|s| s.embedding.len() == EMBEDDING_DIM);
+        samples.sort_by(|a, b| a.enrolled_at.cmp(&b.enrolled_at));
+        if samples.is_empty() {
+            return None;
+        }
+        Some(EnrolledIdentity {
+            id: self.id,
+            name: self.name,
+            samples,
+        })
+    }
 }
 
 /// Failure modes of the identity store.
@@ -66,6 +170,8 @@ pub enum IdentityError {
     BadDimension(usize),
     #[error("identity name must not be empty")]
     EmptyName,
+    #[error("voiced audio too short to enroll: {voiced_ms} ms (need at least {MIN_VOICED_MS} ms)")]
+    VoiceTooShort { voiced_ms: u64 },
 }
 
 /// File-backed store of enrolled identities: one `<id>.json` per identity
@@ -79,8 +185,10 @@ pub struct IdentityStore {
 
 impl IdentityStore {
     /// Open (creating the directory if needed) and load every `*.json`
-    /// identity file. Unreadable/invalid files are skipped rather than failing
-    /// the whole store, so one corrupt record never disables enrollment.
+    /// identity file — both the current multi-sample format and the legacy
+    /// single-embedding one. Unreadable/invalid files are skipped rather than
+    /// failing the whole store, so one corrupt record never disables
+    /// enrollment.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, IdentityError> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
@@ -96,12 +204,14 @@ impl IdentityStore {
             match fs::read_to_string(&path)
                 .map_err(IdentityError::from)
                 .and_then(|text| {
-                    serde_json::from_str::<EnrolledIdentity>(&text).map_err(Into::into)
+                    serde_json::from_str::<PersistedIdentity>(&text).map_err(Into::into)
                 }) {
-                Ok(identity) if identity.embedding.len() == EMBEDDING_DIM => {
-                    identities.push(identity)
+                Ok(persisted) => {
+                    if let Some(identity) = persisted.into_identity() {
+                        identities.push(identity);
+                    }
                 }
-                _ => continue, // skip corrupt / wrong-dimension records
+                _ => continue, // skip corrupt records
             }
         }
         // Stable order for list/UI regardless of directory iteration order.
@@ -109,13 +219,19 @@ impl IdentityStore {
         Ok(Self { dir, identities })
     }
 
-    /// Enroll `name` with the given centroid `embedding`. Re-enrolling an
-    /// existing name replaces its embedding/metadata (keeping the identity id),
-    /// so "重新注册" refreshes the voiceprint instead of duplicating the person.
+    /// Enroll one voiceprint sample for `name`. A new name creates the
+    /// identity; an existing name **appends** the sample (多次注册 = 多样本),
+    /// evicting the oldest sample beyond [`MAX_SAMPLES_PER_IDENTITY`].
+    ///
+    /// `voiced_ms` is the total voiced audio behind `embedding`; below
+    /// [`MIN_VOICED_MS`] the enrollment is rejected
+    /// ([`IdentityError::VoiceTooShort`]) because such centroids are too noisy
+    /// to be trusted for future auto-identification.
     pub fn enroll(
         &mut self,
         name: &str,
         embedding: &[f32],
+        voiced_ms: u64,
         source_meeting_id: Option<Uuid>,
     ) -> Result<EnrolledIdentity, IdentityError> {
         let name = name.trim();
@@ -125,18 +241,36 @@ impl IdentityStore {
         if embedding.len() != EMBEDDING_DIM {
             return Err(IdentityError::BadDimension(embedding.len()));
         }
-        let existing_id = self
+        if voiced_ms < MIN_VOICED_MS {
+            return Err(IdentityError::VoiceTooShort { voiced_ms });
+        }
+        // Build the updated identity without touching memory, write it to disk,
+        // then swap it in — a failed write leaves memory and disk consistent.
+        let mut identity = self
             .identities
             .iter()
             .find(|i| i.name == name)
-            .map(|i| i.id);
-        let identity = EnrolledIdentity {
-            id: existing_id.unwrap_or_else(Uuid::new_v4),
-            name: name.to_string(),
+            .cloned()
+            .unwrap_or_else(|| EnrolledIdentity {
+                id: Uuid::new_v4(),
+                name: name.to_string(),
+                samples: Vec::new(),
+            });
+        identity.samples.push(VoiceprintSample {
             embedding: embedding.to_vec(),
+            voiced_ms,
             enrolled_at: Utc::now(),
             source_meeting_id,
-        };
+        });
+        // Samples are kept oldest-first (stable sort, so same-instant samples
+        // keep insertion order); evict from the front when over the cap.
+        identity
+            .samples
+            .sort_by(|a, b| a.enrolled_at.cmp(&b.enrolled_at));
+        if identity.samples.len() > MAX_SAMPLES_PER_IDENTITY {
+            let excess = identity.samples.len() - MAX_SAMPLES_PER_IDENTITY;
+            identity.samples.drain(..excess);
+        }
         self.write_identity(&identity)?;
         self.identities.retain(|i| i.id != identity.id);
         self.identities.push(identity.clone());
@@ -145,27 +279,49 @@ impl IdentityStore {
     }
 
     /// Match a speaker centroid against the enrolled set with the default
-    /// [`MATCH_THRESHOLD`]. Returns the best-scoring name and its cosine
-    /// similarity, or `None` when the store is empty or nothing clears the
-    /// threshold.
+    /// thresholds ([`AUTO_TAG_THRESHOLD`] / [`CONSENSUS_THRESHOLD`]).
+    ///
+    /// A person is a candidate when **either**:
+    /// - any one of their samples scores ≥ `AUTO_TAG_THRESHOLD` (single
+    ///   high-confidence hit), or
+    /// - at least **half** of their samples — and no fewer than **two** — score
+    ///   ≥ `CONSENSUS_THRESHOLD` (several independent recordings agreeing
+    ///   beats one lukewarm score; the two-sample floor stops a lone
+    ///   just-past-0.60 sample from tagging anyone).
+    ///
+    /// Among multiple candidates, the highest best-sample score wins. Returns
+    /// that name and score, or `None` when the store is empty or nobody
+    /// qualifies.
     pub fn match_speaker(&self, embedding: &[f32]) -> Option<(&str, f32)> {
-        self.match_speaker_with_threshold(embedding, MATCH_THRESHOLD)
+        self.match_speaker_with_thresholds(embedding, AUTO_TAG_THRESHOLD, CONSENSUS_THRESHOLD)
     }
 
-    /// [`match_speaker`](Self::match_speaker) with an explicit threshold.
-    pub fn match_speaker_with_threshold(
+    /// [`match_speaker`](Self::match_speaker) with explicit thresholds
+    /// (`auto_tag` for the single-sample rule, `consensus` for the
+    /// half-of-samples rule).
+    pub fn match_speaker_with_thresholds(
         &self,
         embedding: &[f32],
-        threshold: f32,
+        auto_tag: f32,
+        consensus: f32,
     ) -> Option<(&str, f32)> {
         let mut best: Option<(&str, f32)> = None;
         for identity in &self.identities {
-            let score = cosine_similarity(embedding, &identity.embedding);
-            if best.is_none_or(|(_, b)| score > b) {
-                best = Some((identity.name.as_str(), score));
+            let mut top = f32::NEG_INFINITY;
+            let mut votes = 0usize;
+            for sample in &identity.samples {
+                let score = cosine_similarity(embedding, &sample.embedding);
+                top = top.max(score);
+                if score >= consensus {
+                    votes += 1;
+                }
+            }
+            let qualifies = top >= auto_tag || (votes >= 2 && votes * 2 >= identity.samples.len());
+            if qualifies && best.is_none_or(|(_, b)| top > b) {
+                best = Some((identity.name.as_str(), top));
             }
         }
-        best.filter(|&(_, score)| score >= threshold)
+        best
     }
 
     /// All enrolled identities, name-ordered.
@@ -173,10 +329,11 @@ impl IdentityStore {
         &self.identities
     }
 
-    /// Remove an identity by id (disk, then memory). Returns `true` if it
-    /// existed. Disk first — mirroring [`enroll`](Self::enroll) — so a failed
-    /// file deletion leaves memory and disk consistent (the identity stays
-    /// listed and enrolled) instead of resurrecting on the next open.
+    /// Remove an identity by id (disk, then memory) — the whole person, all
+    /// samples. Returns `true` if it existed. Disk first — mirroring
+    /// [`enroll`](Self::enroll) — so a failed file deletion leaves memory and
+    /// disk consistent (the identity stays listed and enrolled) instead of
+    /// resurrecting on the next open.
     pub fn remove(&mut self, id: Uuid) -> Result<bool, IdentityError> {
         if !self.identities.iter().any(|i| i.id == id) {
             return Ok(false);
@@ -280,12 +437,32 @@ pub fn is_identity_file(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// Comfortably above the enrollment gate.
+    const VOICED_OK: u64 = 5000;
+
     fn emb(seed: f32) -> Vec<f32> {
         // Deterministic non-degenerate vector; different seeds are (almost)
         // orthogonal enough after the alternating pattern below.
         (0..EMBEDDING_DIM)
             .map(|i| ((i as f32) * seed).sin())
             .collect()
+    }
+
+    /// A unit query vector along dim 0.
+    fn query() -> Vec<f32> {
+        let mut v = vec![0.0f32; EMBEDDING_DIM];
+        v[0] = 1.0;
+        v
+    }
+
+    /// A unit vector whose cosine similarity with [`query`] is exactly
+    /// `cosine`, using a distinct orthogonal component per `k`.
+    fn directed(cosine: f32, k: usize) -> Vec<f32> {
+        assert!(k > 0 && k < EMBEDDING_DIM);
+        let mut v = vec![0.0f32; EMBEDDING_DIM];
+        v[0] = cosine;
+        v[k] = (1.0 - cosine * cosine).sqrt();
+        v
     }
 
     fn store() -> (tempfile::TempDir, IdentityStore) {
@@ -304,7 +481,7 @@ mod tests {
     #[test]
     fn enroll_then_match_same_embedding_hits_with_perfect_score() {
         let (_dir, mut store) = store();
-        store.enroll("李明", &emb(0.1), None).unwrap();
+        store.enroll("李明", &emb(0.1), VOICED_OK, None).unwrap();
         let (name, score) = store.match_speaker(&emb(0.1)).expect("should match");
         assert_eq!(name, "李明");
         assert!(score > 0.999, "self-similarity should be ~1.0, got {score}");
@@ -313,27 +490,104 @@ mod tests {
     #[test]
     fn dissimilar_embedding_does_not_match() {
         let (_dir, mut store) = store();
-        store.enroll("李明", &emb(0.1), None).unwrap();
-        // A very different pattern scores far below the threshold.
+        store.enroll("李明", &emb(0.1), VOICED_OK, None).unwrap();
+        // A very different pattern scores far below both thresholds.
         assert!(store.match_speaker(&emb(7.7)).is_none());
     }
 
     #[test]
-    fn threshold_boundary_is_inclusive() {
+    fn single_sample_above_auto_tag_threshold_hits() {
         let (_dir, mut store) = store();
-        store.enroll("A", &emb(0.1), None).unwrap();
-        // Exactly at threshold → match; just above → no match.
-        assert!(store.match_speaker_with_threshold(&emb(0.1), 1.0).is_some());
+        store
+            .enroll("A", &directed(0.75, 1), VOICED_OK, None)
+            .unwrap();
+        let (name, score) = store.match_speaker(&query()).expect("0.75 ≥ auto-tag");
+        assert_eq!(name, "A");
+        assert!((score - 0.75).abs() < 1e-3, "got {score}");
+    }
+
+    #[test]
+    fn single_sample_just_past_consensus_threshold_does_not_hit() {
+        // One lukewarm sample (0.65: past CONSENSUS, short of AUTO_TAG) is not
+        // enough evidence on its own — consensus needs at least two votes.
+        let (_dir, mut store) = store();
+        store
+            .enroll("A", &directed(0.65, 1), VOICED_OK, None)
+            .unwrap();
+        assert!(store.match_speaker(&query()).is_none());
+    }
+
+    #[test]
+    fn majority_of_samples_past_consensus_threshold_hits() {
+        // 3 samples at 0.65 / 0.62 / 0.30: none reaches AUTO_TAG (0.70), but
+        // 2 of 3 ≥ CONSENSUS (0.60) → majority consensus → hit, reported at
+        // the best sample's score.
+        let (_dir, mut store) = store();
+        store
+            .enroll("A", &directed(0.65, 1), VOICED_OK, None)
+            .unwrap();
+        store
+            .enroll("A", &directed(0.62, 2), VOICED_OK, None)
+            .unwrap();
+        store
+            .enroll("A", &directed(0.30, 3), VOICED_OK, None)
+            .unwrap();
+        let (name, score) = store.match_speaker(&query()).expect("2/3 consensus");
+        assert_eq!(name, "A");
+        assert!((score - 0.65).abs() < 1e-3, "got {score}");
+    }
+
+    #[test]
+    fn minority_of_samples_past_consensus_threshold_does_not_hit() {
+        // 3 samples at 0.65 / 0.50 / 0.30: only 1 of 3 ≥ CONSENSUS and none
+        // ≥ AUTO_TAG → no consensus → no match.
+        let (_dir, mut store) = store();
+        store
+            .enroll("A", &directed(0.65, 1), VOICED_OK, None)
+            .unwrap();
+        store
+            .enroll("A", &directed(0.50, 2), VOICED_OK, None)
+            .unwrap();
+        store
+            .enroll("A", &directed(0.30, 3), VOICED_OK, None)
+            .unwrap();
+        assert!(store.match_speaker(&query()).is_none());
+    }
+
+    #[test]
+    fn competing_identities_highest_best_sample_score_wins() {
+        let (_dir, mut store) = store();
+        store
+            .enroll("甲", &directed(0.72, 1), VOICED_OK, None)
+            .unwrap();
+        store
+            .enroll("乙", &directed(0.78, 2), VOICED_OK, None)
+            .unwrap();
+        let (name, score) = store.match_speaker(&query()).expect("both qualify");
+        assert_eq!(name, "乙");
+        assert!((score - 0.78).abs() < 1e-3, "got {score}");
+    }
+
+    #[test]
+    fn thresholds_are_inclusive() {
+        let (_dir, mut store) = store();
+        store.enroll("A", &emb(0.1), VOICED_OK, None).unwrap();
+        // Exactly at the auto-tag threshold → match (self-similarity ~1.0 needs
+        // the f32 rounding slack); an impossible pair → no match.
+        let self_score = store.match_speaker(&emb(0.1)).unwrap().1;
         assert!(store
-            .match_speaker_with_threshold(&emb(7.7), MATCH_THRESHOLD)
+            .match_speaker_with_thresholds(&emb(0.1), self_score, self_score)
+            .is_some());
+        assert!(store
+            .match_speaker_with_thresholds(&emb(7.7), AUTO_TAG_THRESHOLD, CONSENSUS_THRESHOLD)
             .is_none());
     }
 
     #[test]
     fn best_of_multiple_identities_wins() {
         let (_dir, mut store) = store();
-        store.enroll("甲", &emb(0.1), None).unwrap();
-        store.enroll("乙", &emb(7.7), None).unwrap();
+        store.enroll("甲", &emb(0.1), VOICED_OK, None).unwrap();
+        store.enroll("乙", &emb(7.7), VOICED_OK, None).unwrap();
         let (name, _) = store.match_speaker(&emb(7.7)).expect("should match 乙");
         assert_eq!(name, "乙");
     }
@@ -344,26 +598,32 @@ mod tests {
         let meeting = Uuid::new_v4();
         {
             let mut store = IdentityStore::open(dir.path()).unwrap();
-            store.enroll("李明", &emb(0.1), Some(meeting)).unwrap();
+            store
+                .enroll("李明", &emb(0.1), VOICED_OK, Some(meeting))
+                .unwrap();
         }
         let store = IdentityStore::open(dir.path()).unwrap();
         assert_eq!(store.list().len(), 1);
         let identity = &store.list()[0];
         assert_eq!(identity.name, "李明");
-        assert_eq!(identity.source_meeting_id, Some(meeting));
-        assert_eq!(identity.embedding.len(), EMBEDDING_DIM);
+        assert_eq!(identity.samples.len(), 1);
+        assert_eq!(identity.samples[0].source_meeting_id, Some(meeting));
+        assert_eq!(identity.samples[0].voiced_ms, VOICED_OK);
+        assert_eq!(identity.samples[0].embedding.len(), EMBEDDING_DIM);
         assert!(store.match_speaker(&emb(0.1)).is_some());
     }
 
     #[test]
-    fn reenroll_same_name_replaces_embedding_and_keeps_one_record() {
+    fn reenroll_same_name_appends_sample_and_keeps_one_record() {
         let (dir, mut store) = store();
-        let first = store.enroll("李明", &emb(0.1), None).unwrap();
-        let second = store.enroll("李明", &emb(7.7), None).unwrap();
+        let first = store.enroll("李明", &emb(0.1), VOICED_OK, None).unwrap();
+        let second = store.enroll("李明", &emb(7.7), VOICED_OK, None).unwrap();
         assert_eq!(first.id, second.id, "same person keeps one identity id");
+        assert_eq!(second.samples.len(), 2, "re-enroll appends a sample");
         assert_eq!(store.list().len(), 1);
-        // Old embedding no longer matches; new one does.
-        assert!(store.match_speaker(&emb(7.7)).is_some());
+        // Both the old and the new voice now match this person.
+        assert_eq!(store.match_speaker(&emb(0.1)).unwrap().0, "李明");
+        assert_eq!(store.match_speaker(&emb(7.7)).unwrap().0, "李明");
         // Exactly one file on disk.
         let files = std::fs::read_dir(dir.path())
             .unwrap()
@@ -373,9 +633,96 @@ mod tests {
     }
 
     #[test]
+    fn samples_are_capped_evicting_oldest() {
+        let (_dir, mut store) = store();
+        for i in 0..(MAX_SAMPLES_PER_IDENTITY + 2) {
+            store
+                .enroll("李明", &directed(0.9, i + 1), VOICED_OK, None)
+                .unwrap();
+        }
+        let identity = &store.list()[0];
+        assert_eq!(identity.samples.len(), MAX_SAMPLES_PER_IDENTITY);
+        // The two oldest samples (orthogonal components 1 and 2) were evicted;
+        // the newest survives. Recover each sample's `k` from its embedding.
+        let survivors: Vec<usize> = identity
+            .samples
+            .iter()
+            .map(|s| {
+                s.embedding
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find(|(_, &v)| v != 0.0)
+                    .map(|(k, _)| k)
+                    .unwrap()
+            })
+            .collect();
+        assert!(!survivors.contains(&1), "{survivors:?}");
+        assert!(!survivors.contains(&2), "{survivors:?}");
+        assert!(survivors.contains(&(MAX_SAMPLES_PER_IDENTITY + 2)));
+    }
+
+    #[test]
+    fn legacy_single_embedding_file_reads_as_one_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let meeting = Uuid::new_v4();
+        let embedding = emb(0.1);
+        // Exact pre-multi-sample on-disk shape (#69): a single top-level
+        // embedding + enrollment metadata.
+        let legacy = serde_json::json!({
+            "id": id,
+            "name": "李明",
+            "embedding": embedding,
+            "enrolled_at": "2026-07-01T00:00:00Z",
+            "source_meeting_id": meeting,
+        });
+        std::fs::write(
+            dir.path().join(format!("{id}.json")),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let mut store = IdentityStore::open(dir.path()).unwrap();
+        assert_eq!(store.list().len(), 1);
+        let identity = &store.list()[0];
+        assert_eq!(identity.id, id);
+        assert_eq!(identity.samples.len(), 1);
+        assert_eq!(identity.samples[0].voiced_ms, 0, "legacy duration unknown");
+        assert_eq!(identity.samples[0].source_meeting_id, Some(meeting));
+        assert_eq!(store.match_speaker(&emb(0.1)).unwrap().0, "李明");
+
+        // Re-enrolling appends to the migrated identity and rewrites the file
+        // in the new multi-sample format.
+        let updated = store.enroll("李明", &emb(0.2), VOICED_OK, None).unwrap();
+        assert_eq!(updated.id, id);
+        assert_eq!(updated.samples.len(), 2);
+        let text = std::fs::read_to_string(dir.path().join(format!("{id}.json"))).unwrap();
+        assert!(text.contains("\"samples\""));
+        let reopened = IdentityStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.list()[0].samples.len(), 2);
+    }
+
+    #[test]
+    fn enroll_rejects_insufficient_voiced_audio() {
+        let (_dir, mut store) = store();
+        let result = store.enroll("李明", &emb(0.1), MIN_VOICED_MS - 1, None);
+        assert!(matches!(
+            result,
+            Err(IdentityError::VoiceTooShort { voiced_ms }) if voiced_ms == MIN_VOICED_MS - 1
+        ));
+        assert!(store.list().is_empty(), "nothing was stored");
+        // Exactly at the floor is accepted.
+        store
+            .enroll("李明", &emb(0.1), MIN_VOICED_MS, None)
+            .unwrap();
+        assert_eq!(store.list().len(), 1);
+    }
+
+    #[test]
     fn remove_deletes_record_and_file() {
         let (dir, mut store) = store();
-        let identity = store.enroll("李明", &emb(0.1), None).unwrap();
+        let identity = store.enroll("李明", &emb(0.1), VOICED_OK, None).unwrap();
         assert!(store.remove(identity.id).unwrap());
         assert!(store.list().is_empty());
         assert!(
@@ -399,7 +746,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let library = dir.path().join("identity");
         let mut store = IdentityStore::open(&library).unwrap();
-        let identity = store.enroll("李明", &emb(0.1), None).unwrap();
+        let identity = store.enroll("李明", &emb(0.1), VOICED_OK, None).unwrap();
 
         let dir_mode = std::fs::metadata(&library).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "identity dir should be 0700");
@@ -414,7 +761,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let mut store = IdentityStore::open(dir.path()).unwrap();
-        let identity = store.enroll("李明", &emb(0.1), None).unwrap();
+        let identity = store.enroll("李明", &emb(0.1), VOICED_OK, None).unwrap();
 
         // Make the directory non-writable so the unlink fails.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -434,7 +781,7 @@ mod tests {
     #[test]
     fn remove_drops_memory_even_when_file_already_gone() {
         let (dir, mut store) = store();
-        let identity = store.enroll("李明", &emb(0.1), None).unwrap();
+        let identity = store.enroll("李明", &emb(0.1), VOICED_OK, None).unwrap();
         std::fs::remove_file(dir.path().join(format!("{}.json", identity.id))).unwrap();
         assert!(store.remove(identity.id).unwrap());
         assert!(store.list().is_empty());
@@ -444,11 +791,11 @@ mod tests {
     fn enroll_rejects_empty_name_and_bad_dimension() {
         let (_dir, mut store) = store();
         assert!(matches!(
-            store.enroll("  ", &emb(0.1), None),
+            store.enroll("  ", &emb(0.1), VOICED_OK, None),
             Err(IdentityError::EmptyName)
         ));
         assert!(matches!(
-            store.enroll("李明", &[0.5; 8], None),
+            store.enroll("李明", &[0.5; 8], VOICED_OK, None),
             Err(IdentityError::BadDimension(8))
         ));
     }
@@ -458,7 +805,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut store = IdentityStore::open(dir.path()).unwrap();
-            store.enroll("李明", &emb(0.1), None).unwrap();
+            store.enroll("李明", &emb(0.1), VOICED_OK, None).unwrap();
         }
         std::fs::write(dir.path().join("broken.json"), b"{not json").unwrap();
         let store = IdentityStore::open(dir.path()).unwrap();
@@ -467,6 +814,19 @@ mod tests {
             1,
             "valid record survives, corrupt skipped"
         );
+    }
+
+    #[test]
+    fn latest_sample_is_the_most_recent() {
+        let (_dir, mut store) = store();
+        store.enroll("李明", &emb(0.1), VOICED_OK, None).unwrap();
+        let meeting = Uuid::new_v4();
+        store
+            .enroll("李明", &emb(0.2), VOICED_OK + 1, Some(meeting))
+            .unwrap();
+        let latest = store.list()[0].latest_sample().unwrap();
+        assert_eq!(latest.voiced_ms, VOICED_OK + 1);
+        assert_eq!(latest.source_meeting_id, Some(meeting));
     }
 
     #[test]

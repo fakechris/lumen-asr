@@ -258,11 +258,15 @@ async fn run(
     // Cross-meeting auto-identification: match each cluster's voiceprint
     // centroid against the enrolled identity library and assign the real name
     // on a confident hit (logged with cluster label + score only — the name is
-    // PII). Unmatched speakers keep their engine label ("说话人N"). No-op when
-    // `opts.identity_dir` is unset or no embeddings were produced.
+    // PII). Unmatched speakers keep their engine label ("说话人N"), as do
+    // speakers with too little voiced audio (`IDENTIFY_MIN_VOICED_MS`; the
+    // merged turns share the merged engine-id space with `speaker_embeddings`).
+    // No-op when `opts.identity_dir` is unset or no embeddings were produced.
+    let voiced_ms = crate::identify::speaker_voiced_ms(&turns);
     crate::identify::apply_auto_identification(
         &mut assembled.speakers,
         &speaker_embeddings,
+        &voiced_ms,
         opts.identity_dir.as_deref(),
     );
     for speaker in &assembled.speakers {

@@ -10,8 +10,16 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// additive `meetings.system_audio_path` and `transcript_segments.channel`
 /// columns for dual-track (mic + system audio) meetings; v10 adds the additive
 /// `speakers.embedding` column (per-speaker voiceprint centroid, f32
-/// little-endian bytes) for cross-meeting speaker enrollment.
-pub(crate) const SCHEMA_VERSION: i64 = 10;
+/// little-endian bytes) for cross-meeting speaker enrollment; v11 adds the
+/// `ux_meetings_single_active` partial unique index enforcing the
+/// single-active-recording invariant (at most one `meetings` row in status
+/// `recording` at any time).
+pub(crate) const SCHEMA_VERSION: i64 = 11;
+
+/// Failure reason written by the v11 migration onto surplus stale `recording`
+/// rows (older duplicates that would violate the new single-active index).
+pub(crate) const STALE_DUPLICATE_RECORDING_REASON: &str =
+    "recording interrupted (stale duplicate active recording)";
 
 /// Additive v6 migration: the meeting-mode tables. These sit alongside the
 /// dictation tables and never touch them. `speakers` is created before
@@ -352,6 +360,40 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     if !has_embedding {
         conn.execute("ALTER TABLE speakers ADD COLUMN embedding BLOB", [])?;
     }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (10)",
+        [],
+    )?;
+    // v11: single-active-recording invariant. Audio capture is exclusive (the
+    // runtime arbiter rejects a second concurrent recording), so at most one
+    // `meetings` row may be in status `recording` at any time — this partial
+    // unique index turns that runtime rule into a database guarantee. Only
+    // `recording` is "active" in this sense: `processing` / `transcribing` /
+    // `summarizing` meetings legitimately coexist (background transcription of
+    // an earlier meeting runs while a new one records, and crash recovery can
+    // queue several salvaged meetings for processing at once).
+    //
+    // Dirty-data repair first, so the index build cannot fail on databases
+    // where earlier crashes accumulated several rows stuck in `recording`:
+    // keep the newest such row (still salvageable by launch crash recovery)
+    // and mark the older duplicates failed with an explicit reason. Re-running
+    // is a no-op — with at most one `recording` row left, nothing matches.
+    conn.execute(
+        "UPDATE meetings SET status='failed', failure_reason=?1
+         WHERE status='recording'
+           AND id NOT IN (
+             SELECT id FROM meetings WHERE status='recording'
+             ORDER BY created_at DESC, id DESC LIMIT 1)",
+        [STALE_DUPLICATE_RECORDING_REASON],
+    )?;
+    // Unique over the constant expression (1) restricted to active rows:
+    // every `recording` row indexes the same key, so a second one is a
+    // constraint violation.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_meetings_single_active
+         ON meetings((1)) WHERE status = 'recording'",
+        [],
+    )?;
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
         [SCHEMA_VERSION],
@@ -944,6 +986,135 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_eleven_repairs_stale_duplicate_recordings_and_enforces_single_active() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Stand up a v10 database with dirty data: two rows stuck in
+        // `recording` (accumulated across earlier crashes), plus one finished
+        // meeting.
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+                CREATE TABLE meetings (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  title TEXT,
+                  audio_path TEXT,
+                  duration_seconds REAL,
+                  status TEXT NOT NULL DEFAULT 'recording',
+                  language TEXT,
+                  failure_reason TEXT,
+                  notes TEXT NOT NULL DEFAULT '',
+                  system_audio_path TEXT
+                );
+                CREATE TABLE speakers (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  meeting_id TEXT NOT NULL,
+                  label TEXT NOT NULL,
+                  display_name TEXT,
+                  embedding_ref TEXT,
+                  embedding BLOB,
+                  FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+                INSERT INTO meetings (id, created_at, status) VALUES
+                  ('older', '2026-07-27T00:00:00Z', 'recording'),
+                  ('newest', '2026-07-29T00:00:00Z', 'recording'),
+                  ('done',  '2026-07-26T00:00:00Z', 'ready');
+                "#,
+            )
+            .unwrap();
+
+        // The dirty v10 database migrates cleanly (index build cannot fail).
+        migrate(&connection).unwrap();
+
+        // The newest stale recording survives (launch crash recovery will
+        // salvage it); the older duplicate was repaired to failed with an
+        // explicit reason; unrelated rows are untouched.
+        let status_of = |id: &str| -> String {
+            connection
+                .query_row("SELECT status FROM meetings WHERE id=?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(status_of("newest"), "recording");
+        assert_eq!(status_of("older"), "failed");
+        assert_eq!(status_of("done"), "ready");
+        let reason: Option<String> = connection
+            .query_row(
+                "SELECT failure_reason FROM meetings WHERE id='older'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some(STALE_DUPLICATE_RECORDING_REASON));
+
+        // The invariant index exists…
+        let index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='ux_meetings_single_active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+
+        // …and enforces at most one active recording: a second `recording`
+        // row is rejected, while non-active statuses insert freely.
+        let violation = connection.execute(
+            "INSERT INTO meetings (id, created_at, status) VALUES ('x', '2026-07-30T00:00:00Z', 'recording')",
+            [],
+        );
+        let message = violation
+            .expect_err("second recording row must be rejected")
+            .to_string();
+        assert!(
+            message.contains("ux_meetings_single_active"),
+            "unexpected error: {message}"
+        );
+        connection
+            .execute(
+                "INSERT INTO meetings (id, created_at, status) VALUES ('y', '2026-07-30T00:00:00Z', 'processing')",
+                [],
+            )
+            .unwrap();
+
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_eleven_repair_is_a_noop_on_a_single_healthy_recording() {
+        // A lone stale `recording` row (the normal crashed-once case) must
+        // survive migration untouched so launch crash recovery can salvage it.
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO meetings (id, created_at, status) VALUES ('m1', '2026-07-29T00:00:00Z', 'recording')",
+                [],
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let (status, reason): (String, Option<String>) = connection
+            .query_row(
+                "SELECT status, failure_reason FROM meetings WHERE id='m1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "recording");
+        assert_eq!(reason, None);
     }
 
     #[test]

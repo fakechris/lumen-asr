@@ -8,6 +8,10 @@
 //! exactly like manually confirmed ones. A miss leaves the speaker as
 //! `说话人N` (engine label) for manual confirmation.
 //!
+//! Speakers with less than [`IDENTIFY_MIN_VOICED_MS`] of total voiced audio are
+//! never auto-matched: a centroid averaged over a couple of seconds is too
+//! noisy, and a wrong auto-assigned name is worse than an unnamed speaker.
+//!
 //! Pure logic over already-computed embeddings — no models, no platform
 //! gating — so it is fully unit-testable with mock vectors.
 
@@ -18,7 +22,15 @@ use lumen_core::Speaker;
 use lumen_identity::IdentityStore;
 use lumen_store::Store;
 
-use crate::assemble::speaker_label;
+use crate::assemble::{speaker_label, DiarTurn};
+
+/// Minimum total voiced audio (ms, summed over a speaker's diarized turns)
+/// required before that speaker's centroid is auto-matched against the
+/// enrolled library. Same floor as enrollment
+/// ([`lumen_identity::MIN_VOICED_MS`]): below it the centroid is statistically
+/// unreliable, so the speaker keeps the engine label (说话人N) for the user to
+/// confirm manually.
+pub const IDENTIFY_MIN_VOICED_MS: u64 = lumen_identity::MIN_VOICED_MS;
 
 /// One auto-identified speaker: which cluster was recognized as whom, and how
 /// confidently (cosine similarity in `[-1, 1]`).
@@ -28,21 +40,36 @@ pub struct AutoIdentification {
     pub label: String,
     /// The enrolled identity's real name that was assigned.
     pub name: String,
-    /// Cosine similarity of the match (≥ [`lumen_identity::MATCH_THRESHOLD`]).
+    /// Best-sample cosine similarity of the consensus match (see
+    /// [`lumen_identity::IdentityStore::match_speaker`]).
     pub score: f32,
+}
+
+/// Sum each speaker's voiced audio (ms) over its diarized turns. Feeds the
+/// [`IDENTIFY_MIN_VOICED_MS`] gate and enrollment metadata.
+pub fn speaker_voiced_ms(turns: &[DiarTurn]) -> BTreeMap<u32, u64> {
+    let mut voiced: BTreeMap<u32, u64> = BTreeMap::new();
+    for turn in turns {
+        let ms = ((turn.end - turn.start).max(0.0) * 1000.0).round() as u64;
+        *voiced.entry(turn.speaker).or_default() += ms;
+    }
+    voiced
 }
 
 /// Match every still-unnamed speaker's centroid against the enrolled identity
 /// library and assign `display_name` on a confident hit. Speakers that already
-/// carry a `display_name` (e.g. re-processing after manual confirmation) and
-/// speakers without an embedding are left untouched. Returns what was
-/// assigned, for logging/diagnostics.
+/// carry a `display_name` (e.g. re-processing after manual confirmation),
+/// speakers without an embedding, and speakers with less than
+/// [`IDENTIFY_MIN_VOICED_MS`] of voiced audio (per `voiced_ms`, keyed like
+/// `embeddings`; missing = 0) are left untouched. Returns what was assigned,
+/// for logging/diagnostics.
 ///
 /// `embeddings` is keyed by engine speaker id (as produced by diarization);
 /// the id maps to a [`Speaker`] row via its `S{id+1}` label.
 pub fn auto_identify_speakers(
     speakers: &mut [Speaker],
     embeddings: &BTreeMap<u32, Vec<f32>>,
+    voiced_ms: &BTreeMap<u32, u64>,
     identities: &IdentityStore,
 ) -> Vec<AutoIdentification> {
     let mut assigned = Vec::new();
@@ -56,6 +83,18 @@ pub fn auto_identify_speakers(
         };
         if speaker.display_name.is_some() {
             continue; // never override a user-confirmed name
+        }
+        let voiced = voiced_ms.get(engine_id).copied().unwrap_or(0);
+        if voiced < IDENTIFY_MIN_VOICED_MS {
+            // Too little material for a trustworthy centroid: keep the engine
+            // label (说话人N) rather than risk a mislabel.
+            tracing::info!(
+                label = %label,
+                voiced_ms = voiced,
+                min_voiced_ms = IDENTIFY_MIN_VOICED_MS,
+                "speaker has too little voiced audio; skipping auto-identification"
+            );
+            continue;
         }
         if let Some((name, score)) = identities.match_speaker(embedding) {
             speaker.display_name = Some(name.to_string());
@@ -77,6 +116,7 @@ pub fn auto_identify_speakers(
 pub(crate) fn apply_auto_identification(
     speakers: &mut [Speaker],
     embeddings: &BTreeMap<u32, Vec<f32>>,
+    voiced_ms: &BTreeMap<u32, u64>,
     identity_dir: Option<&Path>,
 ) -> Vec<AutoIdentification> {
     let Some(dir) = identity_dir else {
@@ -89,7 +129,7 @@ pub(crate) fn apply_auto_identification(
             return Vec::new();
         }
     };
-    let assigned = auto_identify_speakers(speakers, embeddings, &identities);
+    let assigned = auto_identify_speakers(speakers, embeddings, voiced_ms, &identities);
     for hit in &assigned {
         // The matched name is PII; log only which cluster matched and how
         // confidently.
@@ -138,11 +178,18 @@ mod tests {
             .collect()
     }
 
+    /// Voiced-duration map that passes the gate for the given engine ids.
+    fn voiced_ok(ids: &[u32]) -> BTreeMap<u32, u64> {
+        ids.iter()
+            .map(|&id| (id, IDENTIFY_MIN_VOICED_MS + 1000))
+            .collect()
+    }
+
     fn identity_store_with(entries: &[(&str, f32)]) -> (tempfile::TempDir, IdentityStore) {
         let dir = tempfile::tempdir().unwrap();
         let mut store = IdentityStore::open(dir.path()).unwrap();
         for (name, seed) in entries {
-            store.enroll(name, &emb(*seed), None).unwrap();
+            store.enroll(name, &emb(*seed), 5000, None).unwrap();
         }
         (dir, store)
     }
@@ -153,7 +200,8 @@ mod tests {
         let mut speakers = speakers(2);
         let embeddings = BTreeMap::from([(0, emb(0.1)), (1, emb(7.7))]);
 
-        let assigned = auto_identify_speakers(&mut speakers, &embeddings, &identities);
+        let assigned =
+            auto_identify_speakers(&mut speakers, &embeddings, &voiced_ok(&[0, 1]), &identities);
 
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].label, "S1");
@@ -165,11 +213,59 @@ mod tests {
     }
 
     #[test]
+    fn speaker_below_min_voiced_duration_is_never_auto_matched() {
+        let (_dir, identities) = identity_store_with(&[("李明", 0.1)]);
+        let mut speakers = speakers(2);
+        // Both clusters carry the enrolled voice; only S2 spoke long enough.
+        let embeddings = BTreeMap::from([(0, emb(0.1)), (1, emb(0.1))]);
+        let voiced = BTreeMap::from([(0, IDENTIFY_MIN_VOICED_MS - 1), (1, IDENTIFY_MIN_VOICED_MS)]);
+
+        let assigned = auto_identify_speakers(&mut speakers, &embeddings, &voiced, &identities);
+
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].label, "S2");
+        assert_eq!(
+            speakers[0].display_name, None,
+            "2-second speaker keeps 说话人N"
+        );
+        assert_eq!(speakers[1].display_name.as_deref(), Some("李明"));
+    }
+
+    #[test]
+    fn speaker_missing_from_voiced_map_is_treated_as_zero_and_skipped() {
+        let (_dir, identities) = identity_store_with(&[("李明", 0.1)]);
+        let mut speakers = speakers(1);
+        let embeddings = BTreeMap::from([(0, emb(0.1))]);
+
+        let assigned =
+            auto_identify_speakers(&mut speakers, &embeddings, &BTreeMap::new(), &identities);
+
+        assert!(assigned.is_empty());
+        assert_eq!(speakers[0].display_name, None);
+    }
+
+    #[test]
+    fn speaker_voiced_ms_sums_all_turns_per_speaker() {
+        let turns = vec![
+            DiarTurn::new(0.0, 1.5, 0),
+            DiarTurn::new(2.0, 2.2, 0), // short turns still count toward the total
+            DiarTurn::new(3.0, 6.0, 1),
+        ];
+        let voiced = speaker_voiced_ms(&turns);
+        assert_eq!(voiced.get(&0).copied(), Some(1700));
+        assert_eq!(voiced.get(&1).copied(), Some(3000));
+        assert_eq!(voiced.get(&2), None);
+    }
+
+    #[test]
     fn empty_identity_library_assigns_nothing() {
         let (_dir, identities) = identity_store_with(&[]);
         let mut speakers = speakers(1);
         let embeddings = BTreeMap::from([(0, emb(0.1))]);
-        assert!(auto_identify_speakers(&mut speakers, &embeddings, &identities).is_empty());
+        assert!(
+            auto_identify_speakers(&mut speakers, &embeddings, &voiced_ok(&[0]), &identities)
+                .is_empty()
+        );
         assert_eq!(speakers[0].display_name, None);
     }
 
@@ -180,7 +276,8 @@ mod tests {
         speakers[0].display_name = Some("张三".to_string());
         let embeddings = BTreeMap::from([(0, emb(0.1))]);
 
-        let assigned = auto_identify_speakers(&mut speakers, &embeddings, &identities);
+        let assigned =
+            auto_identify_speakers(&mut speakers, &embeddings, &voiced_ok(&[0]), &identities);
 
         assert!(assigned.is_empty());
         assert_eq!(speakers[0].display_name.as_deref(), Some("张三"));
@@ -193,7 +290,8 @@ mod tests {
         // Only S2 has an embedding; S1 has none (e.g. all its turns too short).
         let embeddings = BTreeMap::from([(1, emb(0.1))]);
 
-        let assigned = auto_identify_speakers(&mut speakers, &embeddings, &identities);
+        let assigned =
+            auto_identify_speakers(&mut speakers, &embeddings, &voiced_ok(&[1]), &identities);
 
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].label, "S2");
@@ -205,7 +303,10 @@ mod tests {
     fn apply_with_no_identity_dir_is_a_noop() {
         let mut speakers = speakers(1);
         let embeddings = BTreeMap::from([(0, emb(0.1))]);
-        assert!(apply_auto_identification(&mut speakers, &embeddings, None).is_empty());
+        assert!(
+            apply_auto_identification(&mut speakers, &embeddings, &voiced_ok(&[0]), None)
+                .is_empty()
+        );
         assert_eq!(speakers[0].display_name, None);
     }
 
