@@ -1180,7 +1180,10 @@ mod tests {
     fn speaker_ops_reject_speakers_from_another_meeting() {
         let (_dir, store) = open_store();
         let m1 = Meeting::new();
-        let m2 = Meeting::new();
+        // m2 must not also be `recording`: the v11 single-active index allows
+        // at most one active recording at a time.
+        let mut m2 = Meeting::new();
+        m2.status = MeetingStatus::Ready;
         store.create_meeting(&m1).unwrap();
         store.create_meeting(&m2).unwrap();
         let m1_spk = Speaker::new(m1.id, "S1");
@@ -1248,29 +1251,63 @@ mod tests {
     #[test]
     fn list_meetings_by_status_finds_interrupted_recordings() {
         let (_dir, store) = open_store();
-        // Two meetings left mid-recording by a crashed run, plus one that
-        // finished normally.
-        let crashed_a = Meeting::new(); // status = Recording
-        let crashed_b = Meeting::new(); // status = Recording
+        // One meeting left mid-recording by a crashed run (the v11
+        // single-active index guarantees there is never more than one), plus
+        // meetings that advanced normally.
+        let crashed = Meeting::new(); // status = Recording
+        let mut processing = Meeting::new();
+        processing.status = MeetingStatus::Processing;
         let mut done = Meeting::new();
         done.status = MeetingStatus::Ready;
-        store.create_meeting(&crashed_a).unwrap();
-        store.create_meeting(&crashed_b).unwrap();
+        store.create_meeting(&crashed).unwrap();
+        store.create_meeting(&processing).unwrap();
         store.create_meeting(&done).unwrap();
 
         let stale = store
             .list_meetings_by_status(MeetingStatus::Recording)
             .unwrap();
-        assert_eq!(stale.len(), 2);
-        let ids: Vec<_> = stale.iter().map(|m| m.id).collect();
-        assert!(ids.contains(&crashed_a.id));
-        assert!(ids.contains(&crashed_b.id));
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, crashed.id);
 
         // A status with no meetings returns empty.
         assert!(store
             .list_meetings_by_status(MeetingStatus::Failed)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn single_active_recording_invariant_is_enforced() {
+        let (_dir, store) = open_store();
+        let first = Meeting::new(); // status = Recording
+        store.create_meeting(&first).unwrap();
+
+        // A second concurrent recording is rejected by the v11 unique index.
+        let second = Meeting::new();
+        let err = store
+            .create_meeting(&second)
+            .expect_err("second active recording must be rejected");
+        assert!(
+            err.to_string().contains("ux_meetings_single_active"),
+            "unexpected error: {err}"
+        );
+
+        // Once the first advances out of `recording`, a new recording starts
+        // fine — and flipping an old meeting back into `recording` while one
+        // is active is rejected too.
+        assert!(store
+            .update_meeting_status(first.id, MeetingStatus::Processing)
+            .unwrap());
+        store.create_meeting(&second).unwrap();
+        assert!(store
+            .update_meeting_status(first.id, MeetingStatus::Recording)
+            .is_err());
+
+        // Multiple meetings in the post-recording pipeline states may coexist
+        // (background processing of one meeting while another records).
+        let mut third = Meeting::new();
+        third.status = MeetingStatus::Transcribing;
+        store.create_meeting(&third).unwrap();
     }
 
     #[test]

@@ -168,10 +168,13 @@ pub async fn transcribe_meeting(
 
     // Cross-meeting auto-identification: give already-enrolled voices their
     // real names before the speaker rows are written (a hit sets
-    // `display_name`, i.e. the speaker persists as confirmed).
+    // `display_name`, i.e. the speaker persists as confirmed). Speakers with
+    // too little voiced audio are skipped (see `IDENTIFY_MIN_VOICED_MS`).
+    let voiced_ms = crate::identify::speaker_voiced_ms(&diar.turns);
     crate::identify::apply_auto_identification(
         &mut assembled.speakers,
         &diar.speaker_embeddings,
+        &voiced_ms,
         opts.identity_dir.as_deref(),
     );
 
