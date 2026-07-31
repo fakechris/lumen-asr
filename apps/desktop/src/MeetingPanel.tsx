@@ -868,18 +868,31 @@ function LiveTranscript({
       // Remove every annotation covering this line, so an older mark cannot
       // resurface at reconciliation time.
       const covering = annotations.filter((a) => annotationCoversLine(a, seg));
-      try {
-        for (const a of covering) {
-          await api.deleteLiveAnnotation(a.id);
-        }
+      const results = await Promise.allSettled(
+        covering.map((a) => api.deleteLiveAnnotation(a.id)),
+      );
+      const firstFailure = results.find(
+        (r): r is PromiseRejectedResult => r.status === "rejected",
+      );
+      if (!firstFailure) {
+        // Every row is gone from the store — mirror that locally.
         setAnnotations((prev) =>
           prev.filter((a) => !covering.some((c) => c.id === a.id)),
         );
+        return;
+      }
+      // Partial failure: some rows may already be deleted while others
+      // survived. Never guess — re-list so the chips converge on the store's
+      // real state, and surface the failure.
+      onError(String(firstFailure.reason));
+      try {
+        setAnnotations(await api.listLiveAnnotations(meetingId));
       } catch (e) {
+        // Keep the (stale) local state; the next mount re-lists anyway.
         onError(String(e));
       }
     },
-    [annotations, onError, closeMenus],
+    [annotations, meetingId, onError, closeMenus],
   );
 
   useEffect(() => {

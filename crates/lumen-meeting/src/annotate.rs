@@ -128,6 +128,29 @@ pub fn reconcile_annotations(
         return outcome;
     }
 
+    // 0. Drop annotations with corrupt time bounds (non-finite start/end, or
+    //    an end at/before the start) so they can never poison the overlap
+    //    arithmetic below. Valid annotations are unaffected.
+    let annotations: Vec<LiveAnnotation> = annotations
+        .iter()
+        .filter(|a| {
+            let valid = a.start_seconds.is_finite()
+                && a.end_seconds
+                    .is_none_or(|end| end.is_finite() && end > a.start_seconds);
+            if !valid {
+                tracing::warn!(
+                    annotation_id = %a.id,
+                    "skipping live annotation with non-finite or inverted time range"
+                );
+            }
+            valid
+        })
+        .cloned()
+        .collect();
+    if annotations.is_empty() {
+        return outcome;
+    }
+
     // 1. Per segment: the newest annotation (created_at; list order breaks
     //    ties) on the same channel whose range covers it enough.
     let manual_names: Vec<Option<String>> = segments
@@ -527,6 +550,82 @@ mod tests {
             &mut speakers2,
             &mut segments2,
             &outside,
+            0.0,
+            0.0,
+        );
+        assert_eq!(outcome2, AnnotationReconciliation::default());
+    }
+
+    #[test]
+    fn corrupt_time_bounds_are_ignored_without_disturbing_valid_annotations() {
+        let meeting_id = Uuid::new_v4();
+        let (speaker, mut segments) = cluster(meeting_id, "S1", &[(0.0, 2.0), (5.0, 7.0)], 0);
+        let mut speakers = vec![speaker];
+        // Corrupt rows (edge writes / damaged storage): NaN start, infinite
+        // end, and an end at/before the start. Newer than the valid row, so
+        // any of them slipping through would beat it in last-write-wins.
+        let annotations = vec![
+            annotation(meeting_id, 0.0, Some(2.0), SegmentChannel::Mic, "李明", 0),
+            annotation(
+                meeting_id,
+                f64::NAN,
+                Some(2.0),
+                SegmentChannel::Mic,
+                "坏数据",
+                1,
+            ),
+            annotation(
+                meeting_id,
+                0.0,
+                Some(f64::INFINITY),
+                SegmentChannel::Mic,
+                "坏数据",
+                2,
+            ),
+            annotation(meeting_id, 2.0, Some(1.0), SegmentChannel::Mic, "坏数据", 3),
+            annotation(meeting_id, 1.0, Some(1.0), SegmentChannel::Mic, "坏数据", 4),
+        ];
+
+        let outcome = reconcile_annotations(
+            meeting_id,
+            &mut speakers,
+            &mut segments,
+            &annotations,
+            0.0,
+            0.0,
+        );
+
+        // Only the valid annotation took effect: the covered segment split
+        // out under 李明, nothing was attributed to 坏数据.
+        assert!(outcome.renamed_speakers.is_empty());
+        assert_eq!(outcome.new_speakers.len(), 1);
+        assert_eq!(outcome.reassigned_segments.len(), 1);
+        let manual = speakers
+            .iter()
+            .find(|s| s.id == outcome.new_speakers[0])
+            .unwrap();
+        assert_eq!(manual.display_name.as_deref(), Some("李明"));
+        assert_eq!(segments[0].speaker_id, Some(manual.id));
+        assert!(speakers
+            .iter()
+            .all(|s| s.display_name.as_deref() != Some("坏数据")));
+
+        // Nothing but corrupt rows → strict no-op.
+        let (speaker2, mut segments2) = cluster(meeting_id, "S1", &[(0.0, 2.0)], 0);
+        let mut speakers2 = vec![speaker2];
+        let corrupt_only = vec![annotation(
+            meeting_id,
+            f64::NAN,
+            None,
+            SegmentChannel::Mic,
+            "坏数据",
+            0,
+        )];
+        let outcome2 = reconcile_annotations(
+            meeting_id,
+            &mut speakers2,
+            &mut segments2,
+            &corrupt_only,
             0.0,
             0.0,
         );
