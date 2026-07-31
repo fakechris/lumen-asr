@@ -243,8 +243,10 @@ pub fn stop_meeting_recording(
     // leave `recording` — otherwise a stop failure would strand it there and
     // every future candidate would be rejected as busy. Harmless when this
     // recording was not started from a detection prompt (the policy no-ops
-    // unless it is tracking an accepted recording).
-    state.meeting_detection.recording_finished();
+    // unless it is tracking an accepted recording). Also retracts a
+    // still-visible "meeting seems over" suggestion, since the question is
+    // now moot however the stop was initiated.
+    state.meeting_detection.recording_finished(&app);
 
     // Now that the mic and hotkey are restored, surface any recorder failure.
     // Mark the meeting Failed so it does not linger in `Recording`.
@@ -380,10 +382,15 @@ pub fn accept_meeting_detection(
     // Reuse the proven start command (arbiter gate, hotkey suspend, recorder).
     // If it fails, tell the policy so it does not sit in `recording` forever
     // (which would reject every future candidate as busy).
-    match start_meeting_recording(app, state.clone(), None) {
-        Ok(id) => Ok(id),
+    match start_meeting_recording(app.clone(), state.clone(), None) {
+        Ok(id) => {
+            // Remember which meeting this detection started so the
+            // end-of-meeting stop suggestion can reference (and stop) it.
+            state.meeting_detection.mark_recording_started(&id);
+            Ok(id)
+        }
         Err(e) => {
-            state.meeting_detection.recording_failed();
+            state.meeting_detection.recording_failed(&app);
             Err(e)
         }
     }
@@ -394,6 +401,63 @@ pub fn accept_meeting_detection(
 pub fn dismiss_meeting_detection(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.meeting_detection.dismiss(&app);
     Ok(())
+}
+
+/// The user accepted an end-of-meeting stop suggestion: stop the
+/// detection-started recording via the *existing* stop path (recorder
+/// finalize, hotkey restore, offline pipeline). A stale click — the recording
+/// already ended some other way — is a silent no-op, never an error toast.
+#[tauri::command]
+pub fn accept_meeting_detection_stop(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let Some(meeting_id) = state.meeting_detection.active_meeting_id() else {
+        return Ok(());
+    };
+    state.meeting_detection.note_stop_accepted();
+    stop_meeting_recording(app, state, meeting_id).map(|_| ())
+}
+
+/// The user declined an end-of-meeting stop suggestion ("继续录制"): the
+/// recording keeps running and no further suggestion is made for it.
+#[tauri::command]
+pub fn decline_meeting_detection_stop(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.meeting_detection.decline_stop(&app);
+    Ok(())
+}
+
+/// Serialized local detection counters (see `detection_stats.rs`). Everything
+/// is counted and stored on this machine only.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingDetectionStatsDto {
+    pub prompt_shown: u64,
+    pub prompt_accepted: u64,
+    pub prompt_dismissed: u64,
+    pub stop_suggested: u64,
+    pub stop_accepted: u64,
+    pub stop_declined: u64,
+}
+
+/// Read the local meeting-detection counters (prompt/suggestion totals) so a
+/// settings page can show how often detection fired and how often it was right.
+#[tauri::command]
+pub fn get_meeting_detection_stats(
+    state: State<'_, AppState>,
+) -> Result<MeetingDetectionStatsDto, String> {
+    let c = state.meeting_detection.stats_snapshot();
+    Ok(MeetingDetectionStatsDto {
+        prompt_shown: c.prompt_shown,
+        prompt_accepted: c.prompt_accepted,
+        prompt_dismissed: c.prompt_dismissed,
+        stop_suggested: c.stop_suggested,
+        stop_accepted: c.stop_accepted,
+        stop_declined: c.stop_declined,
+    })
 }
 
 fn meeting_detection_capability() -> bool {

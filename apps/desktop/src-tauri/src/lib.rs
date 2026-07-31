@@ -10,6 +10,7 @@ mod context_capture;
 mod corrector_cmd;
 mod corrector_probe;
 mod corrector_svc;
+mod detection_stats;
 mod dictation;
 mod edit_attribution;
 mod hotkey;
@@ -371,6 +372,9 @@ pub fn run() {
             meeting_cmd::set_meeting_detection_enabled,
             meeting_cmd::accept_meeting_detection,
             meeting_cmd::dismiss_meeting_detection,
+            meeting_cmd::accept_meeting_detection_stop,
+            meeting_cmd::decline_meeting_detection_stop,
+            meeting_cmd::get_meeting_detection_stats,
             meeting_cmd::process_meeting_now,
             meeting_cmd::list_meetings,
             meeting_cmd::get_meeting_detail,
