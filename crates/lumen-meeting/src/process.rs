@@ -162,7 +162,7 @@ async fn run(
         }
     }
 
-    let assembled = assemble_meeting(
+    let mut assembled = assemble_meeting(
         meeting_id,
         &diar.turns,
         &texts,
@@ -170,9 +170,27 @@ async fn run(
         Some(sample_rate),
         duration,
     );
+    // Cross-meeting auto-identification: match each cluster's voiceprint
+    // centroid against the enrolled identity library and assign the real name
+    // on a confident hit (logged with name + score). Unmatched speakers keep
+    // their engine label ("说话人N"). No-op when `opts.identity_dir` is unset
+    // or no embeddings were produced.
+    crate::identify::apply_auto_identification(
+        &mut assembled.speakers,
+        &diar.speaker_embeddings,
+        opts.identity_dir.as_deref(),
+    );
     for speaker in &assembled.speakers {
         store.upsert_speaker(speaker).map_err(ProcessError::Store)?;
     }
+    // Persist each cluster's centroid so the user can later enroll a confirmed
+    // speaker from this meeting.
+    crate::identify::persist_speaker_embeddings(
+        store,
+        &assembled.speakers,
+        &diar.speaker_embeddings,
+    )
+    .map_err(ProcessError::Store)?;
     store
         .add_segments(&assembled.segments)
         .map_err(ProcessError::Store)?;

@@ -6,6 +6,7 @@
 //! [`MeetingError::Unsupported`] stub everywhere else. The rest of the pipeline
 //! (ASR fan-out over turns, assembly, storage) is cross-platform.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use lumen_asr_engine::{AsrEngine, AsrError, AsrRequest};
@@ -84,6 +85,12 @@ pub struct MeetingOptions {
     /// `false` — the app layer sets it from config, where it defaults **on** so a
     /// user with an LLM configured gets a cleaned transcript automatically.
     pub cleanup_transcript: bool,
+    /// Directory of the local speaker-identity library (enrolled voiceprints).
+    /// When set, each diarized speaker's centroid embedding is matched against
+    /// the enrolled identities and a confident hit auto-assigns the real name
+    /// (see [`auto_identify_speakers`](crate::auto_identify_speakers)). `None`
+    /// disables auto-identification.
+    pub identity_dir: Option<PathBuf>,
 }
 
 /// Failure modes of [`transcribe_meeting`].
@@ -109,6 +116,11 @@ pub(crate) struct DiarOutput {
     pub(crate) samples: Vec<f32>,
     pub(crate) sample_rate: u32,
     pub(crate) turns: Vec<DiarTurn>,
+    /// Per-speaker centroid voiceprint embedding (engine speaker id → 256-d
+    /// WeSpeaker x-vector average), when this build can compute them. Empty on
+    /// non-diarizing builds and on any best-effort computation failure — the
+    /// pipeline persists/matches embeddings only when present ("可得则匹配").
+    pub(crate) speaker_embeddings: BTreeMap<u32, Vec<f32>>,
 }
 
 /// Transcribe a pre-recorded `wav` into a stored, speaker-attributed meeting.
@@ -145,13 +157,22 @@ pub async fn transcribe_meeting(
     meeting.title = opts.title.clone();
     let meeting_id = meeting.id;
 
-    let assembled = assemble_meeting(
+    let mut assembled = assemble_meeting(
         meeting_id,
         &diar.turns,
         &texts,
         &words,
         Some(diar.sample_rate),
         duration,
+    );
+
+    // Cross-meeting auto-identification: give already-enrolled voices their
+    // real names before the speaker rows are written (a hit sets
+    // `display_name`, i.e. the speaker persists as confirmed).
+    crate::identify::apply_auto_identification(
+        &mut assembled.speakers,
+        &diar.speaker_embeddings,
+        opts.identity_dir.as_deref(),
     );
 
     // Everything above is assembled in memory before any write, so a diarize
@@ -165,6 +186,12 @@ pub async fn transcribe_meeting(
         for speaker in &assembled.speakers {
             store.upsert_speaker(speaker).map_err(MeetingError::Store)?;
         }
+        crate::identify::persist_speaker_embeddings(
+            store,
+            &assembled.speakers,
+            &diar.speaker_embeddings,
+        )
+        .map_err(MeetingError::Store)?;
         store
             .add_segments(&assembled.segments)
             .map_err(MeetingError::Store)?;
@@ -251,17 +278,125 @@ pub(crate) fn diarize_wav(
         audio::load_wav_mono16k(wav).map_err(|e| MeetingError::Diarize(e.to_string()))?;
     let result =
         diarize(wav, &model_paths, &cfg).map_err(|e| MeetingError::Diarize(e.to_string()))?;
-    let turns = result
+    let turns: Vec<DiarTurn> = result
         .timeline
         .iter()
         .map(|t| DiarTurn::new(t.start, t.end, t.speaker))
         .collect();
 
+    // Best-effort per-speaker voiceprint centroids for enrollment/matching.
+    // A failure here degrades to "no embeddings" (no enrollment for this
+    // meeting) rather than failing the transcription.
+    let speaker_embeddings = match speaker_centroids(
+        &samples,
+        sample_rate,
+        &turns,
+        &model_paths.embedding,
+    ) {
+        Ok(embeddings) => embeddings,
+        Err(error) => {
+            tracing::warn!(error = %error, "speaker centroid computation failed; no voiceprints for this meeting");
+            BTreeMap::new()
+        }
+    };
+
     Ok(DiarOutput {
         samples,
         sample_rate,
         turns,
+        speaker_embeddings,
     })
+}
+
+/// Per-speaker duration budget for centroid computation. diar-rs's clustering
+/// already saw the whole file; for a stable voiceprint an average over the
+/// speaker's longest ~30 s of speech is plenty, and capping keeps the extra
+/// embedding passes cheap on long meetings.
+#[cfg(all(target_os = "macos", feature = "diarize"))]
+const CENTROID_MAX_SECONDS_PER_SPEAKER: f64 = 30.0;
+
+/// Skip turns shorter than this when building centroids: sub-second snippets
+/// yield noisy x-vectors (and too few fbank frames to embed at all).
+#[cfg(all(target_os = "macos", feature = "diarize"))]
+const CENTROID_MIN_TURN_SECONDS: f64 = 0.5;
+
+/// Compute one centroid voiceprint per diarized speaker: embed each of the
+/// speaker's (longest-first, up to [`CENTROID_MAX_SECONDS_PER_SPEAKER`]) turns
+/// with the same WeSpeaker embedding model + kaldi fbank front-end diar-rs
+/// used for clustering, then average duration-weighted. `diar_rs::diarize`
+/// does not expose its internal window x-vectors, so this recomputes them over
+/// the final merged turns via diar-rs's public `fbank`/`onnx_emb` modules —
+/// one extra ONNX session plus a handful of forward passes per meeting.
+#[cfg(all(target_os = "macos", feature = "diarize"))]
+fn speaker_centroids(
+    samples: &[f32],
+    sample_rate: u32,
+    turns: &[DiarTurn],
+    embedding_model: &Path,
+) -> Result<BTreeMap<u32, Vec<f32>>, String> {
+    use diar_rs::fbank::{compute_fbank, FbankOptions};
+    use diar_rs::onnx_emb::EmbModel;
+    use lumen_identity::EMBEDDING_DIM;
+
+    // Group turn indices per speaker, longest turns first.
+    let mut by_speaker: BTreeMap<u32, Vec<&DiarTurn>> = BTreeMap::new();
+    for turn in turns {
+        if turn.end - turn.start >= CENTROID_MIN_TURN_SECONDS {
+            by_speaker.entry(turn.speaker).or_default().push(turn);
+        }
+    }
+    if by_speaker.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut model = EmbModel::load(embedding_model, 2).map_err(|e| e.to_string())?;
+    let fb_opts = FbankOptions {
+        sample_rate,
+        subtract_mean: true,
+        ..FbankOptions::default()
+    };
+
+    let mut centroids = BTreeMap::new();
+    for (speaker, mut speaker_turns) in by_speaker {
+        speaker_turns.sort_by(|a, b| {
+            (b.end - b.start)
+                .partial_cmp(&(a.end - a.start))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut sum = vec![0.0f64; EMBEDDING_DIM];
+        let mut weight = 0.0f64;
+        let mut budget = CENTROID_MAX_SECONDS_PER_SPEAKER;
+        for turn in speaker_turns {
+            if budget <= 0.0 {
+                break;
+            }
+            let Some((start, end)) =
+                turn_sample_range(turn.start, turn.end, sample_rate, samples.len())
+            else {
+                continue;
+            };
+            let seconds = (end - start) as f64 / sample_rate as f64;
+            let (fb, t_fb) =
+                compute_fbank(&samples[start..end], &fb_opts).map_err(|e| e.to_string())?;
+            if t_fb < 10 {
+                continue; // too short to embed reliably
+            }
+            let xvec = model.embed_fbank(&fb, t_fb).map_err(|e| e.to_string())?;
+            if xvec.len() != EMBEDDING_DIM {
+                return Err(format!("unexpected embedding dim {}", xvec.len()));
+            }
+            for (accumulator, value) in sum.iter_mut().zip(xvec.iter()) {
+                *accumulator += value * seconds;
+            }
+            weight += seconds;
+            budget -= seconds;
+        }
+        if weight > 0.0 {
+            let centroid: Vec<f32> = sum.iter().map(|v| (v / weight) as f32).collect();
+            centroids.insert(speaker, centroid);
+        }
+    }
+    Ok(centroids)
 }
 
 /// Stub for every non-diarizing build (Windows CI, or macOS without the
@@ -273,6 +408,9 @@ pub(crate) fn diarize_wav(
     _models: &DiarModels,
     _opts: &MeetingOptions,
 ) -> Result<DiarOutput, MeetingError> {
+    // Note: `DiarOutput.speaker_embeddings` stays empty on this path by
+    // construction, so voiceprint enrollment/matching is naturally unavailable
+    // wherever diarization is.
     Err(MeetingError::Unsupported(
         "offline diarization requires macOS built with the `diarize` feature (diar-rs)".to_string(),
     ))

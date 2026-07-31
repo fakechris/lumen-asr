@@ -16,6 +16,9 @@ serde_json = { workspace = true }
 lumen-core = { workspace = true }
 lumen-store = { workspace = true }
 lumen-transcript = { workspace = true }
+# Speaker-identity library (voiceprint enroll/match). Pure logic + local JSON
+# storage; cross-platform, so no platform gating here.
+lumen-identity = { workspace = true }
 # Structured-minutes LLM pass (OpenAI-compat client) + its prompt layer. No
 # platform gating: the minutes call is cross-platform.
 lumen-corrector = { workspace = true }
