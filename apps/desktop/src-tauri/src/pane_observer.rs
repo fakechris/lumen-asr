@@ -120,10 +120,7 @@ struct OuterTerminalGuard {
 
 #[derive(Debug, Clone)]
 enum OuterTerminalSurface {
-    Ghostty {
-        terminal_id: String,
-        provider_title: String,
-    },
+    Ghostty { terminal_id: String },
 }
 
 impl OuterTerminalGuard {
@@ -142,7 +139,6 @@ impl OuterTerminalGuard {
             }
             Some(OuterTerminalSurface::Ghostty {
                 terminal_id: identity.terminal_id,
-                provider_title: identity.title,
             })
         } else {
             if read_frontmost_process_id(runner)? != process_id {
@@ -187,15 +183,9 @@ impl OuterTerminalGuard {
         &self,
         process_tree: &ProcessTree,
         client_process_id: u32,
-        provider: &str,
-        title: &str,
     ) -> bool {
         match self.surface.as_ref() {
-            Some(OuterTerminalSurface::Ghostty { provider_title, .. }) => {
-                provider_title.eq_ignore_ascii_case(title)
-                    && process_tree.unique_tty_provider_process(self.process_id, provider)
-                        == Some(client_process_id)
-            }
+            Some(OuterTerminalSurface::Ghostty { .. }) => true,
             None => self.terminal_tty.as_ref().is_some_and(|expected| {
                 process_tree.ttys.get(&client_process_id) == Some(expected)
             }),
@@ -229,10 +219,11 @@ impl ProviderClientGuard {
         process_tree: &ProcessTree,
         process_id: u32,
         provider: &'static str,
-        provider_title: &str,
     ) -> Result<Self, String> {
         if !process_tree.is_descendant_of(process_id, outer.process_id)
-            || !outer.accepts_provider_candidate(process_tree, process_id, provider, provider_title)
+            || process_tree.unique_tty_provider_process(outer.process_id, provider)
+                != Some(process_id)
+            || !outer.accepts_provider_candidate(process_tree, process_id)
         {
             return Err("outer_terminal_provider_unmatched".to_owned());
         }
@@ -264,7 +255,6 @@ impl ProviderClientGuard {
 struct GhosttyTerminalIdentity {
     frontmost_process_id: u32,
     terminal_id: String,
-    title: String,
 }
 
 fn is_ghostty(target: &FrontmostTarget) -> bool {
@@ -306,8 +296,7 @@ tell application "Ghostty"
   end tell
   set focusedTerminal to focused terminal of selected tab of front window
   set terminalId to (id of focusedTerminal as text)
-  set focusedTitle to (name of focusedTerminal as text)
-  return frontProcessId & linefeed & terminalId & linefeed & focusedTitle
+  return frontProcessId & linefeed & terminalId
 end tell
 "#;
     let output = runner.run(
@@ -318,11 +307,9 @@ end tell
     let mut lines = text.lines();
     let frontmost_process_id = lines.next().and_then(|value| value.trim().parse().ok());
     let terminal_id = lines.next().unwrap_or_default().trim().to_owned();
-    let title = lines.next().unwrap_or_default().trim().to_owned();
     if lines.next().is_some()
         || terminal_id.is_empty()
         || terminal_id.len() > 256
-        || title.is_empty()
         || frontmost_process_id.is_none()
     {
         return Err("ghostty_terminal_id_invalid".to_owned());
@@ -330,7 +317,6 @@ end tell
     Ok(GhosttyTerminalIdentity {
         frontmost_process_id: frontmost_process_id.expect("validated above"),
         terminal_id,
-        title,
     })
 }
 
@@ -745,14 +731,9 @@ fn identify_herdr(
     if !process_tree.is_descendant_of(identity.shell_pid, client_process_id) {
         return Err("herdr_shell_not_in_client_tree".to_owned());
     }
-    let client_guard = ProviderClientGuard::bind(
-        outer_guard,
-        process_tree,
-        client_process_id,
-        "herdr",
-        "herdr",
-    )
-    .map_err(|_| "herdr_client_not_bound_to_outer_surface".to_owned())?;
+    let client_guard =
+        ProviderClientGuard::bind(outer_guard, process_tree, client_process_id, "herdr")
+            .map_err(|reason| format!("herdr_client_not_bound_to_outer_surface:{reason}"))?;
     Ok(LockedPane {
         inner: Arc::new(HerdrPane {
             executable,
@@ -839,27 +820,24 @@ struct TmuxClient {
     process_id: u32,
     pane_id: String,
     session_id: String,
-    pane_title: String,
 }
 
 fn parse_tmux_clients(output: &str) -> Vec<TmuxClient> {
     output
         .lines()
         .filter_map(|line| {
-            let mut fields = line.splitn(5, '\t');
+            let mut fields = line.splitn(4, '\t');
             let _client_name = fields.next()?;
             let process_id = fields.next()?.parse().ok()?;
             let pane_id = fields.next()?.to_owned();
             let session_id = fields.next()?.to_owned();
-            let pane_title = fields.next()?.to_owned();
-            if !pane_id.starts_with('%') || session_id.is_empty() || pane_title.is_empty() {
+            if !pane_id.starts_with('%') || session_id.is_empty() {
                 return None;
             }
             Some(TmuxClient {
                 process_id,
                 pane_id,
                 session_id,
-                pane_title,
             })
         })
         .collect()
@@ -883,9 +861,7 @@ fn identify_tmux(
         arguments.extend([
             OsString::from("list-clients"),
             OsString::from("-F"),
-            OsString::from(
-                "#{client_name}\t#{client_pid}\t#{pane_id}\t#{client_session}\t#{pane_title}",
-            ),
+            OsString::from("#{client_name}\t#{client_pid}\t#{pane_id}\t#{client_session}"),
         ]);
         let Ok(output) = runner.run(&executable, &arguments) else {
             continue;
@@ -896,7 +872,6 @@ fn identify_tmux(
                 process_tree,
                 client.process_id,
                 "tmux",
-                &client.pane_title,
             ) {
                 matches.push((socket.clone(), client, client_guard));
             }
@@ -1031,9 +1006,7 @@ impl TmuxPane {
         arguments.extend([
             OsString::from("list-clients"),
             OsString::from("-F"),
-            OsString::from(
-                "#{client_name}\t#{client_pid}\t#{pane_id}\t#{client_session}\t#{pane_title}",
-            ),
+            OsString::from("#{client_name}\t#{client_pid}\t#{pane_id}\t#{client_session}"),
         ]);
         let output = self.runner.run(&self.executable, &arguments)?;
         let clients = parse_tmux_clients(&output.stdout_text());
@@ -1103,7 +1076,6 @@ fn zellij_snapshot_mode(version: &str) -> Option<ZellijSnapshotMode> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ZellijPaneMetadata {
     pane_id: String,
-    title: String,
 }
 
 fn parse_zellij_panes(output: &str) -> Vec<ZellijPaneMetadata> {
@@ -1121,8 +1093,7 @@ fn parse_zellij_panes(output: &str) -> Vec<ZellijPaneMetadata> {
                 serde_json::Value::String(id) if id.starts_with("terminal_") => id.clone(),
                 _ => return None,
             };
-            let title = pane.get("title")?.as_str()?.trim().to_owned();
-            (!title.is_empty()).then_some(ZellijPaneMetadata { pane_id, title })
+            Some(ZellijPaneMetadata { pane_id })
         })
         .collect()
 }
@@ -1256,22 +1227,11 @@ fn identify_zellij(
         .into_iter()
         .filter(|pane| pane.pane_id == client.pane_id)
         .collect::<Vec<_>>();
-    let pane_metadata = match pane_metadata.as_slice() {
-        [single] => single.clone(),
-        _ => return None,
-    };
-    let client_guard = [pane_metadata.title.as_str(), session.as_str()]
-        .into_iter()
-        .find_map(|title| {
-            ProviderClientGuard::bind(
-                outer_guard.clone(),
-                process_tree,
-                client_process_id,
-                "zellij",
-                title,
-            )
-            .ok()
-        })?;
+    if !matches!(pane_metadata.as_slice(), [_]) {
+        return None;
+    }
+    let client_guard =
+        ProviderClientGuard::bind(outer_guard, process_tree, client_process_id, "zellij").ok()?;
     Some(LockedPane {
         inner: Arc::new(ZellijPane {
             executable,
@@ -1429,7 +1389,6 @@ mod tests {
             process_id: 659,
             surface: Some(OuterTerminalSurface::Ghostty {
                 terminal_id: "terminal-1".into(),
-                provider_title: "herdr".into(),
             }),
             terminal_tty: None,
         }
@@ -1437,7 +1396,7 @@ mod tests {
 
     fn bound_herdr_client_guard() -> ProviderClientGuard {
         let tree = ProcessTree::parse(single_herdr_process_list());
-        ProviderClientGuard::bind(ghostty_outer_guard(), &tree, 19794, "herdr", "herdr").unwrap()
+        ProviderClientGuard::bind(ghostty_outer_guard(), &tree, 19794, "herdr").unwrap()
     }
 
     #[test]
@@ -1493,20 +1452,19 @@ mod tests {
             process_id: 659,
             surface: Some(OuterTerminalSurface::Ghostty {
                 terminal_id: "terminal-1".into(),
-                provider_title: "herdr".into(),
             }),
             terminal_tty: None,
         };
 
         assert!(tree.is_descendant_of(identity.shell_pid, 19794));
-        assert!(ProviderClientGuard::bind(outer_guard, &tree, 19794, "herdr", "herdr").is_ok());
+        assert!(ProviderClientGuard::bind(outer_guard, &tree, 19794, "herdr").is_ok());
     }
 
     #[test]
     fn provider_guard_uses_stable_surface_id_after_binding() {
         let client_guard = bound_herdr_client_guard();
         let runner = StaticSystemRunner {
-            ghostty_identity: "659\nterminal-1\na changed dynamic title\n",
+            ghostty_identity: "659\nterminal-1\n",
             process_list: single_herdr_process_list(),
         };
 
@@ -1514,10 +1472,44 @@ mod tests {
     }
 
     #[test]
+    fn non_ghostty_provider_guard_binds_and_verifies_with_the_same_uniqueness_rule() {
+        let process_tree = ProcessTree::parse(single_herdr_process_list());
+        let outer_guard = OuterTerminalGuard {
+            process_id: 659,
+            surface: None,
+            terminal_tty: Some("ttys030".into()),
+        };
+        let client_guard =
+            ProviderClientGuard::bind(outer_guard.clone(), &process_tree, 19794, "herdr")
+                .expect("a unique provider on the captured tty must bind");
+        let runner = StaticSystemRunner {
+            ghostty_identity: "659\n",
+            process_list: single_herdr_process_list(),
+        };
+
+        assert!(client_guard.verify(&runner).is_ok());
+
+        let ambiguous_tree = ProcessTree::parse(
+            "659 1 ?? /Applications/Terminal.app/Contents/MacOS/Terminal\n\
+             755 659 ttys030 /usr/bin/login\n\
+             762 755 ttys030 -/bin/zsh\n\
+             19794 762 ttys030 herdr\n\
+             756 659 ttys031 /usr/bin/login\n\
+             763 756 ttys031 -/bin/zsh\n\
+             19795 763 ttys031 herdr\n",
+        );
+        assert_eq!(
+            ProviderClientGuard::bind(outer_guard, &ambiguous_tree, 19794, "herdr")
+                .expect_err("an ambiguous provider must fail during binding"),
+            "outer_terminal_provider_unmatched"
+        );
+    }
+
+    #[test]
     fn provider_guard_rejects_a_different_outer_surface() {
         let client_guard = bound_herdr_client_guard();
         let runner = StaticSystemRunner {
-            ghostty_identity: "659\nterminal-2\nherdr\n",
+            ghostty_identity: "659\nterminal-2\n",
             process_list: single_herdr_process_list(),
         };
 
@@ -1531,7 +1523,7 @@ mod tests {
     fn provider_guard_rejects_a_replaced_client_process() {
         let client_guard = bound_herdr_client_guard();
         let runner = StaticSystemRunner {
-            ghostty_identity: "659\nterminal-1\nherdr\n",
+            ghostty_identity: "659\nterminal-1\n",
             process_list: "659 1 ?? /Applications/Ghostty.app/Contents/MacOS/ghostty\n\
                  755 659 ttys030 /usr/bin/login\n\
                  762 755 ttys030 -/bin/zsh\n\
@@ -1587,7 +1579,6 @@ mod tests {
                 process_id: 659,
                 surface: Some(OuterTerminalSurface::Ghostty {
                     terminal_id: "terminal-1".into(),
-                    provider_title: "herdr".into(),
                 }),
                 terminal_tty: None,
             },
@@ -1609,8 +1600,8 @@ mod tests {
     }
 
     #[test]
-    fn tmux_client_format_keeps_process_pane_and_session_identity() {
-        let clients = parse_tmux_clients("/dev/ttys001\t421\t%7\twork\tproject shell\n");
+    fn tmux_client_format_uses_only_process_pane_and_session_identity() {
+        let clients = parse_tmux_clients("/dev/ttys001\t421\t%7\twork\n");
 
         assert_eq!(
             clients,
@@ -1618,7 +1609,6 @@ mod tests {
                 process_id: 421,
                 pane_id: "%7".into(),
                 session_id: "work".into(),
-                pane_title: "project shell".into(),
             }]
         );
     }
@@ -1672,10 +1662,10 @@ mod tests {
     }
 
     #[test]
-    fn zellij_pane_metadata_is_keyed_by_stable_pane_id() {
+    fn zellij_pane_metadata_does_not_require_a_mutable_title() {
         let panes = parse_zellij_panes(
             r#"[
-              {"id":3,"is_plugin":false,"title":"editor","pane_cwd":"/work"},
+              {"id":3,"is_plugin":false,"pane_cwd":"/work"},
               {"id":4,"is_plugin":true,"title":"status","pane_cwd":"/work"}
             ]"#,
         );
@@ -1684,7 +1674,6 @@ mod tests {
             panes,
             vec![ZellijPaneMetadata {
                 pane_id: "terminal_3".into(),
-                title: "editor".into(),
             }]
         );
     }
@@ -1755,7 +1744,6 @@ mod tests {
             process_id: ghostty_process_id,
             surface: Some(OuterTerminalSurface::Ghostty {
                 terminal_id: ghostty.terminal_id,
-                provider_title: ghostty.title,
             }),
             terminal_tty: None,
         };
