@@ -17,7 +17,10 @@
 use crate::mode_arbiter::HotkeyAction;
 use crate::AppState;
 use lumen_asr::{live_tap_channel, LIVE_TAP_CAPACITY};
-use lumen_core::{Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SummaryKind};
+use lumen_core::{
+    LiveAnnotation, Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SegmentChannel,
+    SummaryKind,
+};
 use lumen_dictionary::split_for_injection;
 use lumen_meeting::{
     export_meeting as render_export, process_meeting, CorrectionDict, DiarModels, ExportOutput,
@@ -1213,6 +1216,96 @@ pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<
         }
     }
     Ok(deleted)
+}
+
+// ----- live speaker annotations (L2) -------------------------------------
+//
+// While a meeting records, the user can mark "who is speaking" on individual
+// live caption lines. Speaker rows do not exist yet (the offline pipeline
+// creates them after stop), so each mark is persisted immediately as a
+// `live_annotations` row anchored to a time range on the meeting's unified
+// timeline plus its capture track. The offline pipeline reconciles them into
+// speaker attribution after stop (manual always wins).
+
+/// Annotate one live caption line with "who is speaking". Appends a new
+/// annotation row (repeat annotations on the same range are resolved
+/// last-write-wins by `created_at` at reconciliation time) and returns it.
+/// `segment_id` is the transient live segment id (e.g. `mic-3`) — used for
+/// tracing only, never persisted. `end_seconds` may be absent when the live
+/// line has not finalized yet. `identity_id` links an enrolled identity from
+/// the local voiceprint library; `display_name` is the name snapshot shown on
+/// the chip (required either way).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // the IPC payload is exactly these fields
+pub fn annotate_live_segment(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    segment_id: String,
+    start_seconds: f64,
+    end_seconds: Option<f64>,
+    channel: String,
+    identity_id: Option<String>,
+    display_name: String,
+) -> Result<LiveAnnotation, String> {
+    let meeting = parse_id(&meeting_id, "meeting")?;
+    let identity = identity_id
+        .as_deref()
+        .map(|id| parse_id(id, "identity"))
+        .transpose()?;
+    let name = display_name.trim();
+    if name.is_empty() {
+        return Err("说话人名字不能为空".to_string());
+    }
+    if !start_seconds.is_finite() || end_seconds.is_some_and(|end| !end.is_finite()) {
+        return Err("invalid annotation time range".to_string());
+    }
+    let annotation = LiveAnnotation::new(
+        meeting,
+        start_seconds,
+        end_seconds,
+        SegmentChannel::from_str_or_mic(&channel),
+        identity,
+        name,
+    );
+    with_store(&state, |s| {
+        s.add_live_annotation(&annotation)
+            .map_err(|e| e.to_string())
+    })?;
+    // Ids and times only — the annotated name is PII.
+    tracing::info!(
+        meeting_id = %meeting,
+        live_segment = %segment_id,
+        annotation_id = %annotation.id,
+        start_seconds,
+        "live speaker annotation saved"
+    );
+    Ok(annotation)
+}
+
+/// List a meeting's live annotations, oldest first — used by the recording
+/// view to restore chip labels after a remount.
+#[tauri::command]
+pub fn list_live_annotations(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<LiveAnnotation>, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    with_store(&state, |s| {
+        s.list_live_annotations(id).map_err(|e| e.to_string())
+    })
+}
+
+/// Delete one live annotation (the chip's "清除" action). Returns `true` if a
+/// row was deleted.
+#[tauri::command]
+pub fn delete_live_annotation(
+    state: State<'_, AppState>,
+    annotation_id: String,
+) -> Result<bool, String> {
+    let id = parse_id(&annotation_id, "annotation")?;
+    with_store(&state, |s| {
+        s.delete_live_annotation(id).map_err(|e| e.to_string())
+    })
 }
 
 /// Rename a speaker cluster (Speaker 3 → 李明). Returns `true` if updated.

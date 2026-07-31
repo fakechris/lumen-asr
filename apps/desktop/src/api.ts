@@ -14,6 +14,7 @@ import type {
   ExportPreset,
   Health,
   LearnCandidate,
+  LiveAnnotation,
   Meeting,
   MeetingDetail,
   MeetingRecordingResult,
@@ -530,6 +531,43 @@ export const api = {
 
   renameSpeaker: (speakerId: string, displayName: string) =>
     invoke<boolean>("rename_speaker", { speakerId, displayName }),
+
+  // ---- Live speaker annotations (L2) ------------------------------------
+  // Recording-time "who is speaking" marks on live caption lines. Persisted
+  // immediately; the offline pipeline reconciles them into speaker
+  // attribution after stop (manual always wins).
+
+  /** Annotate one live caption line. `segmentId` is the transient live
+   * segment id (tracing only); the persisted anchor is the unified-timeline
+   * range + track. Resolves the stored annotation row. */
+  annotateLiveSegment: (input: {
+    meetingId: string;
+    segmentId: string;
+    startSeconds: number;
+    endSeconds?: number | null;
+    channel: "mic" | "system";
+    identityId?: string | null;
+    displayName: string;
+  }) =>
+    invoke<LiveAnnotation>("annotate_live_segment", {
+      meetingId: input.meetingId,
+      segmentId: input.segmentId,
+      startSeconds: input.startSeconds,
+      endSeconds: input.endSeconds ?? null,
+      channel: input.channel,
+      identityId: input.identityId ?? null,
+      displayName: input.displayName,
+    }),
+
+  /** List a meeting's live annotations, oldest first (restores chip labels
+   * after a remount mid-recording). */
+  listLiveAnnotations: (meetingId: string) =>
+    invoke<LiveAnnotation[]>("list_live_annotations", { meetingId }),
+
+  /** Delete one live annotation (the chip's 清除 action). Resolves `true` if
+   * a row was deleted. */
+  deleteLiveAnnotation: (annotationId: string) =>
+    invoke<boolean>("delete_live_annotation", { annotationId }),
 
   // ---- Speaker voiceprint enrollment (M5) -------------------------------
   // The identity library is local-only (JSON under the Lumen identity dir);

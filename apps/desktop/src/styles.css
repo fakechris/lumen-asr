@@ -3331,6 +3331,87 @@ button.meeting-seg-text.seekable:hover {
   opacity: 0.85;
 }
 
+/* Per-line speaker-annotation chip (L2). Unannotated lines show a faint
+ * 标注 affordance that firms up on hover; an annotated line shows the name.
+ * The menu opens upward (the newest lines sit at the scroll bottom). */
+.meeting-live-annotate {
+  position: relative;
+  display: inline-block;
+  margin-left: 6px;
+}
+
+.meeting-live-chip {
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  font: inherit;
+  font-size: 0.68rem;
+  line-height: 1.5;
+  color: var(--text-muted, #8a8a8a);
+  opacity: 0.55;
+  cursor: pointer;
+  vertical-align: 1px;
+}
+
+.meeting-live-chip:hover {
+  opacity: 1;
+  border-color: var(--border);
+}
+
+.meeting-live-chip.named {
+  opacity: 1;
+  border-color: var(--border);
+  color: var(--accent, #4a7dbd);
+  background: var(--accent-dim, transparent);
+}
+
+.meeting-live-annotate-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 4px);
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  min-width: 130px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+}
+
+.meeting-live-annotate-menu button {
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 6px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.meeting-live-annotate-menu button:hover {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.meeting-live-annotate-input {
+  margin: 2px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card-soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.82rem;
+  min-width: 120px;
+}
+
 .meeting-live-empty {
   margin: 0;
   font-size: 0.8rem;
