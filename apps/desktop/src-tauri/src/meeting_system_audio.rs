@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use lumen_asr::{RecordingSummary, SystemTrackRecorder, SystemTrackSender};
+use lumen_asr::{LiveTapSender, RecordingSummary, SystemTrackRecorder, SystemTrackSender};
 use lumen_platform_macos::{SystemAudioCapture, SystemAudioSink};
 
 /// One live tap→WAV session for the active meeting recording.
@@ -41,11 +41,16 @@ impl MeetingSystemAudio {
     /// sample rate on success, or `None` when unavailable/failed — the caller
     /// records mic-only in that case (a warning is logged here).
     ///
+    /// `live` optionally fans a copy of each tap chunk out to the real-time
+    /// preview worker (bounded, non-blocking, timestamped on the meeting's
+    /// unified timeline). Only chunks the WAV writer accepted are forwarded,
+    /// so the live feed respects pause/finalize exactly like the file does.
+    ///
     /// The tap must be started before the WAV sink exists (the tap reports its
     /// native sample rate, which the WAV header needs), so the capture sink
     /// forwards through a late-bound slot; the handful of callbacks that can
     /// fire before the slot is filled are dropped (a few ms at session start).
-    pub fn start(&self, out_path: PathBuf) -> Option<u32> {
+    pub fn start(&self, out_path: PathBuf, live: Option<LiveTapSender>) -> Option<u32> {
         let mut guard = match self.inner.lock() {
             Ok(guard) => guard,
             Err(_) => {
@@ -63,7 +68,14 @@ impl MeetingSystemAudio {
         let sink: SystemAudioSink = Arc::new(move |samples: &[f32]| {
             if let Ok(sender) = sink_slot.lock() {
                 if let Some(sender) = sender.as_ref() {
-                    sender.push(samples);
+                    // WAV first (authoritative). Its `push` returns `false`
+                    // while paused/finalized, which also gates the live copy —
+                    // the preview never hears audio the file did not keep.
+                    if sender.push(samples) {
+                        if let Some(live) = live.as_ref() {
+                            live.push(samples);
+                        }
+                    }
                 }
             }
         });

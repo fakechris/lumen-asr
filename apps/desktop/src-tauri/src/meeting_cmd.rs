@@ -16,6 +16,7 @@
 
 use crate::mode_arbiter::HotkeyAction;
 use crate::AppState;
+use lumen_asr::{live_tap_channel, LIVE_TAP_CAPACITY};
 use lumen_core::{Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SummaryKind};
 use lumen_dictionary::split_for_injection;
 use lumen_meeting::{
@@ -26,8 +27,47 @@ use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
+
+/// Unified-timeline sidecar written next to a meeting's WAVs as
+/// `<meeting-id>.timeline.json`. Records where each track's WAV begins
+/// relative to the meeting's shared `t0` (the `Instant` taken at recording
+/// start) plus `t0`'s wall-clock, so downstream passes can line the two
+/// tracks up without guessing.
+///
+/// The offsets are measured when each capture reports "started" — close, but
+/// not sample-exact. Later work (echo suppression between the tracks,
+/// aligning live-caption annotations with the offline transcript) reads this
+/// sidecar and can tighten the alignment; the format stays additive metadata,
+/// never a DB schema change.
+#[derive(Debug, Serialize)]
+struct MeetingTimeline {
+    /// Seconds from `t0` until the mic recorder was capturing.
+    mic_offset_seconds: f64,
+    /// Seconds from `t0` until the system-audio tap was capturing; absent on
+    /// mic-only meetings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_offset_seconds: Option<f64>,
+    /// RFC 3339 wall-clock timestamp of `t0`.
+    t0_wall_clock: String,
+}
+
+/// Best-effort sidecar write: a failure only costs the alignment metadata,
+/// never the recording.
+fn write_timeline_sidecar(path: &Path, timeline: &MeetingTimeline) {
+    let json = match serde_json::to_string_pretty(timeline) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not serialize meeting timeline sidecar");
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(path, json) {
+        tracing::warn!(path = %path.display(), error = %e, "could not write meeting timeline sidecar");
+    }
+}
 
 fn with_store<T>(
     state: &State<'_, AppState>,
@@ -125,35 +165,44 @@ pub fn start_meeting_recording(
     let out_path = dir.join(format!("{meeting_id}.wav"));
 
     // 4. Start the independent continuous recorder. When the real-time layer is
-    //    engaged (macOS + streaming Paraformer installed), attach an audio
-    //    fan-out so the streaming worker can transcribe live; otherwise record
-    //    plainly (no sink → zero extra work in the audio callback).
+    //    engaged (macOS + streaming Paraformer installed), attach a bounded
+    //    audio fan-out so the streaming worker can transcribe live; otherwise
+    //    record plainly (no sink → zero extra work in the audio callback).
+    //
+    //    `t0` is the meeting's **unified timeline origin**: one `Instant`
+    //    shared by every track. Fan-out packets are stamped against it at
+    //    callback-arrival time, and each track's WAV start offset below is
+    //    measured from it.
     let device = preferred_device(&state);
     let streaming_dir = crate::meeting_live::streaming_dir_if_ready();
-    let (sample_sink, sample_rx) = if streaming_dir.is_some() {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
-        (Some(tx), Some(rx))
+    let t0 = Instant::now();
+    let t0_wall_clock = chrono::Utc::now().to_rfc3339();
+    let (mic_tap, mic_rx) = if streaming_dir.is_some() {
+        let (tap, rx) = live_tap_channel("mic", t0, LIVE_TAP_CAPACITY);
+        (Some(tap), Some(rx))
     } else {
         (None, None)
     };
-    let sample_rate = match state
-        .meeting_recorder
-        .start_with_sink(device, out_path, sample_sink)
-    {
-        Ok(rate) => rate,
-        Err(e) => {
-            // Roll back: mark failed and release the arbiter. No hotkey suspend
-            // was applied yet, so nothing to restore. `sample_rx` drops here,
-            // so no worker is left dangling.
-            state.capture.force_idle();
-            let reason = format!("could not start recording: {e}");
-            let _ = with_store(&state, |s| {
-                s.fail_meeting(meeting_id, Some(&reason))
-                    .map_err(|e| e.to_string())
-            });
-            return Err(reason);
-        }
-    };
+    let sample_rate =
+        match state
+            .meeting_recorder
+            .start_with_sink(device, out_path.clone(), mic_tap)
+        {
+            Ok(rate) => rate,
+            Err(e) => {
+                // Roll back: mark failed and release the arbiter. No hotkey suspend
+                // was applied yet, so nothing to restore. `mic_rx` drops here,
+                // so no worker is left dangling.
+                state.capture.force_idle();
+                let reason = format!("could not start recording: {e}");
+                let _ = with_store(&state, |s| {
+                    s.fail_meeting(meeting_id, Some(&reason))
+                        .map_err(|e| e.to_string())
+                });
+                return Err(reason);
+            }
+        };
+    let mic_offset_seconds = t0.elapsed().as_secs_f64();
 
     // 5. Optional second track: system audio output (remote participants) via
     //    the macOS Core Audio process tap. Strictly best-effort and
@@ -161,18 +210,35 @@ pub fn start_meeting_recording(
     //    (< 14.2), the permission is denied, or anything else fails, the
     //    session logs a warning and the meeting records mic-only exactly as
     //    before. The mic path above is already live and is never touched.
-    let system_audio_enabled = state
+    //    When the live layer is engaged (and `system_live_preview` opted in),
+    //    the tap additionally fans out to the live worker as the "system"
+    //    (远端) track.
+    let (system_audio_enabled, system_live_preview) = state
         .config
         .lock()
-        .map(|cfg| cfg.meeting.system_audio)
-        .unwrap_or(true);
+        .map(|cfg| (cfg.meeting.system_audio, cfg.meeting.system_live_preview))
+        .unwrap_or((true, true));
+    let mut system_feed: Option<crate::meeting_live::LiveTrackFeed> = None;
+    let mut system_offset_seconds: Option<f64> = None;
     if system_audio_enabled {
+        let (system_tap, system_rx) = if streaming_dir.is_some() && system_live_preview {
+            let (tap, rx) = live_tap_channel("system", t0, LIVE_TAP_CAPACITY);
+            (Some(tap), Some(rx))
+        } else {
+            (None, None)
+        };
         let system_path = dir.join(format!("{meeting_id}.system.wav"));
-        if state
+        if let Some(system_rate) = state
             .meeting_system_audio
-            .start(system_path.clone())
-            .is_some()
+            .start(system_path.clone(), system_tap)
         {
+            system_offset_seconds = Some(t0.elapsed().as_secs_f64());
+            if let Some(rx) = system_rx {
+                system_feed = Some(crate::meeting_live::LiveTrackFeed {
+                    rx,
+                    capture_rate: system_rate,
+                });
+            }
             // Record the path up front so crash recovery can salvage the
             // system track too. Best-effort: a store failure only loses the
             // system track, never the recording.
@@ -184,13 +250,35 @@ pub fn start_meeting_recording(
                 tracing::warn!(meeting_id = %meeting_id, error = %e, "could not record system audio path");
             }
         }
+        // `system_rx` (when the tap failed to start) drops here, so the live
+        // worker sees an immediately-disconnected system feed — i.e. none.
     }
+
+    // Persist the unified-timeline sidecar next to the meeting WAVs. Purely
+    // additive metadata (no schema change), best-effort like the tracks.
+    write_timeline_sidecar(
+        &out_path.with_extension("timeline.json"),
+        &MeetingTimeline {
+            mic_offset_seconds,
+            system_offset_seconds,
+            t0_wall_clock,
+        },
+    );
 
     // 6. Recording is live — spawn the live-transcript worker (if streaming) and
     //    suspend the dictation hotkey. A live-worker failure never fails the
     //    recording: the worker itself degrades to "no live text" on any error.
-    if let (Some(dir), Some(rx)) = (streaming_dir, sample_rx) {
-        state.meeting_live.start(app.clone(), rx, sample_rate, dir);
+    if let (Some(streaming), Some(rx)) = (streaming_dir, mic_rx) {
+        state.meeting_live.start(
+            app.clone(),
+            meeting_id.to_string(),
+            streaming,
+            crate::meeting_live::LiveTrackFeed {
+                rx,
+                capture_rate: sample_rate,
+            },
+            system_feed,
+        );
     }
     apply_hotkey_action(&app, action);
 
@@ -1088,6 +1176,14 @@ pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<
     })?;
     let deleted = with_store(&state, |s| s.delete_meeting(id).map_err(|e| e.to_string()))?;
     if deleted {
+        // The timeline sidecar sits next to the mic WAV; sweep it with the
+        // audio (best-effort, missing is fine).
+        if let Some(mic) = audio_path.as_deref() {
+            let sidecar = Path::new(mic).with_extension("timeline.json");
+            if sidecar.exists() {
+                let _ = std::fs::remove_file(&sidecar);
+            }
+        }
         for path in [audio_path, system_audio_path].into_iter().flatten() {
             let wav = Path::new(&path);
             if wav.exists() {
@@ -1365,7 +1461,56 @@ pub fn export_meeting(
 
 #[cfg(test)]
 mod tests {
-    use super::merge_attendees_into_notes;
+    use super::{merge_attendees_into_notes, write_timeline_sidecar, MeetingTimeline};
+
+    #[test]
+    fn timeline_sidecar_serializes_offsets_and_wall_clock() {
+        let dual = serde_json::to_string(&MeetingTimeline {
+            mic_offset_seconds: 0.012,
+            system_offset_seconds: Some(0.45),
+            t0_wall_clock: "2026-01-01T00:00:00+00:00".into(),
+        })
+        .unwrap();
+        assert!(dual.contains("\"mic_offset_seconds\":0.012"));
+        assert!(dual.contains("\"system_offset_seconds\":0.45"));
+        assert!(dual.contains("\"t0_wall_clock\":\"2026-01-01T00:00:00+00:00\""));
+
+        // Mic-only meetings omit the system offset instead of writing null.
+        let mic_only = serde_json::to_string(&MeetingTimeline {
+            mic_offset_seconds: 0.01,
+            system_offset_seconds: None,
+            t0_wall_clock: "2026-01-01T00:00:00+00:00".into(),
+        })
+        .unwrap();
+        assert!(!mic_only.contains("system_offset_seconds"));
+    }
+
+    #[test]
+    fn timeline_sidecar_write_is_best_effort_and_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.timeline.json");
+        write_timeline_sidecar(
+            &path,
+            &MeetingTimeline {
+                mic_offset_seconds: 0.02,
+                system_offset_seconds: Some(0.3),
+                t0_wall_clock: "2026-01-01T00:00:00+00:00".into(),
+            },
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["mic_offset_seconds"], 0.02);
+        assert_eq!(parsed["system_offset_seconds"], 0.3);
+        // A failing write (unwritable directory) must not panic.
+        write_timeline_sidecar(
+            &dir.path().join("missing").join("m.timeline.json"),
+            &MeetingTimeline {
+                mic_offset_seconds: 0.0,
+                system_offset_seconds: None,
+                t0_wall_clock: String::new(),
+            },
+        );
+    }
 
     fn attendees(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| n.to_string()).collect()

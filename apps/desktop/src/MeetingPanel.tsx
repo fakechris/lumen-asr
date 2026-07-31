@@ -717,24 +717,51 @@ function RecordingBar({
           </button>
         </span>
       </div>
-      <LiveTranscript models={models} />
+      <LiveTranscript meetingId={meetingId} models={models} />
     </div>
   );
 }
 
 // Rolling live transcript (P3). Listens for `meeting-live-transcript` events
-// emitted by the streaming Paraformer worker while recording: finalized
-// segments accumulate as fixed lines; the in-progress partial trails greyed at
-// the end. If the streaming model is not installed (or the platform is not
-// macOS), no events ever arrive and a muted hint is shown instead — the
-// recording and the offline final transcript are unaffected either way.
-type LiveEvent = { text: string; isFinal: boolean; seq: number };
+// emitted by the streaming worker while recording. Events are **revisable
+// segments** on the meeting's unified timeline: each carries a stable
+// `segmentId` per utterance per track (mic = 现场, system = 远端), partials
+// re-emit the same id with an increasing `revision` (rendered greyed,
+// updated in place), and the finalizing event fixes the line (an empty final
+// retracts it). Rendering keeps a Map of the latest event per segment,
+// ordered by `startSeconds`. If the streaming model is not installed (or the
+// platform is not macOS), no events ever arrive and a muted hint is shown
+// instead — the recording and the offline final transcript are unaffected
+// either way.
+type LiveEvent = {
+  meetingId: string;
+  segmentId: string;
+  revision: number;
+  track: "mic" | "system";
+  startSeconds: number;
+  endSeconds?: number;
+  text: string;
+  isFinal: boolean;
+  /** Speaker attribution placeholder — never set by the live layer yet. */
+  speaker?: string;
+};
 
-function LiveTranscript({ models }: { models: MeetingModels }) {
-  // Finalized segment lines, in order.
-  const [finals, setFinals] = useState<string[]>([]);
-  // The current rolling partial (not yet finalized).
-  const [partial, setPartial] = useState("");
+const LIVE_TRACK_LABEL: Record<LiveEvent["track"], string> = {
+  mic: "现场",
+  system: "远端",
+};
+
+function LiveTranscript({
+  meetingId,
+  models,
+}: {
+  meetingId: string;
+  models: MeetingModels;
+}) {
+  // Latest event per segmentId (revision-guarded).
+  const [segments, setSegments] = useState<Map<string, LiveEvent>>(
+    () => new Map(),
+  );
   // Whether we've received any event at all (distinguishes "no model" from
   // "recording started, nothing said yet").
   const [active, setActive] = useState(false);
@@ -745,14 +772,19 @@ function LiveTranscript({ models }: { models: MeetingModels }) {
     let disposed = false;
     void listen<LiveEvent>("meeting-live-transcript", (e) => {
       const p = e.payload;
+      if (p.meetingId !== meetingId) return; // stale worker / other recording
       setActive(true);
-      if (p.isFinal) {
-        const t = p.text.trim();
-        if (t) setFinals((prev) => [...prev, t]);
-        setPartial("");
-      } else {
-        setPartial(p.text);
-      }
+      setSegments((prev) => {
+        const current = prev.get(p.segmentId);
+        if (current && current.revision >= p.revision) return prev; // out of order
+        const next = new Map(prev);
+        if (p.isFinal && !p.text.trim()) {
+          next.delete(p.segmentId); // retracted segment
+        } else {
+          next.set(p.segmentId, p);
+        }
+        return next;
+      });
     }).then((fn) => {
       if (disposed) fn();
       else un = fn;
@@ -761,13 +793,24 @@ function LiveTranscript({ models }: { models: MeetingModels }) {
       disposed = true;
       un?.();
     };
-  }, []);
+  }, [meetingId]);
+
+  // Unified-timeline order across both tracks (id as a stable tiebreak).
+  const ordered = useMemo(
+    () =>
+      [...segments.values()].sort(
+        (a, b) =>
+          a.startSeconds - b.startSeconds ||
+          a.segmentId.localeCompare(b.segmentId),
+      ),
+    [segments],
+  );
 
   // Keep the newest text in view.
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [finals, partial]);
+  }, [ordered]);
 
   return (
     <div className="meeting-live" aria-live="polite">
@@ -781,16 +824,24 @@ function LiveTranscript({ models }: { models: MeetingModels }) {
       <div className="meeting-live-body" ref={scrollRef}>
         {active ? (
           <div className="meeting-live-text">
-            {finals.map((line, i) => (
-              <p key={i} className="meeting-live-final">
-                {line}
+            {ordered.map((seg) => (
+              <p
+                key={seg.segmentId}
+                className={
+                  seg.isFinal ? "meeting-live-final" : "meeting-live-partial"
+                }
+              >
+                <span
+                  className={`meeting-live-track meeting-live-track-${seg.track}`}
+                >
+                  {LIVE_TRACK_LABEL[seg.track]}
+                </span>
+                {seg.text}
               </p>
             ))}
-            {partial ? (
-              <p className="meeting-live-partial">{partial}</p>
-            ) : finals.length === 0 ? (
+            {ordered.length === 0 && (
               <p className="muted-text meeting-live-listening">正在聆听…</p>
-            ) : null}
+            )}
           </div>
         ) : models.status?.paraformerStreamingReady ? (
           <p className="muted-text meeting-live-empty">正在聆听…</p>
