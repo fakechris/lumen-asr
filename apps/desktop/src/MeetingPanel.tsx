@@ -2316,23 +2316,28 @@ function MeetingSideInfo({
   const [selfIdentityId, setSelfIdentityId] = useState<string | null>(null);
 
   const refreshEnrollment = useCallback(async () => {
-    // Supplementary info: a load failure hides the enroll affordances but must
-    // never block the participants list itself.
-    try {
-      const [prints, identities, selfId] = await Promise.all([
-        api.getMeetingVoiceprints(meetingId),
-        api.listEnrolledSpeakers(),
-        api.getSelfIdentity(),
-      ]);
+    // Supplementary info: each read degrades independently (allSettled) so one
+    // failure only hides its own affordance — the participants list and the
+    // other voiceprint data still render; the first failure is surfaced.
+    const [prints, identities, selfId] = await Promise.allSettled([
+      api.getMeetingVoiceprints(meetingId),
+      api.listEnrolledSpeakers(),
+      api.getSelfIdentity(),
+    ]);
+    if (prints.status === "fulfilled") {
       setVoiceprints(
-        Object.fromEntries(prints.map((p) => [p.speakerId, p.hasEmbedding])),
+        Object.fromEntries(
+          prints.value.map((p) => [p.speakerId, p.hasEmbedding]),
+        ),
       );
-      setEnrolled(identities);
-      setSelfIdentityId(selfId);
-    } catch (e) {
-      console.warn("voiceprint info load failed", e);
     }
-  }, [meetingId]);
+    if (identities.status === "fulfilled") setEnrolled(identities.value);
+    if (selfId.status === "fulfilled") setSelfIdentityId(selfId.value);
+    const failed = [prints, identities, selfId].find(
+      (r): r is PromiseRejectedResult => r.status === "rejected",
+    );
+    if (failed) onError(String(failed.reason));
+  }, [meetingId, onError]);
 
   /** Mark an enrolled identity as the user themself (or clear the mark).
    * Live captions and future meetings then render this person as "我". */

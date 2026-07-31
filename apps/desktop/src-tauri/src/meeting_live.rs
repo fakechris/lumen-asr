@@ -480,12 +480,17 @@ impl LiveVerifier {
 /// same identity, *subsequent* provisional hits on that track may display as
 /// verified. Only actually-matched segments are ever revised; a differing
 /// identity resets the streak, while skipped/short utterances (no report)
-/// leave it untouched. Pure and unit-testable.
+/// leave it untouched. Pure and unit-testable — kept un-gated (like
+/// [`EmbedJob`]) so the rule is tested on every platform; its only non-test
+/// caller is the macOS embedder thread, hence the dead-code allowance
+/// elsewhere.
 #[derive(Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct VerificationStreak {
     by_track: std::collections::HashMap<&'static str, (Uuid, u32)>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl VerificationStreak {
     /// Record a hit for `identity` on `track`; returns `true` when a
     /// provisional hit may display as verified (streak established *before*

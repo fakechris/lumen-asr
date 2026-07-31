@@ -3386,7 +3386,7 @@ button.meeting-seg-text.seekable:hover {
 
 .meeting-live-chip.voiceprint.provisional {
   opacity: 0.6;
-  color: var(--text-muted, #8a8a8a);
+  color: var(--muted);
 }
 
 /* Positioned `fixed` from the chip's viewport rect at open time (inline
