@@ -1522,6 +1522,38 @@ pub fn remove_enrolled_speaker(identity_id: String) -> Result<bool, String> {
     identities.remove(id).map_err(|e| format!("remove: {e}"))
 }
 
+/// Read the enrolled identity marked as *the user themself* ("这是我"), if
+/// any. Rendering hint only: the UI shows "我" when attribution matches it.
+#[tauri::command]
+pub fn get_self_identity(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    Ok(cfg.meeting.self_identity_id.clone())
+}
+
+/// Set (or clear, with `None`) which enrolled identity is the user themself.
+/// Validates the id shape; pointing at a since-removed identity is harmless
+/// (it simply never matches). Returns the stored value.
+#[tauri::command]
+pub fn set_self_identity(
+    state: State<'_, AppState>,
+    identity_id: Option<String>,
+) -> Result<Option<String>, String> {
+    let identity_id = match identity_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(value) => Some(parse_id(value, "identity")?.to_string()),
+    };
+    let mut cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    cfg.meeting.self_identity_id = identity_id.clone();
+    cfg.save()?;
+    Ok(identity_id)
+}
+
 /// Report which of a meeting's speakers have a stored voiceprint embedding, so
 /// the UI can offer "注册声纹" only where enrollment is actually possible.
 #[tauri::command]

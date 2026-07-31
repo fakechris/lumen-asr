@@ -734,6 +734,17 @@ function RecordingBar({
 // platform is not macOS), no events ever arrive and a muted hint is shown
 // instead — the recording and the offline final transcript are unaffected
 // either way.
+/** Voiceprint speaker attribution appended by the live verifier (L3) as an
+ * extra revision of a finalized segment. Manual chip annotations (L2) always
+ * take display precedence over this. */
+type LiveSpeakerAttribution = {
+  identityId: string;
+  displayName: string;
+  source: "voiceprint";
+  /** true → tentative ("李明?"), false → auto-verified. */
+  provisional: boolean;
+};
+
 type LiveEvent = {
   meetingId: string;
   segmentId: string;
@@ -743,8 +754,8 @@ type LiveEvent = {
   endSeconds?: number;
   text: string;
   isFinal: boolean;
-  /** Speaker attribution placeholder — never set by the live layer yet. */
-  speaker?: string;
+  /** Set only on the verifier's attribution revision; absent otherwise. */
+  speaker?: LiveSpeakerAttribution;
 };
 
 const LIVE_TRACK_LABEL: Record<LiveEvent["track"], string> = {
@@ -808,6 +819,7 @@ function LiveTranscript({
   // immediately; the offline pipeline applies it to the final transcript.
   const [identities, setIdentities] = useState<EnrolledSpeaker[]>([]);
   const [annotations, setAnnotations] = useState<LiveAnnotation[]>([]);
+  const [selfIdentityId, setSelfIdentityId] = useState<string | null>(null);
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [customFor, setCustomFor] = useState<string | null>(null);
   const [customName, setCustomName] = useState("");
@@ -820,6 +832,13 @@ function LiveTranscript({
       .listEnrolledSpeakers()
       .then((list) => {
         if (!disposed) setIdentities(list);
+      })
+      .catch(() => {});
+    // "这是我" rendering hint; a failed read just shows the real name.
+    void api
+      .getSelfIdentity()
+      .then((id) => {
+        if (!disposed) setSelfIdentityId(id);
       })
       .catch(() => {});
     void api
@@ -956,6 +975,16 @@ function LiveTranscript({
               const named = seg.isFinal
                 ? annotationForLine(annotations, seg)
                 : null;
+              // Chip display priority: manual annotation (L2) > voiceprint
+              // attribution (L3, "我" when it is the self identity, "?" when
+              // provisional) > the bare 标注 affordance.
+              const voiceprint = named ? null : (seg.speaker ?? null);
+              const voiceprintName = voiceprint
+                ? (voiceprint.identityId === selfIdentityId
+                    ? "我"
+                    : voiceprint.displayName) +
+                  (voiceprint.provisional ? "?" : "")
+                : null;
               return (
                 <p
                   key={seg.segmentId}
@@ -973,7 +1002,13 @@ function LiveTranscript({
                     <span className="meeting-live-annotate">
                       <button
                         type="button"
-                        className={`meeting-live-chip${named ? " named" : ""}`}
+                        className={`meeting-live-chip${
+                          named
+                            ? " named"
+                            : voiceprint
+                              ? ` voiceprint${voiceprint.provisional ? " provisional" : ""}`
+                              : ""
+                        }`}
                         title="标注这句话是谁在说"
                         onClick={() => {
                           if (menuFor === seg.segmentId) closeMenus();
@@ -984,7 +1019,7 @@ function LiveTranscript({
                           }
                         }}
                       >
-                        {named ? named.display_name : "标注"}
+                        {named ? named.display_name : (voiceprintName ?? "标注")}
                       </button>
                       {menuFor === seg.segmentId && (
                         <span className="meeting-live-annotate-menu" role="menu">
@@ -2144,22 +2179,41 @@ function MeetingSideInfo({
 
   const meetingId = detail.meeting.id;
 
+  const [selfIdentityId, setSelfIdentityId] = useState<string | null>(null);
+
   const refreshEnrollment = useCallback(async () => {
     // Supplementary info: a load failure hides the enroll affordances but must
     // never block the participants list itself.
     try {
-      const [prints, identities] = await Promise.all([
+      const [prints, identities, selfId] = await Promise.all([
         api.getMeetingVoiceprints(meetingId),
         api.listEnrolledSpeakers(),
+        api.getSelfIdentity(),
       ]);
       setVoiceprints(
         Object.fromEntries(prints.map((p) => [p.speakerId, p.hasEmbedding])),
       );
       setEnrolled(identities);
+      setSelfIdentityId(selfId);
     } catch (e) {
       console.warn("voiceprint info load failed", e);
     }
   }, [meetingId]);
+
+  /** Mark an enrolled identity as the user themself (or clear the mark).
+   * Live captions and future meetings then render this person as "我". */
+  const toggleSelf = useCallback(
+    async (identityId: string) => {
+      onError(null);
+      try {
+        const next = selfIdentityId === identityId ? null : identityId;
+        setSelfIdentityId(await api.setSelfIdentity(next));
+      } catch (e) {
+        onError(String(e));
+      }
+    },
+    [selfIdentityId, onError],
+  );
 
   useEffect(() => {
     void refreshEnrollment();
@@ -2332,7 +2386,27 @@ function MeetingSideInfo({
                 <li key={identity.id} className="meeting-voiceprint-item">
                   <span className="meeting-voiceprint-name">
                     {identity.name}
+                    {selfIdentityId === identity.id && (
+                      <span
+                        className="meeting-voiceprint-self"
+                        title="这是你自己：实时字幕与识别结果将显示为「我」"
+                      >
+                        我
+                      </span>
+                    )}
                   </span>
+                  <button
+                    type="button"
+                    className="btn small"
+                    title={
+                      selfIdentityId === identity.id
+                        ? "取消「这是我」标记"
+                        : "把这个声纹标记为你自己，识别到时显示「我」"
+                    }
+                    onClick={() => void toggleSelf(identity.id)}
+                  >
+                    {selfIdentityId === identity.id ? "取消我" : "这是我"}
+                  </button>
                   <button
                     type="button"
                     className="btn small"
