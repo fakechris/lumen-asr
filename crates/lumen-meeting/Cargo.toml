@@ -9,6 +9,9 @@ description = "Offline meeting pipeline (M2): diarize a wav, transcribe each tur
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# Blocking-pool offload for the CPU-heavy echo cross-correlation pass, so it
+# cannot starve the caller's async runtime (works on current-thread runtimes).
+tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
@@ -44,5 +47,4 @@ diarize = ["dep:diar-rs"]
 [dev-dependencies]
 lumen-asr-engine = { workspace = true }
 async-trait = { workspace = true }
-tokio = { version = "1", features = ["rt", "macros"] }
 tempfile = "3"

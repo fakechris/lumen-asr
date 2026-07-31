@@ -90,6 +90,12 @@ const XCORR_WINDOW_MAX_S: f64 = 2.0;
 /// correlate reliably → evidence missing, segment kept.
 const XCORR_MIN_WINDOW_SAMPLES: usize = 4_000;
 
+/// How many leading characters of a segment's text the diagnostics sidecar may
+/// carry. The sidecar is plain-text JSON on disk, so it must never duplicate
+/// the meeting transcript — a short preview is only for lining an entry up
+/// with the stored segment.
+const DIAGNOSTIC_PREVIEW_CHARS: usize = 8;
+
 /// A mic/system segment pair that passed evidence 1–3 (delay window, coverage,
 /// text similarity) and awaits the audio check.
 #[derive(Debug, Clone, PartialEq)]
@@ -118,6 +124,12 @@ pub(crate) struct TextEvidence {
 
 /// Diagnostic record for one evaluated candidate pair — everything needed to
 /// audit why a segment was (or was not) suppressed.
+///
+/// Privacy: the sidecar is an unmanaged plain-text JSON file next to the
+/// meeting audio, so it must **not** contain the verbatim transcript. Text is
+/// summarized as a character count plus a short
+/// ([`DIAGNOSTIC_PREVIEW_CHARS`]) preview — enough to line an entry up with
+/// the stored transcript segment without duplicating meeting content on disk.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EchoDiagnosticEntry {
     pub mic_index: usize,
@@ -126,8 +138,15 @@ pub(crate) struct EchoDiagnosticEntry {
     pub mic_end: f64,
     pub system_start: f64,
     pub system_end: f64,
-    pub mic_text: String,
-    pub system_text: String,
+    /// Character count of the mic segment's text (not the text itself).
+    pub mic_text_chars: usize,
+    /// Character count of the system segment's text (not the text itself).
+    pub system_text_chars: usize,
+    /// First few characters of the mic text, for lining the entry up with the
+    /// transcript.
+    pub mic_text_preview: String,
+    /// First few characters of the system text.
+    pub system_text_preview: String,
     pub delay_s: f64,
     pub coverage: f64,
     pub text_similarity: f64,
@@ -182,6 +201,12 @@ fn normalize_text(text: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+/// Truncated preview of a segment's text for the diagnostics sidecar (never
+/// the full text — see [`EchoDiagnosticEntry`]).
+fn text_preview(text: &str) -> String {
+    text.chars().take(DIAGNOSTIC_PREVIEW_CHARS).collect()
 }
 
 /// Character-level Levenshtein distance (two-row DP).
@@ -381,8 +406,10 @@ pub(crate) fn evaluate_candidates(
             mic_end: mic.end,
             system_start: system.start,
             system_end: system.end,
-            mic_text: mic_texts[candidate.mic_index].clone(),
-            system_text: system_texts[candidate.system_index].clone(),
+            mic_text_chars: mic_texts[candidate.mic_index].chars().count(),
+            system_text_chars: system_texts[candidate.system_index].chars().count(),
+            mic_text_preview: text_preview(&mic_texts[candidate.mic_index]),
+            system_text_preview: text_preview(&system_texts[candidate.system_index]),
             delay_s: candidate.delay_s,
             coverage: candidate.coverage,
             text_similarity: candidate.text_similarity,
@@ -1003,10 +1030,18 @@ mod tests {
         // Sidecar lands next to the mic wav, namespaced by its stem.
         let sidecar = write_diagnostics_sidecar(&result.diagnostics, &mic_wav).unwrap();
         assert_eq!(sidecar, dir.path().join("meeting.echo_suppression.json"));
-        let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        let raw = std::fs::read_to_string(&sidecar).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(json["suppressed"], 1);
         assert_eq!(json["entries"][0]["suppressed"], true);
+        // Privacy: the sidecar carries only lengths and a short preview,
+        // never the verbatim transcript text.
+        assert!(!raw.contains(line), "sidecar must not contain full text");
+        assert_eq!(json["entries"][0]["mic_text_chars"], line.chars().count());
+        assert_eq!(
+            json["entries"][0]["mic_text_preview"],
+            line.chars().take(8).collect::<String>()
+        );
     }
 
     #[test]

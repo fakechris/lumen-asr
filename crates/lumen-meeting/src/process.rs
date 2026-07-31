@@ -210,22 +210,52 @@ async fn run(
     let mut mic_take = mic_take;
     if opts.echo_suppression {
         if let (Some((system, _)), Some(sys_wav)) = (system_take.as_ref(), system_wav) {
-            let result = crate::echo::suppress_cross_track_echoes(&mic_take, system, wav, sys_wav);
-            tracing::info!(
-                meeting_id = %meeting_id,
-                candidates = result.diagnostics.candidates,
-                suppressed = result.diagnostics.suppressed,
-                "cross-track echo suppression evaluated"
-            );
-            if let Err(err) = crate::echo::write_diagnostics_sidecar(&result.diagnostics, wav) {
-                tracing::warn!(
-                    meeting_id = %meeting_id,
-                    error = %err,
-                    "could not write echo suppression diagnostics sidecar"
+            // The cross-correlation is CPU-bound (hundreds of millions of
+            // multiply-adds per candidate pair) and the sidecar write is file
+            // IO, so both run on the blocking pool rather than starving the
+            // caller's async runtime. Fail-open extends to the offload itself:
+            // a panicked/cancelled task keeps every mic segment.
+            let mic_clone = mic_take.clone();
+            let system_clone = system.clone();
+            let mic_wav = wav.to_path_buf();
+            let sys_wav = sys_wav.to_path_buf();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let result = crate::echo::suppress_cross_track_echoes(
+                    &mic_clone,
+                    &system_clone,
+                    &mic_wav,
+                    &sys_wav,
                 );
-            }
-            if result.diagnostics.suppressed > 0 {
-                mic_take = crate::echo::filter_track_take(&mic_take, &result.keep);
+                if let Err(err) =
+                    crate::echo::write_diagnostics_sidecar(&result.diagnostics, &mic_wav)
+                {
+                    tracing::warn!(
+                        error = %err,
+                        "could not write echo suppression diagnostics sidecar"
+                    );
+                }
+                result
+            })
+            .await;
+            match outcome {
+                Ok(result) => {
+                    tracing::info!(
+                        meeting_id = %meeting_id,
+                        candidates = result.diagnostics.candidates,
+                        suppressed = result.diagnostics.suppressed,
+                        "cross-track echo suppression evaluated"
+                    );
+                    if result.diagnostics.suppressed > 0 {
+                        mic_take = crate::echo::filter_track_take(&mic_take, &result.keep);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        meeting_id = %meeting_id,
+                        error = %err,
+                        "echo suppression task failed; keeping all mic segments"
+                    );
+                }
             }
         }
     }

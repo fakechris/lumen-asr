@@ -89,7 +89,7 @@ pub struct MeetingOptions {
     /// dual-track merge: without headphones the remote voice plays through the
     /// loudspeaker, is picked up by the mic again, and would appear twice in
     /// the final transcript. Multi-evidence (delay window + time coverage +
-    /// text similarity + audio cross-correlation, see [`crate::echo`]) and
+    /// text similarity + audio cross-correlation, see the private `echo` module) and
     /// fail-open: any missing evidence keeps the segment. Only meaningful for
     /// dual-track meetings; the mic-only pipeline never consults it. `Default`
     /// is `false` — the app layer sets it from config
