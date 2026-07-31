@@ -13,6 +13,7 @@ import { Icon } from "./Icons";
 import { diarGuidance, isNoLlmMarker } from "./meetingGuidance";
 import type {
   ActionItem,
+  EnrolledSpeaker,
   ExportPreset,
   Meeting,
   MeetingDetail,
@@ -1866,7 +1867,14 @@ function MinutesIndex({
  * Enter/保存 to commit (calls `rename_speaker`), Escape to cancel. A speaker with
  * a name reads as "已确认"; a blank name reverts it to the engine label + "未确认".
  * The commit patches the parent detail in place (`onRenamed`) so the transcript
- * and this list re-label the speaker at once, without a reload. */
+ * and this list re-label the speaker at once, without a reload.
+ *
+ * Voiceprint enrollment (M5): a confirmed speaker whose cluster has a stored
+ * embedding gets a "注册声纹" action — enrolling stores the voiceprint in the
+ * local identity library so later meetings auto-assign the name. Speakers whose
+ * name is already enrolled show a "已注册声纹" badge instead (auto-identified
+ * speakers therefore arrive pre-badged). A small collapsible 声纹库 list allows
+ * removing enrolled identities. */
 function MeetingSideInfo({
   detail,
   onRenamed,
@@ -1880,6 +1888,68 @@ function MeetingSideInfo({
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  /** speakerId → has a stored voiceprint embedding (enrollable). */
+  const [voiceprints, setVoiceprints] = useState<Record<string, boolean>>({});
+  const [enrolled, setEnrolled] = useState<EnrolledSpeaker[]>([]);
+  const [enrollingId, setEnrollingId] = useState<string | null>(null);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+
+  const meetingId = detail.meeting.id;
+
+  const refreshEnrollment = useCallback(async () => {
+    // Supplementary info: a load failure hides the enroll affordances but must
+    // never block the participants list itself.
+    try {
+      const [prints, identities] = await Promise.all([
+        api.getMeetingVoiceprints(meetingId),
+        api.listEnrolledSpeakers(),
+      ]);
+      setVoiceprints(
+        Object.fromEntries(prints.map((p) => [p.speakerId, p.hasEmbedding])),
+      );
+      setEnrolled(identities);
+    } catch (e) {
+      console.warn("voiceprint info load failed", e);
+    }
+  }, [meetingId]);
+
+  useEffect(() => {
+    void refreshEnrollment();
+  }, [refreshEnrollment]);
+
+  const enrolledNames = useMemo(
+    () => new Set(enrolled.map((i) => i.name)),
+    [enrolled],
+  );
+
+  const enroll = useCallback(
+    async (speaker: Speaker) => {
+      setEnrollingId(speaker.id);
+      onError(null);
+      try {
+        await api.enrollSpeaker(meetingId, speaker.id);
+        await refreshEnrollment();
+      } catch (e) {
+        onError(String(e));
+      } finally {
+        setEnrollingId(null);
+      }
+    },
+    [meetingId, refreshEnrollment, onError],
+  );
+
+  const removeEnrolled = useCallback(
+    async (identityId: string) => {
+      onError(null);
+      try {
+        await api.removeEnrolledSpeaker(identityId);
+        await refreshEnrollment();
+      } catch (e) {
+        onError(String(e));
+      }
+    },
+    [refreshEnrollment, onError],
+  );
 
   useEffect(() => {
     if (editingId) inputRef.current?.select();
@@ -1972,6 +2042,24 @@ function MeetingSideInfo({
                       ) : (
                         <span className="meeting-unconfirmed">未确认</span>
                       )}
+                      {confirmed && enrolledNames.has(name) ? (
+                        <span
+                          className="meeting-voiceprint-badge"
+                          title="此人已注册声纹，新会议会自动识别"
+                        >
+                          已注册声纹
+                        </span>
+                      ) : confirmed && voiceprints[s.id] ? (
+                        <button
+                          type="button"
+                          className="btn small meeting-enroll-btn"
+                          title="注册此人的声纹，之后的会议将自动识别（仅保存在本机）"
+                          disabled={enrollingId === s.id}
+                          onClick={() => void enroll(s)}
+                        >
+                          {enrollingId === s.id ? "…" : "注册声纹"}
+                        </button>
+                      ) : null}
                     </>
                   )}
                 </li>
@@ -1980,6 +2068,37 @@ function MeetingSideInfo({
           </ul>
         )}
       </section>
+      {enrolled.length > 0 && (
+        <section className="meeting-side-sec">
+          <button
+            type="button"
+            className="meeting-index-title meeting-voiceprint-toggle"
+            aria-expanded={libraryOpen}
+            onClick={() => setLibraryOpen((open) => !open)}
+          >
+            声纹库（{enrolled.length}）{libraryOpen ? "▾" : "▸"}
+          </button>
+          {libraryOpen && (
+            <ul className="meeting-voiceprint-list">
+              {enrolled.map((identity) => (
+                <li key={identity.id} className="meeting-voiceprint-item">
+                  <span className="meeting-voiceprint-name">
+                    {identity.name}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn small"
+                    title="删除此声纹（已识别的会议不受影响，之后的会议不再自动识别）"
+                    onClick={() => void removeEnrolled(identity.id)}
+                  >
+                    删除
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
       <section className="meeting-side-sec">
         <h4 className="meeting-index-title">会议信息</h4>
         <dl className="meeting-info">
