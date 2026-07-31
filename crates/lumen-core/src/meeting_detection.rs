@@ -14,6 +14,16 @@
 //! only ever produced in response to an explicit [`DetectionInput::UserAccepted`]
 //! (the user clicking "start"). Everything else is advisory.
 //!
+//! ## End-of-meeting stop suggestion (same contract, in reverse)
+//! For a recording that *was* started from a detection prompt, the policy also
+//! watches for the triggering candidate's input to disappear. Once it has been
+//! continuously gone for [`DetectionConfig::stop_stability_ms`] (debounced so
+//! in-meeting mutes/reconnects never fire), it emits
+//! [`DetectionOutput::SuggestStop`] — again advisory only: the host asks the
+//! user, and the recording is never stopped silently. Declining suppresses
+//! further suggestions for the rest of that recording. Manually started
+//! meetings have no associated candidate and are never suggested on.
+//!
 //! ## Classification & the browser carve-out
 //! A raw candidate carries an [`AppClass`]. Native meeting apps (a small bundle
 //! id allow-list) are promptable on input activity alone. Browsers are *not*
@@ -86,6 +96,9 @@ pub enum DetectionInput {
     /// candidate as `busy_with_other_candidate` — silently disabling detection
     /// until restart.
     RecordingFailed { now_ms: u64 },
+    /// The user declined a stop suggestion ("继续录制"): suppress further stop
+    /// suggestions for the remainder of this recording.
+    StopDeclined { now_ms: u64 },
 }
 
 /// Side-effect requests the host should carry out. The policy itself performs
@@ -101,6 +114,14 @@ pub enum DetectionOutput {
     CancelPrompt,
     /// Begin recording — only ever emitted after an explicit user accept.
     StartRecording { bundle_id: String },
+    /// Suggest stopping a detection-started recording: the candidate that
+    /// triggered it has been continuously gone for the stop-stability window.
+    /// Like `ShowPrompt`, this is advisory — the host asks the user; the
+    /// policy never stops a recording on its own.
+    SuggestStop { bundle_id: String },
+    /// Hide a stop suggestion that is no longer warranted (the meeting app's
+    /// input came back, or the recording ended some other way).
+    CancelStopPrompt,
     /// A decision-trail line for local logging (never uploaded). Helps triage
     /// false positives/negatives after the fact.
     Decision(DetectionDecision),
@@ -143,6 +164,11 @@ pub struct DetectionConfig {
     /// case-insensitively; a candidate whose bundle contains any of these is
     /// dropped so we never prompt on our own capture.
     pub self_bundle_ids: Vec<String>,
+    /// How long the candidate that triggered a detection-started recording must
+    /// be *continuously* gone before suggesting a stop. 10s: long enough that
+    /// an in-meeting mute, device switch, or reconnect never suggests stopping,
+    /// short enough to catch the end of a real meeting promptly.
+    pub stop_stability_ms: u64,
 }
 
 impl Default for DetectionConfig {
@@ -151,6 +177,7 @@ impl Default for DetectionConfig {
             stability_ms: 3_000,
             cooldown_ms: 120_000,
             self_bundle_ids: vec!["com.lumenopen.asr".to_string(), "lumen".to_string()],
+            stop_stability_ms: 10_000,
         }
     }
 }
@@ -164,8 +191,22 @@ enum State {
     Candidate { cand: Candidate, since_ms: u64 },
     /// A prompt is currently shown for `cand`.
     Prompted { cand: Candidate },
-    /// The user accepted; a recording is in progress for `cand`.
-    Recording { cand: Candidate },
+    /// The user accepted; a recording is in progress for `cand`. Only
+    /// detection-started recordings ever enter this state — a manually started
+    /// meeting has no associated candidate, so the stop-suggestion fields
+    /// below can never fire for it.
+    Recording {
+        cand: Candidate,
+        /// When the tracked candidate's input disappeared (`None` while
+        /// present). Cleared whenever the same app's input re-appears, so
+        /// mute/reconnect jitter restarts the stop-stability timer.
+        gone_since_ms: Option<u64>,
+        /// A stop suggestion is currently shown to the user.
+        stop_prompted: bool,
+        /// The user declined a stop suggestion: never suggest again for this
+        /// recording (anti-nag; the user explicitly chose to keep recording).
+        stop_suppressed: bool,
+    },
 }
 
 /// The meeting-detection decision policy. Feed it [`DetectionInput`]s; act on
@@ -229,7 +270,7 @@ impl MeetingDetectionPolicy {
             State::Idle => None,
             State::Candidate { cand, .. }
             | State::Prompted { cand }
-            | State::Recording { cand } => Some(cand.session_key.as_str()),
+            | State::Recording { cand, .. } => Some(cand.session_key.as_str()),
         }
     }
 
@@ -248,6 +289,7 @@ impl MeetingDetectionPolicy {
             DetectionInput::UserDismissed { now_ms } => self.on_user_dismissed(now_ms),
             DetectionInput::RecordingFinished { now_ms } => self.on_recording_finished(now_ms),
             DetectionInput::RecordingFailed { now_ms } => self.on_recording_failed(now_ms),
+            DetectionInput::StopDeclined { now_ms } => self.on_stop_declined(now_ms),
         }
     }
 
@@ -267,7 +309,25 @@ impl MeetingDetectionPolicy {
                     "prompt_cancelled_reset",
                 )),
             ],
-            State::Candidate { cand, .. } | State::Recording { cand } => {
+            State::Recording {
+                cand,
+                stop_prompted,
+                ..
+            } => {
+                let mut outs = Vec::new();
+                if *stop_prompted {
+                    // A stop suggestion is on screen: retract it (the machine
+                    // is leaving `recording`, so the question is moot).
+                    outs.push(DetectionOutput::CancelStopPrompt);
+                }
+                outs.push(DetectionOutput::Decision(DetectionDecision::new(
+                    cand.bundle_id.clone(),
+                    "detection_disabled",
+                    "reset_to_idle",
+                )));
+                outs
+            }
+            State::Candidate { cand, .. } => {
                 vec![DetectionOutput::Decision(DetectionDecision::new(
                     cand.bundle_id.clone(),
                     "detection_disabled",
@@ -299,6 +359,45 @@ impl MeetingDetectionPolicy {
                 "input_active",
                 reason,
             ))];
+        }
+        // While a detection-started recording is live, a re-appearing input of
+        // the *same app* (mute/unmute, device switch, meeting rejoin — usually
+        // under a fresh session key) re-attaches to the tracked candidate and
+        // withdraws any pending or shown stop suggestion. This must run before
+        // the cooldown check below: the recording app is inside the cooldown
+        // armed at accept, which would otherwise swallow the re-add and let a
+        // stale removal suggest stopping a meeting that is still going.
+        if let State::Recording {
+            cand: tracked,
+            gone_since_ms,
+            stop_prompted,
+            ..
+        } = &mut self.state
+        {
+            if tracked
+                .bundle_id
+                .eq_ignore_ascii_case(cand.bundle_id.as_str())
+            {
+                let was_gone = gone_since_ms.is_some();
+                let was_prompted = *stop_prompted;
+                tracked.session_key = cand.session_key;
+                *gone_since_ms = None;
+                *stop_prompted = false;
+                if !was_gone && !was_prompted {
+                    // Idempotent re-report of a session we already track.
+                    return Vec::new();
+                }
+                let mut outs = Vec::new();
+                if was_prompted {
+                    outs.push(DetectionOutput::CancelStopPrompt);
+                }
+                outs.push(DetectionOutput::Decision(DetectionDecision::new(
+                    cand.bundle_id,
+                    "input_returned",
+                    "stop_suggestion_withdrawn",
+                )));
+                return outs;
+            }
         }
         // Respect the per-app quiet period.
         if self.in_cooldown(&cand.bundle_id, now_ms) {
@@ -334,7 +433,29 @@ impl MeetingDetectionPolicy {
         vec![DetectionOutput::Decision(decision)]
     }
 
-    fn on_candidate_removed(&mut self, session_key: &str, _now_ms: u64) -> Vec<DetectionOutput> {
+    fn on_candidate_removed(&mut self, session_key: &str, now_ms: u64) -> Vec<DetectionOutput> {
+        // Detection-started recording: the candidate that triggered it going
+        // away starts the stop-stability timer. Nothing is suggested yet —
+        // only a tick after `stop_stability_ms` of continuous absence does
+        // that, so a brief drop (reconnect, device switch) never surfaces
+        // anything. The recording itself is user-owned and keeps running.
+        if let State::Recording {
+            cand,
+            gone_since_ms,
+            ..
+        } = &mut self.state
+        {
+            if cand.session_key == session_key && gone_since_ms.is_none() {
+                *gone_since_ms = Some(now_ms);
+                return vec![DetectionOutput::Decision(DetectionDecision::new(
+                    cand.bundle_id.clone(),
+                    "input_ended",
+                    "stop_candidate_gone",
+                ))];
+            }
+            // Unrelated key, or already tracked as gone: nothing new.
+            return Vec::new();
+        }
         match &self.state {
             State::Candidate { cand, .. } if cand.session_key == session_key => {
                 // Disappeared before it ever stabilized: silently drop it (there
@@ -360,13 +481,42 @@ impl MeetingDetectionPolicy {
                     )),
                 ]
             }
-            // While Recording (or for an unrelated key), removal is ignored:
-            // the recording is user-owned and outlives the detection signal.
+            // Unrelated key while idle/candidate/prompted: nothing to do.
+            // (Recording-state removals are handled above.)
             _ => Vec::new(),
         }
     }
 
     fn on_tick(&mut self, now_ms: u64) -> Vec<DetectionOutput> {
+        // Detection-started recording whose triggering candidate has been gone
+        // long enough → suggest stopping, exactly once per absence. Advisory
+        // only: the machine stays in `recording` until the user (or the stop
+        // command) says otherwise — it never stops a recording on its own.
+        if let State::Recording {
+            cand,
+            gone_since_ms,
+            stop_prompted,
+            stop_suppressed,
+        } = &mut self.state
+        {
+            let stable = gone_since_ms
+                .is_some_and(|gone| now_ms.saturating_sub(gone) >= self.config.stop_stability_ms);
+            if stable && !*stop_prompted && !*stop_suppressed {
+                *stop_prompted = true;
+                let bundle_id = cand.bundle_id.clone();
+                return vec![
+                    DetectionOutput::SuggestStop {
+                        bundle_id: bundle_id.clone(),
+                    },
+                    DetectionOutput::Decision(DetectionDecision::new(
+                        bundle_id,
+                        "input_gone_stable",
+                        "stop_suggested",
+                    )),
+                ];
+            }
+            return Vec::new();
+        }
         let State::Candidate { cand, since_ms } = &self.state else {
             return Vec::new();
         };
@@ -417,7 +567,12 @@ impl MeetingDetectionPolicy {
                 "accepted_start_recording",
             )),
         ];
-        self.state = State::Recording { cand };
+        self.state = State::Recording {
+            cand,
+            gone_since_ms: None,
+            stop_prompted: false,
+            stop_suppressed: false,
+        };
         outputs
     }
 
@@ -435,14 +590,51 @@ impl MeetingDetectionPolicy {
     }
 
     fn on_recording_finished(&mut self, _now_ms: u64) -> Vec<DetectionOutput> {
-        if let State::Recording { cand } = &self.state {
+        if let State::Recording {
+            cand,
+            stop_prompted,
+            ..
+        } = &self.state
+        {
             let app = cand.bundle_id.clone();
+            let mut outs = Vec::new();
+            if *stop_prompted {
+                // The recording ended (user accepted the suggestion, or
+                // stopped it manually elsewhere) while the suggestion was
+                // still on screen: retract it.
+                outs.push(DetectionOutput::CancelStopPrompt);
+            }
             self.state = State::Idle;
-            return vec![DetectionOutput::Decision(DetectionDecision::new(
+            outs.push(DetectionOutput::Decision(DetectionDecision::new(
                 app,
                 "recording_ended",
                 "idle",
-            ))];
+            )));
+            return outs;
+        }
+        Vec::new()
+    }
+
+    /// The user declined a stop suggestion ("继续录制"): hide it and never
+    /// suggest again for this recording. The next recording starts fresh.
+    fn on_stop_declined(&mut self, _now_ms: u64) -> Vec<DetectionOutput> {
+        if let State::Recording {
+            cand,
+            gone_since_ms,
+            stop_prompted,
+            stop_suppressed,
+        } = &mut self.state
+        {
+            if *stop_prompted {
+                *stop_prompted = false;
+                *stop_suppressed = true;
+                *gone_since_ms = None;
+                return vec![DetectionOutput::Decision(DetectionDecision::new(
+                    cand.bundle_id.clone(),
+                    "user_click",
+                    "stop_declined",
+                ))];
+            }
         }
         Vec::new()
     }
@@ -456,14 +648,26 @@ impl MeetingDetectionPolicy {
     /// persists for a while — an instant re-prompt for the same app would nag
     /// without helping. Other apps are unaffected either way.
     fn on_recording_failed(&mut self, _now_ms: u64) -> Vec<DetectionOutput> {
-        if let State::Recording { cand } = &self.state {
+        if let State::Recording {
+            cand,
+            stop_prompted,
+            ..
+        } = &self.state
+        {
             let app = cand.bundle_id.clone();
+            let mut outs = Vec::new();
+            if *stop_prompted {
+                // Defensive: a start failure normally precedes any suggestion,
+                // but if one is somehow up, leaving `recording` retracts it.
+                outs.push(DetectionOutput::CancelStopPrompt);
+            }
             self.state = State::Idle;
-            return vec![DetectionOutput::Decision(DetectionDecision::new(
+            outs.push(DetectionOutput::Decision(DetectionDecision::new(
                 app,
                 "recording_failed",
                 "idle",
-            ))];
+            )));
+            return outs;
         }
         Vec::new()
     }
@@ -920,6 +1124,192 @@ mod tests {
         assert!(p
             .handle(DetectionInput::UserAccepted { now_ms: 0 })
             .is_empty());
+        assert_eq!(p.phase(), "idle");
+    }
+
+    // --- End-of-meeting stop suggestion --------------------------------------
+
+    fn has_suggest_stop(outs: &[DetectionOutput]) -> bool {
+        outs.iter()
+            .any(|o| matches!(o, DetectionOutput::SuggestStop { .. }))
+    }
+    fn has_cancel_stop(outs: &[DetectionOutput]) -> bool {
+        outs.iter()
+            .any(|o| matches!(o, DetectionOutput::CancelStopPrompt))
+    }
+
+    /// Drive a policy through detect → prompt → accept so it is `recording`
+    /// the way a detection-started meeting is. The tracked session is "zoom#1".
+    fn recording_policy() -> MeetingDetectionPolicy {
+        let mut p = MeetingDetectionPolicy::with_defaults();
+        p.handle(added(native("zoom#1"), 0));
+        p.handle(DetectionInput::Tick { now_ms: 3_000 });
+        p.handle(DetectionInput::UserAccepted { now_ms: 3_500 });
+        assert_eq!(p.phase(), "recording");
+        p
+    }
+
+    #[test]
+    fn candidate_gone_stable_suggests_stop_once() {
+        let mut p = recording_policy();
+        // Input disappears at t=10s.
+        let outs = p.handle(removed("zoom#1", 10_000));
+        assert!(!has_suggest_stop(&outs), "removal alone must not suggest");
+        // Before the 10s stop window: nothing.
+        assert!(!has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 15_000 })
+        ));
+        assert!(!has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 19_999 })
+        ));
+        // At/after the window: exactly one suggestion; still recording.
+        let outs = p.handle(DetectionInput::Tick { now_ms: 20_000 });
+        assert!(has_suggest_stop(&outs));
+        assert_eq!(p.phase(), "recording", "suggestion never stops on its own");
+        // Later ticks do not re-suggest while the prompt is up.
+        assert!(!has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 30_000 })
+        ));
+    }
+
+    #[test]
+    fn input_jitter_during_recording_never_suggests_stop() {
+        let mut p = recording_policy();
+        // Mute/reconnect: input drops and comes back (new session key) within
+        // the window — the absence timer must restart.
+        p.handle(removed("zoom#1", 10_000));
+        p.handle(added(native("zoom#2"), 15_000));
+        assert!(!has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 25_000 })
+        ));
+        // The *new* session going away is what counts now: gone at 30s, so a
+        // tick at 39.9s is still inside the window …
+        p.handle(removed("zoom#2", 30_000));
+        assert!(!has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 39_999 })
+        ));
+        // … and only a stable absence finally suggests.
+        assert!(has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 40_000 })
+        ));
+    }
+
+    #[test]
+    fn input_returning_after_suggestion_withdraws_it() {
+        let mut p = recording_policy();
+        p.handle(removed("zoom#1", 10_000));
+        assert!(has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 20_000 })
+        ));
+        // The meeting app's input comes back (rejoin): retract the suggestion.
+        let outs = p.handle(added(native("zoom#3"), 21_000));
+        assert!(has_cancel_stop(&outs));
+        assert_eq!(p.phase(), "recording");
+        // And the timer restarted: no immediate re-suggestion.
+        assert!(!has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 25_000 })
+        ));
+    }
+
+    #[test]
+    fn declining_a_stop_suggestion_suppresses_it_for_this_recording() {
+        let mut p = recording_policy();
+        p.handle(removed("zoom#1", 10_000));
+        assert!(has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 20_000 })
+        ));
+        // User clicks 继续录制.
+        let outs = p.handle(DetectionInput::StopDeclined { now_ms: 21_000 });
+        assert!(!has_cancel_stop(&outs), "front-end already hid the prompt");
+        assert_eq!(p.phase(), "recording");
+        // Even a fresh disappear + long stability never re-suggests now.
+        p.handle(added(native("zoom#4"), 30_000));
+        p.handle(removed("zoom#4", 40_000));
+        assert!(!has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 120_000 })
+        ));
+        assert_eq!(p.phase(), "recording");
+    }
+
+    #[test]
+    fn suppression_ends_with_the_recording() {
+        let mut p = recording_policy();
+        p.handle(removed("zoom#1", 10_000));
+        p.handle(DetectionInput::Tick { now_ms: 20_000 });
+        p.handle(DetectionInput::StopDeclined { now_ms: 21_000 });
+        p.handle(DetectionInput::RecordingFinished { now_ms: 60_000 });
+        assert_eq!(p.phase(), "idle");
+        // Next detection-started recording (after the cooldown) suggests again.
+        let t0 = 60_000 + 120_000 + 1;
+        p.handle(added(native("zoom#5"), t0));
+        p.handle(DetectionInput::Tick { now_ms: t0 + 3_000 });
+        p.handle(DetectionInput::UserAccepted { now_ms: t0 + 3_500 });
+        p.handle(removed("zoom#5", t0 + 10_000));
+        assert!(has_suggest_stop(&p.handle(DetectionInput::Tick {
+            now_ms: t0 + 20_000
+        })));
+    }
+
+    #[test]
+    fn recording_finished_while_suggested_retracts_the_stop_prompt() {
+        let mut p = recording_policy();
+        p.handle(removed("zoom#1", 10_000));
+        assert!(has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 20_000 })
+        ));
+        // The stop command ran (accepted suggestion or a manual stop elsewhere).
+        let outs = p.handle(DetectionInput::RecordingFinished { now_ms: 21_000 });
+        assert!(has_cancel_stop(&outs));
+        assert_eq!(p.phase(), "idle");
+    }
+
+    #[test]
+    fn unrelated_removal_during_recording_never_starts_the_stop_timer() {
+        let mut p = recording_policy();
+        p.handle(removed("slack#9", 10_000));
+        assert!(!has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 60_000 })
+        ));
+        assert_eq!(p.phase(), "recording");
+    }
+
+    #[test]
+    fn manual_meetings_are_never_suggested_on() {
+        // A manually started meeting never routes through the policy, so the
+        // machine sits idle: removals and ticks must produce nothing.
+        let mut p = MeetingDetectionPolicy::with_defaults();
+        assert!(p.handle(removed("zoom#1", 1_000)).is_empty());
+        assert!(!has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 60_000 })
+        ));
+        assert!(p
+            .handle(DetectionInput::StopDeclined { now_ms: 61_000 })
+            .is_empty());
+        assert_eq!(p.phase(), "idle");
+    }
+
+    #[test]
+    fn stop_declined_without_a_suggestion_is_a_noop() {
+        let mut p = recording_policy();
+        assert!(p
+            .handle(DetectionInput::StopDeclined { now_ms: 10_000 })
+            .is_empty());
+        // A later real suggestion still works (no accidental suppression).
+        p.handle(removed("zoom#1", 20_000));
+        assert!(has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 30_000 })
+        ));
+    }
+
+    #[test]
+    fn reset_while_stop_suggested_retracts_the_stop_prompt() {
+        let mut p = recording_policy();
+        p.handle(removed("zoom#1", 10_000));
+        assert!(has_suggest_stop(
+            &p.handle(DetectionInput::Tick { now_ms: 20_000 })
+        ));
+        let outs = p.reset();
+        assert!(has_cancel_stop(&outs));
         assert_eq!(p.phase(), "idle");
     }
 }

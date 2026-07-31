@@ -161,6 +161,12 @@ export default function App() {
     bundleId: string;
     appClass: string;
   } | null>(null);
+  // End-of-meeting stop suggestion for a detection-started recording. The
+  // backend asks; nothing is ever stopped without an explicit user click.
+  const [stopSuggested, setStopSuggested] = useState<{
+    bundleId: string;
+    meetingId: string | null;
+  } | null>(null);
 
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -311,6 +317,32 @@ export default function App() {
     };
   }, []);
 
+  // End-of-meeting stop suggestion lifecycle: `meeting-detection-stop-suggested`
+  // when the triggering app's input has been gone for the stop-stability
+  // window, `meeting-detection-stop-cancelled` when the suggestion is moot
+  // (input came back, or the recording ended another way).
+  useEffect(() => {
+    let unSuggested: (() => void) | undefined;
+    let unStopCancelled: (() => void) | undefined;
+    listen<{ bundleId: string; meetingId: string | null }>(
+      "meeting-detection-stop-suggested",
+      (e) => {
+        setStopSuggested(e.payload);
+      }
+    ).then((fn) => {
+      unSuggested = fn;
+    });
+    listen("meeting-detection-stop-cancelled", () =>
+      setStopSuggested(null)
+    ).then((fn) => {
+      unStopCancelled = fn;
+    });
+    return () => {
+      unSuggested?.();
+      unStopCancelled?.();
+    };
+  }, []);
+
   useEffect(() => {
     void (async () => {
       try {
@@ -409,6 +441,31 @@ export default function App() {
               setDetected(null);
               try {
                 await api.dismissMeetingDetection();
+              } catch {
+                /* ignore */
+              }
+            })()
+          }
+        />
+      )}
+      {stopSuggested && (
+        <StopSuggestPrompt
+          bundleId={stopSuggested.bundleId}
+          onStop={() =>
+            void (async () => {
+              setStopSuggested(null);
+              try {
+                await api.acceptMeetingDetectionStop();
+              } catch (e) {
+                setError(String(e));
+              }
+            })()
+          }
+          onKeep={() =>
+            void (async () => {
+              setStopSuggested(null);
+              try {
+                await api.declineMeetingDetectionStop();
               } catch {
                 /* ignore */
               }
@@ -798,6 +855,58 @@ function DetectionPrompt({
         </button>
         <button type="button" className="btn ghost" onClick={onDismiss}>
           忽略
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Counterpart of DetectionPrompt for the end of a detected meeting: the
+// triggering app's audio input has been gone long enough that the meeting
+// looks over. Purely advisory — recording continues until the user clicks
+// 停止录音 (继续录制 / Esc keeps it running and suppresses further
+// suggestions for this recording). Focus lands on 继续录制 so a stray Enter
+// never stops a recording the user wanted to keep.
+function StopSuggestPrompt({
+  bundleId,
+  onStop,
+  onKeep,
+}: {
+  bundleId: string;
+  onStop: () => void;
+  onKeep: () => void;
+}) {
+  const keepRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    keepRef.current?.focus();
+  }, []);
+  return (
+    <div
+      className="detection-prompt"
+      role="alertdialog"
+      aria-labelledby="stop-suggest-title"
+      aria-describedby="stop-suggest-sub"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          onKeep();
+        }
+      }}
+    >
+      <div className="detection-prompt-body">
+        <span id="stop-suggest-title" className="detection-prompt-title">
+          会议似乎已结束
+        </span>
+        <span id="stop-suggest-sub" className="detection-prompt-sub">
+          {meetingAppLabel(bundleId)} 已不再使用麦克风。是否停止录音？
+        </span>
+      </div>
+      <div className="detection-prompt-actions">
+        <button type="button" className="btn danger" onClick={onStop}>
+          停止录音
+        </button>
+        <button type="button" className="btn ghost" ref={keepRef} onClick={onKeep}>
+          继续录制
         </button>
       </div>
     </div>
