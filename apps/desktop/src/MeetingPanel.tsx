@@ -2425,6 +2425,14 @@ function TranscriptView({
                   {name.slice(0, 1)}
                 </span>
                 <span className="meeting-turn-name">{name}</span>
+                {head.channel === "system" && (
+                  <span
+                    className="meeting-channel-system"
+                    title="来自系统音频（远端参会者）"
+                  >
+                    对方
+                  </span>
+                )}
                 {!confirmed && (
                   <span className="meeting-unconfirmed">未确认</span>
                 )}

@@ -6,5 +6,7 @@
 	<string>Lumen ASR needs the microphone to record your voice for local speech-to-text.</string>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>Lumen ASR needs Accessibility permission to paste transcribed text into other apps.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Lumen ASR 需要采集系统音频，以便在会议录音中同步记录远端参会者的声音（仅在本机处理，不会上传）。</string>
 </dict>
 </plist>

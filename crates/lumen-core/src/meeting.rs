@@ -81,6 +81,40 @@ impl MeetingStatus {
     }
 }
 
+/// Which capture track a transcript segment came from.
+///
+/// Dual-track meetings record two synchronized WAVs: the microphone (the
+/// user's own voice) and — on capable macOS hosts — the system audio output
+/// (the remote participants in a call). Legacy single-track meetings have no
+/// channel recorded (`None` on the segment), which reads the same as `Mic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentChannel {
+    /// Captured from the microphone (the local user).
+    Mic,
+    /// Captured from the system audio output (remote participants).
+    System,
+}
+
+impl SegmentChannel {
+    /// Stable lowercase token persisted in storage.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mic => "mic",
+            Self::System => "system",
+        }
+    }
+
+    /// Parse a persisted token; unknown values read as [`SegmentChannel::Mic`]
+    /// so a forward-written channel never fails a read.
+    pub fn from_str_or_mic(value: &str) -> Self {
+        match value {
+            "system" => Self::System,
+            _ => Self::Mic,
+        }
+    }
+}
+
 /// A meeting recording (maps to the `meetings` table).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Meeting {
@@ -90,6 +124,11 @@ pub struct Meeting {
     pub title: Option<String>,
     /// Path to the recorded audio on disk; absent while still recording.
     pub audio_path: Option<String>,
+    /// Path to the optional second, synchronized system-audio (remote
+    /// participants) WAV. Present only for dual-track recordings on capable
+    /// macOS hosts; `None` for mic-only meetings (the pre-dual-track behavior).
+    #[serde(default)]
+    pub system_audio_path: Option<String>,
     /// Total recording duration in seconds, once known.
     pub duration_seconds: Option<f64>,
     pub status: MeetingStatus,
@@ -115,6 +154,7 @@ impl Meeting {
             created_at: Utc::now(),
             title: None,
             audio_path: None,
+            system_audio_path: None,
             duration_seconds: None,
             status: MeetingStatus::Recording,
             language: None,
@@ -150,6 +190,11 @@ pub struct TranscriptSegment {
     pub confidence: Option<f64>,
     /// Optional word-level timing, aligned with the interchange `Word` shape.
     pub words: Option<Vec<Word>>,
+    /// Capture track this segment came from ([`SegmentChannel::Mic`] /
+    /// [`SegmentChannel::System`]). `None` for legacy single-track meetings,
+    /// which reads the same as mic.
+    #[serde(default)]
+    pub channel: Option<SegmentChannel>,
 }
 
 impl TranscriptSegment {
@@ -171,6 +216,7 @@ impl TranscriptSegment {
             speaker_id: None,
             confidence: None,
             words: None,
+            channel: None,
         }
     }
 }
@@ -344,6 +390,29 @@ mod tests {
             MeetingStatus::from_str_or_recording("nonsense"),
             MeetingStatus::Recording
         );
+    }
+
+    #[test]
+    fn segment_channel_serde_uses_snake_case_tokens() {
+        assert_eq!(
+            serde_json::to_string(&SegmentChannel::System).unwrap(),
+            "\"system\""
+        );
+        for channel in [SegmentChannel::Mic, SegmentChannel::System] {
+            assert_eq!(SegmentChannel::from_str_or_mic(channel.as_str()), channel);
+        }
+        // Unknown / forward-written tokens read as mic instead of failing.
+        assert_eq!(
+            SegmentChannel::from_str_or_mic("nonsense"),
+            SegmentChannel::Mic
+        );
+        // Legacy JSON without the field deserializes with channel absent.
+        let legacy = r#"{"id":"7f4a1f34-2f4f-4bcb-9f43-111111111111",
+            "meeting_id":"7f4a1f34-2f4f-4bcb-9f43-222222222222",
+            "seq":0,"start_seconds":0.0,"end_seconds":1.0,"text":"hi",
+            "speaker_id":null,"confidence":null,"words":null}"#;
+        let seg: TranscriptSegment = serde_json::from_str(legacy).unwrap();
+        assert_eq!(seg.channel, None);
     }
 
     #[test]

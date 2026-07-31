@@ -23,16 +23,19 @@ mod assemble;
 mod cleanup;
 mod correct;
 pub mod export;
+mod merge;
 pub mod minutes;
 mod pipeline;
 mod process;
 
 pub use assemble::{
-    assemble_meeting, new_meeting, speaker_label, turn_sample_range, AssembledMeeting, DiarTurn,
+    assemble_meeting, assemble_meeting_with_channels, new_meeting, speaker_label,
+    turn_sample_range, AssembledMeeting, DiarTurn,
 };
 pub use cleanup::{cleanup_transcript, should_cleanup, CleanupStats};
 pub use correct::{correct_segment, correct_words, CorrectionDict};
 pub use export::{export_meeting, ExportError, ExportOutput, ExportPreset};
+pub use merge::{merge_tracks, system_speaker_offset, MergedTake, TrackTake};
 pub use pipeline::{transcribe_meeting, DiarModels, MeetingError, MeetingOptions};
 pub use process::{process_meeting, MinutesConfig, ProcessError};
 
