@@ -1079,11 +1079,18 @@ pub struct EnrolledSpeakerDto {
 
 impl From<&lumen_identity::EnrolledIdentity> for EnrolledSpeakerDto {
     fn from(identity: &lumen_identity::EnrolledIdentity) -> Self {
+        // Identities now hold multiple samples; the UI list shows the most
+        // recent enrollment's metadata.
+        let latest = identity.latest_sample();
         Self {
             id: identity.id.to_string(),
             name: identity.name.clone(),
-            enrolled_at: identity.enrolled_at.to_rfc3339(),
-            source_meeting_id: identity.source_meeting_id.map(|id| id.to_string()),
+            enrolled_at: latest
+                .map(|s| s.enrolled_at.to_rfc3339())
+                .unwrap_or_default(),
+            source_meeting_id: latest
+                .and_then(|s| s.source_meeting_id)
+                .map(|id| id.to_string()),
         }
     }
 }
@@ -1103,11 +1110,14 @@ fn open_identity_store() -> Result<lumen_identity::IdentityStore, String> {
         .map_err(|e| format!("open identity library: {e}"))
 }
 
-/// Enroll one confirmed meeting speaker into the local voiceprint library.
-/// The name defaults to the speaker's `display_name`; passing `name` overrides
-/// it (and confirms the speaker with that name when it was still unnamed).
-/// Fails when the speaker has no stored embedding (meeting transcribed before
-/// voiceprints existed → re-run transcription first).
+/// Enroll one confirmed meeting speaker into the local voiceprint library
+/// (repeat enrollments of the same person accumulate samples, making future
+/// auto-identification more robust). The name defaults to the speaker's
+/// `display_name`; passing `name` overrides it (and confirms the speaker with
+/// that name when it was still unnamed). Fails when the speaker has no stored
+/// embedding (meeting transcribed before voiceprints existed → re-run
+/// transcription first) or spoke for less than the minimum voiced duration
+/// (`lumen_identity::MIN_VOICED_MS`).
 #[tauri::command]
 pub fn enroll_speaker(
     state: State<'_, AppState>,
@@ -1118,7 +1128,7 @@ pub fn enroll_speaker(
     let meeting = parse_id(&meeting_id, "meeting")?;
     let speaker_uuid = parse_id(&speaker_id, "speaker")?;
 
-    let (speaker, embedding) = with_store(&state, |s| {
+    let (speaker, embedding, voiced_ms) = with_store(&state, |s| {
         let speaker = s
             .list_speakers(meeting)
             .map_err(|e| e.to_string())?
@@ -1128,11 +1138,29 @@ pub fn enroll_speaker(
         let embedding = s
             .get_speaker_embedding(speaker_uuid)
             .map_err(|e| e.to_string())?;
-        Ok((speaker, embedding))
+        // Total voiced duration = the sum of this speaker's segment spans,
+        // the same turns the centroid embedding was computed from.
+        let voiced_ms: u64 = s
+            .list_segments(meeting)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .filter(|seg| seg.speaker_id == Some(speaker_uuid))
+            .map(|seg| ((seg.end_seconds - seg.start_seconds).max(0.0) * 1000.0).round() as u64)
+            .sum();
+        Ok((speaker, embedding, voiced_ms))
     })?;
     let embedding = embedding.ok_or_else(|| {
         "该说话人没有声纹数据（此会议在声纹功能之前转录，重新转录后即可注册）".to_string()
     })?;
+    // Same gate `lumen_identity::enroll` enforces, checked up front so the
+    // user gets an actionable message before anything is renamed or written.
+    if voiced_ms < lumen_identity::MIN_VOICED_MS {
+        return Err(format!(
+            "该说话人语音太短，无法注册声纹（有效语音约 {:.1} 秒，至少需要 {} 秒）",
+            voiced_ms as f64 / 1000.0,
+            lumen_identity::MIN_VOICED_MS / 1000
+        ));
+    }
 
     let name = name
         .as_deref()
@@ -1157,7 +1185,7 @@ pub fn enroll_speaker(
 
     let mut identities = open_identity_store()?;
     let enrolled = identities
-        .enroll(&name, &embedding, Some(meeting))
+        .enroll(&name, &embedding, voiced_ms, Some(meeting))
         .map_err(|e| format!("enroll: {e}"))?;
 
     // The enrolled name is PII — log only the ids.
