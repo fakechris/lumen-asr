@@ -76,6 +76,14 @@ pub struct MeetingConfig {
     /// transcribed offline either way. No effect when `system_audio` is off or
     /// the streaming model is absent.
     pub system_live_preview: bool,
+    /// Hide mic-track echo duplicates of remote speech from the final
+    /// transcript: without headphones the remote voice plays through the
+    /// loudspeaker and is picked up by the mic again, so the same utterance
+    /// would appear once per track. Suppression is multi-evidence (timing,
+    /// coverage, text similarity, audio cross-correlation) and fail-open, so
+    /// headphone meetings and uncertain pairs are untouched. Defaults to
+    /// `true`; only meaningful when a system track was recorded.
+    pub echo_suppression: bool,
 }
 
 impl Default for MeetingConfig {
@@ -86,6 +94,7 @@ impl Default for MeetingConfig {
             calendar_link: true,
             system_audio: true,
             system_live_preview: true,
+            echo_suppression: true,
         }
     }
 }
@@ -1003,6 +1012,31 @@ system_audio = false
         )
         .unwrap();
         assert!(!off.meeting.system_audio);
+    }
+
+    #[test]
+    fn meeting_echo_suppression_defaults_on_and_can_opt_out() {
+        // Defaults on (only meaningful for dual-track meetings)…
+        assert!(MeetingConfig::default().echo_suppression);
+        assert!(AppConfig::default().meeting.echo_suppression);
+        // …absent from an existing config → still on…
+        let existing: AppConfig = toml::from_str(
+            r#"
+[meeting]
+transcript_cleanup = true
+"#,
+        )
+        .unwrap();
+        assert!(existing.meeting.echo_suppression);
+        // …and an explicit opt-out is honored.
+        let off: AppConfig = toml::from_str(
+            r#"
+[meeting]
+echo_suppression = false
+"#,
+        )
+        .unwrap();
+        assert!(!off.meeting.echo_suppression);
     }
 
     #[test]

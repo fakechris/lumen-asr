@@ -22,6 +22,7 @@
 mod assemble;
 mod cleanup;
 mod correct;
+mod echo;
 pub mod export;
 mod identify;
 mod merge;

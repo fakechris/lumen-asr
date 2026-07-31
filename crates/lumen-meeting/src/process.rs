@@ -178,11 +178,7 @@ async fn run(
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (a, b) => a.or(b),
                 };
-                let offset = system_speaker_offset(&mic_take.turns);
-                for (engine_id, embedding) in sys_embeddings {
-                    speaker_embeddings.insert(engine_id.saturating_add(offset), embedding);
-                }
-                Some(take)
+                Some((take, sys_embeddings))
             }
             Err(err) => {
                 tracing::warn!(
@@ -196,6 +192,85 @@ async fn run(
         },
         None => None,
     };
+
+    // Cross-track echo duplicate suppression (config `meeting.echo_suppression`):
+    // without headphones the remote voice plays through the loudspeaker and is
+    // picked up by the mic again, so the same utterance would appear once per
+    // track in the final transcript. A mic segment is hidden only when all four
+    // evidences agree (delay window, time coverage, text similarity, audio
+    // cross-correlation over the two WAVs — see `echo`); anything missing
+    // (unreadable WAV, short text, …) fails open to keeping the segment. Runs
+    // only when enabled AND a system track transcribed, so mic-only meetings
+    // and the opt-out stay byte-identical to the previous behavior. Must run
+    // *before* the system speaker-id offset below is derived, so the merged id
+    // space and the embedding keys agree after mic turns are removed. The
+    // per-pair evidence is written to a `<stem>.echo_suppression.json` sidecar
+    // next to the meeting audio for auditing; a sidecar write failure is only
+    // logged.
+    let mut mic_take = mic_take;
+    if opts.echo_suppression {
+        if let (Some((system, _)), Some(sys_wav)) = (system_take.as_ref(), system_wav) {
+            // The cross-correlation is CPU-bound (hundreds of millions of
+            // multiply-adds per candidate pair) and the sidecar write is file
+            // IO, so both run on the blocking pool rather than starving the
+            // caller's async runtime. Fail-open extends to the offload itself:
+            // a panicked/cancelled task keeps every mic segment.
+            let mic_clone = mic_take.clone();
+            let system_clone = system.clone();
+            let mic_wav = wav.to_path_buf();
+            let sys_wav = sys_wav.to_path_buf();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let result = crate::echo::suppress_cross_track_echoes(
+                    &mic_clone,
+                    &system_clone,
+                    &mic_wav,
+                    &sys_wav,
+                );
+                if let Err(err) =
+                    crate::echo::write_diagnostics_sidecar(&result.diagnostics, &mic_wav)
+                {
+                    tracing::warn!(
+                        error = %err,
+                        "could not write echo suppression diagnostics sidecar"
+                    );
+                }
+                result
+            })
+            .await;
+            match outcome {
+                Ok(result) => {
+                    tracing::info!(
+                        meeting_id = %meeting_id,
+                        candidates = result.diagnostics.candidates,
+                        suppressed = result.diagnostics.suppressed,
+                        "cross-track echo suppression evaluated"
+                    );
+                    if result.diagnostics.suppressed > 0 {
+                        mic_take = crate::echo::filter_track_take(&mic_take, &result.keep);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        meeting_id = %meeting_id,
+                        error = %err,
+                        "echo suppression task failed; keeping all mic segments"
+                    );
+                }
+            }
+        }
+    }
+
+    // Lift the system track's embeddings into the merged speaker-id space: the
+    // same offset `merge_tracks` will apply (computed from the possibly
+    // echo-filtered mic turns), so every merged `S{n}` label maps to the right
+    // centroid.
+    let system_take = system_take.map(|(take, sys_embeddings)| {
+        let offset = system_speaker_offset(&mic_take.turns);
+        for (engine_id, embedding) in sys_embeddings {
+            speaker_embeddings.insert(engine_id.saturating_add(offset), embedding);
+        }
+        take
+    });
 
     // Merge into one chronological take. Mic-only meetings skip the merge and
     // keep untagged (legacy) segments — zero behavior change.
