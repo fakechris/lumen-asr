@@ -716,14 +716,18 @@ async fn process_meeting_pipeline(
     // Build the ASR engine and (optional) minutes corrector from the user's
     // settings under brief locks, then drop the app-state handle before the long
     // async run below.
-    let (asr_engine, corrector, minutes_model, cleanup_transcript) = {
+    let (asr_engine, corrector, minutes_model, cleanup_transcript, echo_suppression) = {
         let state = app.state::<AppState>();
-        let (corrector_cfg, cleanup_transcript) = {
+        let (corrector_cfg, cleanup_transcript, echo_suppression) = {
             let cfg = state
                 .config
                 .lock()
                 .map_err(|_| "config lock poisoned".to_string())?;
-            (cfg.corrector.clone(), cfg.meeting.transcript_cleanup)
+            (
+                cfg.corrector.clone(),
+                cfg.meeting.transcript_cleanup,
+                cfg.meeting.echo_suppression,
+            )
         };
         let asr_engine = crate::dictation::build_meeting_asr_engine(state.inner())?;
         // Only build a corrector when an LLM is actually configured. With none,
@@ -738,7 +742,13 @@ async fn process_meeting_pipeline(
             let model = corrector_cfg.model.trim();
             (!model.is_empty()).then(|| model.to_string())
         });
-        (asr_engine, corrector, minutes_model, cleanup_transcript)
+        (
+            asr_engine,
+            corrector,
+            minutes_model,
+            cleanup_transcript,
+            echo_suppression,
+        )
     };
 
     // Diarization models under `<lumen_models_dir>/diar/{seg.onnx,emb.onnx,plda}`.
@@ -764,6 +774,10 @@ async fn process_meeting_pipeline(
         max_speakers: Some(DEFAULT_MAX_SPEAKERS),
         correction: meeting_correction_dict(&store),
         cleanup_transcript,
+        // Hide mic-track echo duplicates of remote speech (speakerphone
+        // pickup) from the final transcript; multi-evidence and fail-open, so
+        // headphone meetings are untouched. Config: `meeting.echo_suppression`.
+        echo_suppression,
         // Cross-meeting auto-identification: match diarized speakers against
         // the local voiceprint library and auto-assign enrolled names. The
         // library lives entirely on this machine (never uploaded); on builds
