@@ -56,6 +56,13 @@ pub struct MeetingConfig {
     /// deliberately, keeping first-run false positives out of the default
     /// experience. Only runs when this is on AND the OS capability is present.
     pub detection_enabled: bool,
+    /// Link a just-started recording to the calendar: look up the current /
+    /// imminent (EventKit) event once at recording start, auto-title an
+    /// untitled meeting with the event title, and note the attendee names.
+    /// Read-only and best-effort — without calendar permission (or with no
+    /// matching event) the recording proceeds exactly as before. Defaults to
+    /// `true`; macOS-only (a no-op elsewhere).
+    pub calendar_link: bool,
     /// Record the system audio output (remote participants) as a second,
     /// synchronized meeting track via a Core Audio process tap. Defaults to
     /// `true` but only takes effect when the OS capability (macOS 14.2+) and
@@ -69,6 +76,7 @@ impl Default for MeetingConfig {
         Self {
             transcript_cleanup: true,
             detection_enabled: false,
+            calendar_link: true,
             system_audio: true,
         }
     }
@@ -987,6 +995,31 @@ system_audio = false
         )
         .unwrap();
         assert!(!off.meeting.system_audio);
+    }
+
+    #[test]
+    fn meeting_calendar_link_defaults_on_and_can_opt_out() {
+        // Defaults on (permission-gated at runtime)…
+        assert!(MeetingConfig::default().calendar_link);
+        assert!(AppConfig::default().meeting.calendar_link);
+        // …absent from an existing config → still on…
+        let existing: AppConfig = toml::from_str(
+            r#"
+[meeting]
+transcript_cleanup = true
+"#,
+        )
+        .unwrap();
+        assert!(existing.meeting.calendar_link);
+        // …and an explicit opt-out is honored.
+        let off: AppConfig = toml::from_str(
+            r#"
+[meeting]
+calendar_link = false
+"#,
+        )
+        .unwrap();
+        assert!(!off.meeting.calendar_link);
     }
 
     #[test]

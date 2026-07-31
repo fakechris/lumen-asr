@@ -194,8 +194,113 @@ pub fn start_meeting_recording(
     }
     apply_hotkey_action(&app, action);
 
+    // 7. Best-effort calendar link (opt-out): look up the current / imminent
+    //    calendar event on a background thread and, when one matches,
+    //    auto-title an untitled meeting and note the attendee names. Spawned
+    //    *after* the recorder is live so the start path is never delayed —
+    //    a denied permission or no matching event changes nothing.
+    let calendar_link_enabled = state
+        .config
+        .lock()
+        .map(|cfg| cfg.meeting.calendar_link)
+        .unwrap_or(true);
+    if calendar_link_enabled {
+        spawn_calendar_link(meeting_id);
+    }
+
     tracing::info!(meeting_id = %meeting_id, "meeting recording started");
     Ok(meeting_id.to_string())
+}
+
+/// Look-ahead window for linking a just-started recording to a calendar
+/// event: an event starting within the next 15 minutes counts (the lookback
+/// for already-running events lives in the platform layer).
+#[cfg(target_os = "macos")]
+const CALENDAR_LOOKAHEAD_MINUTES: u32 = 15;
+
+/// Marker of the auto-inserted attendees line; its presence in the existing
+/// notes means the line was already written (never duplicate it).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const ATTENDEES_MARKER: &str = "参会人:";
+
+/// Build the notes text with the "参会人: …" line prepended, or `None` when
+/// there is nothing to write: no attendees, or the notes already carry an
+/// attendees line (manual or from a previous link).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn merge_attendees_into_notes(existing: &str, attendees: &[String]) -> Option<String> {
+    if attendees.is_empty() || existing.contains(ATTENDEES_MARKER) {
+        return None;
+    }
+    let line = format!("{ATTENDEES_MARKER} {}\n", attendees.join("、"));
+    Some(format!("{line}{existing}"))
+}
+
+/// Query the calendar for the event this recording belongs to and fold it
+/// into the meeting row (title when still untitled, attendees into notes).
+/// Runs on its own thread with its own SQLite connection (never the UI store
+/// lock), exactly like the processing pipeline: the start path has already
+/// returned, and every failure here is log-and-drop — the recording itself
+/// is untouched. On non-macOS there is no calendar bridge, so this is a no-op.
+fn spawn_calendar_link(meeting_id: Uuid) {
+    #[cfg(target_os = "macos")]
+    std::thread::spawn(move || {
+        // May block on the (first-use) permission prompt and the EventKit
+        // fetch — harmless on this background thread. Denied permission or
+        // no matching event → None, and the meeting stays as started.
+        let Some(event) =
+            lumen_platform_macos::calendar_current_or_upcoming_event(CALENDAR_LOOKAHEAD_MINUTES)
+        else {
+            return;
+        };
+        let store = match Store::open(default_db_path()) {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::warn!(meeting_id = %meeting_id, error = %e, "calendar link: could not open store");
+                return;
+            }
+        };
+        if let Err(e) = apply_calendar_event(&store, meeting_id, &event) {
+            tracing::warn!(meeting_id = %meeting_id, error = %e, "calendar link: could not apply event");
+        }
+    });
+    #[cfg(not(target_os = "macos"))]
+    let _ = meeting_id;
+}
+
+/// Fold a matched calendar event into the meeting row: title the meeting
+/// after the event when the user left it untitled, and prepend the attendee
+/// line to the notes (skipped when one is already there). Reads the row
+/// fresh so a title the user typed in the start dialog — or set in the UI in
+/// the meantime — is never overwritten.
+#[cfg(target_os = "macos")]
+fn apply_calendar_event(
+    store: &Store,
+    meeting_id: Uuid,
+    event: &lumen_platform_macos::CalendarEventInfo,
+) -> Result<(), String> {
+    let meeting = store
+        .get_meeting(meeting_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "meeting not found".to_string())?;
+    if meeting.title.is_none() && !event.title.trim().is_empty() {
+        store
+            .set_meeting_title(meeting_id, event.title.trim())
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(merged) = merge_attendees_into_notes(&meeting.notes, &event.attendee_names) {
+        store
+            .set_meeting_notes(meeting_id, &merged)
+            .map_err(|e| e.to_string())?;
+    }
+    // Only ids and counts in the log — the event title / attendees are
+    // personal data.
+    tracing::info!(
+        meeting_id = %meeting_id,
+        auto_titled = meeting.title.is_none(),
+        attendees = event.attendee_names.len(),
+        "calendar link applied to meeting"
+    );
+    Ok(())
 }
 
 /// Stop the active meeting recording. Finalizes the WAV, records the audio path
@@ -1256,4 +1361,43 @@ pub fn export_meeting(
     })?
     .ok_or_else(|| "meeting not found".to_string())?;
     render_export(&detail, preset).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_attendees_into_notes;
+
+    fn attendees(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn attendees_line_is_prepended_to_existing_notes() {
+        let merged = merge_attendees_into_notes(
+            "记得跟进预算",
+            &attendees(&["张三", "李四 <li@example.com>"]),
+        )
+        .unwrap();
+        assert_eq!(merged, "参会人: 张三、李四 <li@example.com>\n记得跟进预算");
+    }
+
+    #[test]
+    fn empty_notes_get_just_the_attendees_line() {
+        let merged = merge_attendees_into_notes("", &attendees(&["张三"])).unwrap();
+        assert_eq!(merged, "参会人: 张三\n");
+    }
+
+    #[test]
+    fn no_attendees_means_no_write() {
+        assert_eq!(merge_attendees_into_notes("笔记", &[]), None);
+    }
+
+    #[test]
+    fn existing_attendees_line_is_never_duplicated() {
+        let existing = "参会人: 张三\n记得跟进预算";
+        assert_eq!(
+            merge_attendees_into_notes(existing, &attendees(&["王五"])),
+            None
+        );
+    }
 }

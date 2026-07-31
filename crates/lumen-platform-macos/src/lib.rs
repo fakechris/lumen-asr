@@ -1,5 +1,6 @@
 //! macOS platform adapters: permissions, text injection, frontmost app, hotkeys.
 
+mod calendar;
 mod focused_field;
 mod hotkey_tap;
 mod inject;
@@ -7,6 +8,11 @@ mod meeting_activity;
 mod permissions;
 mod system_audio;
 
+pub use calendar::{
+    current_or_upcoming_event as calendar_current_or_upcoming_event,
+    request_access as calendar_request_access, select_event_in_window, CalendarCandidate,
+    CalendarEventInfo, CALENDAR_LOOKBACK_MINUTES,
+};
 pub use focused_field::{focused_text_field_snapshot, FocusedTextFieldSnapshot};
 pub use hotkey_tap::{
     physical_fn_down, start_monitor, start_multi_monitor, stop_monitor, HotkeyBinding, HotkeyEdge,
