@@ -479,6 +479,23 @@ export type EnrolledSpeaker = {
   sourceMeetingId?: string | null;
 };
 
+/** A recording-time "who is speaking" mark on a live caption line (serde
+ * snake_case domain struct). Anchored to a time range on the meeting's unified
+ * timeline + capture track; reconciled into speaker attribution after stop. */
+export type LiveAnnotation = {
+  id: string;
+  meeting_id: string;
+  start_seconds: number;
+  /** Absent when the live line had not finalized yet at annotate time. */
+  end_seconds?: number | null;
+  channel: "mic" | "system";
+  /** Enrolled identity id when picked from the library; null for typed names. */
+  identity_id?: string | null;
+  /** Name snapshot at annotate time. */
+  display_name: string;
+  created_at: string;
+};
+
 /** Whether a meeting speaker has a stored voiceprint embedding (enrollable). */
 export type SpeakerVoiceprint = {
   speakerId: string;

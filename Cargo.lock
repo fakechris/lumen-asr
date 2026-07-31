@@ -2416,6 +2416,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "diar-rs",
  "lumen-asr-engine",
  "lumen-core",

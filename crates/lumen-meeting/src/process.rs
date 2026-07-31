@@ -350,6 +350,39 @@ async fn run(
         &voiced_ms,
         opts.identity_dir.as_deref(),
     );
+    // Manual live annotations (L2): reconcile the recording-time "who is
+    // speaking" marks into the assembled speakers/segments. Runs *after*
+    // auto-identification so a manual name always overrides the voiceprint
+    // guess (manual > verified > offline_diarization), and *before* the
+    // persists/minutes below so every downstream consumer sees the manual
+    // attribution. The annotation ranges live on the meeting's unified
+    // timeline; each track's WAV-time segments are lifted onto it with the
+    // timeline-sidecar offsets. No annotations → byte-for-byte no-op.
+    let annotations = store
+        .list_live_annotations(meeting_id)
+        .map_err(ProcessError::Store)?;
+    if !annotations.is_empty() {
+        let (mic_offset, system_offset) = crate::echo::read_timeline_offsets(wav);
+        let resolved =
+            crate::annotate::resolve_annotation_names(&annotations, opts.identity_dir.as_deref());
+        let outcome = crate::annotate::reconcile_annotations(
+            meeting_id,
+            &mut assembled.speakers,
+            &mut assembled.segments,
+            &resolved,
+            mic_offset,
+            system_offset.unwrap_or(0.0),
+        );
+        // Counts only — the manual names are PII.
+        tracing::info!(
+            meeting_id = %meeting_id,
+            annotations = annotations.len(),
+            renamed_clusters = outcome.renamed_speakers.len(),
+            new_speakers = outcome.new_speakers.len(),
+            reassigned_segments = outcome.reassigned_segments.len(),
+            "live speaker annotations reconciled (manual-first)"
+        );
+    }
     for speaker in &assembled.speakers {
         store.upsert_speaker(speaker).map_err(ProcessError::Store)?;
     }

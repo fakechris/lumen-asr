@@ -15,6 +15,7 @@ import type {
   ActionItem,
   EnrolledSpeaker,
   ExportPreset,
+  LiveAnnotation,
   Meeting,
   MeetingDetail,
   MeetingStatus,
@@ -717,7 +718,7 @@ function RecordingBar({
           </button>
         </span>
       </div>
-      <LiveTranscript meetingId={meetingId} models={models} />
+      <LiveTranscript meetingId={meetingId} models={models} onError={onError} />
     </div>
   );
 }
@@ -751,12 +752,46 @@ const LIVE_TRACK_LABEL: Record<LiveEvent["track"], string> = {
   system: "远端",
 };
 
+// Front-end mirror of the reconciliation matching rule (annotate.rs): a
+// closed annotation must cover ≥50% of the line's span on the same track; an
+// open-ended one (annotated while the line was still partial) matches by
+// point containment. Used only to label chips locally — the authoritative
+// application happens offline after stop.
+function annotationCoversLine(a: LiveAnnotation, seg: LiveEvent): boolean {
+  if (a.channel !== seg.track) return false;
+  const start = seg.startSeconds;
+  const end = seg.endSeconds ?? seg.startSeconds;
+  if (a.end_seconds != null) {
+    const length = end - start;
+    if (!(length > 0)) return false;
+    const overlap =
+      Math.min(a.end_seconds, end) - Math.max(a.start_seconds, start);
+    return overlap / length >= 0.5;
+  }
+  return a.start_seconds >= start && a.start_seconds <= end;
+}
+
+/** The annotation currently labeling a live line (newest wins), if any. */
+function annotationForLine(
+  annotations: LiveAnnotation[],
+  seg: LiveEvent,
+): LiveAnnotation | null {
+  let best: LiveAnnotation | null = null;
+  for (const a of annotations) {
+    if (!annotationCoversLine(a, seg)) continue;
+    if (!best || a.created_at >= best.created_at) best = a;
+  }
+  return best;
+}
+
 function LiveTranscript({
   meetingId,
   models,
+  onError,
 }: {
   meetingId: string;
   models: MeetingModels;
+  onError: (e: string | null) => void;
 }) {
   // Latest event per segmentId (revision-guarded).
   const [segments, setSegments] = useState<Map<string, LiveEvent>>(
@@ -766,6 +801,99 @@ function LiveTranscript({
   // "recording started, nothing said yet").
   const [active, setActive] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  // ---- live speaker annotation chips (L2) -------------------------------
+  // Enrolled identities feed the chip menu; stored annotations label the
+  // chips (and survive a remount mid-recording). Every pick is persisted
+  // immediately; the offline pipeline applies it to the final transcript.
+  const [identities, setIdentities] = useState<EnrolledSpeaker[]>([]);
+  const [annotations, setAnnotations] = useState<LiveAnnotation[]>([]);
+  const [menuFor, setMenuFor] = useState<string | null>(null);
+  const [customFor, setCustomFor] = useState<string | null>(null);
+  const [customName, setCustomName] = useState("");
+
+  useEffect(() => {
+    let disposed = false;
+    // An empty/missing identity library is a normal state — the chip still
+    // offers ad-hoc names — so a failed list only degrades the menu.
+    void api
+      .listEnrolledSpeakers()
+      .then((list) => {
+        if (!disposed) setIdentities(list);
+      })
+      .catch(() => {});
+    void api
+      .listLiveAnnotations(meetingId)
+      .then((rows) => {
+        if (!disposed) setAnnotations(rows);
+      })
+      .catch((e) => onError(String(e)));
+    return () => {
+      disposed = true;
+    };
+  }, [meetingId, onError]);
+
+  const closeMenus = useCallback(() => {
+    setMenuFor(null);
+    setCustomFor(null);
+    setCustomName("");
+  }, []);
+
+  const annotate = useCallback(
+    async (seg: LiveEvent, displayName: string, identityId?: string) => {
+      closeMenus();
+      try {
+        const row = await api.annotateLiveSegment({
+          meetingId,
+          segmentId: seg.segmentId,
+          startSeconds: seg.startSeconds,
+          endSeconds: seg.endSeconds ?? null,
+          channel: seg.track,
+          identityId: identityId ?? null,
+          displayName,
+        });
+        // The chip shows the name immediately from local state — no backend
+        // event round trip.
+        setAnnotations((prev) => [...prev, row]);
+      } catch (e) {
+        onError(String(e));
+      }
+    },
+    [meetingId, onError, closeMenus],
+  );
+
+  const clearAnnotation = useCallback(
+    async (seg: LiveEvent) => {
+      closeMenus();
+      // Remove every annotation covering this line, so an older mark cannot
+      // resurface at reconciliation time.
+      const covering = annotations.filter((a) => annotationCoversLine(a, seg));
+      const results = await Promise.allSettled(
+        covering.map((a) => api.deleteLiveAnnotation(a.id)),
+      );
+      const firstFailure = results.find(
+        (r): r is PromiseRejectedResult => r.status === "rejected",
+      );
+      if (!firstFailure) {
+        // Every row is gone from the store — mirror that locally.
+        setAnnotations((prev) =>
+          prev.filter((a) => !covering.some((c) => c.id === a.id)),
+        );
+        return;
+      }
+      // Partial failure: some rows may already be deleted while others
+      // survived. Never guess — re-list so the chips converge on the store's
+      // real state, and surface the failure.
+      onError(String(firstFailure.reason));
+      try {
+        setAnnotations(await api.listLiveAnnotations(meetingId));
+      } catch (e) {
+        // Keep the (stale) local state; the next mount re-lists anyway.
+        onError(String(e));
+      }
+    },
+    [annotations, meetingId, onError, closeMenus],
+  );
 
   useEffect(() => {
     let un: (() => void) | undefined;
@@ -818,27 +946,96 @@ function LiveTranscript({
         <Icon name="mic" size={12} />
         <span>实时预览</span>
         <span className="muted-text meeting-live-note">
-          无说话人区分 · 停止后生成带说话人最终稿
+          点行尾「标注」可记录谁在说 · 停止后生成带说话人最终稿
         </span>
       </div>
       <div className="meeting-live-body" ref={scrollRef}>
         {active ? (
           <div className="meeting-live-text">
-            {ordered.map((seg) => (
-              <p
-                key={seg.segmentId}
-                className={
-                  seg.isFinal ? "meeting-live-final" : "meeting-live-partial"
-                }
-              >
-                <span
-                  className={`meeting-live-track meeting-live-track-${seg.track}`}
+            {ordered.map((seg) => {
+              const named = seg.isFinal
+                ? annotationForLine(annotations, seg)
+                : null;
+              return (
+                <p
+                  key={seg.segmentId}
+                  className={
+                    seg.isFinal ? "meeting-live-final" : "meeting-live-partial"
+                  }
                 >
-                  {LIVE_TRACK_LABEL[seg.track]}
-                </span>
-                {seg.text}
-              </p>
-            ))}
+                  <span
+                    className={`meeting-live-track meeting-live-track-${seg.track}`}
+                  >
+                    {LIVE_TRACK_LABEL[seg.track]}
+                  </span>
+                  {seg.text}
+                  {seg.isFinal && (
+                    <span className="meeting-live-annotate">
+                      <button
+                        type="button"
+                        className={`meeting-live-chip${named ? " named" : ""}`}
+                        title="标注这句话是谁在说"
+                        onClick={() => {
+                          if (menuFor === seg.segmentId) closeMenus();
+                          else {
+                            setMenuFor(seg.segmentId);
+                            setCustomFor(null);
+                            setCustomName("");
+                          }
+                        }}
+                      >
+                        {named ? named.display_name : "标注"}
+                      </button>
+                      {menuFor === seg.segmentId && (
+                        <span className="meeting-live-annotate-menu" role="menu">
+                          {identities.map((p) => (
+                            <button
+                              key={p.id}
+                              type="button"
+                              onClick={() => void annotate(seg, p.name, p.id)}
+                            >
+                              {p.name}
+                            </button>
+                          ))}
+                          {customFor === seg.segmentId ? (
+                            <input
+                              className="meeting-live-annotate-input"
+                              autoFocus
+                              value={customName}
+                              placeholder="输入名字后回车"
+                              onChange={(e) => setCustomName(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" && customName.trim()) {
+                                  void annotate(seg, customName.trim());
+                                } else if (e.key === "Escape") {
+                                  setCustomFor(null);
+                                  setCustomName("");
+                                }
+                              }}
+                            />
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setCustomFor(seg.segmentId)}
+                            >
+                              自定义名字…
+                            </button>
+                          )}
+                          {named && (
+                            <button
+                              type="button"
+                              onClick={() => void clearAnnotation(seg)}
+                            >
+                              清除
+                            </button>
+                          )}
+                        </span>
+                      )}
+                    </span>
+                  )}
+                </p>
+              );
+            })}
             {ordered.length === 0 && (
               <p className="muted-text meeting-live-listening">正在聆听…</p>
             )}
