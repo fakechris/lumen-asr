@@ -460,23 +460,38 @@ struct TimelineSidecar {
 /// a mic-only recording, or a non-finite value all yield `0.0` (the previous
 /// near-common-start assumption).
 pub(crate) fn read_timeline_skew(mic_wav: &Path) -> f64 {
-    let path = mic_wav.with_extension("timeline.json");
-    let Ok(json) = std::fs::read_to_string(&path) else {
+    let (mic_offset, system_offset) = read_timeline_offsets(mic_wav);
+    let Some(system_offset) = system_offset else {
         return 0.0;
     };
-    let Ok(sidecar) = serde_json::from_str::<TimelineSidecar>(&json) else {
-        tracing::warn!(path = %path.display(), "unparseable timeline sidecar; assuming zero skew");
-        return 0.0;
-    };
-    let Some(system_offset) = sidecar.system_offset_seconds else {
-        return 0.0;
-    };
-    let skew = system_offset - sidecar.mic_offset_seconds;
+    let skew = system_offset - mic_offset;
     if skew.is_finite() {
         skew
     } else {
         0.0
     }
+}
+
+/// Read both per-track WAV start offsets (seconds from the meeting's shared
+/// `t0`) from the timeline sidecar next to the mic WAV. Adding a track's
+/// offset to a timestamp in that track's WAV time maps it onto the unified
+/// meeting timeline — which is where the recording-time live annotations
+/// live. Fail-open: a missing/unreadable sidecar yields `(0.0, None)` (the
+/// near-common-start assumption); a mic-only recording has no system offset.
+pub(crate) fn read_timeline_offsets(mic_wav: &Path) -> (f64, Option<f64>) {
+    let path = mic_wav.with_extension("timeline.json");
+    let Ok(json) = std::fs::read_to_string(&path) else {
+        return (0.0, None);
+    };
+    let Ok(sidecar) = serde_json::from_str::<TimelineSidecar>(&json) else {
+        tracing::warn!(path = %path.display(), "unparseable timeline sidecar; assuming zero offsets");
+        return (0.0, None);
+    };
+    let sanitize = |v: f64| if v.is_finite() { v } else { 0.0 };
+    (
+        sanitize(sidecar.mic_offset_seconds),
+        sidecar.system_offset_seconds.map(sanitize),
+    )
 }
 
 /// Shift system-track turns onto the mic track's timeline by the sidecar skew,

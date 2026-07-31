@@ -47,4 +47,6 @@ diarize = ["dep:diar-rs"]
 [dev-dependencies]
 lumen-asr-engine = { workspace = true }
 async-trait = { workspace = true }
+# Deterministic `created_at` stamps in the annotation-reconciliation tests.
+chrono = { workspace = true }
 tempfile = "3"
