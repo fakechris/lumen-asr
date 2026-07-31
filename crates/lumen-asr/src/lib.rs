@@ -13,8 +13,9 @@ mod meeting_recorder;
 
 pub use audio::{AudioCapture, AudioDeviceInfo, AudioError, CaptureResult};
 pub use meeting_recorder::{
-    repair_wav_header, MeetingRecorder, MeetingRecorderError, RecordingSummary, RepairedWav,
-    SampleSink, SystemTrackRecorder, SystemTrackSender, WavSink,
+    live_tap_channel, repair_wav_header, LiveAudioPacket, LiveTapSender, MeetingRecorder,
+    MeetingRecorderError, RecordingSummary, RepairedWav, SampleSink, SystemTrackRecorder,
+    SystemTrackSender, WavSink, LIVE_TAP_CAPACITY,
 };
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).
@@ -25,8 +26,8 @@ pub use lumen_asr_engine::{
     OpenAiAudioConfig, ParaformerAsr, ParaformerOfflineModelPaths, QwenAsr, QwenAsrConfig,
     QwenDecodeMode, QwenRuntimeMetrics, QwenShadowCandidate, QwenShadowDiagnostics,
     QwenShadowRequest, QwenShadowScore, QwenShadowSpan, QwenShadowStatus, QwenShadowTerm,
-    SenseVoiceSherpaAsr, StreamingAsrEngine, StreamingParaformerAsr, StreamingResult, StubAsr,
-    WhisperAsr, WordTiming,
+    SenseVoiceSherpaAsr, StreamingAsrEngine, StreamingParaformerAsr, StreamingRecognizer,
+    StreamingResult, StreamingStream, StubAsr, WhisperAsr, WordTiming,
 };
 
 // Model layer (path resolution, readiness probes, install lock, download).

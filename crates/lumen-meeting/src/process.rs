@@ -220,11 +220,17 @@ async fn run(
             let mic_wav = wav.to_path_buf();
             let sys_wav = sys_wav.to_path_buf();
             let outcome = tokio::task::spawn_blocking(move || {
+                // Measured system→mic start skew from the recording-time
+                // timeline sidecar (0.0 when absent), so the delay/coverage
+                // evidence compares both tracks on one timeline instead of
+                // assuming a near-common start.
+                let system_skew_s = crate::echo::read_timeline_skew(&mic_wav);
                 let result = crate::echo::suppress_cross_track_echoes(
                     &mic_clone,
                     &system_clone,
                     &mic_wav,
                     &sys_wav,
+                    system_skew_s,
                 );
                 if let Err(err) =
                     crate::echo::write_diagnostics_sidecar(&result.diagnostics, &mic_wav)

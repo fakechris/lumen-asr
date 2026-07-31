@@ -22,9 +22,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -390,15 +391,114 @@ impl SystemTrackRecorder {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Live fan-out — bounded, timestamped, never blocks the capture callback.
+//
+// Every track of a meeting (mic, system audio) can fan a copy of its mono
+// chunks out to the real-time preview worker. The fan-out is:
+//
+// - **timestamped on a unified timeline**: each packet carries `start_seconds`
+//   = the *callback arrival time* minus the meeting's shared `t0` `Instant`
+//   (one `t0` for all tracks, taken when the recording starts). Arrival time —
+//   not per-track frame accumulation — because the system track starts later
+//   than the mic and may drop packets, so frame counting would drift.
+// - **bounded and non-blocking**: `try_send` on a small sync channel. When the
+//   consumer falls behind the packet is dropped and counted; the capture
+//   callback never blocks. The WAV write path is a separate, unbounded writer
+//   channel and stays authoritative — live drops never lose recorded audio.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Default bound of a live fan-out channel, in packets. Capture callbacks
+/// arrive every ~10–100 ms, so ~64 packets is seconds of headroom while still
+/// keeping worst-case buffered audio (and memory) small.
+pub const LIVE_TAP_CAPACITY: usize = 64;
+
+/// Log a channel-full drop summary every this many dropped packets.
+const LIVE_TAP_DROP_LOG_EVERY: u64 = 512;
+
+/// One timestamped mono chunk fanned out to the live preview worker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveAudioPacket {
+    /// Seconds since the meeting's shared `t0` at which this chunk arrived.
+    pub start_seconds: f64,
+    /// Mono samples at the track's native capture rate.
+    pub samples: Vec<f32>,
+}
+
+/// Bounded, timestamping fan-out handle for one track (see the section
+/// comment above). Cloneable; safe to call from a real-time audio callback.
+#[derive(Clone)]
+pub struct LiveTapSender {
+    tx: SyncSender<LiveAudioPacket>,
+    t0: Instant,
+    track: &'static str,
+    dropped: Arc<AtomicU64>,
+}
+
+impl LiveTapSender {
+    /// Timestamp `samples` against the shared `t0` and `try_send` them to the
+    /// live worker. Never blocks: a full channel drops the packet (counted and
+    /// periodically summarized via `tracing`), a disconnected consumer is
+    /// silently ignored. Returns `true` iff the packet was delivered.
+    pub fn push(&self, samples: &[f32]) -> bool {
+        if samples.is_empty() {
+            return false;
+        }
+        let start_seconds = self.t0.elapsed().as_secs_f64();
+        match self.tx.try_send(LiveAudioPacket {
+            start_seconds,
+            samples: samples.to_vec(),
+        }) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped == 1 || dropped.is_multiple_of(LIVE_TAP_DROP_LOG_EVERY) {
+                    tracing::warn!(
+                        track = self.track,
+                        dropped,
+                        "live preview fan-out full; dropping packets (WAV write unaffected)"
+                    );
+                }
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// Total packets dropped because the channel was full.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// Create a bounded live fan-out channel for one track. `track` labels drop
+/// logs ("mic"/"system"); `t0` is the meeting's shared timeline origin.
+pub fn live_tap_channel(
+    track: &'static str,
+    t0: Instant,
+    capacity: usize,
+) -> (LiveTapSender, Receiver<LiveAudioPacket>) {
+    let (tx, rx) = mpsc::sync_channel(capacity);
+    (
+        LiveTapSender {
+            tx,
+            t0,
+            track,
+            dropped: Arc::new(AtomicU64::new(0)),
+        },
+        rx,
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MeetingRecorder — cross-platform (no cfg gate); control handles only.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A subscriber that receives the same mono `f32` sample chunks the WAV writer
-/// gets, at the **native capture sample rate**. Used by the real-time meeting
-/// layer (streaming Paraformer) to consume audio while it is still being
-/// recorded (see `docs/MEETING.md` M6/P3). When no sink is attached the audio
-/// callback does zero extra work.
-pub type SampleSink = Sender<Vec<f32>>;
+/// gets, at the **native capture sample rate**, timestamped on the meeting's
+/// unified timeline. Used by the real-time meeting layer (streaming Paraformer)
+/// to consume audio while it is still being recorded (see `docs/MEETING.md`
+/// M6/P3). When no sink is attached the audio callback does zero extra work.
+pub type SampleSink = LiveTapSender;
 
 enum RecCmd {
     Start {
@@ -918,12 +1018,12 @@ where
 }
 
 /// Forward one already-down-mixed mono chunk to an optional fan-out subscriber.
-/// Mirrors the audio-callback branch so the "clone-and-send when present,
-/// no-op when absent" contract is unit-testable without a live cpal stream.
-/// Returns `true` if a chunk was delivered to a live subscriber.
+/// Mirrors the audio-callback branch so the "timestamp-and-try-send when
+/// present, no-op when absent" contract is unit-testable without a live cpal
+/// stream. Returns `true` if a chunk was delivered to a live subscriber.
 fn fanout_chunk(sink: &Option<SampleSink>, mono: &[f32]) -> bool {
     match sink {
-        Some(tx) => tx.send(mono.to_vec()).is_ok(),
+        Some(tap) => tap.push(mono),
         None => false,
     }
 }
@@ -1017,12 +1117,14 @@ mod tests {
     }
 
     #[test]
-    fn fanout_delivers_clone_when_subscribed() {
-        let (tx, rx) = mpsc::channel::<Vec<f32>>();
-        let sink: Option<SampleSink> = Some(tx);
+    fn fanout_delivers_timestamped_clone_when_subscribed() {
+        let (tap, rx) = live_tap_channel("mic", Instant::now(), LIVE_TAP_CAPACITY);
+        let sink: Option<SampleSink> = Some(tap);
         let chunk = [0.1f32, 0.2, 0.3];
         assert!(fanout_chunk(&sink, &chunk));
-        assert_eq!(rx.recv().unwrap(), vec![0.1, 0.2, 0.3]);
+        let packet = rx.recv().unwrap();
+        assert_eq!(packet.samples, vec![0.1, 0.2, 0.3]);
+        assert!(packet.start_seconds >= 0.0);
     }
 
     #[test]
@@ -1034,11 +1136,52 @@ mod tests {
 
     #[test]
     fn fanout_reports_false_when_receiver_dropped() {
-        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let (tap, rx) = live_tap_channel("mic", Instant::now(), LIVE_TAP_CAPACITY);
         drop(rx); // subscriber went away (e.g. streaming task ended)
-        let sink: Option<SampleSink> = Some(tx);
+        let sink: Option<SampleSink> = Some(tap);
         // Send fails but is swallowed — the recorder never breaks on a dead sink.
         assert!(!fanout_chunk(&sink, &[0.5f32]));
+    }
+
+    #[test]
+    fn live_tap_timestamps_are_monotonic_on_the_shared_timeline() {
+        let (tap, rx) = live_tap_channel("mic", Instant::now(), LIVE_TAP_CAPACITY);
+        assert!(tap.push(&[0.1]));
+        assert!(tap.push(&[0.2]));
+        let first = rx.recv().unwrap();
+        let second = rx.recv().unwrap();
+        // Arrival-time stamping: non-negative and non-decreasing, regardless of
+        // per-track frame counts.
+        assert!(first.start_seconds >= 0.0);
+        assert!(second.start_seconds >= first.start_seconds);
+    }
+
+    #[test]
+    fn live_tap_drops_and_counts_when_full_without_blocking() {
+        let (tap, rx) = live_tap_channel("system", Instant::now(), 2);
+        // Fill the bounded channel, then keep pushing: the extra packets are
+        // dropped (returning immediately) and counted, never blocking.
+        assert!(tap.push(&[0.1]));
+        assert!(tap.push(&[0.2]));
+        assert!(!tap.push(&[0.3]));
+        assert!(!tap.push(&[0.4]));
+        assert!(!tap.push(&[0.5]));
+        assert_eq!(tap.dropped(), 3);
+        // The two accepted packets are intact; the rest never arrive.
+        assert_eq!(rx.recv().unwrap().samples, vec![0.1]);
+        assert_eq!(rx.recv().unwrap().samples, vec![0.2]);
+        assert!(rx.try_recv().is_err());
+        // Draining frees capacity again.
+        assert!(tap.push(&[0.6]));
+        assert_eq!(tap.dropped(), 3);
+    }
+
+    #[test]
+    fn live_tap_ignores_empty_chunks() {
+        let (tap, rx) = live_tap_channel("mic", Instant::now(), 2);
+        assert!(!tap.push(&[]));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(tap.dropped(), 0);
     }
 
     #[test]

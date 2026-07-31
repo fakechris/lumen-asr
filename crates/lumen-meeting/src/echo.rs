@@ -26,11 +26,16 @@
 //!    of lag.
 //!
 //! Timeline caveat: the two tracks are written by two independent recorders
-//! that start near-simultaneously but do **not** share a sample clock, and
-//! each WAV's timestamps count from its own first sample. All constants
-//! therefore carry generous tolerances under a "near-common start" assumption;
-//! once the recorder stamps both tracks onto one shared clock, the delay
-//! window and lag range can be tightened.
+//! and each WAV's timestamps count from its own first sample. The recorder
+//! writes a `<meeting-id>.timeline.json` sidecar with each track's measured
+//! start offset from the shared recording `t0`; [`read_timeline_skew`] turns
+//! that into the system→mic start skew and the pass shifts the system
+//! segments onto the mic timeline before pairing (and shifts back when
+//! reading system audio windows). Without a sidecar (older or crash-recovered
+//! meetings) the skew is `0.0` — the previous "near-common start" assumption.
+//! The offsets are capture-start measurements, not sample-exact, so the
+//! constants keep their generous tolerances; they can be tightened once the
+//! offsets are derived from the audio itself.
 //!
 //! Everything IO-related **fails open**: when a WAV cannot be read or a window
 //! is too short/silent to correlate, the audio evidence is *missing* and the
@@ -39,7 +44,7 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::assemble::DiarTurn;
 use crate::merge::TrackTake;
@@ -165,6 +170,10 @@ pub(crate) struct EchoDiagnostics {
     pub version: u32,
     pub mic_segments: usize,
     pub system_segments: usize,
+    /// System→mic start skew (seconds) applied from the recording-time
+    /// timeline sidecar before pairing; `0.0` when no sidecar was available.
+    /// `system_start`/`system_end` in the entries are already shifted by it.
+    pub system_skew_seconds: f64,
     /// Pairs that passed evidence 1–3 and were audio-checked.
     pub candidates: usize,
     /// Pairs where all four evidences agreed → mic segment hidden.
@@ -375,10 +384,12 @@ pub(crate) fn evaluate_candidates(
     for candidate in candidates {
         let mic = &mic_turns[candidate.mic_index];
         let system = &system_turns[candidate.system_index];
-        // Correlate over the (capped) overlap of the two segments, taken at
-        // the same nominal time in each track's own timeline (near-common
-        // start assumption). The system read is padded by the lag range on
-        // both sides so every lag has full support.
+        // Correlate over the (capped) overlap of the two segments. Both turn
+        // lists are on one timeline here (the caller aligns the system turns
+        // by the sidecar skew, or by 0.0 without one); the injected reader
+        // maps System window times back to that WAV's own clock. The system
+        // read is padded by the lag range on both sides so every lag has
+        // full support.
         let window_start = mic.start.max(system.start);
         let window_len = (mic.end.min(system.end) - window_start).min(XCORR_WINDOW_MAX_S);
         let xcorr_peak = if window_len > 0.0 {
@@ -422,38 +433,97 @@ pub(crate) fn evaluate_candidates(
         version: 1,
         mic_segments: mic_turns.len(),
         system_segments: system_turns.len(),
+        // Callers that aligned the system turns overwrite this with the
+        // sidecar skew they applied (see `suppress_cross_track_echoes`).
+        system_skew_seconds: 0.0,
         candidates: entries.len(),
         suppressed: suppressed_total,
         entries,
     }
 }
 
+/// Recording-time timeline sidecar fields the echo pass cares about (see the
+/// desktop recorder's `<meeting-id>.timeline.json`; extra fields are ignored).
+#[derive(Debug, Deserialize)]
+struct TimelineSidecar {
+    #[serde(default)]
+    mic_offset_seconds: f64,
+    #[serde(default)]
+    system_offset_seconds: Option<f64>,
+}
+
+/// Read the system→mic start skew (seconds) from the timeline sidecar next to
+/// the mic WAV: `system_offset_seconds − mic_offset_seconds`, i.e. how much
+/// later than the mic WAV's first sample the system WAV's first sample is on
+/// the shared recording timeline. Adding it to a system-track timestamp maps
+/// it onto the mic track's timeline. Fail-open: a missing/unreadable sidecar,
+/// a mic-only recording, or a non-finite value all yield `0.0` (the previous
+/// near-common-start assumption).
+pub(crate) fn read_timeline_skew(mic_wav: &Path) -> f64 {
+    let path = mic_wav.with_extension("timeline.json");
+    let Ok(json) = std::fs::read_to_string(&path) else {
+        return 0.0;
+    };
+    let Ok(sidecar) = serde_json::from_str::<TimelineSidecar>(&json) else {
+        tracing::warn!(path = %path.display(), "unparseable timeline sidecar; assuming zero skew");
+        return 0.0;
+    };
+    let Some(system_offset) = sidecar.system_offset_seconds else {
+        return 0.0;
+    };
+    let skew = system_offset - sidecar.mic_offset_seconds;
+    if skew.is_finite() {
+        skew
+    } else {
+        0.0
+    }
+}
+
+/// Shift system-track turns onto the mic track's timeline by the sidecar skew,
+/// so evidence 1–2 (delay window, coverage) compare like with like.
+pub(crate) fn align_system_turns(turns: &[DiarTurn], system_skew_s: f64) -> Vec<DiarTurn> {
+    turns
+        .iter()
+        .map(|t| DiarTurn::new(t.start + system_skew_s, t.end + system_skew_s, t.speaker))
+        .collect()
+}
+
 /// The whole pass over two transcribed takes plus their on-disk WAVs: evidence
 /// 1–3 pairing, per-candidate audio cross-check against the two files, and the
 /// keep/suppress verdict per mic turn. Never fails — any IO problem downgrades
 /// to "keep".
+///
+/// `system_skew_s` (from [`read_timeline_skew`]) puts the system segments on
+/// the mic timeline before pairing; system audio windows are read back in the
+/// system WAV's own timeline. Diagnostics therefore report `system_start` /
+/// `system_end` on the unified (mic) timeline.
 pub(crate) fn suppress_cross_track_echoes(
     mic: &TrackTake,
     system: &TrackTake,
     mic_wav: &Path,
     system_wav: &Path,
+    system_skew_s: f64,
 ) -> EchoSuppression {
-    let candidates = find_echo_candidates(&mic.turns, &mic.texts, &system.turns, &system.texts);
+    let system_turns = align_system_turns(&system.turns, system_skew_s);
+    let candidates = find_echo_candidates(&mic.turns, &mic.texts, &system_turns, &system.texts);
     let mut read = |track: EchoTrack, start_s: f64, duration_s: f64| -> Option<Vec<f32>> {
-        let path = match track {
-            EchoTrack::Mic => mic_wav,
-            EchoTrack::System => system_wav,
+        // Window times arrive on the unified (mic) timeline; the system WAV's
+        // own clock starts `system_skew_s` later, so map back before reading.
+        let (path, start_s) = match track {
+            EchoTrack::Mic => (mic_wav, start_s),
+            EchoTrack::System => (system_wav, start_s - system_skew_s),
         };
         read_wav_window_mono_16k(path, start_s, duration_s)
     };
-    let diagnostics = evaluate_candidates(
+    let mut diagnostics = evaluate_candidates(
         &candidates,
         &mic.turns,
         &mic.texts,
-        &system.turns,
+        &system_turns,
         &system.texts,
         &mut read,
     );
+    diagnostics.system_skew_seconds = system_skew_s;
     let mut keep = vec![true; mic.turns.len()];
     for entry in &diagnostics.entries {
         if entry.suppressed {
@@ -1021,9 +1091,10 @@ mod tests {
             words: Vec::new(),
         };
 
-        let result = suppress_cross_track_echoes(&mic, &system, &mic_wav, &system_wav);
+        let result = suppress_cross_track_echoes(&mic, &system, &mic_wav, &system_wav, 0.0);
         assert_eq!(result.keep, vec![false]);
         assert_eq!(result.diagnostics.suppressed, 1);
+        assert_eq!(result.diagnostics.system_skew_seconds, 0.0);
         let entry = &result.diagnostics.entries[0];
         assert!(entry.xcorr_peak.unwrap() > ECHO_XCORR_MIN_PEAK);
 
@@ -1063,10 +1134,104 @@ mod tests {
             &system,
             &dir.path().join("missing.wav"),
             &dir.path().join("missing.system.wav"),
+            0.0,
         );
         // Evidence 1–3 matched, but the audio evidence is missing → keep.
         assert_eq!(result.keep, vec![true]);
         assert_eq!(result.diagnostics.candidates, 1);
         assert_eq!(result.diagnostics.suppressed, 0);
+    }
+
+    // ── unified-timeline skew (timeline.json sidecar) ───────────────────
+
+    #[test]
+    fn align_system_turns_shifts_onto_mic_timeline() {
+        let turns = vec![DiarTurn::new(0.4, 1.6, 0), DiarTurn::new(3.0, 4.0, 1)];
+        let aligned = align_system_turns(&turns, 1.0);
+        assert_eq!(aligned[0], DiarTurn::new(1.4, 2.6, 0));
+        assert_eq!(aligned[1], DiarTurn::new(4.0, 5.0, 1));
+        // Zero skew is the identity (the no-sidecar fallback).
+        assert_eq!(align_system_turns(&turns, 0.0), turns);
+    }
+
+    #[test]
+    fn timeline_skew_read_from_sidecar_or_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mic_wav = dir.path().join("meeting.wav");
+
+        // No sidecar at all → 0.0 (older / crash-recovered meetings).
+        assert_eq!(read_timeline_skew(&mic_wav), 0.0);
+
+        // Dual-track sidecar → system minus mic offset.
+        let sidecar = dir.path().join("meeting.timeline.json");
+        std::fs::write(
+            &sidecar,
+            r#"{"mic_offset_seconds":0.05,"system_offset_seconds":0.45,"t0_wall_clock":"x"}"#,
+        )
+        .unwrap();
+        assert!((read_timeline_skew(&mic_wav) - 0.4).abs() < 1e-12);
+
+        // Mic-only sidecar (no system offset) → 0.0.
+        std::fs::write(
+            &sidecar,
+            r#"{"mic_offset_seconds":0.05,"t0_wall_clock":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_timeline_skew(&mic_wav), 0.0);
+
+        // Garbage stays fail-open.
+        std::fs::write(&sidecar, "not json").unwrap();
+        assert_eq!(read_timeline_skew(&mic_wav), 0.0);
+    }
+
+    #[test]
+    fn sidecar_skew_lets_a_late_starting_system_track_pair_up() {
+        // The system tap started 1.0 s after the mic (a realistic permission
+        // prompt / tap spin-up gap). In raw per-WAV timestamps the echo pair
+        // is 1.1 s apart — far outside the delay window — but on the unified
+        // timeline it is a plain 0.1 s echo.
+        let dir = tempfile::tempdir().unwrap();
+        let mic_wav = dir.path().join("meeting.wav");
+        let system_wav = dir.path().join("meeting.system.wav");
+        let skew = 1.0f64;
+
+        // System WAV (its own clock): 0.4 s silence, then 1.2 s of "speech".
+        let line_audio = noise(21, 19_200);
+        let mut system_audio = vec![0.0f32; 6_400];
+        system_audio.extend(line_audio.iter().copied());
+        write_wav(&system_wav, 16_000, &system_audio);
+        // Mic WAV: the same audio picked up from the loudspeaker, starting at
+        // 1.5 s mic time (= 0.4 s system time + 1.0 s skew + 0.1 s delay).
+        let mut mic_audio = vec![0.0f32; 24_000];
+        mic_audio.extend(line_audio.iter().map(|s| s * 0.5));
+        write_wav(&mic_wav, 16_000, &mic_audio);
+
+        let line = "今天我们讨论一下项目进度安排";
+        let system = TrackTake {
+            turns: vec![DiarTurn::new(0.4, 1.6, 0)], // system WAV's own clock
+            texts: texts(&[line]),
+            words: Vec::new(),
+        };
+        let mic = TrackTake {
+            turns: vec![DiarTurn::new(1.5, 2.7, 0)], // mic WAV clock
+            texts: texts(&[line]),
+            words: Vec::new(),
+        };
+
+        // Without the sidecar skew the pair is not even a candidate.
+        let unaligned = suppress_cross_track_echoes(&mic, &system, &mic_wav, &system_wav, 0.0);
+        assert_eq!(unaligned.keep, vec![true]);
+        assert_eq!(unaligned.diagnostics.candidates, 0);
+
+        // With it, all four evidences line up and the echo is suppressed.
+        let aligned = suppress_cross_track_echoes(&mic, &system, &mic_wav, &system_wav, skew);
+        assert_eq!(aligned.keep, vec![false]);
+        assert_eq!(aligned.diagnostics.suppressed, 1);
+        assert_eq!(aligned.diagnostics.system_skew_seconds, skew);
+        let entry = &aligned.diagnostics.entries[0];
+        // Diagnostics report the system segment on the unified timeline.
+        assert!((entry.system_start - 1.4).abs() < 1e-9);
+        assert!((entry.delay_s - 0.1).abs() < 1e-9);
+        assert!(entry.xcorr_peak.unwrap() > ECHO_XCORR_MIN_PEAK);
     }
 }

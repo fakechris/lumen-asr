@@ -3312,6 +3312,25 @@ button.meeting-seg-text.seekable:hover {
   color: var(--text-muted, #8a8a8a);
 }
 
+/* Lightweight per-line track tag: 现场 (mic) / 远端 (system). */
+.meeting-live-track {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.68rem;
+  line-height: 1.5;
+  color: var(--text-muted, #8a8a8a);
+  vertical-align: 1px;
+}
+
+.meeting-live-track-system {
+  color: var(--accent, #4a7dbd);
+  border-color: currentcolor;
+  opacity: 0.85;
+}
+
 .meeting-live-empty {
   margin: 0;
   font-size: 0.8rem;

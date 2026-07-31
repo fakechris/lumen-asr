@@ -69,6 +69,13 @@ pub struct MeetingConfig {
     /// the system-audio permission are present — otherwise recording degrades
     /// to mic-only, never fails.
     pub system_audio: bool,
+    /// Also feed the system-audio track into the recording-time live
+    /// transcript (a second decoding stream on the already-loaded streaming
+    /// model). Defaults to `true`; turn off to cut live-preview CPU on weaker
+    /// machines — the system track is still recorded to WAV and fully
+    /// transcribed offline either way. No effect when `system_audio` is off or
+    /// the streaming model is absent.
+    pub system_live_preview: bool,
     /// Hide mic-track echo duplicates of remote speech from the final
     /// transcript: without headphones the remote voice plays through the
     /// loudspeaker and is picked up by the mic again, so the same utterance
@@ -86,6 +93,7 @@ impl Default for MeetingConfig {
             detection_enabled: false,
             calendar_link: true,
             system_audio: true,
+            system_live_preview: true,
             echo_suppression: true,
         }
     }
