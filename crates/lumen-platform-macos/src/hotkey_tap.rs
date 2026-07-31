@@ -251,6 +251,14 @@ fn observe_tap_disabled(generation: u64) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn monitor_tap_options() -> core_graphics::event::CGEventTapOptions {
+    // Hotkeys only observe the global keyboard stream. A passive tap makes
+    // that product boundary enforceable by macOS: callback bugs, stalls, or
+    // lifecycle races can never suppress typing in this or any other app.
+    core_graphics::event::CGEventTapOptions::ListenOnly
+}
+
 #[derive(Debug, Clone)]
 pub struct HotkeyBinding {
     pub id: String,
@@ -343,8 +351,7 @@ fn run_tap_loop_multi<F>(
 {
     use core_foundation::runloop::{kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop};
     use core_graphics::event::{
-        CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
-        EventField,
+        CGEventTap, CGEventTapLocation, CGEventTapPlacement, CGEventType, EventField,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -378,7 +385,7 @@ fn run_tap_loop_multi<F>(
     let tap = match CGEventTap::new(
         CGEventTapLocation::Session,
         CGEventTapPlacement::HeadInsertEventTap,
-        CGEventTapOptions::Default,
+        monitor_tap_options(),
         vec![
             CGEventType::KeyDown,
             CGEventType::KeyUp,
@@ -574,6 +581,18 @@ mod tests {
         let mods = HotkeySpec::parse("Alt+Shift", HotkeyMode::Hold).unwrap();
         let key = HotkeySpec::parse("Alt+Shift+T", HotkeyMode::Hold).unwrap();
         assert!(key.specificity() > mods.specificity());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keyboard_monitor_cannot_intercept_input() {
+        use core_graphics::event::CGEventTapOptions;
+
+        assert_eq!(
+            monitor_tap_options() as u32,
+            CGEventTapOptions::ListenOnly as u32,
+            "global hotkeys only observe input and must use a passive event tap"
+        );
     }
 
     // The physical-Fn state is a process-global atomic; serialize the tests that
