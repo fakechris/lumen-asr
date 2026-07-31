@@ -79,6 +79,32 @@ pub fn assemble_meeting(
     sample_rate: Option<u32>,
     duration_seconds: Option<f64>,
 ) -> AssembledMeeting {
+    assemble_meeting_with_channels(
+        meeting_id,
+        turns,
+        texts,
+        words,
+        &[],
+        sample_rate,
+        duration_seconds,
+    )
+}
+
+/// [`assemble_meeting`] for dual-track (mic + system audio) meetings:
+/// `channels[i]` tags segment `i` with the capture track it came from (see
+/// [`SegmentChannel`](lumen_core::SegmentChannel)). An empty (or short)
+/// `channels` slice leaves the remaining segments untagged (`None`), which is
+/// exactly the legacy single-track behavior — [`assemble_meeting`] delegates
+/// here with `&[]`.
+pub fn assemble_meeting_with_channels(
+    meeting_id: Uuid,
+    turns: &[DiarTurn],
+    texts: &[String],
+    words: &[Vec<Word>],
+    channels: &[lumen_core::SegmentChannel],
+    sample_rate: Option<u32>,
+    duration_seconds: Option<f64>,
+) -> AssembledMeeting {
     // Distinct engine speaker ids, ascending, so S1/S2/... are stable.
     let mut ids: Vec<u32> = turns.iter().map(|t| t.speaker).collect();
     ids.sort_unstable();
@@ -109,6 +135,7 @@ pub fn assemble_meeting(
             TranscriptSegment::new(meeting_id, seq_u32, turn.start, turn.end, text.clone());
         segment.speaker_id = Some(speaker.id);
         segment.words = turn_words.clone();
+        segment.channel = channels.get(seq).copied();
         segments.push(segment);
 
         let mut t_segment = TSegment::new(turn.start, turn.end, text.clone())
@@ -322,6 +349,30 @@ mod tests {
         assert!(out.segments[0].words.is_some());
         assert!(out.segments[1].words.is_none());
         assert!(out.segments[2].words.is_none());
+    }
+
+    #[test]
+    fn assemble_with_channels_tags_segments_and_plain_assemble_leaves_none() {
+        use lumen_core::SegmentChannel;
+
+        let mid = Uuid::new_v4();
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let channels = vec![
+            SegmentChannel::Mic,
+            SegmentChannel::System,
+            SegmentChannel::Mic,
+        ];
+        let out = assemble_meeting_with_channels(mid, &turns(), &texts, &[], &channels, None, None);
+        assert_eq!(out.segments[0].channel, Some(SegmentChannel::Mic));
+        assert_eq!(out.segments[1].channel, Some(SegmentChannel::System));
+        assert_eq!(out.segments[2].channel, Some(SegmentChannel::Mic));
+
+        // Legacy single-track assembly stores no channel at all.
+        let legacy = assemble_meeting(mid, &turns(), &texts, &[], None, None);
+        assert!(legacy.segments.iter().all(|s| s.channel.is_none()));
+        // And apart from ids/channel, the shapes match (same speakers/segments).
+        assert_eq!(legacy.segments.len(), out.segments.len());
+        assert_eq!(legacy.speakers.len(), out.speakers.len());
     }
 
     #[test]

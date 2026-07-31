@@ -2786,6 +2786,16 @@ button.meeting-index-item:hover {
   flex-shrink: 0;
 }
 
+.meeting-channel-system {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--accent, var(--text));
+  border: 1px solid color-mix(in srgb, var(--accent, var(--text)) 40%, transparent);
+  border-radius: 999px;
+  padding: 0 6px;
+  flex-shrink: 0;
+}
+
 .meeting-confirmed {
   font-size: 0.68rem;
   font-weight: 600;

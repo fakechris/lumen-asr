@@ -282,6 +282,114 @@ fn spawn_writer(mut sink: WavSink) -> (Sender<WriterMsg>, JoinHandle<()>) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SystemTrackRecorder — an optional second, externally-fed WAV track.
+//
+// Dual-track meetings write the microphone (via `MeetingRecorder`) and the
+// system audio output (remote participants, captured by the platform layer's
+// Core Audio process tap) as two synchronized WAVs. This type owns the second
+// file: it reuses the exact `WavSink` + writer-thread machinery of the mic
+// path, but is fed *externally* — the platform capture pushes mono `f32`
+// chunks through a [`SystemTrackSender`] — so this crate never depends on the
+// macOS tap FFI and the type compiles (and is unit-testable) everywhere.
+//
+// The mic path is untouched by this type: a meeting without a system track
+// never constructs one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Writer side of the system-audio track: owns the WAV writer thread.
+pub struct SystemTrackRecorder {
+    writer_tx: Sender<WriterMsg>,
+    writer_handle: JoinHandle<()>,
+    paused: Arc<AtomicBool>,
+    out_path: PathBuf,
+    sample_rate: u32,
+}
+
+/// Cloneable, thread-safe feed handle for a [`SystemTrackRecorder`]. The
+/// platform capture callback pushes each mono chunk through this; chunks are
+/// dropped while the track is paused (mirroring the mic recorder, so the two
+/// timelines stay aligned with no silent padding).
+#[derive(Clone)]
+pub struct SystemTrackSender {
+    tx: Arc<Mutex<Sender<WriterMsg>>>,
+    paused: Arc<AtomicBool>,
+}
+
+impl SystemTrackSender {
+    /// Forward one mono `f32` chunk to the writer thread. Returns `false` (and
+    /// drops the chunk) when the track is paused or already finalized — the
+    /// caller never needs to handle an error.
+    pub fn push(&self, samples: &[f32]) -> bool {
+        if samples.is_empty() || self.paused.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.tx
+            .lock()
+            .send(WriterMsg::Chunk(samples.to_vec()))
+            .is_ok()
+    }
+}
+
+impl SystemTrackRecorder {
+    /// Create the WAV (placeholder header, same as the mic path) and spawn its
+    /// writer thread.
+    pub fn create(out_path: impl Into<PathBuf>, sample_rate: u32) -> io::Result<Self> {
+        let out_path = out_path.into();
+        let sink = WavSink::create(&out_path, sample_rate)?;
+        let (writer_tx, writer_handle) = spawn_writer(sink);
+        Ok(Self {
+            writer_tx,
+            writer_handle,
+            paused: Arc::new(AtomicBool::new(false)),
+            out_path,
+            sample_rate,
+        })
+    }
+
+    /// A feed handle for the platform capture callback.
+    pub fn sender(&self) -> SystemTrackSender {
+        SystemTrackSender {
+            tx: Arc::new(Mutex::new(self.writer_tx.clone())),
+            paused: Arc::clone(&self.paused),
+        }
+    }
+
+    /// Pause / resume the track. Paused chunks are dropped (no silent gap),
+    /// matching the mic recorder so pausing compresses both timelines by the
+    /// same wall-clock interval.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    /// Path of the WAV being written.
+    pub fn out_path(&self) -> &Path {
+        &self.out_path
+    }
+
+    /// Finalize the WAV (back-fill the RIFF/`data` sizes) and join the writer.
+    pub fn finalize(self) -> io::Result<RecordingSummary> {
+        let (fin_tx, fin_rx) = mpsc::channel();
+        let _ = self.writer_tx.send(WriterMsg::Finalize(fin_tx));
+        drop(self.writer_tx);
+        let result = fin_rx
+            .recv()
+            .unwrap_or_else(|_| Err(io::Error::other("system track writer thread gone")));
+        let _ = self.writer_handle.join();
+        let samples = result?;
+        let duration_seconds = if self.sample_rate > 0 {
+            samples as f64 / self.sample_rate as f64
+        } else {
+            0.0
+        };
+        Ok(RecordingSummary {
+            wav_path: self.out_path,
+            duration_seconds,
+            sample_rate: self.sample_rate,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MeetingRecorder — cross-platform (no cfg gate); control handles only.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -931,6 +1039,57 @@ mod tests {
         let sink: Option<SampleSink> = Some(tx);
         // Send fails but is swallowed — the recorder never breaks on a dead sink.
         assert!(!fanout_chunk(&sink, &[0.5f32]));
+    }
+
+    #[test]
+    fn system_track_writes_pushed_chunks_and_finalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("take.system.wav");
+        let track = SystemTrackRecorder::create(&path, 48_000).unwrap();
+        assert_eq!(track.out_path(), path.as_path());
+        let sender = track.sender();
+
+        assert!(sender.push(&[0.0, 0.5, -0.5]));
+        // Empty chunks are dropped without touching the writer.
+        assert!(!sender.push(&[]));
+        assert!(sender.push(&[1.0]));
+
+        let summary = track.finalize().unwrap();
+        assert_eq!(summary.wav_path, path);
+        assert_eq!(summary.sample_rate, 48_000);
+        assert!((summary.duration_seconds - 4.0 / 48_000.0).abs() < 1e-12);
+
+        // The finalized file is a valid mono PCM16 WAV with all four samples.
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().sample_rate, 48_000);
+        let decoded: Vec<i16> = reader.samples::<i16>().map(Result::unwrap).collect();
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded[3], 32767);
+
+        // Pushing after finalize reports false instead of erroring.
+        assert!(!sender.push(&[0.1]));
+    }
+
+    #[test]
+    fn system_track_drops_chunks_while_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paused.system.wav");
+        let track = SystemTrackRecorder::create(&path, 16_000).unwrap();
+        let sender = track.sender();
+
+        assert!(sender.push(&[0.1, 0.2]));
+        track.set_paused(true);
+        // Paused: dropped, not written — no silent gap in the file.
+        assert!(!sender.push(&[0.9; 100]));
+        track.set_paused(false);
+        assert!(sender.push(&[0.3]));
+
+        let summary = track.finalize().unwrap();
+        // Only the 3 unpaused samples made it to disk.
+        let reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.len(), 3);
+        assert!((summary.duration_seconds - 3.0 / 16_000.0).abs() < 1e-12);
     }
 
     /// Simulate a crash: write a placeholder header + `n_samples` of PCM but

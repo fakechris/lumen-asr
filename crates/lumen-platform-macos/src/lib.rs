@@ -5,6 +5,7 @@ mod hotkey_tap;
 mod inject;
 mod meeting_activity;
 mod permissions;
+mod system_audio;
 
 pub use focused_field::{focused_text_field_snapshot, FocusedTextFieldSnapshot};
 pub use hotkey_tap::{
@@ -18,6 +19,10 @@ pub use meeting_activity::{
 };
 pub use permissions::{
     ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,
+};
+pub use system_audio::{
+    capability_available as system_audio_capability_available, SystemAudioCapture,
+    SystemAudioError, SystemAudioSink,
 };
 
 use async_trait::async_trait;

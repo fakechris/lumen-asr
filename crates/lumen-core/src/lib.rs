@@ -10,7 +10,8 @@ mod types;
 
 pub use export::{export_session_transcript, probe_wav_info, session_to_transcript, AudioInfo};
 pub use meeting::{
-    Meeting, MeetingDetail, MeetingStatus, MeetingSummary, Speaker, SummaryKind, TranscriptSegment,
+    Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SegmentChannel, Speaker, SummaryKind,
+    TranscriptSegment,
 };
 pub use meeting_detection::{
     classify_bundle_id, normalize_bundle_id, AppClass, Candidate, DetectionConfig,

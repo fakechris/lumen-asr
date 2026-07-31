@@ -19,6 +19,7 @@ mod learning;
 mod meeting_cmd;
 mod meeting_detection;
 mod meeting_live;
+mod meeting_system_audio;
 mod mod_chord;
 mod mode_arbiter;
 mod onboard;
@@ -65,6 +66,10 @@ pub struct AppState {
     /// Real-time (P3) streaming-Paraformer live-transcript worker for the
     /// active recording. Idle (no worker) unless a recording is streaming.
     pub meeting_live: meeting_live::MeetingLive,
+    /// Optional system-audio (remote participants) track for the active
+    /// meeting recording. Capability-gated (macOS 14.2+ process tap);
+    /// best-effort — idle everywhere else.
+    pub meeting_system_audio: meeting_system_audio::MeetingSystemAudio,
     /// Mutual-exclusion arbiter between dictation and meeting recording.
     pub capture: CaptureArbiter,
     /// Opt-in, capability-gated meeting activity detection + prompt policy.
@@ -293,6 +298,7 @@ pub fn run() {
             audio,
             meeting_recorder: MeetingRecorder::new(),
             meeting_live: meeting_live::MeetingLive::default(),
+            meeting_system_audio: meeting_system_audio::MeetingSystemAudio::default(),
             capture: CaptureArbiter::new(),
             meeting_detection: meeting_detection::MeetingDetectionService::new(),
             engine: Mutex::new(initial_engine),
