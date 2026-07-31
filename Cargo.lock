@@ -2272,6 +2272,7 @@ dependencies = [
  "lumen-core",
  "lumen-corrector",
  "lumen-dictionary",
+ "lumen-identity",
  "lumen-inject",
  "lumen-meeting",
  "lumen-platform",
@@ -2386,6 +2387,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-identity"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "lumen-inject"
 version = "0.1.0"
 dependencies = [
@@ -2407,6 +2420,7 @@ dependencies = [
  "lumen-asr-engine",
  "lumen-core",
  "lumen-corrector",
+ "lumen-identity",
  "lumen-prompts",
  "lumen-store",
  "lumen-transcript",

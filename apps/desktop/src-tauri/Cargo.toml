@@ -23,6 +23,7 @@ lumen-platform = { workspace = true }
 lumen-store = { workspace = true }
 lumen-core = { workspace = true }
 lumen-meeting = { workspace = true }
+lumen-identity = { workspace = true }
 lumen-dictionary = { workspace = true }
 lumen-asr = { workspace = true }
 lumen-corrector = { workspace = true }

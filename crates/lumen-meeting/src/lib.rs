@@ -23,6 +23,7 @@ mod assemble;
 mod cleanup;
 mod correct;
 pub mod export;
+mod identify;
 mod merge;
 pub mod minutes;
 mod pipeline;
@@ -35,6 +36,7 @@ pub use assemble::{
 pub use cleanup::{cleanup_transcript, should_cleanup, CleanupStats};
 pub use correct::{correct_segment, correct_words, CorrectionDict};
 pub use export::{export_meeting, ExportError, ExportOutput, ExportPreset};
+pub use identify::{auto_identify_speakers, AutoIdentification};
 pub use merge::{merge_tracks, system_speaker_offset, MergedTake, TrackTake};
 pub use pipeline::{transcribe_meeting, DiarModels, MeetingError, MeetingOptions};
 pub use process::{process_meeting, MinutesConfig, ProcessError};

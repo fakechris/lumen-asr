@@ -595,6 +595,11 @@ async fn process_meeting_pipeline(
         max_speakers: Some(DEFAULT_MAX_SPEAKERS),
         correction: meeting_correction_dict(&store),
         cleanup_transcript,
+        // Cross-meeting auto-identification: match diarized speakers against
+        // the local voiceprint library and auto-assign enrolled names. The
+        // library lives entirely on this machine (never uploaded); on builds
+        // without diarization no embeddings exist, so this is naturally inert.
+        identity_dir: Some(lumen_identity::default_identity_dir()),
         ..MeetingOptions::default()
     };
 
@@ -989,6 +994,157 @@ pub fn merge_speakers(
     let into = parse_id(&into_speaker_id, "into speaker")?;
     with_store(&state, |s| {
         s.merge_speakers(mid, from, into).map_err(|e| e.to_string())
+    })
+}
+
+// ----- speaker voiceprint enrollment (M5) --------------------------------
+//
+// The identity library is a local-only directory of JSON voiceprints
+// (`lumen_identity::default_identity_dir()`); nothing here leaves the machine.
+
+/// Serialized enrolled identity for the UI. The embedding itself is
+/// deliberately not exposed over IPC — the front-end only needs name/metadata.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrolledSpeakerDto {
+    pub id: String,
+    pub name: String,
+    pub enrolled_at: String,
+    pub source_meeting_id: Option<String>,
+}
+
+impl From<&lumen_identity::EnrolledIdentity> for EnrolledSpeakerDto {
+    fn from(identity: &lumen_identity::EnrolledIdentity) -> Self {
+        Self {
+            id: identity.id.to_string(),
+            name: identity.name.clone(),
+            enrolled_at: identity.enrolled_at.to_rfc3339(),
+            source_meeting_id: identity.source_meeting_id.map(|id| id.to_string()),
+        }
+    }
+}
+
+/// Per-speaker voiceprint availability for one meeting: whether the diarization
+/// pipeline stored a centroid embedding for each speaker (pre-v9 meetings and
+/// non-diarized builds have none, so the enroll button can be hidden).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerVoiceprintDto {
+    pub speaker_id: String,
+    pub has_embedding: bool,
+}
+
+fn open_identity_store() -> Result<lumen_identity::IdentityStore, String> {
+    lumen_identity::IdentityStore::open(lumen_identity::default_identity_dir())
+        .map_err(|e| format!("open identity library: {e}"))
+}
+
+/// Enroll one confirmed meeting speaker into the local voiceprint library.
+/// The name defaults to the speaker's `display_name`; passing `name` overrides
+/// it (and confirms the speaker with that name when it was still unnamed).
+/// Fails when the speaker has no stored embedding (meeting transcribed before
+/// voiceprints existed → re-run transcription first).
+#[tauri::command]
+pub fn enroll_speaker(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    speaker_id: String,
+    name: Option<String>,
+) -> Result<EnrolledSpeakerDto, String> {
+    let meeting = parse_id(&meeting_id, "meeting")?;
+    let speaker_uuid = parse_id(&speaker_id, "speaker")?;
+
+    let (speaker, embedding) = with_store(&state, |s| {
+        let speaker = s
+            .list_speakers(meeting)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|sp| sp.id == speaker_uuid)
+            .ok_or_else(|| "speaker not found in this meeting".to_string())?;
+        let embedding = s
+            .get_speaker_embedding(speaker_uuid)
+            .map_err(|e| e.to_string())?;
+        Ok((speaker, embedding))
+    })?;
+    let embedding = embedding.ok_or_else(|| {
+        "该说话人没有声纹数据（此会议在声纹功能之前转录，重新转录后即可注册）".to_string()
+    })?;
+
+    let name = name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .or_else(|| speaker.display_name.clone())
+        .ok_or_else(|| "请先为该说话人设置真实姓名再注册声纹".to_string())?;
+
+    // Keep the speaker row consistent when the enroll call supplied the name
+    // (e.g. enrolling an unnamed speaker directly). Done *before* the identity
+    // write: every fallible step precedes the enrollment persist, so a
+    // reported error always means "not enrolled" — the command can no longer
+    // fail after the voiceprint is already stored. (A confirmed-but-not-yet-
+    // enrolled speaker is a normal state; the user just retries the enroll.)
+    if speaker.display_name.as_deref() != Some(name.as_str()) {
+        with_store(&state, |s| {
+            s.rename_speaker(speaker_uuid, &name)
+                .map_err(|e| e.to_string())
+        })?;
+    }
+
+    let mut identities = open_identity_store()?;
+    let enrolled = identities
+        .enroll(&name, &embedding, Some(meeting))
+        .map_err(|e| format!("enroll: {e}"))?;
+
+    // The enrolled name is PII — log only the ids.
+    tracing::info!(meeting_id = %meeting, speaker_id = %speaker_uuid, "speaker voiceprint enrolled");
+    Ok(EnrolledSpeakerDto::from(&enrolled))
+}
+
+/// List every enrolled identity in the local voiceprint library (name-ordered).
+#[tauri::command]
+pub fn list_enrolled_speakers() -> Result<Vec<EnrolledSpeakerDto>, String> {
+    let identities = open_identity_store()?;
+    Ok(identities
+        .list()
+        .iter()
+        .map(EnrolledSpeakerDto::from)
+        .collect())
+}
+
+/// Remove one enrolled identity (its voiceprint file is deleted from disk).
+/// Returns `true` if it existed. Existing meetings keep their display names —
+/// removal only stops future auto-identification.
+#[tauri::command]
+pub fn remove_enrolled_speaker(identity_id: String) -> Result<bool, String> {
+    let id = parse_id(&identity_id, "identity")?;
+    let mut identities = open_identity_store()?;
+    identities.remove(id).map_err(|e| format!("remove: {e}"))
+}
+
+/// Report which of a meeting's speakers have a stored voiceprint embedding, so
+/// the UI can offer "注册声纹" only where enrollment is actually possible.
+#[tauri::command]
+pub fn get_meeting_voiceprints(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<SpeakerVoiceprintDto>, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    with_store(&state, |s| {
+        let speakers = s.list_speakers(id).map_err(|e| e.to_string())?;
+        speakers
+            .iter()
+            .map(|speaker| {
+                let has_embedding = s
+                    .get_speaker_embedding(speaker.id)
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+                Ok(SpeakerVoiceprintDto {
+                    speaker_id: speaker.id.to_string(),
+                    has_embedding,
+                })
+            })
+            .collect()
     })
 }
 

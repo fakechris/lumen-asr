@@ -504,6 +504,36 @@ export const api = {
 
   renameSpeaker: (speakerId: string, displayName: string) =>
     invoke<boolean>("rename_speaker", { speakerId, displayName }),
+
+  // ---- Speaker voiceprint enrollment (M5) -------------------------------
+  // The identity library is local-only (JSON under the Lumen identity dir);
+  // embeddings never leave the machine and never cross IPC.
+
+  /** Enroll a confirmed speaker's voiceprint under their real name (defaults
+   * to the speaker's display name; `name` overrides it). Later meetings will
+   * auto-identify this person. */
+  enrollSpeaker: (meetingId: string, speakerId: string, name?: string) =>
+    invoke<import("./types").EnrolledSpeaker>("enroll_speaker", {
+      meetingId,
+      speakerId,
+      name: name ?? null,
+    }),
+
+  /** List every enrolled identity (name-ordered). */
+  listEnrolledSpeakers: () =>
+    invoke<import("./types").EnrolledSpeaker[]>("list_enrolled_speakers"),
+
+  /** Remove one enrolled identity; resolves `true` if it existed. Existing
+   * meetings keep their names — only future auto-identification stops. */
+  removeEnrolledSpeaker: (identityId: string) =>
+    invoke<boolean>("remove_enrolled_speaker", { identityId }),
+
+  /** Which of a meeting's speakers have a stored voiceprint (enrollable). */
+  getMeetingVoiceprints: (meetingId: string) =>
+    invoke<import("./types").SpeakerVoiceprint[]>("get_meeting_voiceprints", {
+      meetingId,
+    }),
+
   reassignSegmentSpeaker: (segmentId: string, speakerId: string) =>
     invoke<boolean>("reassign_segment_speaker", { segmentId, speakerId }),
   mergeSpeakers: (

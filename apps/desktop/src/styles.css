@@ -2806,6 +2806,58 @@ button.meeting-index-item:hover {
   flex-shrink: 0;
 }
 
+/* Voiceprint enrollment (M5): enrolled badge, enroll action, and the
+ * collapsible 声纹库 list under 参与者. */
+.meeting-voiceprint-badge {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 6px;
+  flex-shrink: 0;
+}
+
+.meeting-enroll-btn {
+  flex-shrink: 0;
+}
+
+.meeting-voiceprint-toggle {
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.meeting-voiceprint-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.meeting-voiceprint-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.meeting-voiceprint-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .meeting-info {
   margin: 0;
   display: grid;

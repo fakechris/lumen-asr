@@ -17,6 +17,7 @@
 //! (no models needed). The minutes leg is cross-platform (an LLM call behind the
 //! [`Corrector`] trait) and is skipped when no corrector is supplied.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use lumen_asr_engine::AsrEngine;
@@ -28,7 +29,7 @@ use uuid::Uuid;
 
 use crate::assemble::assemble_meeting_with_channels;
 use crate::correct::{correct_segment, correct_words};
-use crate::merge::{merge_tracks, TrackTake};
+use crate::merge::{merge_tracks, system_speaker_offset, TrackTake};
 use crate::minutes::{
     generate_minutes, minutes_summaries, render_transcript_for_minutes, MinutesError,
 };
@@ -108,14 +109,16 @@ pub async fn process_meeting(
     result
 }
 
-/// Diarize + transcribe one WAV into a positional [`TrackTake`], plus the
-/// decoded duration (`None` when the sample rate is unknown).
+/// Diarize + transcribe one WAV into a positional [`TrackTake`], plus this
+/// track's per-speaker centroid voiceprints (keyed by the track's own engine
+/// speaker ids) and the decoded duration (`None` when the sample rate is
+/// unknown).
 async fn transcribe_track(
     wav: &Path,
     diar_models: &DiarModels,
     asr_engine: &dyn AsrEngine,
     opts: &MeetingOptions,
-) -> Result<(TrackTake, u32, Option<f64>), ProcessError> {
+) -> Result<(TrackTake, BTreeMap<u32, Vec<f32>>, u32, Option<f64>), ProcessError> {
     let diar = diarize_wav(wav, diar_models, opts)?;
     let sample_rate = diar.sample_rate;
     let duration = (sample_rate > 0).then(|| diar.samples.len() as f64 / sample_rate as f64);
@@ -131,7 +134,7 @@ async fn transcribe_track(
         take.texts.push(text);
         take.words.push(turn_words);
     }
-    Ok((take, sample_rate, duration))
+    Ok((take, diar.speaker_embeddings, sample_rate, duration))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -152,8 +155,17 @@ async fn run(
 
     // Mic track: authoritative — any failure here fails the meeting, exactly
     // as before dual-track existed.
-    let (mic_take, sample_rate, mut duration) =
+    let (mic_take, mic_embeddings, sample_rate, mut duration) =
         transcribe_track(wav, diar_models, asr_engine, opts).await?;
+
+    // Per-speaker centroid voiceprints across both tracks, keyed by the
+    // *merged* engine speaker id space: mic ids stay as-is; system ids are
+    // shifted by the same `system_speaker_offset` that `merge_tracks` applies,
+    // so every merged `S{n}` label maps to the right centroid. Both tracks are
+    // extracted — the system track carries the remote participants, which are
+    // exactly the people worth enrolling/auto-identifying — and the extra cost
+    // is one more embedding session over ≤30 s per speaker.
+    let mut speaker_embeddings = mic_embeddings;
 
     // System track (optional): best-effort. The remote-participants track is a
     // bonus on top of a working mic recording, so a diarize/ASR failure here
@@ -161,11 +173,15 @@ async fn run(
     // the whole meeting.
     let system_take = match system_wav {
         Some(sys) => match transcribe_track(sys, diar_models, asr_engine, opts).await {
-            Ok((take, _sys_rate, sys_duration)) => {
+            Ok((take, sys_embeddings, _sys_rate, sys_duration)) => {
                 duration = match (duration, sys_duration) {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (a, b) => a.or(b),
                 };
+                let offset = system_speaker_offset(&mic_take.turns);
+                for (engine_id, embedding) in sys_embeddings {
+                    speaker_embeddings.insert(engine_id.saturating_add(offset), embedding);
+                }
                 Some(take)
             }
             Err(err) => {
@@ -230,7 +246,7 @@ async fn run(
         }
     }
 
-    let assembled = assemble_meeting_with_channels(
+    let mut assembled = assemble_meeting_with_channels(
         meeting_id,
         &turns,
         &texts,
@@ -239,9 +255,23 @@ async fn run(
         Some(sample_rate),
         duration,
     );
+    // Cross-meeting auto-identification: match each cluster's voiceprint
+    // centroid against the enrolled identity library and assign the real name
+    // on a confident hit (logged with cluster label + score only — the name is
+    // PII). Unmatched speakers keep their engine label ("说话人N"). No-op when
+    // `opts.identity_dir` is unset or no embeddings were produced.
+    crate::identify::apply_auto_identification(
+        &mut assembled.speakers,
+        &speaker_embeddings,
+        opts.identity_dir.as_deref(),
+    );
     for speaker in &assembled.speakers {
         store.upsert_speaker(speaker).map_err(ProcessError::Store)?;
     }
+    // Persist each cluster's centroid so the user can later enroll a confirmed
+    // speaker from this meeting.
+    crate::identify::persist_speaker_embeddings(store, &assembled.speakers, &speaker_embeddings)
+        .map_err(ProcessError::Store)?;
     store
         .add_segments(&assembled.segments)
         .map_err(ProcessError::Store)?;

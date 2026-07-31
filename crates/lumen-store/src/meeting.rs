@@ -333,6 +333,36 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Store a speaker's centroid voiceprint embedding (v9 `embedding` BLOB,
+    /// f32 little-endian). Written by the diarization pipeline right after the
+    /// speaker rows; read back by voiceprint enrollment. Returns `true` if a
+    /// row was updated.
+    pub fn set_speaker_embedding(&self, id: Uuid, embedding: &[f32]) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE speakers SET embedding=?2 WHERE id=?1",
+            params![id.to_string(), embedding_to_bytes(embedding)],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Read back a speaker's centroid voiceprint embedding, or `None` when the
+    /// speaker has none (pre-v9 meetings, or non-diarized builds). A stored
+    /// blob whose length is not a multiple of 4 is rejected as corrupt.
+    pub fn get_speaker_embedding(&self, id: Uuid) -> Result<Option<Vec<f32>>> {
+        let blob: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row(
+                "SELECT embedding FROM speakers WHERE id=?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match blob.flatten() {
+            Some(bytes) => Ok(Some(embedding_from_bytes(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Reassign one transcript segment to a different speaker. This is the
     /// "the model split this one line onto the wrong person" fix — it moves a
     /// single segment without touching the rest of the cluster. Returns `true`
@@ -472,6 +502,27 @@ impl Store {
     }
 }
 
+/// Serialize an embedding as f32 little-endian bytes (the v9 BLOB contract).
+fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(embedding.len() * 4);
+    for value in embedding {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// Inverse of [`embedding_to_bytes`]; errors on a length that is not a
+/// multiple of 4 (a corrupt blob) instead of silently truncating.
+fn embedding_from_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        anyhow::bail!("speaker embedding blob has invalid length {}", bytes.len());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
 fn add_segment_on(conn: &Connection, segment: &TranscriptSegment) -> Result<()> {
     let words_json = match &segment.words {
         Some(words) => Some(serde_json::to_string(words)?),
@@ -587,6 +638,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("meeting.sqlite")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn speaker_embedding_round_trips_and_defaults_none() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        let speaker = Speaker::new(meeting.id, "S1");
+        store.upsert_speaker(&speaker).unwrap();
+
+        // A fresh speaker has no embedding; an unknown id reads back None too.
+        assert_eq!(store.get_speaker_embedding(speaker.id).unwrap(), None);
+        assert_eq!(store.get_speaker_embedding(Uuid::new_v4()).unwrap(), None);
+
+        // f32 LE roundtrip is exact, including negatives and non-round values.
+        let embedding: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.017).collect();
+        assert!(store.set_speaker_embedding(speaker.id, &embedding).unwrap());
+        assert_eq!(
+            store.get_speaker_embedding(speaker.id).unwrap(),
+            Some(embedding.clone())
+        );
+
+        // Overwrite wins; other speaker fields are untouched.
+        let other: Vec<f32> = vec![1.5; 256];
+        assert!(store.set_speaker_embedding(speaker.id, &other).unwrap());
+        assert_eq!(
+            store.get_speaker_embedding(speaker.id).unwrap(),
+            Some(other)
+        );
+        let listed = store.list_speakers(meeting.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].label, "S1");
+
+        // Setting on an unknown speaker updates nothing.
+        assert!(!store
+            .set_speaker_embedding(Uuid::new_v4(), &embedding)
+            .unwrap());
     }
 
     #[test]

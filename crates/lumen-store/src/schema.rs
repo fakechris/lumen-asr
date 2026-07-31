@@ -8,8 +8,10 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// adds the additive `meetings.failure_reason` column; v8 adds the additive
 /// `meetings.notes` column (user notes taken during the meeting); v9 adds the
 /// additive `meetings.system_audio_path` and `transcript_segments.channel`
-/// columns for dual-track (mic + system audio) meetings.
-pub(crate) const SCHEMA_VERSION: i64 = 9;
+/// columns for dual-track (mic + system audio) meetings; v10 adds the additive
+/// `speakers.embedding` column (per-speaker voiceprint centroid, f32
+/// little-endian bytes) for cross-meeting speaker enrollment.
+pub(crate) const SCHEMA_VERSION: i64 = 10;
 
 /// Additive v6 migration: the meeting-mode tables. These sit alongside the
 /// dictation tables and never touch them. `speakers` is created before
@@ -328,6 +330,27 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             "ALTER TABLE transcript_segments ADD COLUMN channel TEXT",
             [],
         )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (9)",
+        [],
+    )?;
+    // v10: additive `embedding` column on `speakers` — the diarization
+    // pipeline's per-speaker centroid voiceprint (256 × f32, little-endian
+    // bytes). Powers cross-meeting speaker enrollment; NULL for speakers from
+    // meetings transcribed before this version (they simply cannot be
+    // enrolled until re-processed). Guarded by a column check so re-running is
+    // a no-op.
+    let has_embedding = {
+        let mut statement = conn.prepare("PRAGMA table_info(speakers)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "embedding")
+    };
+    if !has_embedding {
+        conn.execute("ALTER TABLE speakers ADD COLUMN embedding BLOB", [])?;
     }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
@@ -841,6 +864,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(text, "旧句子");
+
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_ten_adds_speaker_embedding_column_without_touching_v9_speakers() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Stand up a v9 database (schema recorded up to 9: meetings with the
+        // dual-track system_audio_path, speakers without embedding) holding
+        // one speaker row.
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version) VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9);
+                CREATE TABLE meetings (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  title TEXT,
+                  audio_path TEXT,
+                  duration_seconds REAL,
+                  status TEXT NOT NULL DEFAULT 'recording',
+                  language TEXT,
+                  failure_reason TEXT,
+                  notes TEXT NOT NULL DEFAULT '',
+                  system_audio_path TEXT
+                );
+                CREATE TABLE speakers (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  meeting_id TEXT NOT NULL,
+                  label TEXT NOT NULL,
+                  display_name TEXT,
+                  embedding_ref TEXT,
+                  FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+                INSERT INTO meetings (id, created_at, status) VALUES ('m1', '2026-07-29T00:00:00Z', 'ready');
+                INSERT INTO speakers (id, meeting_id, label, display_name) VALUES ('s1', 'm1', 'S1', '李明');
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        // The new column exists and pre-existing rows default it to NULL.
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(speakers)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"embedding".to_owned()));
+
+        let embedding: Option<Vec<u8>> = connection
+            .query_row("SELECT embedding FROM speakers WHERE id='s1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(embedding, None);
+        // The pre-existing speaker row is otherwise untouched.
+        let name: Option<String> = connection
+            .query_row(
+                "SELECT display_name FROM speakers WHERE id='s1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("李明"));
 
         let version: i64 = connection
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {

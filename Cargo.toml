@@ -7,6 +7,7 @@ members = [
   "crates/lumen-dictionary",
   "crates/lumen-store",
   "crates/lumen-meeting",
+  "crates/lumen-identity",
   "crates/lumen-inject",
   "crates/lumen-platform",
   "crates/lumen-platform-macos",
@@ -20,6 +21,7 @@ default-members = [
   "crates/lumen-dictionary",
   "crates/lumen-store",
   "crates/lumen-meeting",
+  "crates/lumen-identity",
   "crates/lumen-inject",
   "crates/lumen-platform",
   "crates/lumen-prompts",
@@ -52,6 +54,7 @@ lumen-corrector = { path = "crates/lumen-corrector" }
 lumen-dictionary = { path = "crates/lumen-dictionary" }
 lumen-store = { path = "crates/lumen-store" }
 lumen-meeting = { path = "crates/lumen-meeting" }
+lumen-identity = { path = "crates/lumen-identity" }
 lumen-inject = { path = "crates/lumen-inject" }
 lumen-platform = { path = "crates/lumen-platform" }
 lumen-platform-macos = { path = "crates/lumen-platform-macos" }

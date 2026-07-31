@@ -470,6 +470,21 @@ export type Speaker = {
   embedding_ref?: string | null;
 };
 
+/** An identity enrolled in the local voiceprint library (camelCase DTO; the
+ * embedding itself never crosses IPC). */
+export type EnrolledSpeaker = {
+  id: string;
+  name: string;
+  enrolledAt: string;
+  sourceMeetingId?: string | null;
+};
+
+/** Whether a meeting speaker has a stored voiceprint embedding (enrollable). */
+export type SpeakerVoiceprint = {
+  speakerId: string;
+  hasEmbedding: boolean;
+};
+
 /** One transcript segment (aligned with the lumen-transcript.v1 shape). */
 export type TranscriptSegment = {
   id: string;
