@@ -10,6 +10,11 @@ import { HotkeyRecorder } from "./HotkeyRecorder";
 import { formatHotkeyLabel } from "./hotkeyFormat";
 import { Icon } from "./Icons";
 import { chooseAudioDevice } from "./audioDeviceSelection";
+import {
+  useMeetingModels,
+  type MeetingModels,
+  type ModelTarget,
+} from "./meetingModels";
 import type { AudioDevice } from "./types";
 
 type Props = {
@@ -19,6 +24,12 @@ type Props = {
 const STEPS = ["欢迎", "权限", "麦克风", "模型", "修正", "热键", "试听"] as const;
 const PEAK_THRESHOLD = 0.04;
 const IS_WINDOWS = navigator.userAgent.includes("Windows");
+
+const MODEL_LABELS: Record<ModelTarget, string> = {
+  sensevoice: "SenseVoice（听写）",
+  offline: "Paraformer 离线（会议）",
+  streaming: "Paraformer 流式（会议）",
+};
 
 export function OnboardingWizard({ onDone }: Props) {
   const [step, setStep] = useState(0);
@@ -33,13 +44,13 @@ export function OnboardingWizard({ onDone }: Props) {
   const heardRef = useRef(false);
   const monitoring = useRef(false);
 
+  const models = useMeetingModels();
   const [asr, setAsr] = useState<AsrModelStatus | null>(null);
   const [engineChoice, setEngineChoice] = useState<"sensevoice" | "whisper" | "qwen">(
     "sensevoice",
   );
-  const [dlMsg, setDlMsg] = useState("");
-  const [dlPct, setDlPct] = useState<number | null>(null);
   const [customPath, setCustomPath] = useState("");
+  const autoQueuedRef = useRef(false);
 
   const [probe, setProbe] = useState<CorrectorProbeResult | null>(null);
   const [pullMsg, setPullMsg] = useState("");
@@ -170,21 +181,28 @@ export function OnboardingWizard({ onDone }: Props) {
     if (step === 4) void refreshProbe();
   }, [step, refreshAsr, refreshProbe]);
 
+  // Model status is owned by the app-level coordinator; keep the wizard's
+  // local snapshot (engine pickers, ready pills) in sync as queued downloads
+  // finish in the background.
   useEffect(() => {
-    if (step !== 3) return;
-    let un: (() => void) | undefined;
-    listen<{
-      phase: string;
-      message: string;
-      percent?: number | null;
-    }>("asr-download-progress", (e) => {
-      setDlMsg(e.payload.message);
-      setDlPct(e.payload.percent ?? null);
-    }).then((fn) => {
-      un = fn;
-    });
-    return () => un?.();
-  }, [step]);
+    if (models.status) setAsr(models.status);
+  }, [models.status]);
+
+  // Kick off the core dictation-model download as soon as the wizard opens:
+  // the user walks the other steps while it installs in the background. Only
+  // SenseVoice auto-starts — the Paraformer meeting models (~1GB each) are
+  // optional and download only when explicitly requested (model step or the
+  // meeting page). An explicit user cancel is never auto-restarted.
+  useEffect(() => {
+    const s = models.status;
+    if (!s || autoQueuedRef.current) return;
+    autoQueuedRef.current = true;
+    const dictationReady =
+      s.sensevoiceReady ||
+      (s.activeEngine === "qwen" && s.qwenReady && s.qwenRuntimeSupported) ||
+      (s.activeEngine === "whisper" && s.whisperReady);
+    if (!dictationReady) models.enqueue(["sensevoice"]);
+  }, [models]);
 
   useEffect(() => {
     if (step !== 4) return;
@@ -319,6 +337,7 @@ export function OnboardingWizard({ onDone }: Props) {
         <div className="onboard-topbar">
           <span className="onboard-topbar-title">首次设置 · {step + 1}/{STEPS.length}</span>
           <div className="onboard-topbar-actions">
+            <DownloadBadge models={models} />
             <button
               type="button"
               className="onboard-skip-btn"
@@ -573,7 +592,7 @@ export function OnboardingWizard({ onDone }: Props) {
             <h1>本地 ASR 模型</h1>
             <p className="muted-text">
               默认 SenseVoice，适合无独显和低内存机器。Qwen3-ASR 本地 runtime 当前基于 Apple
-              MLX；Windows 会自动降级到 SenseVoice。
+              MLX；Windows 会自动降级到 SenseVoice。缺失的听写模型已在后台自动下载（见右上角进度），无需停留等待。
             </p>
             {asr?.qwenFallbackReason && (
               <div className="onboard-perm-card" style={{ marginBottom: 12 }}>
@@ -649,6 +668,9 @@ export function OnboardingWizard({ onDone }: Props) {
                             setBusy(true);
                             try {
                               setAsr(await api.useExistingAsrModel(c.path, engineChoice));
+                              // Keep the app-level coordinator's snapshot fresh
+                              // so the queue skips now-ready targets.
+                              void models.refresh();
                             } catch (e) {
                               setError(String(e));
                             } finally {
@@ -681,6 +703,7 @@ export function OnboardingWizard({ onDone }: Props) {
                     setBusy(true);
                     try {
                       setAsr(await api.useExistingAsrModel(customPath.trim(), engineChoice));
+                      void models.refresh();
                     } catch (e) {
                       setError(String(e));
                     } finally {
@@ -701,30 +724,33 @@ export function OnboardingWizard({ onDone }: Props) {
               <button
                 type="button"
                 className="btn"
-                disabled={busy || asrReady || engineChoice !== "sensevoice"}
+                disabled={
+                  asrReady ||
+                  engineChoice !== "sensevoice" ||
+                  models.active === "sensevoice" ||
+                  models.queued.includes("sensevoice")
+                }
                 onClick={() =>
-                  void (async () => {
-                    setBusy(true);
-                    setError(null);
-                    setDlMsg("开始下载…");
-                    try {
-                      setAsr(await api.startAsrModelDownload());
-                      setDlMsg("完成");
-                    } catch (e) {
-                      setError(String(e));
-                    } finally {
-                      setBusy(false);
-                    }
-                  })()
+                  models.failed.includes("sensevoice")
+                    ? models.retry()
+                    : models.enqueue(["sensevoice"])
                 }
               >
-                {asrReady ? "已就绪" : "下载 SenseVoice"}
+                {asrReady
+                  ? "已就绪"
+                  : models.active === "sensevoice"
+                    ? "下载中…"
+                    : models.queued.includes("sensevoice")
+                      ? "排队中…"
+                      : models.failed.includes("sensevoice")
+                        ? "重试下载"
+                        : "下载 SenseVoice"}
               </button>
               <button
                 type="button"
                 className="btn ghost"
-                disabled={!busy || engineChoice !== "sensevoice"}
-                onClick={() => void api.cancelAsrModelDownload()}
+                disabled={models.active !== "sensevoice"}
+                onClick={() => void models.cancel()}
               >
                 取消下载
               </button>
@@ -732,10 +758,21 @@ export function OnboardingWizard({ onDone }: Props) {
                 刷新
               </button>
             </div>
-            {(dlMsg || dlPct != null) && (
+            {models.active === "sensevoice" && models.progress && (
               <p className="muted-text">
-                {dlMsg}
-                {dlPct != null ? ` · ${dlPct.toFixed(0)}%` : ""}
+                {models.progress.message}
+                {models.progress.percent != null
+                  ? ` · ${models.progress.percent.toFixed(0)}%`
+                  : ""}
+                {" · 下载在后台进行，可先继续下一步"}
+              </p>
+            )}
+            {models.error && models.failed.includes("sensevoice") && (
+              <p className="muted-text">
+                下载失败：{models.error}{" "}
+                <button type="button" className="btn ghost small" onClick={() => models.retry()}>
+                  重试
+                </button>
               </p>
             )}
             {asr && (
@@ -744,70 +781,20 @@ export function OnboardingWizard({ onDone }: Props) {
                   会议模型 · Paraformer <span className="onboard-pill">可选</span>
                 </div>
                 <p className="muted-text">
-                  用于会议记录（实时转写 + 词级时间戳）。日常听写无需安装，仅在使用会议功能时需要；点「安装」即可，无需手动下载。
+                  用于会议记录（实时转写 + 词级时间戳）。会议功能可选，日常听写无需安装，因此不会自动下载；点「安装」加入后台下载队列，也可稍后在会议页安装。
                 </p>
-                <div className="onboard-candidate">
-                  <span>
-                    Paraformer 离线（会议转写）{" "}
-                    <span className="onboard-pill">
-                      {asr.paraformerOfflineReady ? "已安装" : "未安装"}
-                    </span>
-                  </span>
-                  <button
-                    type="button"
-                    className="btn ghost"
-                    disabled={busy || asr.paraformerOfflineReady}
-                    onClick={() =>
-                      void (async () => {
-                        setBusy(true);
-                        setError(null);
-                        setDlMsg("开始下载 Paraformer 离线模型…");
-                        setDlPct(null);
-                        try {
-                          setAsr(await api.downloadParaformerOffline());
-                          setDlMsg("Paraformer 离线模型已安装");
-                        } catch (e) {
-                          setError(String(e));
-                        } finally {
-                          setBusy(false);
-                        }
-                      })()
-                    }
-                  >
-                    {asr.paraformerOfflineReady ? "已安装" : "安装"}
-                  </button>
-                </div>
-                <div className="onboard-candidate">
-                  <span>
-                    Paraformer 流式（会议实时）{" "}
-                    <span className="onboard-pill">
-                      {asr.paraformerStreamingReady ? "已安装" : "未安装"}
-                    </span>
-                  </span>
-                  <button
-                    type="button"
-                    className="btn ghost"
-                    disabled={busy || asr.paraformerStreamingReady}
-                    onClick={() =>
-                      void (async () => {
-                        setBusy(true);
-                        setError(null);
-                        setDlMsg("开始下载 Paraformer 流式模型…");
-                        setDlPct(null);
-                        try {
-                          setAsr(await api.downloadParaformerStreaming());
-                          setDlMsg("Paraformer 流式模型已安装");
-                        } catch (e) {
-                          setError(String(e));
-                        } finally {
-                          setBusy(false);
-                        }
-                      })()
-                    }
-                  >
-                    {asr.paraformerStreamingReady ? "已安装" : "安装"}
-                  </button>
-                </div>
+                <ParaformerRow
+                  label="Paraformer 离线（会议转写）"
+                  target="offline"
+                  ready={asr.paraformerOfflineReady}
+                  models={models}
+                />
+                <ParaformerRow
+                  label="Paraformer 流式（会议实时）"
+                  target="streaming"
+                  ready={asr.paraformerStreamingReady}
+                  models={models}
+                />
                 <p className="muted-text" style={{ wordBreak: "break-all" }}>
                   <code>{asr.paraformerOfflineDir}</code>
                 </p>
@@ -818,7 +805,7 @@ export function OnboardingWizard({ onDone }: Props) {
                 上一步
               </button>
               <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(4)}>
-                跳过（稍后配置）
+                {models.active !== null ? "跳过（后台继续下载）" : "跳过（稍后配置）"}
               </button>
               <button
                 type="button"
@@ -1124,6 +1111,186 @@ export function OnboardingWizard({ onDone }: Props) {
           </section>
         )}
       </div>
+    </div>
+  );
+}
+
+/** Lightweight always-visible download indicator in the wizard topbar. Shows
+ * "模型下载中 42%" while the queue runs; click to expand details (current item,
+ * queued items, cancel) or, after a failure/cancel, to retry. Hidden when the
+ * queue is idle with nothing to report. */
+function DownloadBadge({ models }: { models: MeetingModels }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const { active, queued, progress, error, failed, cancelled } = models;
+  const pct = progress?.percent ?? null;
+  const downloading = active !== null;
+  const show = downloading || error !== null || (cancelled && failed.length > 0);
+  useEffect(() => {
+    if (!show) setOpen(false);
+  }, [show]);
+  // Close the popover on Escape or a click outside it. Escape stops
+  // propagation so the wizard's own window-level Escape (exit wizard)
+  // doesn't fire from the same keypress.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setOpen(false);
+      }
+    };
+    const onDown = (e: MouseEvent) => {
+      if (
+        rootRef.current &&
+        e.target instanceof Node &&
+        !rootRef.current.contains(e.target)
+      ) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [open]);
+  if (!show) return null;
+  const label = downloading
+    ? `模型下载中${pct != null ? ` ${pct.toFixed(0)}%` : "…"}`
+    : error
+      ? "模型下载失败"
+      : "模型下载已取消";
+  return (
+    <div className="onboard-dl" ref={rootRef}>
+      <button
+        type="button"
+        className={`onboard-dl-chip ${error ? "err" : ""}`}
+        onClick={() => setOpen((v) => !v)}
+        title="模型在后台下载，可继续其它步骤"
+        aria-expanded={open}
+      >
+        {downloading && <span className="onboard-dl-spin" aria-hidden />}
+        {label}
+      </button>
+      {open && (
+        <div className="onboard-dl-pop" role="status">
+          {downloading && active && (
+            <>
+              <div className="onboard-dl-row">
+                <span>{MODEL_LABELS[active]}</span>
+                <span className="muted-text">
+                  {pct != null ? `${pct.toFixed(0)}%` : "下载中"}
+                </span>
+              </div>
+              <div className="onboard-dl-bar" aria-hidden>
+                <div
+                  className="onboard-dl-fill"
+                  style={{ width: `${Math.min(100, Math.max(2, pct ?? 2))}%` }}
+                />
+              </div>
+              {progress?.message && (
+                <p className="muted-text onboard-dl-msg">{progress.message}</p>
+              )}
+              {queued.map((t) => (
+                <div key={t} className="onboard-dl-row muted-text">
+                  <span>{MODEL_LABELS[t]}</span>
+                  <span>排队中</span>
+                </div>
+              ))}
+              <div className="actions">
+                <button
+                  type="button"
+                  className="btn ghost small"
+                  onClick={() => void models.cancel()}
+                >
+                  取消下载
+                </button>
+              </div>
+            </>
+          )}
+          {!downloading && error && (
+            <>
+              <p className="muted-text onboard-dl-msg">{error}</p>
+              <div className="actions">
+                <button
+                  type="button"
+                  className="btn small"
+                  onClick={() => models.retry()}
+                >
+                  重试
+                </button>
+              </div>
+            </>
+          )}
+          {!downloading && !error && cancelled && failed.length > 0 && (
+            <>
+              <p className="muted-text onboard-dl-msg">
+                已取消，未完成的模型可稍后在模型步或会议页安装。
+              </p>
+              <div className="actions">
+                <button
+                  type="button"
+                  className="btn ghost small"
+                  onClick={() => models.retry()}
+                >
+                  重新下载
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One optional meeting-model row on the model step. Installs go through the
+ * app-level queue (single-flight backend), so the row never blocks the wizard:
+ * it just reflects queue state and offers install/cancel. */
+function ParaformerRow({
+  label,
+  target,
+  ready,
+  models,
+}: {
+  label: string;
+  target: ModelTarget;
+  ready: boolean;
+  models: MeetingModels;
+}) {
+  const activeRow = models.active === target;
+  const queuedRow = models.queued.includes(target);
+  const pct = activeRow ? models.progress?.percent ?? null : null;
+  return (
+    <div className="onboard-candidate">
+      <span>
+        {label}{" "}
+        <span className="onboard-pill">
+          {ready
+            ? "已安装"
+            : activeRow
+              ? `下载中${pct != null ? ` ${pct.toFixed(0)}%` : ""}`
+              : queuedRow
+                ? "排队中"
+                : "未安装"}
+        </span>
+      </span>
+      {activeRow ? (
+        <button type="button" className="btn ghost" onClick={() => void models.cancel()}>
+          取消
+        </button>
+      ) : (
+        <button
+          type="button"
+          className="btn ghost"
+          disabled={ready || queuedRow}
+          onClick={() => models.enqueue([target])}
+        >
+          {ready ? "已安装" : queuedRow ? "排队中" : "安装"}
+        </button>
+      )}
     </div>
   );
 }

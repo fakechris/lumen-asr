@@ -3,24 +3,26 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, type AsrModelStatus } from "./api";
 
-// App-level Paraformer model install state.
+// App-level ASR model download coordinator.
 //
-// Meeting transcription needs the Paraformer models, which onboarding may have
-// skipped. Model downloads are inherently global (onboarding downloads them
-// too) and the backend runs a single-flight ~1GB download, so the *UI* state
-// must also be app-level: held here in a provider mounted at the App root that
-// never unmounts on tab switches. That keeps one `asr-download-progress`
-// listener and one in-flight download's progress/cancel binding alive even when
-// the meeting panel is not mounted — switch away mid-download and back, and the
-// progress/cancel are still there.
+// The backend download commands are single-flight (one download at a time,
+// one global cancel flag), so the *UI* must funnel every model download
+// through one place. This provider — mounted at the App root so it never
+// unmounts on tab switches — is that place: onboarding's automatic background
+// download, the onboarding model step, and the meeting model card all enqueue
+// here. Targets download strictly one after another (a FIFO queue: the next
+// starts only when the previous invoke settles), one `asr-download-progress`
+// listener drives progress for whichever download is in flight, and cancel /
+// failure state survives navigation.
 
-export type ModelTarget = "streaming" | "offline";
+export type ModelTarget = "sensevoice" | "streaming" | "offline";
 
 export type ModelProgressState = {
   phase: string;
@@ -30,29 +32,72 @@ export type ModelProgressState = {
 
 export type MeetingModels = {
   status: AsrModelStatus | null;
+  /** Target currently downloading (null when idle). */
   active: ModelTarget | null;
+  /** Targets waiting behind `active`, in download order. */
+  queued: ModelTarget[];
   progress: ModelProgressState | null;
   error: string | null;
+  /** Targets dropped by a failure or cancel; `retry()` re-enqueues them. */
+  failed: ModelTarget[];
+  /** True after an explicit user cancel — the queue never restarts on its
+   * own; only an explicit enqueue/retry starts downloads again. */
+  cancelled: boolean;
+  /** Add targets to the download queue (already-installed / already-queued
+   * targets are skipped) and start it if idle. */
+  enqueue: (targets: ModelTarget[]) => void;
+  /** Re-enqueue whatever a failure or cancel left undone. */
+  retry: () => void;
+  /** Back-compat single-target entry point (meeting model card). */
   download: (target: ModelTarget) => Promise<void>;
   cancel: () => Promise<void>;
   refresh: () => Promise<void>;
 };
 
-/** Owns Paraformer model status + a single in-flight download. Only one model
- * downloads at a time (the backend cancel command is global), so `active` marks
- * which target is running and disables the other. `download()` resolves with the
- * refreshed status; the `asr-download-progress` listener drives the progress bar
- * meanwhile (same pattern as OnboardingWizard). */
+export function isModelTargetReady(
+  status: AsrModelStatus | null,
+  target: ModelTarget,
+): boolean {
+  if (!status) return false;
+  switch (target) {
+    case "sensevoice":
+      return status.sensevoiceReady;
+    case "streaming":
+      return status.paraformerStreamingReady;
+    case "offline":
+      return status.paraformerOfflineReady;
+  }
+}
+
+/** Union of two target lists, `add` entries last, no duplicates. */
+function mergeTargets(prev: ModelTarget[], add: ModelTarget[]): ModelTarget[] {
+  return [...prev.filter((t) => !add.includes(t)), ...add];
+}
+
+/** Owns model status + the single download queue. Only one model downloads at
+ * a time (the backend guard rejects concurrent starts and the cancel command
+ * is global), so the runner awaits each invoke before starting the next. */
 function useProvideMeetingModels(): MeetingModels {
   const [status, setStatus] = useState<AsrModelStatus | null>(null);
   const [active, setActive] = useState<ModelTarget | null>(null);
+  const [queued, setQueued] = useState<ModelTarget[]>([]);
   const [progress, setProgress] = useState<ModelProgressState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [failed, setFailed] = useState<ModelTarget[]>([]);
+  const [cancelled, setCancelled] = useState(false);
+
+  // Refs mirror the queue for the async runner (state is for rendering).
+  const statusRef = useRef<AsrModelStatus | null>(null);
+  const queueRef = useRef<ModelTarget[]>([]);
+  const activeRef = useRef<ModelTarget | null>(null);
+  const runningRef = useRef(false);
+  const cancelRef = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
-      setStatus(await api.checkAsrModelStatus());
-      setError(null);
+      const s = await api.checkAsrModelStatus();
+      statusRef.current = s;
+      setStatus(s);
     } catch (e) {
       setError(String(e));
     }
@@ -87,40 +132,123 @@ function useProvideMeetingModels(): MeetingModels {
     };
   }, []);
 
-  const download = useCallback(async (target: ModelTarget) => {
-    setError(null);
-    setActive(target);
-    setProgress({ phase: "waiting", message: "准备下载…", percent: null });
-    try {
-      const next =
-        target === "streaming"
-          ? await api.downloadParaformerStreaming()
-          : await api.downloadParaformerOffline();
-      setStatus(next);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActive(null);
-      setProgress(null);
+  /** Drain the queue one target at a time. On failure (or cancel) the rest of
+   * the queue is parked in `failed` so `retry()` can resume it. */
+  const runQueue = useCallback(async () => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    for (;;) {
+      if (cancelRef.current) {
+        // A cancel landed between downloads (or right as one settled): stop
+        // before starting the next target and park the rest for retry.
+        const remaining = [...queueRef.current];
+        queueRef.current = [];
+        if (remaining.length > 0) {
+          setFailed((prev) => mergeTargets(prev, remaining));
+          setCancelled(true);
+        }
+        break;
+      }
+      const target = queueRef.current.shift();
+      if (!target) break;
+      activeRef.current = target;
+      setActive(target);
+      setQueued([...queueRef.current]);
+      setProgress({ phase: "waiting", message: "准备下载…", percent: null });
+      try {
+        const next =
+          target === "sensevoice"
+            ? await api.startAsrModelDownload()
+            : target === "streaming"
+              ? await api.downloadParaformerStreaming()
+              : await api.downloadParaformerOffline();
+        statusRef.current = next;
+        setStatus(next);
+      } catch (e) {
+        const remaining = [target, ...queueRef.current];
+        queueRef.current = [];
+        setFailed((prev) => mergeTargets(prev, remaining));
+        if (cancelRef.current) {
+          // Explicit user cancel: stop quietly, never auto-restart.
+          setCancelled(true);
+        } else {
+          setError(String(e));
+        }
+        break;
+      }
     }
+    activeRef.current = null;
+    runningRef.current = false;
+    setActive(null);
+    setQueued([]);
+    setProgress(null);
   }, []);
 
+  const enqueue = useCallback(
+    (targets: ModelTarget[]) => {
+      const add = targets.filter(
+        (t) =>
+          !isModelTargetReady(statusRef.current, t) &&
+          t !== activeRef.current &&
+          !queueRef.current.includes(t),
+      );
+      if (add.length === 0) return;
+      cancelRef.current = false;
+      setCancelled(false);
+      setError(null);
+      // Only clear the failure records of the targets being re-enqueued;
+      // unrelated targets keep their failed state visible.
+      setFailed((prev) => prev.filter((t) => !add.includes(t)));
+      queueRef.current = [...queueRef.current, ...add];
+      setQueued([...queueRef.current]);
+      void runQueue();
+    },
+    [runQueue],
+  );
+
+  const retry = useCallback(() => {
+    if (failed.length > 0) enqueue(failed);
+  }, [failed, enqueue]);
+
+  const download = useCallback(
+    async (target: ModelTarget) => {
+      enqueue([target]);
+    },
+    [enqueue],
+  );
+
   const cancel = useCallback(async () => {
+    // Mark first so the in-flight invoke's rejection is treated as a user
+    // cancel (queue drains into `failed` for a possible retry, no error UI).
+    cancelRef.current = true;
     try {
       await api.cancelAsrModelDownload();
     } catch (e) {
       setError(String(e));
     }
-    // active/progress clear when the in-flight download() promise settles.
+    // active/progress clear when the in-flight download promise settles.
   }, []);
 
-  return { status, active, progress, error, download, cancel, refresh };
+  return {
+    status,
+    active,
+    queued,
+    progress,
+    error,
+    failed,
+    cancelled,
+    enqueue,
+    retry,
+    download,
+    cancel,
+    refresh,
+  };
 }
 
 const MeetingModelsContext = createContext<MeetingModels | null>(null);
 
 /** Mount once at the App root (outside any tab-switched subtree) so the single
- * download listener + in-flight state survive navigation between tabs. */
+ * download listener + queue state survive navigation between tabs. */
 export function MeetingModelsProvider({ children }: { children: ReactNode }) {
   const models = useProvideMeetingModels();
   return (
