@@ -119,6 +119,17 @@ export type MeetingDetectionStatus = {
   active: boolean;
 };
 
+/** Local-only meeting-detection counters (stored on this machine, never
+ * uploaded) — how often detection prompted/suggested and what the user chose. */
+export type MeetingDetectionStats = {
+  promptShown: number;
+  promptAccepted: number;
+  promptDismissed: number;
+  stopSuggested: number;
+  stopAccepted: number;
+  stopDeclined: number;
+};
+
 export const api = {
   health: () => invoke<Health>("app_health"),
   buildInfo: () => invoke<BuildInfo>("build_info"),
@@ -468,6 +479,21 @@ export const api = {
   /** User dismissed a detection prompt (arms a per-app cooldown). */
   dismissMeetingDetection: () =>
     invoke<void>("dismiss_meeting_detection"),
+
+  /** User accepted the end-of-meeting stop suggestion → stop the
+   * detection-started recording via the existing stop path. A stale click
+   * (recording already ended some other way) resolves as a no-op. */
+  acceptMeetingDetectionStop: () =>
+    invoke<void>("accept_meeting_detection_stop"),
+
+  /** User declined the stop suggestion ("继续录制"): keep recording; no
+   * further suggestion is made for this recording. */
+  declineMeetingDetectionStop: () =>
+    invoke<void>("decline_meeting_detection_stop"),
+
+  /** Read the local detection counters (all counting stays on this machine). */
+  getMeetingDetectionStats: () =>
+    invoke<MeetingDetectionStats>("get_meeting_detection_stats"),
 
   /** Read one meeting with its speakers, seq-ordered segments, and summaries. */
   getMeetingDetail: (meetingId: string) =>
