@@ -7,6 +7,7 @@ mod inject;
 mod meeting_activity;
 mod permissions;
 mod system_audio;
+mod voice_processing;
 
 pub use calendar::{
     current_or_upcoming_event as calendar_current_or_upcoming_event,
@@ -29,6 +30,9 @@ pub use permissions::{
 pub use system_audio::{
     capability_available as system_audio_capability_available, SystemAudioCapture,
     SystemAudioError, SystemAudioSink,
+};
+pub use voice_processing::{
+    voice_processing_supported, VoiceInputSink, VoiceProcessingError, VoiceProcessingInput,
 };
 
 use async_trait::async_trait;
