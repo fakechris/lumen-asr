@@ -186,8 +186,41 @@ pub fn start_meeting_recording(
     } else {
         (None, None)
     };
-    let sample_rate =
-        match state
+    // Mic capture backend selection: prefer the system voice processor
+    // (VoiceProcessingIO — OS-level echo cancellation, so speakerphone
+    // meetings stop feeding the far-end voice back through the mic) when the
+    // user has not opted out (`meeting.mic_aec`, default on) and the host
+    // supports it. Any AEC start failure falls back to the plain cpal
+    // recorder — the recording itself never fails because of AEC. Both
+    // backends feed the identical WAV/fan-out contracts, so live preview,
+    // pause, sidecars, and the offline pipeline are unaffected by the choice.
+    // (Trade-off behind the opt-out: VPIO's bundled noise suppression may
+    // attenuate quiet far-field speakers in a conference room.)
+    let mic_aec_enabled = state
+        .config
+        .lock()
+        .map(|cfg| cfg.meeting.mic_aec)
+        .unwrap_or(true);
+    let aec_rate = if mic_aec_enabled && crate::meeting_mic_aec::MeetingMicAec::is_supported() {
+        let rate = state
+            .meeting_mic_aec
+            .start(device.clone(), out_path.clone(), mic_tap.clone());
+        if rate.is_some() {
+            tracing::info!("meeting mic path: VoiceProcessingIO (system AEC) engaged");
+        } else {
+            tracing::warn!("meeting mic path: VoiceProcessingIO failed, falling back to cpal");
+        }
+        rate
+    } else {
+        tracing::info!(
+            mic_aec_enabled,
+            "meeting mic path: cpal (AEC disabled or unsupported on this host)"
+        );
+        None
+    };
+    let sample_rate = match aec_rate {
+        Some(rate) => rate,
+        None => match state
             .meeting_recorder
             .start_with_sink(device, out_path.clone(), mic_tap)
         {
@@ -204,7 +237,8 @@ pub fn start_meeting_recording(
                 });
                 return Err(reason);
             }
-        };
+        },
+    };
     let mic_offset_seconds = t0.elapsed().as_secs_f64();
 
     // 5. Optional second track: system audio output (remote participants) via
@@ -411,7 +445,16 @@ pub fn stop_meeting_recording(
     // below (restore hotkey + reset arbiter) must run on every path, success or
     // failure. This is finally/defer semantics: whatever happens to the
     // recorder or the store write, "the mic and hotkey always come back".
-    let stop_result = state.meeting_recorder.stop();
+    //
+    // The mic may have been captured by either backend: the AEC
+    // (VoiceProcessingIO) session when one engaged at start, else the plain
+    // cpal recorder. `meeting_mic_aec.stop()` returns `None` when it was not
+    // the active path.
+    let stop_result: Result<lumen_asr::RecordingSummary, String> =
+        match state.meeting_mic_aec.stop() {
+            Some(result) => result,
+            None => state.meeting_recorder.stop().map_err(|e| e.to_string()),
+        };
 
     // Stop the system-audio track (no-op when none is running): tears down the
     // tap and finalizes the second WAV. Best-effort — `None` here just means
@@ -454,7 +497,7 @@ pub fn stop_meeting_recording(
                 s.fail_meeting(id, Some(&reason)).map_err(|e| e.to_string())
             });
             tracing::warn!(meeting_id = %id, error = %e, "meeting recorder stop failed");
-            return Err(e.to_string());
+            return Err(e);
         }
     };
     let audio_path = summary.wav_path.to_string_lossy().to_string();
@@ -668,9 +711,13 @@ fn meeting_detection_capability() -> bool {
 }
 
 /// Pause the active meeting recording. Paused audio is dropped (no silent gap).
+/// Routes to whichever mic backend is active: the AEC (VoiceProcessingIO)
+/// session when one engaged at start, else the cpal recorder.
 #[tauri::command]
 pub fn pause_meeting_recording(state: State<'_, AppState>) -> Result<(), String> {
-    state.meeting_recorder.pause().map_err(|e| e.to_string())?;
+    if !state.meeting_mic_aec.set_paused(true) {
+        state.meeting_recorder.pause().map_err(|e| e.to_string())?;
+    }
     // Keep the system track's timeline in lockstep with the mic's.
     state.meeting_system_audio.set_paused(true);
     Ok(())
@@ -679,7 +726,9 @@ pub fn pause_meeting_recording(state: State<'_, AppState>) -> Result<(), String>
 /// Resume a paused meeting recording.
 #[tauri::command]
 pub fn resume_meeting_recording(state: State<'_, AppState>) -> Result<(), String> {
-    state.meeting_recorder.resume().map_err(|e| e.to_string())?;
+    if !state.meeting_mic_aec.set_paused(false) {
+        state.meeting_recorder.resume().map_err(|e| e.to_string())?;
+    }
     state.meeting_system_audio.set_paused(false);
     Ok(())
 }
