@@ -20,6 +20,7 @@ mod learning;
 mod meeting_cmd;
 mod meeting_detection;
 mod meeting_live;
+mod meeting_mic_aec;
 mod meeting_system_audio;
 mod mod_chord;
 mod mode_arbiter;
@@ -71,6 +72,11 @@ pub struct AppState {
     /// meeting recording. Capability-gated (macOS 14.2+ process tap);
     /// best-effort — idle everywhere else.
     pub meeting_system_audio: meeting_system_audio::MeetingSystemAudio,
+    /// System-AEC (VoiceProcessingIO) mic capture for the active meeting
+    /// recording. Opt-out via `meeting.mic_aec`; on any init failure the
+    /// meeting falls back to `meeting_recorder` (plain cpal). macOS-only —
+    /// idle everywhere else. Dictation never touches this.
+    pub meeting_mic_aec: meeting_mic_aec::MeetingMicAec,
     /// Mutual-exclusion arbiter between dictation and meeting recording.
     pub capture: CaptureArbiter,
     /// Opt-in, capability-gated meeting activity detection + prompt policy.
@@ -300,6 +306,7 @@ pub fn run() {
             meeting_recorder: MeetingRecorder::new(),
             meeting_live: meeting_live::MeetingLive::default(),
             meeting_system_audio: meeting_system_audio::MeetingSystemAudio::default(),
+            meeting_mic_aec: meeting_mic_aec::MeetingMicAec::default(),
             capture: CaptureArbiter::new(),
             meeting_detection: meeting_detection::MeetingDetectionService::new(),
             engine: Mutex::new(initial_engine),
