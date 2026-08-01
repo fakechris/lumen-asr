@@ -738,7 +738,10 @@ function RecordingBar({
  * extra revision of a finalized segment. Manual chip annotations (L2) always
  * take display precedence over this. */
 type LiveSpeakerAttribution = {
-  identityId: string;
+  /** Enrolled identity id. Absent for a session-voiceprint hit (L3.5): the
+   * name was seeded by a manual annotation this meeting only, with no
+   * permanent identity behind it. */
+  identityId?: string;
   displayName: string;
   source: "voiceprint";
   /** true → tentative ("李明?"), false → auto-verified. */
