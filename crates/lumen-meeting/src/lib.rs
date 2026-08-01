@@ -30,6 +30,7 @@ mod merge;
 pub mod minutes;
 mod pipeline;
 mod process;
+mod unify;
 
 pub use annotate::{
     reconcile_annotations, resolve_annotation_names, AnnotationReconciliation,
@@ -50,6 +51,10 @@ pub use merge::{merge_tracks, system_speaker_offset, MergedTake, TrackTake};
 pub use pipeline::LiveVoiceprintEmbedder;
 pub use pipeline::{transcribe_meeting, DiarModels, MeetingError, MeetingOptions};
 pub use process::{process_meeting, reconcile_stored_annotations, MinutesConfig, ProcessError};
+pub use unify::{
+    unify_cross_track_speakers, EchoSpeakerEvidence, SpeakerUnification, UnifyEvidence,
+    ECHO_UNIFY_MIN_PAIRS, ECHO_UNIFY_MIN_RATIO,
+};
 
 /// The engine speaker-count hint passed to diarization by default.
 pub const DEFAULT_MAX_SPEAKERS: usize = 6;

@@ -135,10 +135,19 @@ pub(crate) struct TextEvidence {
 /// summarized as a character count plus a short
 /// ([`DIAGNOSTIC_PREVIEW_CHARS`]) preview — enough to line an entry up with
 /// the stored transcript segment without duplicating meeting content on disk.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EchoDiagnosticEntry {
     pub mic_index: usize,
     pub system_index: usize,
+    /// Engine speaker id of the mic turn (the mic track's own id space).
+    /// Absent in pre-v2 sidecars — the cross-track unification pass then
+    /// treats the entry as evidence-free.
+    #[serde(default)]
+    pub mic_speaker: Option<u32>,
+    /// Engine speaker id of the system turn (the system track's own id space,
+    /// *before* the merge offset). Absent in pre-v2 sidecars.
+    #[serde(default)]
+    pub system_speaker: Option<u32>,
     pub mic_start: f64,
     pub mic_end: f64,
     pub system_start: f64,
@@ -165,11 +174,17 @@ pub(crate) struct EchoDiagnosticEntry {
 
 /// The sidecar document written next to the meeting audio
 /// (`<audio-stem>.echo_suppression.json`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EchoDiagnostics {
     pub version: u32,
     pub mic_segments: usize,
     pub system_segments: usize,
+    /// Per mic engine speaker id: how many mic turns that speaker had
+    /// *before* suppression. Denominator for the cross-track unification
+    /// pass's "significant share suppressed" test. Absent (empty) in pre-v2
+    /// sidecars.
+    #[serde(default)]
+    pub mic_speaker_segments: std::collections::BTreeMap<u32, usize>,
     /// System→mic start skew (seconds) applied from the recording-time
     /// timeline sidecar before pairing; `0.0` when no sidecar was available.
     /// `system_start`/`system_end` in the entries are already shifted by it.
@@ -413,6 +428,8 @@ pub(crate) fn evaluate_candidates(
         entries.push(EchoDiagnosticEntry {
             mic_index: candidate.mic_index,
             system_index: candidate.system_index,
+            mic_speaker: Some(mic.speaker),
+            system_speaker: Some(system.speaker),
             mic_start: mic.start,
             mic_end: mic.end,
             system_start: system.start,
@@ -429,10 +446,15 @@ pub(crate) fn evaluate_candidates(
             suppressed,
         });
     }
+    let mut mic_speaker_segments = std::collections::BTreeMap::new();
+    for turn in mic_turns {
+        *mic_speaker_segments.entry(turn.speaker).or_default() += 1;
+    }
     EchoDiagnostics {
-        version: 1,
+        version: 2,
         mic_segments: mic_turns.len(),
         system_segments: system_turns.len(),
+        mic_speaker_segments,
         // Callers that aligned the system turns overwrite this with the
         // sidecar skew they applied (see `suppress_cross_track_echoes`).
         system_skew_seconds: 0.0,
@@ -588,6 +610,25 @@ pub(crate) fn write_diagnostics_sidecar(
     let json = serde_json::to_string_pretty(diagnostics).map_err(io::Error::other)?;
     std::fs::write(&path, json)?;
     Ok(path)
+}
+
+/// Read the diagnostics sidecar back (for the cross-track unification pass).
+/// Fault-tolerant by contract: a missing, unreadable, or unparseable sidecar
+/// yields `None` — the echo evidence is then simply absent, never an error.
+pub(crate) fn read_diagnostics_sidecar(mic_wav: &Path) -> Option<EchoDiagnostics> {
+    let path = diagnostics_sidecar_path(mic_wav);
+    let json = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<EchoDiagnostics>(&json) {
+        Ok(diagnostics) => Some(diagnostics),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "unparseable echo suppression sidecar; skipping echo unification evidence"
+            );
+            None
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1155,6 +1196,49 @@ mod tests {
         assert_eq!(result.keep, vec![true]);
         assert_eq!(result.diagnostics.candidates, 1);
         assert_eq!(result.diagnostics.suppressed, 0);
+    }
+
+    #[test]
+    fn diagnostics_sidecar_round_trips_and_tolerates_missing_or_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mic_wav = dir.path().join("meeting.wav");
+
+        // Missing sidecar → evidence absent, not an error.
+        assert!(read_diagnostics_sidecar(&mic_wav).is_none());
+
+        // Round-trip: the v2 speaker attribution fields survive.
+        let mic_turns = vec![DiarTurn::new(0.0, 1.0, 0), DiarTurn::new(2.0, 3.0, 0)];
+        let system_turns = vec![DiarTurn::new(0.0, 1.1, 1)];
+        let candidates = vec![EchoCandidate {
+            mic_index: 0,
+            system_index: 0,
+            delay_s: 0.0,
+            coverage: 1.0,
+            text_similarity: 1.0,
+            text_contains: true,
+        }];
+        let mut always_missing = |_track: EchoTrack, _s: f64, _d: f64| None;
+        let diagnostics = evaluate_candidates(
+            &candidates,
+            &mic_turns,
+            &texts(&["今天我们讨论一下项目进度", "另一句"]),
+            &system_turns,
+            &texts(&["今天我们讨论一下项目进度"]),
+            &mut always_missing,
+        );
+        assert_eq!(diagnostics.version, 2);
+        assert_eq!(diagnostics.mic_speaker_segments.get(&0).copied(), Some(2));
+        write_diagnostics_sidecar(&diagnostics, &mic_wav).unwrap();
+        let back = read_diagnostics_sidecar(&mic_wav).expect("sidecar reads back");
+        assert_eq!(back.version, 2);
+        assert_eq!(back.mic_speaker_segments, diagnostics.mic_speaker_segments);
+        assert_eq!(back.entries.len(), 1);
+        assert_eq!(back.entries[0].mic_speaker, Some(0));
+        assert_eq!(back.entries[0].system_speaker, Some(1));
+
+        // Corrupt sidecar → evidence absent, not an error.
+        std::fs::write(diagnostics_sidecar_path(&mic_wav), "not json").unwrap();
+        assert!(read_diagnostics_sidecar(&mic_wav).is_none());
     }
 
     // ── unified-timeline skew (timeline.json sidecar) ───────────────────

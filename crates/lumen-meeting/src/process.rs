@@ -311,9 +311,13 @@ async fn run(
     // Lift the system track's embeddings into the merged speaker-id space: the
     // same offset `merge_tracks` will apply (computed from the possibly
     // echo-filtered mic turns), so every merged `S{n}` label maps to the right
-    // centroid.
+    // centroid. The offset is remembered for the cross-track unification pass
+    // below, which maps the echo sidecar's per-track engine speaker ids back
+    // onto merged `S{n}` labels.
+    let mut system_speaker_id_offset = None;
     let system_take = system_take.map(|(take, sys_embeddings)| {
         let offset = system_speaker_offset(&mic_take.turns);
+        system_speaker_id_offset = Some(offset);
         for (engine_id, embedding) in sys_embeddings {
             speaker_embeddings.insert(engine_id.saturating_add(offset), embedding);
         }
@@ -407,6 +411,41 @@ async fn run(
         &mut assembled.segments,
     )
     .map_err(ProcessError::Store)?;
+    // Cross-track speaker unification (L4b): the very last attribution step —
+    // after auto-identification and annotation reconciliation, before any
+    // persistence — merges a mic-track and a system-track speaker row when
+    // strong evidence says they are one person (same verified identity, same
+    // manual attribution, or strong echo-suppression evidence read back from
+    // the `<stem>.echo_suppression.json` sidecar; see `unify`). The dropped
+    // row is never upserted and its label no longer resolves in the embedding
+    // persist below, so the surviving row's centroid is the one kept — the
+    // simple choice. Mic-only meetings skip this entirely.
+    let echo_evidence = match system_speaker_id_offset {
+        Some(offset) => crate::echo::read_diagnostics_sidecar(wav)
+            .map(|diagnostics| {
+                crate::unify::echo_evidence_from_diagnostics(
+                    &diagnostics,
+                    &assembled.speakers,
+                    offset,
+                )
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if system_speaker_id_offset.is_some() {
+        let unified = crate::unify::unify_cross_track_speakers(
+            &mut assembled.speakers,
+            &mut assembled.segments,
+            &echo_evidence,
+        );
+        if !unified.is_empty() {
+            tracing::info!(
+                meeting_id = %meeting_id,
+                merges = unified.len(),
+                "cross-track speaker unification applied"
+            );
+        }
+    }
     for speaker in &assembled.speakers {
         store.upsert_speaker(speaker).map_err(ProcessError::Store)?;
     }
