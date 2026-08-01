@@ -105,7 +105,11 @@ struct LiveTranscriptEvent {
 #[serde(rename_all = "camelCase")]
 struct LiveSpeaker {
     /// Enrolled identity id (the UI translates `self_identity_id` to "我").
-    identity_id: String,
+    /// Absent for a **session voiceprint** hit (L3.5): the name came from a
+    /// manual annotation this meeting, not from the permanent identity
+    /// library, so there is no enrolled identity to reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_id: Option<String>,
     /// The identity's current real name.
     display_name: String,
     /// Attribution source; always `"voiceprint"` from this layer.
@@ -133,6 +137,40 @@ pub struct LiveTrackFeed {
     pub capture_rate: u32,
 }
 
+/// A change to the recording meeting's manual speaker annotations (L2 chips),
+/// forwarded from the annotate/delete commands to the running live worker so
+/// it can maintain the in-memory **session voiceprint** set (L3.5). Purely
+/// advisory: when no worker is running (not recording, live layer disabled)
+/// the notice is silently dropped.
+#[derive(Debug, Clone)]
+pub enum AnnotationNotice {
+    /// The user marked "who is speaking" on a live caption line.
+    Annotated {
+        /// Capture track the annotated line came from (`"mic"` / `"system"`).
+        channel: String,
+        /// Annotated range on the unified meeting timeline (open-ended when
+        /// `end_seconds` is `None` — "此句及之后").
+        start_seconds: f64,
+        end_seconds: Option<f64>,
+        /// Enrolled identity, when the user picked one from the library.
+        /// Registered people are already covered by permanent-library
+        /// verification (L3), so the worker only seeds session voiceprints
+        /// for ad-hoc names (`None`).
+        identity_id: Option<Uuid>,
+        /// The annotated name (session voiceprint group key).
+        display_name: String,
+    },
+    /// The user cleared an annotation: retract that name's session
+    /// voiceprint samples (simple rule — the whole group by name).
+    Cleared { display_name: String },
+}
+
+/// Bound of the command → worker annotation-notice queue. Notices are
+/// user-click-rate events, so this is generous; when it ever fills, the
+/// notice is dropped (only session-voiceprint seeding is lost, never the
+/// persisted annotation itself).
+const ANNOTATION_NOTICE_CAPACITY: usize = 16;
+
 /// Owns the live-transcript worker for the currently active recording (if any).
 /// Held in `AppState`; cross-platform and Send + Sync.
 #[derive(Default)]
@@ -141,7 +179,11 @@ pub struct MeetingLive {
 }
 
 struct Worker {
+    /// Meeting this worker is recording — annotation notices for any other
+    /// meeting id are ignored.
+    meeting_id: String,
     stop: Arc<AtomicBool>,
+    notices: SyncSender<AnnotationNotice>,
     handle: JoinHandle<()>,
 }
 
@@ -163,14 +205,55 @@ impl MeetingLive {
         self.stop();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_worker = Arc::clone(&stop);
+        let (notices, notices_rx) =
+            std::sync::mpsc::sync_channel::<AnnotationNotice>(ANNOTATION_NOTICE_CAPACITY);
+        let worker_meeting_id = meeting_id.clone();
         let handle = std::thread::Builder::new()
             .name("lumen-meeting-live".into())
             .spawn(move || {
-                run_worker(app, meeting_id, streaming_dir, mic, system, stop_worker);
+                run_worker(
+                    app,
+                    worker_meeting_id,
+                    streaming_dir,
+                    mic,
+                    system,
+                    notices_rx,
+                    stop_worker,
+                );
             })
             .expect("spawn meeting live worker thread");
         if let Ok(mut guard) = self.inner.lock() {
-            *guard = Some(Worker { stop, handle });
+            *guard = Some(Worker {
+                meeting_id,
+                stop,
+                notices,
+                handle,
+            });
+        }
+    }
+
+    /// Forward a manual-annotation change to the running live worker (L3.5
+    /// session voiceprints). Silently a no-op when no worker is running, when
+    /// the worker records a different meeting, or when the notice queue is
+    /// momentarily full — the persisted annotation itself is unaffected.
+    pub fn notify_annotation(&self, meeting_id: &str, notice: AnnotationNotice) {
+        let Ok(guard) = self.inner.lock() else {
+            return;
+        };
+        let Some(worker) = guard.as_ref() else {
+            return;
+        };
+        if worker.meeting_id != meeting_id {
+            return;
+        }
+        match worker.notices.try_send(notice) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!("annotation notice queue full; session voiceprint update skipped");
+            }
+            // Worker already exiting: seeding is moot, the session set is
+            // about to be dropped anyway.
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
@@ -431,6 +514,189 @@ impl AudioWindow {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// L3.5: session voiceprints — "标一次就够" for unregistered people. When the
+// user manually annotates a live line with an ad-hoc name, that line's audio
+// is embedded and kept as a **session voiceprint** for the rest of the
+// recording, so later utterances by the same person auto-label with the name.
+//
+// Privacy boundary (design red line): a single chip click must never enroll
+// permanent biometrics. Session voiceprints live only in the embedder
+// thread's memory, are never written to the identity library or any disk
+// path, and are dropped when the worker exits at stop. Names are never
+// logged (PII), only counts and scores.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Longest audio span seeded from one annotation. Open-ended annotations
+/// ("此句及之后") take whatever the ring still holds from the annotated start,
+/// capped here — a single utterance's worth is plenty for one sample, and the
+/// cap bounds the embedder hand-off.
+const SESSION_SEED_MAX_SECONDS: f64 = 10.0;
+
+/// Minimum audio a seed needs to be worth an embedding. Below ~2 s a
+/// single-span embedding is too noisy to anchor a whole session's matching
+/// (mirrors [`lumen_identity::LIVE_PROVISIONAL_MIN_VOICED_MS`]). Spans whose
+/// audio the ring window already evicted also fall below this and are skipped.
+const SESSION_SEED_MIN_SECONDS: f64 = 2.0;
+
+/// Samples kept per annotated name; further seeds roll the oldest out.
+/// Re-annotating the same person in different moments accumulates voice
+/// variety, and the small cap bounds per-utterance matching cost.
+const SESSION_MAX_SAMPLES_PER_NAME: usize = 3;
+
+/// Session score floor for a tentative ("名字?") label. Slightly *looser*
+/// than the permanent library's provisional floor
+/// ([`lumen_identity::CONSENSUS_THRESHOLD`] = 0.60 is the score floor there,
+/// but permanent samples are multi-meeting centroids): a session sample is a
+/// single-utterance embedding from the *same* microphone, room, and hour, so
+/// same-person scores run higher and 0.65 keeps strangers out while catching
+/// the annotated person reliably.
+const SESSION_PROVISIONAL_THRESHOLD: f32 = 0.65;
+
+/// Session score floor for a non-tentative label, combined with the margin
+/// rule below. Deliberately a notch above [`lumen_identity::AUTO_TAG_THRESHOLD`]
+/// territory scaled to same-session conditions: same-session same-speaker
+/// cosine typically lands 0.75+, so 0.72 plus a clear margin is confident
+/// without being unreachable.
+const SESSION_VERIFIED_THRESHOLD: f32 = 0.72;
+
+/// Minimum `best − runner_up` for a session auto-verified label; reuses the
+/// permanent live rule's margin ([`lumen_identity::LIVE_VERIFIED_MIN_MARGIN`]).
+const SESSION_VERIFIED_MIN_MARGIN: f32 = lumen_identity::LIVE_VERIFIED_MIN_MARGIN;
+
+/// Decide whether (and with which audio) an annotation seeds a session
+/// voiceprint. `None` — skip — when:
+///
+/// - `identity_id` is set: the person is **enrolled**, permanent-library
+///   verification (L3) already labels them, so the session set never
+///   duplicates registered biometrics;
+/// - `window` is absent (verifier layer disengaged);
+/// - the ring window holds less than [`SESSION_SEED_MIN_SECONDS`] of the
+///   annotated span — the audio was already evicted, or the line is too
+///   short to seed reliably.
+///
+/// Otherwise the annotated `[start, end]` span's audio (open-ended → whatever
+/// exists from `start`, capped at [`SESSION_SEED_MAX_SECONDS`]).
+fn plan_session_seed(
+    identity_id: Option<Uuid>,
+    window: Option<&AudioWindow>,
+    start: f64,
+    end: Option<f64>,
+) -> Option<Vec<f32>> {
+    if identity_id.is_some() {
+        return None;
+    }
+    let window = window?;
+    let end = end
+        .unwrap_or(f64::INFINITY)
+        .min(start + SESSION_SEED_MAX_SECONDS);
+    let samples = window.extract(start, end);
+    let min = (SESSION_SEED_MIN_SECONDS * f64::from(window.sample_rate)) as usize;
+    (samples.len() >= min).then_some(samples)
+}
+
+/// Outcome of matching one utterance embedding against the session set.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq)]
+struct SessionMatch {
+    display_name: String,
+    /// `true` → render tentatively ("名字?").
+    provisional: bool,
+    best_score: f32,
+    margin: f32,
+}
+
+/// The in-memory session voiceprint set: annotated name → up to
+/// [`SESSION_MAX_SAMPLES_PER_NAME`] utterance embeddings, seeded from manual
+/// chip annotations and consulted only when the permanent identity library
+/// does not label an utterance. Owned by the embedder thread; dropped —
+/// embeddings and all — when the worker exits at recording stop. Pure and
+/// unit-testable.
+#[derive(Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct SessionVoiceprints {
+    /// Insertion-ordered `(name, samples)` groups; samples oldest-first.
+    by_name: Vec<(String, VecDeque<Vec<f32>>)>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl SessionVoiceprints {
+    fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
+    /// Add one sample for `name` (a repeat annotation appends), rolling the
+    /// oldest sample out beyond the per-name cap.
+    fn seed(&mut self, name: &str, embedding: Vec<f32>) {
+        let index = match self.by_name.iter().position(|(n, _)| n.as_str() == name) {
+            Some(index) => index,
+            None => {
+                self.by_name.push((name.to_string(), VecDeque::new()));
+                self.by_name.len() - 1
+            }
+        };
+        let samples = &mut self.by_name[index].1;
+        samples.push_back(embedding);
+        while samples.len() > SESSION_MAX_SAMPLES_PER_NAME {
+            samples.pop_front();
+        }
+    }
+
+    /// Drop every sample seeded for `name` (annotation cleared). Returns
+    /// whether the group existed.
+    fn retract(&mut self, name: &str) -> bool {
+        let before = self.by_name.len();
+        self.by_name.retain(|(n, _)| n.as_str() != name);
+        self.by_name.len() != before
+    }
+
+    /// Match one finalized utterance against the session set: per name the
+    /// **best** cosine over its ≤ [`SESSION_MAX_SAMPLES_PER_NAME`] samples,
+    /// highest best wins. Decision tiers (constants above):
+    ///
+    /// - `voiced_ms ≥ 3000` and `best ≥ 0.72` and `margin ≥ 0.08` →
+    ///   non-provisional (matches the permanent live rule's duration floor);
+    /// - `voiced_ms ≥ 2000` and `best ≥ 0.65` → provisional ("名字?");
+    /// - otherwise `None`.
+    fn match_speaker(&self, embedding: &[f32], voiced_ms: u64) -> Option<SessionMatch> {
+        let mut scored: Vec<(&str, f32)> = self
+            .by_name
+            .iter()
+            .map(|(name, samples)| {
+                let best = samples
+                    .iter()
+                    .map(|s| lumen_identity::cosine_similarity(embedding, s))
+                    .fold(f32::NEG_INFINITY, f32::max);
+                (name.as_str(), best)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let (name, best) = *scored.first()?;
+        // Sole group → the margin is maximally permissive (cosine floor),
+        // mirroring `VerificationReport::runner_up_score`.
+        let runner_up = scored.get(1).map_or(-1.0, |&(_, s)| s);
+        let margin = best - runner_up;
+        let provisional = if voiced_ms >= lumen_identity::LIVE_VERIFIED_MIN_VOICED_MS
+            && best >= SESSION_VERIFIED_THRESHOLD
+            && margin >= SESSION_VERIFIED_MIN_MARGIN
+        {
+            false
+        } else if voiced_ms >= lumen_identity::LIVE_PROVISIONAL_MIN_VOICED_MS
+            && best >= SESSION_PROVISIONAL_THRESHOLD
+        {
+            true
+        } else {
+            return None;
+        };
+        Some(SessionMatch {
+            display_name: name.to_string(),
+            provisional,
+            best_score: best,
+            margin,
+        })
+    }
+}
+
 /// One finalized utterance handed to the embedder thread: everything needed to
 /// re-emit the segment with a speaker attribution appended as revision + 1.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -446,24 +712,53 @@ struct EmbedJob {
     samples: Vec<f32>,
 }
 
+/// Everything the worker loop hands to the embedder thread: utterances to
+/// verify (L3) and session-voiceprint maintenance (L3.5). All embedding work
+/// stays on the one embedder thread; the transcription loop never blocks.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum VerifierMsg {
+    /// Verify a finalized utterance's speaker.
+    Verify(EmbedJob),
+    /// Seed a session voiceprint sample from a manual annotation's audio
+    /// span (already extracted from the track's ring window, model rate).
+    Seed {
+        display_name: String,
+        samples: Vec<f32>,
+    },
+    /// An annotation was cleared: drop that name's session samples.
+    Retract { display_name: String },
+}
+
 /// Handle to the long-lived embedder thread; dropping `tx` ends its loop and
 /// `handle` is joined so trailing attributions flush before the worker exits.
 struct LiveVerifier {
-    tx: SyncSender<EmbedJob>,
+    tx: SyncSender<VerifierMsg>,
     handle: JoinHandle<()>,
 }
 
 impl LiveVerifier {
     /// Hand a finalized utterance over; drops the job when the queue is full
     /// or the thread is gone — verification never delays transcription.
-    fn enqueue(&self, job: EmbedJob) {
-        match self.tx.try_send(job) {
+    fn enqueue_verify(&self, job: EmbedJob) {
+        match self.tx.try_send(VerifierMsg::Verify(job)) {
             Ok(()) => {}
-            Err(TrySendError::Full(job)) => {
+            Err(TrySendError::Full(VerifierMsg::Verify(job))) => {
                 tracing::debug!(
                     segment = %job.segment_id,
                     "live verifier busy; skipping speaker verification for this utterance"
                 );
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Hand a session-voiceprint change over (same drop-when-busy contract;
+    /// a lost seed only means the user annotates again).
+    fn enqueue_session(&self, msg: VerifierMsg) {
+        match self.tx.try_send(msg) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!("live verifier busy; session voiceprint update skipped");
             }
             Err(TrySendError::Disconnected(_)) => {}
         }
@@ -512,10 +807,15 @@ impl VerificationStreak {
     }
 }
 
-/// Spawn the embedder thread when the whole layer should run: macOS, the diar
-/// embedding model installed, and at least one enrolled identity. Anywhere
-/// else `None` — the worker then behaves exactly like L1/L2 (no ring pushes,
-/// no jobs, no speaker events).
+/// Spawn the embedder thread when the layer can run: macOS with the diar
+/// embedding model installed. Anywhere else `None` — the worker then behaves
+/// exactly like L1/L2 (no ring pushes, no jobs, no speaker events).
+///
+/// Unlike the original L3 gate this no longer requires a non-empty identity
+/// library: session voiceprints (L3.5) must work precisely for *unregistered*
+/// people, and an annotation can arrive at any moment mid-recording. With
+/// both the library and the session set empty, the verify path skips before
+/// embedding, so the idle cost is just the ring windows (~1.9 MB/track).
 #[cfg(target_os = "macos")]
 fn spawn_live_verifier(app: AppHandle, meeting_id: String) -> Option<LiveVerifier> {
     let emb_model = lumen_asr::lumen_models_dir().join("diar").join("emb.onnx");
@@ -523,11 +823,7 @@ fn spawn_live_verifier(app: AppHandle, meeting_id: String) -> Option<LiveVerifie
         return None;
     }
     let identity_dir = lumen_identity::default_identity_dir();
-    match lumen_identity::IdentityStore::open(&identity_dir) {
-        Ok(store) if !store.list().is_empty() => {}
-        _ => return None, // empty/unreadable library → layer stays inert
-    }
-    let (tx, rx) = std::sync::mpsc::sync_channel::<EmbedJob>(EMBED_QUEUE_CAPACITY);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<VerifierMsg>(EMBED_QUEUE_CAPACITY);
     let handle = std::thread::Builder::new()
         .name("lumen-meeting-live-verify".into())
         .spawn(move || run_verifier(app, meeting_id, emb_model, identity_dir, rx))
@@ -540,18 +836,22 @@ fn spawn_live_verifier(_app: AppHandle, _meeting_id: String) -> Option<LiveVerif
     None
 }
 
-/// Embedder thread body: load the WeSpeaker model once, then for each queued
-/// utterance embed → verify → apply the live decision policy (+ streak
-/// upgrade) → append a `revision + 1` event carrying the speaker attribution.
-/// Every failure path skips the utterance; nothing here can affect the
-/// transcription loop.
+/// Embedder thread body: load the WeSpeaker model once, then process queued
+/// messages — session voiceprint seeds/retractions (L3.5) and finalized
+/// utterances to verify (L3). Verification checks the **permanent identity
+/// library first** (unchanged behaviour), and only when it does not label the
+/// utterance falls back to the in-memory session set; a session hit is
+/// emitted with no `identity_id`. Every failure path skips the message;
+/// nothing here can affect the transcription loop. The session set — the
+/// only place session embeddings ever live — is dropped when this thread
+/// exits at recording stop.
 #[cfg(target_os = "macos")]
 fn run_verifier(
     app: AppHandle,
     meeting_id: String,
     emb_model: PathBuf,
     identity_dir: PathBuf,
-    rx: Receiver<EmbedJob>,
+    rx: Receiver<VerifierMsg>,
 ) {
     use lumen_identity::{live_decision, IdentityStore, LiveDecision};
 
@@ -564,13 +864,53 @@ fn run_verifier(
     };
     tracing::info!("live speaker verification started (WeSpeaker embedder thread)");
     let mut streak = VerificationStreak::default();
-    while let Ok(job) = rx.recv() {
-        // Reopen per utterance so enrollments made mid-recording are picked up
-        // (the library is a handful of small JSON files).
-        let identities = match IdentityStore::open(&identity_dir) {
-            Ok(identities) if !identities.list().is_empty() => identities,
-            _ => continue,
+    // In-memory only; never persisted, dropped at thread exit (privacy
+    // boundary of L3.5 — one click must not permanently enroll biometrics).
+    let mut session = SessionVoiceprints::default();
+    while let Ok(msg) = rx.recv() {
+        let job = match msg {
+            VerifierMsg::Seed {
+                display_name,
+                samples,
+            } => {
+                match embedder.embed(&samples, STREAMING_TARGET_RATE) {
+                    Ok(Some(embedding)) => {
+                        session.seed(&display_name, embedding);
+                        // Counts only — the annotated name is PII.
+                        tracing::info!(
+                            names = session.by_name.len(),
+                            "session voiceprint seeded from manual annotation"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::info!("session voiceprint seed skipped: audio too short to embed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "session voiceprint seed failed");
+                    }
+                }
+                continue;
+            }
+            VerifierMsg::Retract { display_name } => {
+                if session.retract(&display_name) {
+                    tracing::info!(
+                        names = session.by_name.len(),
+                        "session voiceprint retracted (annotation cleared)"
+                    );
+                }
+                continue;
+            }
+            VerifierMsg::Verify(job) => job,
         };
+        // Reopen per utterance so enrollments made mid-recording are picked up
+        // (the library is a handful of small JSON files). An empty/unreadable
+        // library is fine now: session voiceprints may still label.
+        let identities = IdentityStore::open(&identity_dir)
+            .ok()
+            .filter(|store| !store.list().is_empty());
+        if identities.is_none() && session.is_empty() {
+            continue; // nothing could match — skip the embedding work
+        }
         let embedding = match embedder.embed(&job.samples, STREAMING_TARGET_RATE) {
             Ok(Some(embedding)) => embedding,
             Ok(None) => continue, // too short to embed reliably
@@ -579,29 +919,63 @@ fn run_verifier(
                 continue;
             }
         };
-        let Some(report) = identities.verify_speaker(&embedding) else {
+        let voiced_ms = ((job.end_seconds - job.start_seconds).max(0.0) * 1000.0).round() as u64;
+        // 1) Permanent identity library (existing L3 behaviour, streak rule
+        //    included).
+        let mut speaker: Option<LiveSpeaker> = None;
+        if let Some(report) = identities.and_then(|ids| ids.verify_speaker(&embedding)) {
+            match live_decision(&report, voiced_ms) {
+                LiveDecision::NoMatch => {
+                    streak.observe_miss(job.track);
+                }
+                decision => {
+                    let provisional = match decision {
+                        LiveDecision::VerifiedAuto => {
+                            streak.observe_hit(job.track, report.identity_id);
+                            false
+                        }
+                        _ => !streak.observe_hit(job.track, report.identity_id),
+                    };
+                    // Ids and scores only — the matched name is PII.
+                    tracing::info!(
+                        segment = %job.segment_id,
+                        score = report.best_score,
+                        margin = report.margin,
+                        provisional,
+                        "live speaker verification hit"
+                    );
+                    speaker = Some(LiveSpeaker {
+                        identity_id: Some(report.identity_id.to_string()),
+                        display_name: report.display_name,
+                        source: "voiceprint",
+                        provisional,
+                    });
+                }
+            }
+        }
+        // 2) Session voiceprints (L3.5): only when the permanent library did
+        //    not label the utterance. No identity id — the name exists only
+        //    for this meeting.
+        if speaker.is_none() {
+            if let Some(hit) = session.match_speaker(&embedding, voiced_ms) {
+                tracing::info!(
+                    segment = %job.segment_id,
+                    score = hit.best_score,
+                    margin = hit.margin,
+                    provisional = hit.provisional,
+                    "session voiceprint hit"
+                );
+                speaker = Some(LiveSpeaker {
+                    identity_id: None,
+                    display_name: hit.display_name,
+                    source: "voiceprint",
+                    provisional: hit.provisional,
+                });
+            }
+        }
+        let Some(speaker) = speaker else {
             continue;
         };
-        let voiced_ms = ((job.end_seconds - job.start_seconds).max(0.0) * 1000.0).round() as u64;
-        let provisional = match live_decision(&report, voiced_ms) {
-            LiveDecision::NoMatch => {
-                streak.observe_miss(job.track);
-                continue;
-            }
-            LiveDecision::VerifiedAuto => {
-                streak.observe_hit(job.track, report.identity_id);
-                false
-            }
-            LiveDecision::Provisional => !streak.observe_hit(job.track, report.identity_id),
-        };
-        // Ids and scores only — the matched name is PII.
-        tracing::info!(
-            segment = %job.segment_id,
-            score = report.best_score,
-            margin = report.margin,
-            provisional,
-            "live speaker verification hit"
-        );
         emit(
             &app,
             &meeting_id,
@@ -614,12 +988,7 @@ fn run_verifier(
                 text: job.text,
                 is_final: true,
             },
-            Some(LiveSpeaker {
-                identity_id: report.identity_id.to_string(),
-                display_name: report.display_name,
-                source: "voiceprint",
-                provisional,
-            }),
+            Some(speaker),
         );
     }
     tracing::info!("live speaker verification stopped");
@@ -727,7 +1096,7 @@ impl TrackState {
         if samples.len() * 10 < wanted * 9 {
             return;
         }
-        verifier.enqueue(EmbedJob {
+        verifier.enqueue_verify(EmbedJob {
             segment_id: update.segment_id.clone(),
             revision: update.revision,
             track: self.tracker.track,
@@ -752,6 +1121,57 @@ impl TrackState {
     }
 }
 
+/// Apply one manual-annotation notice inside the worker (L3.5):
+///
+/// - annotation of an **enrolled** identity → nothing to do, the permanent
+///   library already covers that person (L3);
+/// - annotation of an ad-hoc name → extract the annotated span from that
+///   track's ring window and hand it to the embedder thread as a session
+///   voiceprint seed (skipped, with a log, when the ring already evicted the
+///   audio or the span holds under [`SESSION_SEED_MIN_SECONDS`] of it);
+/// - a cleared annotation → retract that name's session samples.
+///
+/// With the verifier disengaged (no model) there are no ring windows and no
+/// session set, so every notice is a no-op.
+fn handle_annotation_notice(
+    tracks: &[TrackState],
+    verifier: &Option<LiveVerifier>,
+    notice: AnnotationNotice,
+) {
+    let Some(verifier) = verifier else {
+        return;
+    };
+    match notice {
+        AnnotationNotice::Annotated {
+            channel,
+            start_seconds,
+            end_seconds,
+            identity_id,
+            display_name,
+        } => {
+            let window = tracks
+                .iter()
+                .find(|t| t.tracker.track == channel)
+                .and_then(|t| t.window.as_ref());
+            match plan_session_seed(identity_id, window, start_seconds, end_seconds) {
+                Some(samples) => verifier.enqueue_session(VerifierMsg::Seed {
+                    display_name,
+                    samples,
+                }),
+                None if identity_id.is_none() => tracing::info!(
+                    start_seconds,
+                    "session voiceprint seed skipped: annotated audio already evicted or too short"
+                ),
+                // Enrolled identity: intentionally nothing to seed.
+                None => {}
+            }
+        }
+        AnnotationNotice::Cleared { display_name } => {
+            verifier.enqueue_session(VerifierMsg::Retract { display_name });
+        }
+    }
+}
+
 /// The worker body: load the shared recognizer once, create one stream per
 /// track, then round-robin drain → decode → emit until stopped. Exits when
 /// stopped or the mic's sender is dropped (recording ended), flushing any
@@ -763,6 +1183,7 @@ fn run_worker(
     streaming_dir: PathBuf,
     mic: LiveTrackFeed,
     system: Option<LiveTrackFeed>,
+    notices: Receiver<AnnotationNotice>,
     stop: Arc<AtomicBool>,
 ) {
     // Building the recognizer can fail (missing/corrupt model, non-`sherpa`
@@ -810,6 +1231,12 @@ fn run_worker(
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
+        }
+        // Manual-annotation changes (L3.5): seed/retract session voiceprints.
+        // Drained before the audio so a seed sees the ring as close to the
+        // annotated moment as possible.
+        while let Ok(notice) = notices.try_recv() {
+            handle_annotation_notice(&tracks, &verifier, notice);
         }
         let mut got_audio = false;
         for track in &mut tracks {
@@ -1061,6 +1488,15 @@ mod tests {
         // stop() on an idle instance is a harmless no-op.
         live.stop();
         assert!(live.inner.lock().unwrap().is_none());
+        // Notifying with no worker running is a silent no-op too (the
+        // annotate/delete commands call this unconditionally).
+        live.notify_annotation(
+            "m1",
+            AnnotationNotice::Cleared {
+                display_name: "客户A".into(),
+            },
+        );
+        assert!(live.inner.lock().unwrap().is_none());
     }
 
     // ---- L3: speaker attribution payload ---------------------------------
@@ -1077,7 +1513,7 @@ mod tests {
             text: "你好".into(),
             is_final: true,
             speaker: Some(LiveSpeaker {
-                identity_id: "11111111-2222-3333-4444-555555555555".into(),
+                identity_id: Some("11111111-2222-3333-4444-555555555555".into()),
                 display_name: "李明".into(),
                 source: "voiceprint",
                 provisional: true,
@@ -1093,6 +1529,33 @@ mod tests {
         assert!(json.contains("\"displayName\":\"李明\""));
         assert!(json.contains("\"source\":\"voiceprint\""));
         assert!(json.contains("\"provisional\":true"));
+    }
+
+    #[test]
+    fn session_speaker_attribution_omits_identity_id() {
+        // A session-voiceprint hit (L3.5) has no enrolled identity: the
+        // payload carries only the name, and `identityId` is omitted
+        // entirely (not sent as null).
+        let ev = LiveTranscriptEvent {
+            meeting_id: "m1".into(),
+            segment_id: "mic-4".into(),
+            revision: 3,
+            track: TRACK_MIC,
+            start_seconds: 2.0,
+            end_seconds: Some(5.0),
+            text: "好的".into(),
+            is_final: true,
+            speaker: Some(LiveSpeaker {
+                identity_id: None,
+                display_name: "客户A".into(),
+                source: "voiceprint",
+                provisional: true,
+            }),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("identityId"));
+        assert!(json.contains("\"displayName\":\"客户A\""));
+        assert!(json.contains("\"source\":\"voiceprint\""));
     }
 
     // ---- L3: audio ring window -------------------------------------------
@@ -1172,5 +1635,171 @@ mod tests {
         // A rejected/differing report breaks it too.
         streak.observe_miss(TRACK_MIC);
         assert!(!streak.observe_hit(TRACK_MIC, b));
+    }
+
+    // ---- L3.5: session voiceprints ---------------------------------------
+
+    /// A unit vector whose cosine similarity with [`probe`] is exactly
+    /// `cosine` (2-d is enough — the session set is dimension-agnostic).
+    fn toward(cosine: f32) -> Vec<f32> {
+        vec![cosine, (1.0 - cosine * cosine).sqrt()]
+    }
+
+    fn probe() -> Vec<f32> {
+        vec![1.0, 0.0]
+    }
+
+    /// Comfortably above both live duration floors (≥ 3 s).
+    const VOICED_LONG: u64 = 5000;
+
+    #[test]
+    fn session_seed_then_match_uses_best_of_samples() {
+        let mut session = SessionVoiceprints::default();
+        assert!(session.is_empty());
+        assert_eq!(session.match_speaker(&probe(), VOICED_LONG), None);
+
+        session.seed("客户A", toward(0.30));
+        session.seed("客户A", toward(0.90));
+        let hit = session
+            .match_speaker(&probe(), VOICED_LONG)
+            .expect("best sample 0.90 matches");
+        assert_eq!(hit.display_name, "客户A");
+        assert!((hit.best_score - 0.90).abs() < 1e-3, "{hit:?}");
+        // Sole group: margin uses the cosine floor (-1.0), so it verifies.
+        assert!(!hit.provisional);
+        assert!((hit.margin - 1.90).abs() < 1e-3, "{hit:?}");
+    }
+
+    #[test]
+    fn session_thresholds_provisional_verified_and_reject() {
+        let mut session = SessionVoiceprints::default();
+        // 0.66: past the provisional floor (0.65), short of verified (0.72).
+        session.seed("客户A", toward(0.66));
+        let hit = session.match_speaker(&probe(), VOICED_LONG).unwrap();
+        assert!(hit.provisional, "grey-zone score renders as 名字?");
+
+        // 0.64: below the provisional floor → no label at all.
+        let mut weak = SessionVoiceprints::default();
+        weak.seed("客户A", toward(0.64));
+        assert_eq!(weak.match_speaker(&probe(), VOICED_LONG), None);
+
+        // 0.80 with a clear field → verified at ≥ 3 s.
+        let mut strong = SessionVoiceprints::default();
+        strong.seed("客户A", toward(0.80));
+        assert!(
+            !strong
+                .match_speaker(&probe(), VOICED_LONG)
+                .unwrap()
+                .provisional
+        );
+    }
+
+    #[test]
+    fn session_narrow_margin_between_names_stays_provisional() {
+        let mut session = SessionVoiceprints::default();
+        session.seed("客户A", toward(0.80));
+        session.seed("客户B", toward(0.75)); // margin 0.05 < 0.08
+        let hit = session.match_speaker(&probe(), VOICED_LONG).unwrap();
+        assert_eq!(hit.display_name, "客户A");
+        assert!(hit.provisional, "ambiguous between two names → tentative");
+        assert!((hit.margin - 0.05).abs() < 1e-3, "{hit:?}");
+
+        // A distant runner-up restores the verified tier.
+        let mut clear = SessionVoiceprints::default();
+        clear.seed("客户A", toward(0.80));
+        clear.seed("客户B", toward(0.20));
+        assert!(
+            !clear
+                .match_speaker(&probe(), VOICED_LONG)
+                .unwrap()
+                .provisional
+        );
+    }
+
+    #[test]
+    fn session_duration_floors_gate_the_tiers() {
+        let mut session = SessionVoiceprints::default();
+        session.seed("客户A", toward(0.90));
+        // Under 2 s: no label however strong the score.
+        assert_eq!(session.match_speaker(&probe(), 1999), None);
+        // 2–3 s: provisional at most, even at verified-grade scores.
+        assert!(session.match_speaker(&probe(), 2500).unwrap().provisional);
+        // ≥ 3 s: verified.
+        assert!(!session.match_speaker(&probe(), 3000).unwrap().provisional);
+    }
+
+    #[test]
+    fn session_samples_cap_at_three_rolling_oldest_out() {
+        let mut session = SessionVoiceprints::default();
+        for cosine in [0.95, 0.30, 0.40, 0.50] {
+            session.seed("客户A", toward(cosine));
+        }
+        let (_, samples) = &session.by_name[0];
+        assert_eq!(samples.len(), SESSION_MAX_SAMPLES_PER_NAME);
+        // The 0.95 sample (oldest) rolled out: best is now 0.50.
+        let hit = session.match_speaker(&probe(), VOICED_LONG);
+        assert_eq!(hit, None, "0.50 is below the provisional floor");
+    }
+
+    #[test]
+    fn session_retract_removes_the_whole_name_group() {
+        let mut session = SessionVoiceprints::default();
+        session.seed("客户A", toward(0.90));
+        session.seed("客户A", toward(0.85));
+        assert!(session.retract("客户A"));
+        assert!(session.is_empty());
+        assert_eq!(session.match_speaker(&probe(), VOICED_LONG), None);
+        // Retracting an unknown name is a no-op.
+        assert!(!session.retract("客户B"));
+    }
+
+    #[test]
+    fn seed_plan_skips_enrolled_identities() {
+        // An enrolled person is already covered by the permanent library —
+        // never duplicated into the session set, even with audio available.
+        let mut window = AudioWindow::new(10);
+        window.push(0.0, &[0.5; 100]); // 10 s of audio
+        assert_eq!(
+            plan_session_seed(Some(Uuid::new_v4()), Some(&window), 0.0, Some(5.0)),
+            None
+        );
+        // The same span with no identity seeds normally.
+        assert!(plan_session_seed(None, Some(&window), 0.0, Some(5.0)).is_some());
+        // And with the verifier layer disengaged (no window), nothing seeds.
+        assert_eq!(plan_session_seed(None, None, 0.0, Some(5.0)), None);
+    }
+
+    #[test]
+    fn seed_plan_skips_spans_evicted_from_the_ring() {
+        let rate = 100u32;
+        let mut window = AudioWindow::new(rate);
+        // Fill 40 s at 100 Hz — the 30 s ring keeps roughly [10, 40).
+        for second in 0..40 {
+            window.push(f64::from(second), &vec![0.5; rate as usize]);
+        }
+        // The annotated line at [2, 6] was evicted long ago → skip.
+        assert_eq!(plan_session_seed(None, Some(&window), 2.0, Some(6.0)), None);
+        // A recent line still in the ring seeds fine.
+        let seeded = plan_session_seed(None, Some(&window), 35.0, Some(39.0)).unwrap();
+        assert_eq!(seeded.len(), 4 * rate as usize);
+    }
+
+    #[test]
+    fn seed_plan_enforces_minimum_and_caps_open_ended_spans() {
+        let rate = 10u32;
+        let mut window = AudioWindow::new(rate);
+        window.push(0.0, &vec![0.5; 20 * rate as usize]); // 20 s
+
+        // A 1 s annotated line is under the 2 s floor → skip.
+        assert_eq!(plan_session_seed(None, Some(&window), 0.0, Some(1.0)), None);
+        // An open-ended annotation ("此句及之后") takes at most 10 s.
+        let open = plan_session_seed(None, Some(&window), 2.0, None).unwrap();
+        assert_eq!(
+            open.len(),
+            (SESSION_SEED_MAX_SECONDS * f64::from(rate)) as usize
+        );
+        // A closed span is taken as-is (within the cap).
+        let closed = plan_session_seed(None, Some(&window), 2.0, Some(5.0)).unwrap();
+        assert_eq!(closed.len(), 3 * rate as usize);
     }
 }

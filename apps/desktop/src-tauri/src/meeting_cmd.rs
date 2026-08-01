@@ -1273,6 +1273,20 @@ pub fn annotate_live_segment(
         s.add_live_annotation(&annotation)
             .map_err(|e| e.to_string())
     })?;
+    // L3.5: let the running live worker seed a session voiceprint from this
+    // annotation's audio, so later utterances by the same (unregistered)
+    // person auto-label for the rest of the recording. Purely advisory —
+    // silently a no-op when no worker is running.
+    state.meeting_live.notify_annotation(
+        &meeting_id,
+        crate::meeting_live::AnnotationNotice::Annotated {
+            channel: annotation.channel.as_str().to_string(),
+            start_seconds: annotation.start_seconds,
+            end_seconds: annotation.end_seconds,
+            identity_id: annotation.identity_id,
+            display_name: annotation.display_name.clone(),
+        },
+    );
     // Ids and times only — the annotated name is PII.
     tracing::info!(
         meeting_id = %meeting,
@@ -1305,9 +1319,27 @@ pub fn delete_live_annotation(
     annotation_id: String,
 ) -> Result<bool, String> {
     let id = parse_id(&annotation_id, "annotation")?;
-    with_store(&state, |s| {
-        s.delete_live_annotation(id).map_err(|e| e.to_string())
+    // Read the row before deleting so the live worker can retract the
+    // matching session voiceprint samples (L3.5). Best-effort: a failed read
+    // never blocks the delete.
+    let annotation = with_store(&state, |s| {
+        s.get_live_annotation(id).map_err(|e| e.to_string())
     })
+    .unwrap_or(None);
+    let deleted = with_store(&state, |s| {
+        s.delete_live_annotation(id).map_err(|e| e.to_string())
+    })?;
+    if deleted {
+        if let Some(annotation) = annotation {
+            state.meeting_live.notify_annotation(
+                &annotation.meeting_id.to_string(),
+                crate::meeting_live::AnnotationNotice::Cleared {
+                    display_name: annotation.display_name,
+                },
+            );
+        }
+    }
+    Ok(deleted)
 }
 
 /// Rename a speaker cluster (Speaker 3 → 李明). Returns `true` if updated.
