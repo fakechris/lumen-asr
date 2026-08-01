@@ -490,6 +490,23 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Read one live annotation by id, or `None` when it does not exist.
+    /// Used by the delete command to know which annotation (track + name) is
+    /// about to go away, so the live worker can retract the matching
+    /// session-voiceprint samples.
+    pub fn get_live_annotation(&self, id: Uuid) -> Result<Option<LiveAnnotation>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, meeting_id, start_seconds, end_seconds, channel,
+                   identity_id, display_name, created_at
+            FROM live_annotations
+            WHERE id=?1
+            "#,
+        )?;
+        let mut rows = statement.query_map(params![id.to_string()], map_live_annotation)?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
     /// Delete one live annotation (the "清除" action on an annotated caption
     /// line). Returns `true` if a row was deleted.
     pub fn delete_live_annotation(&self, id: Uuid) -> Result<bool> {
@@ -1248,6 +1265,29 @@ mod tests {
         );
         // Deleting a missing annotation is a no-op.
         assert!(!store.delete_live_annotation(Uuid::new_v4()).unwrap());
+    }
+
+    #[test]
+    fn get_live_annotation_reads_one_row_by_id() {
+        use lumen_core::{LiveAnnotation, SegmentChannel};
+
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        let mut annotation =
+            LiveAnnotation::new(meeting.id, 1.0, None, SegmentChannel::System, None, "客户A");
+        annotation.created_at = crate::parse_dt("2026-07-30T00:00:03Z");
+        store.add_live_annotation(&annotation).unwrap();
+
+        assert_eq!(
+            store.get_live_annotation(annotation.id).unwrap(),
+            Some(annotation.clone())
+        );
+        // Missing id reads as None (not an error).
+        assert_eq!(store.get_live_annotation(Uuid::new_v4()).unwrap(), None);
+        // And a deleted row is gone.
+        assert!(store.delete_live_annotation(annotation.id).unwrap());
+        assert_eq!(store.get_live_annotation(annotation.id).unwrap(), None);
     }
 
     #[test]
