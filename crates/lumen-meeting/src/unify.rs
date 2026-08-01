@@ -14,14 +14,16 @@
 //! 2. **Same manual attribution** — both rows carry `manual` attribution with
 //!    the same `identity_id`, or (when neither has an identity link) the same
 //!    non-empty `display_name`.
-//! 3. **Strong echo evidence** — the echo-suppression diagnostics sidecar
-//!    (`<stem>.echo_suppression.json`) shows at least
-//!    [`ECHO_UNIFY_MIN_PAIRS`] mic segments of speaker X suppressed as echo
-//!    copies of system speaker Y, and those pairs make up at least
-//!    [`ECHO_UNIFY_MIN_RATIO`] of X's pre-suppression segment count — the
-//!    residual (unsuppressed) mic segments of X are then almost certainly Y
-//!    picked up through the loudspeaker. A missing or unreadable sidecar means
-//!    this evidence is simply absent — never a merge, never an error.
+//! 3. **Strong echo evidence** — *this run's* echo-suppression diagnostics
+//!    (the same data written to the `<stem>.echo_suppression.json` sidecar
+//!    for auditing) show at least [`ECHO_UNIFY_MIN_PAIRS`] mic segments of
+//!    speaker X suppressed as echo copies of system speaker Y, and those
+//!    pairs make up at least [`ECHO_UNIFY_MIN_RATIO`] of X's pre-suppression
+//!    segment count — the residual (unsuppressed) mic segments of X are then
+//!    almost certainly Y picked up through the loudspeaker. The diagnostics
+//!    are handed over in memory, never read back from disk: with echo
+//!    suppression disabled (or its pass failed) this evidence is simply
+//!    absent — never a merge, never an error.
 //!
 //! Raw centroid cosine similarity is deliberately **not** evidence: merging
 //! two unknown people wrongly is far worse than showing a duplicate
@@ -174,7 +176,7 @@ pub fn unify_cross_track_speakers(
         &tracks,
         UnifyEvidence::VerifiedIdentity,
     ));
-    candidates.extend(echo_pairs(echo_evidence, &tracks));
+    candidates.extend(echo_pairs(echo_evidence, &tracks, speakers));
 
     let mut used: Vec<Uuid> = Vec::new();
     let mut applied = Vec::new();
@@ -340,12 +342,26 @@ fn attribution_pairs(
     pairs
 }
 
+/// Suppressed-pairs share of the mic speaker's pre-suppression segment count.
+/// Callers guarantee a non-zero denominator.
+fn echo_ratio(entry: &EchoSpeakerEvidence) -> f64 {
+    entry.suppressed_pairs as f64 / entry.mic_segments_before_suppression as f64
+}
+
 /// Evidence 3 pairing: qualifying echo evidence (pair count and ratio
 /// thresholds, correct tracks). A mic speaker with two equally strong system
 /// partners is ambiguous and pairs with neither.
+///
+/// The returned pairs are ordered by evidence strength (suppressed pairs
+/// desc, then ratio desc, then mic label asc) so the greedy one-merge-per-
+/// speaker pass downstream is fully deterministic — in particular, when two
+/// mic speakers both point at the same system speaker, the one with the
+/// stronger evidence always wins, and a full tie is broken by label rather
+/// than by (random) speaker-id ordering.
 fn echo_pairs(
     evidence: &[EchoSpeakerEvidence],
     tracks: &BTreeMap<Uuid, SegmentChannel>,
+    speakers: &[Speaker],
 ) -> Vec<(Uuid, Uuid, UnifyEvidence)> {
     let mut by_mic: BTreeMap<Uuid, Vec<&EchoSpeakerEvidence>> = BTreeMap::new();
     for entry in evidence {
@@ -354,8 +370,7 @@ fn echo_pairs(
         {
             continue;
         }
-        let ratio = entry.suppressed_pairs as f64 / entry.mic_segments_before_suppression as f64;
-        if ratio < ECHO_UNIFY_MIN_RATIO {
+        if echo_ratio(entry) < ECHO_UNIFY_MIN_RATIO {
             continue;
         }
         // Defensive: the pair must actually span mic → system.
@@ -366,15 +381,36 @@ fn echo_pairs(
         }
         by_mic.entry(entry.mic_speaker_id).or_default().push(entry);
     }
-    let mut pairs = Vec::new();
-    for (mic_id, mut entries) in by_mic {
+    let mut best: Vec<&EchoSpeakerEvidence> = Vec::new();
+    for (_mic_id, mut entries) in by_mic {
         entries.sort_by(|a, b| b.suppressed_pairs.cmp(&a.suppressed_pairs));
         if entries.len() > 1 && entries[0].suppressed_pairs == entries[1].suppressed_pairs {
             continue; // two equally strong partners → ambiguous, merge neither
         }
-        pairs.push((mic_id, entries[0].system_speaker_id, UnifyEvidence::Echo));
+        best.push(entries[0]);
     }
-    pairs
+    let label_of = |id: Uuid| {
+        speakers
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.label.as_str())
+            .unwrap_or("")
+    };
+    best.sort_by(|a, b| {
+        b.suppressed_pairs
+            .cmp(&a.suppressed_pairs)
+            .then_with(|| echo_ratio(b).total_cmp(&echo_ratio(a)))
+            .then_with(|| label_of(a.mic_speaker_id).cmp(label_of(b.mic_speaker_id)))
+    });
+    best.into_iter()
+        .map(|entry| {
+            (
+                entry.mic_speaker_id,
+                entry.system_speaker_id,
+                UnifyEvidence::Echo,
+            )
+        })
+        .collect()
 }
 
 fn trimmed_name(speaker: &Speaker) -> Option<String> {
@@ -686,6 +722,57 @@ mod tests {
         assert_eq!(merges[0].into_speaker_id, system_a_id);
         assert_eq!(speakers.len(), 2);
         assert!(speakers.iter().any(|s| s.id == system_b_id));
+    }
+
+    #[test]
+    fn competing_mic_speakers_pick_the_stronger_evidence_deterministically() {
+        // Two mic speakers both echo-linked to the same system speaker: the
+        // stronger evidence must win regardless of (random) speaker-id order.
+        let build = || {
+            let meeting_id = Uuid::new_v4();
+            let (mic_a, mut segments) =
+                speaker_with_segments(meeting_id, "S1", SegmentChannel::Mic, 2, 0);
+            let (mic_b, mut more_b) =
+                speaker_with_segments(meeting_id, "S2", SegmentChannel::Mic, 2, 2);
+            let (system, mut more_s) =
+                speaker_with_segments(meeting_id, "S3", SegmentChannel::System, 3, 4);
+            segments.append(&mut more_b);
+            segments.append(&mut more_s);
+            (vec![mic_a, mic_b, system], segments)
+        };
+        let echo = |mic: Uuid, system: Uuid, pairs: usize| EchoSpeakerEvidence {
+            mic_speaker_id: mic,
+            system_speaker_id: system,
+            suppressed_pairs: pairs,
+            mic_segments_before_suppression: 4,
+        };
+
+        // S2's evidence (3 pairs) beats S1's (2 pairs) — listed weaker-first
+        // to prove input order does not matter.
+        let (mut speakers, mut segments) = build();
+        let (s1, s2, s3) = (speakers[0].id, speakers[1].id, speakers[2].id);
+        let evidence = vec![echo(s1, s3, 2), echo(s2, s3, 3)];
+        let merges = unify_cross_track_speakers(&mut speakers, &mut segments, &evidence);
+        assert_eq!(merges.len(), 1, "system speaker consumed by one merge only");
+        assert_eq!(merges[0].removed_speaker_id, s2);
+        assert_eq!(merges[0].into_speaker_id, s3);
+        assert!(
+            speakers.iter().any(|s| s.id == s1),
+            "weaker mic speaker stays"
+        );
+
+        // Full tie (same pairs, same ratio): the lexicographically smaller
+        // mic label (S1) wins — repeat to catch any ordering nondeterminism.
+        for _ in 0..16 {
+            let (mut speakers, mut segments) = build();
+            let (s1, s2, s3) = (speakers[0].id, speakers[1].id, speakers[2].id);
+            let evidence = vec![echo(s2, s3, 2), echo(s1, s3, 2)];
+            let merges = unify_cross_track_speakers(&mut speakers, &mut segments, &evidence);
+            assert_eq!(merges.len(), 1);
+            assert_eq!(merges[0].removed_speaker_id, s1);
+            assert_eq!(merges[0].into_speaker_id, s3);
+            assert!(speakers.iter().any(|s| s.id == s2));
+        }
     }
 
     /// A sidecar diagnostics entry with only the fields the mapping cares

@@ -612,25 +612,6 @@ pub(crate) fn write_diagnostics_sidecar(
     Ok(path)
 }
 
-/// Read the diagnostics sidecar back (for the cross-track unification pass).
-/// Fault-tolerant by contract: a missing, unreadable, or unparseable sidecar
-/// yields `None` — the echo evidence is then simply absent, never an error.
-pub(crate) fn read_diagnostics_sidecar(mic_wav: &Path) -> Option<EchoDiagnostics> {
-    let path = diagnostics_sidecar_path(mic_wav);
-    let json = std::fs::read_to_string(&path).ok()?;
-    match serde_json::from_str::<EchoDiagnostics>(&json) {
-        Ok(diagnostics) => Some(diagnostics),
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %error,
-                "unparseable echo suppression sidecar; skipping echo unification evidence"
-            );
-            None
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // WAV window IO — minimal reader for the exact format our recorders write
 // (RIFF / PCM16 mono), decimated to 16 kHz. Every failure returns `None`.
@@ -1198,13 +1179,14 @@ mod tests {
         assert_eq!(result.diagnostics.suppressed, 0);
     }
 
+    /// The unification pass consumes the in-memory diagnostics, but the
+    /// sidecar is the on-disk audit trail of the very same data — so its JSON
+    /// must round-trip losslessly (`Deserialize` is the format contract for
+    /// tooling and tests).
     #[test]
-    fn diagnostics_sidecar_round_trips_and_tolerates_missing_or_corrupt() {
+    fn diagnostics_sidecar_round_trips_the_v2_speaker_fields() {
         let dir = tempfile::tempdir().unwrap();
         let mic_wav = dir.path().join("meeting.wav");
-
-        // Missing sidecar → evidence absent, not an error.
-        assert!(read_diagnostics_sidecar(&mic_wav).is_none());
 
         // Round-trip: the v2 speaker attribution fields survive.
         let mic_turns = vec![DiarTurn::new(0.0, 1.0, 0), DiarTurn::new(2.0, 3.0, 0)];
@@ -1228,17 +1210,14 @@ mod tests {
         );
         assert_eq!(diagnostics.version, 2);
         assert_eq!(diagnostics.mic_speaker_segments.get(&0).copied(), Some(2));
-        write_diagnostics_sidecar(&diagnostics, &mic_wav).unwrap();
-        let back = read_diagnostics_sidecar(&mic_wav).expect("sidecar reads back");
+        let sidecar = write_diagnostics_sidecar(&diagnostics, &mic_wav).unwrap();
+        let json = std::fs::read_to_string(&sidecar).unwrap();
+        let back: EchoDiagnostics = serde_json::from_str(&json).expect("sidecar parses back");
         assert_eq!(back.version, 2);
         assert_eq!(back.mic_speaker_segments, diagnostics.mic_speaker_segments);
         assert_eq!(back.entries.len(), 1);
         assert_eq!(back.entries[0].mic_speaker, Some(0));
         assert_eq!(back.entries[0].system_speaker, Some(1));
-
-        // Corrupt sidecar → evidence absent, not an error.
-        std::fs::write(diagnostics_sidecar_path(&mic_wav), "not json").unwrap();
-        assert!(read_diagnostics_sidecar(&mic_wav).is_none());
     }
 
     // ── unified-timeline skew (timeline.json sidecar) ───────────────────
