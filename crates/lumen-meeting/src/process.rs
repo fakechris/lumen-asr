@@ -250,6 +250,11 @@ async fn run(
     // next to the meeting audio for auditing; a sidecar write failure is only
     // logged.
     let mut mic_take = mic_take;
+    // Diagnostics of *this run's* echo pass, kept for the cross-track speaker
+    // unification below. Stays `None` when echo suppression is disabled,
+    // never ran (mic-only), or the offloaded task failed — the echo evidence
+    // is then simply absent.
+    let mut echo_diagnostics: Option<crate::echo::EchoDiagnostics> = None;
     if opts.echo_suppression {
         if let (Some((system, _)), Some(sys_wav)) = (system_take.as_ref(), system_wav) {
             // The cross-correlation is CPU-bound (hundreds of millions of
@@ -296,6 +301,7 @@ async fn run(
                     if result.diagnostics.suppressed > 0 {
                         mic_take = crate::echo::filter_track_take(&mic_take, &result.keep);
                     }
+                    echo_diagnostics = Some(result.diagnostics);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -311,9 +317,13 @@ async fn run(
     // Lift the system track's embeddings into the merged speaker-id space: the
     // same offset `merge_tracks` will apply (computed from the possibly
     // echo-filtered mic turns), so every merged `S{n}` label maps to the right
-    // centroid.
+    // centroid. The offset is remembered for the cross-track unification pass
+    // below, which maps the echo diagnostics' per-track engine speaker ids
+    // back onto merged `S{n}` labels.
+    let mut system_speaker_id_offset = None;
     let system_take = system_take.map(|(take, sys_embeddings)| {
         let offset = system_speaker_offset(&mic_take.turns);
+        system_speaker_id_offset = Some(offset);
         for (engine_id, embedding) in sys_embeddings {
             speaker_embeddings.insert(engine_id.saturating_add(offset), embedding);
         }
@@ -407,6 +417,41 @@ async fn run(
         &mut assembled.segments,
     )
     .map_err(ProcessError::Store)?;
+    // Cross-track speaker unification (L4b): the very last attribution step —
+    // after auto-identification and annotation reconciliation, before any
+    // persistence — merges a mic-track and a system-track speaker row when
+    // strong evidence says they are one person (same verified identity, same
+    // manual attribution, or strong echo-suppression evidence; see `unify`).
+    // The dropped row is never upserted and its label no longer resolves in
+    // the embedding persist below, so the surviving row's centroid is the one
+    // kept — the simple choice. Mic-only meetings skip this entirely.
+    //
+    // The echo evidence is deliberately taken from *this run's* in-memory
+    // diagnostics only (the same data written to the
+    // `<stem>.echo_suppression.json` sidecar for auditing) — never read back
+    // from disk. That keeps the pass exactly behind the `echo_suppression`
+    // switch (disabled ⇒ evidence absent) and immune to stale sidecars left
+    // by an earlier processing run of the same recording.
+    let echo_evidence = match (echo_diagnostics.as_ref(), system_speaker_id_offset) {
+        (Some(diagnostics), Some(offset)) => {
+            crate::unify::echo_evidence_from_diagnostics(diagnostics, &assembled.speakers, offset)
+        }
+        _ => Vec::new(),
+    };
+    if system_speaker_id_offset.is_some() {
+        let unified = crate::unify::unify_cross_track_speakers(
+            &mut assembled.speakers,
+            &mut assembled.segments,
+            &echo_evidence,
+        );
+        if !unified.is_empty() {
+            tracing::info!(
+                meeting_id = %meeting_id,
+                merges = unified.len(),
+                "cross-track speaker unification applied"
+            );
+        }
+    }
     for speaker in &assembled.speakers {
         store.upsert_speaker(speaker).map_err(ProcessError::Store)?;
     }
