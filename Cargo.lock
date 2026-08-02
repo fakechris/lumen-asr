@@ -2280,6 +2280,7 @@ dependencies = [
  "lumen-prompts",
  "lumen-store",
  "parking_lot",
+ "raw-window-handle",
  "reqwest 0.12.28",
  "security-framework",
  "security-framework-sys",

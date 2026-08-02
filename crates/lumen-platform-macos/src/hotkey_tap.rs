@@ -106,6 +106,31 @@ impl HotkeySpec {
             && self.meta == meta
     }
 
+    /// Subset check used only for the *hold-release* decision: is every modifier
+    /// this binding requires still held? Extra modifiers the binding doesn't care
+    /// about are intentionally ignored.
+    ///
+    /// Why this exists separately from [`mods_active`](Self::mods_active): press
+    /// detection must stay exact (so Alt+Shift doesn't arm while Alt+Shift+T is
+    /// the active chord), but a hold-to-record must NOT stop just because a
+    /// transient extra modifier appears — most commonly ⌘ while you cmd-tab away
+    /// mid-recording, or a FlagsChanged an app emits when it becomes frontmost.
+    /// With the exact check, "Fn held + ⌘ tapped" reads as "no longer a bare-Fn
+    /// chord" and tears down the recording after the 70 ms grace. The subset
+    /// check keeps it alive until a required modifier (Fn itself) is actually
+    /// lifted.
+    fn required_mods_active(&self, flags: u64, phys_fn: bool) -> bool {
+        let alt = flags & FLAG_ALTERNATE != 0;
+        let shift = flags & FLAG_SHIFT != 0;
+        let control = flags & FLAG_CONTROL != 0;
+        let meta = flags & FLAG_COMMAND != 0;
+        (!self.fn_key || phys_fn)
+            && (!self.alt || alt)
+            && (!self.shift || shift)
+            && (!self.control || control)
+            && (!self.meta || meta)
+    }
+
     /// Higher = more specific. Prefer key+mods over pure modifier chords.
     fn specificity(&self) -> u32 {
         let mods = (self.fn_key as u32)
@@ -230,15 +255,54 @@ fn tap_generation_is_current(generation: u64) -> bool {
     TAP_GENERATION.load(Ordering::SeqCst) == generation
 }
 
+// Read the secondary-Fn bit straight from the HID event source
+// (`CGEventSourceFlagsState`). Unlike the CGEventTap *event stream*, this
+// reports the physical key state and is NOT disturbed when macOS emits a
+// spurious Fn event during a Space switch — so it is the tie-breaker we trust
+// when a Fn FlagsChanged event looks suspicious.
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceFlagsState(state_id: u32) -> u64;
+}
+// kCGEventSourceStateHIDSystemState — live hardware keyboard state.
+#[cfg(target_os = "macos")]
+const HID_SYSTEM_STATE: u32 = 1;
+
+#[cfg(target_os = "macos")]
+fn hid_secondary_fn_flag() -> bool {
+    unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) & FLAG_SECONDARY_FN != 0 }
+}
+
 /// Publish physical Fn from a FlagsChanged observation, but only while
 /// `generation` is still live and only for the physical Fn/Globe keycode. A
 /// torn-down tap (stale generation) is ignored, and every other key — which
 /// merely rides the shared secondary-Fn flag — is filtered out by the keycode.
+///
+/// `hid_fn` is the live secondary-Fn state read from the HID event source. A Fn
+/// FlagsChanged that claims "released" is cross-checked against it: switching
+/// Spaces (Mission Control) makes macOS emit a bogus keyCode-63 "released" event
+/// while the key is physically still down, and trusting it would stop an
+/// in-flight recording. If the HID flag still says Fn is held, the event is
+/// treated as spurious and the held state is preserved.
 #[cfg(any(target_os = "macos", test))]
-fn observe_flags_changed(generation: u64, keycode: i64, flags: u64) {
-    if keycode == KVK_FUNCTION && tap_generation_is_current(generation) {
-        PHYSICAL_FN_DOWN.store(flags & FLAG_SECONDARY_FN != 0, Ordering::SeqCst);
+fn observe_flags_changed(generation: u64, keycode: i64, flags: u64, hid_fn: bool) {
+    if keycode != KVK_FUNCTION || !tap_generation_is_current(generation) {
+        return;
     }
+    if flags & FLAG_SECONDARY_FN != 0 {
+        PHYSICAL_FN_DOWN.store(true, Ordering::SeqCst);
+        return;
+    }
+    // Event claims Fn released. Cross-check the live HID flag: if Fn is still
+    // physically held, this is the spurious Fn-up macOS emits on a Space switch.
+    if hid_fn {
+        tracing::info!(
+            "ignored spurious Fn-up (keycode 63, no fn flag): HID still reports Fn held (likely Space switch)"
+        );
+        return;
+    }
+    PHYSICAL_FN_DOWN.store(false, Ordering::SeqCst);
 }
 
 /// Clear physical Fn when the system disables the tap: we stop receiving events,
@@ -412,7 +476,14 @@ fn run_tap_loop_multi<F>(
             // bit but never this keycode, so it can no longer flip Fn on. The
             // update is generation-guarded so a torn-down tap can't publish.
             if matches!(etype, CGEventType::FlagsChanged) {
-                observe_flags_changed(generation, keycode, flags);
+                // Only the Fn key's own FlagsChanged drives physical-Fn state,
+                // so only pay the HID FFI cost for that keycode.
+                let hid_fn = if keycode == KVK_FUNCTION {
+                    hid_secondary_fn_flag()
+                } else {
+                    false
+                };
+                observe_flags_changed(generation, keycode, flags, hid_fn);
             }
             let phys_fn = PHYSICAL_FN_DOWN.load(Ordering::SeqCst);
 
@@ -468,19 +539,35 @@ fn run_tap_loop_multi<F>(
                         on_edge_c(HotkeyEdge::Press, b.id.clone());
                     }
                 } else if latch.active {
-                    let now = Instant::now();
-                    match latch.release_after {
-                        None => {
-                            latch.release_after = Some(now + Duration::from_millis(70));
+                    // `want` is false. Three possible reasons:
+                    //   1. superseded — a more-specific chord exactly matched;
+                    //   2. a required modifier (or the key) was genuinely lifted;
+                    //   3. a transient extra modifier appeared (⌘ during a cmd-tab,
+                    //      or a FlagsChanged the frontmost app emitted on focus).
+                    // Only (1) and (2) should stop a hold. (3) must keep the
+                    // recording alive, or switching windows mid-record kills it.
+                    let superseded = best_id.is_some(); // another chord matched
+                    let required_held = b.spec.required_mods_active(flags, phys_fn)
+                        && (b.spec.keycode.is_none() || latch.key_held);
+                    if superseded || !required_held {
+                        let now = Instant::now();
+                        match latch.release_after {
+                            None => {
+                                latch.release_after = Some(now + Duration::from_millis(70));
+                            }
+                            Some(deadline) if now >= deadline => {
+                                latch.release_after = None;
+                                latch.active = false;
+                                latch.key_held = false;
+                                tracing::info!(id = %b.id, "hotkey release");
+                                on_edge_c(HotkeyEdge::Release, b.id.clone());
+                            }
+                            Some(_) => {}
                         }
-                        Some(deadline) if now >= deadline => {
-                            latch.release_after = None;
-                            latch.active = false;
-                            latch.key_held = false;
-                            tracing::info!(id = %b.id, "hotkey release");
-                            on_edge_c(HotkeyEdge::Release, b.id.clone());
-                        }
-                        Some(_) => {}
+                    } else {
+                        // transient extra modifier — keep holding, cancel any
+                        // pending release so a flicker doesn't stop the recording.
+                        latch.release_after = None;
                     }
                 }
             }
@@ -571,6 +658,29 @@ mod tests {
     }
 
     #[test]
+    fn required_mods_ignores_transient_extra_modifier() {
+        // Hold-release subset check: a bare-Fn hold must stay "required held"
+        // while an extra modifier (⌘ during a cmd-tab) is also down, so an
+        // in-flight recording isn't torn down. Only lifting Fn clears it.
+        let s = HotkeySpec::parse("Fn", HotkeyMode::Hold).unwrap();
+        // Fn held, no extras → exact and subset both true.
+        assert!(s.mods_active(0, true));
+        assert!(s.required_mods_active(0, true));
+        // Fn held + ⌘ (cmd-tab flicker): exact false, subset still true → keep.
+        assert!(!s.mods_active(FLAG_COMMAND, true));
+        assert!(s.required_mods_active(FLAG_COMMAND, true));
+        // Fn released → subset false → release.
+        assert!(!s.required_mods_active(FLAG_COMMAND, false));
+        assert!(!s.required_mods_active(0, false));
+
+        // Two-modifier chord: Alt+Shift stays held while ⌘ is also down, but
+        // lifting Shift clears it.
+        let as_ = HotkeySpec::parse("Alt+Shift", HotkeyMode::Hold).unwrap();
+        assert!(as_.required_mods_active(FLAG_ALTERNATE | FLAG_SHIFT | FLAG_COMMAND, false));
+        assert!(!as_.required_mods_active(FLAG_ALTERNATE, false));
+    }
+
+    #[test]
     fn globe_is_an_alias_for_fn() {
         let s = HotkeySpec::parse("Globe", HotkeyMode::Hold).unwrap();
         assert!(s.fn_key);
@@ -606,10 +716,10 @@ mod tests {
         let generation = begin_tap_generation();
         // Up arrow (0x7E) raises the shared secondary-Fn flag bit but is NOT
         // keyCode 63 — the exact root cause of the misfire. It must not arm Fn.
-        observe_flags_changed(generation, 0x7E, FLAG_SECONDARY_FN);
+        observe_flags_changed(generation, 0x7E, FLAG_SECONDARY_FN, false);
         assert!(!physical_fn_down(), "arrow key must not set physical Fn");
         // The genuine Fn/Globe keycode still tracks correctly.
-        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN, false);
         assert!(physical_fn_down(), "physical Fn/Globe key sets the state");
         reset_physical_fn_tracking();
     }
@@ -620,7 +730,7 @@ mod tests {
         reset_physical_fn_tracking();
 
         let generation = begin_tap_generation();
-        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN, false);
         assert!(physical_fn_down(), "Fn should be set while observed");
 
         // Stopping the monitor must clear Fn immediately...
@@ -630,7 +740,7 @@ mod tests {
         // ...and retire this generation, so the old tap's lingering callback
         // (e.g. a stray Fn-down event after the Fn-up was missed) cannot
         // resurrect the state and re-arm a bare-Fn chord.
-        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN, false);
         assert!(!physical_fn_down(), "a stale tap must not publish Fn state");
     }
 
@@ -640,7 +750,7 @@ mod tests {
         reset_physical_fn_tracking();
 
         let generation = begin_tap_generation();
-        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN, false);
         assert!(physical_fn_down());
 
         // System disables the tap: a Fn release during the gap would be lost, so
@@ -651,26 +761,53 @@ mod tests {
     }
 
     #[test]
+    fn spurious_fn_up_during_space_switch_is_ignored() {
+        // Switching Spaces makes macOS emit a keyCode-63 FlagsChanged with NO
+        // secondary-Fn flag while the key is physically still down. The HID flag
+        // still reports Fn held, so the bogus event must NOT clear physical Fn —
+        // otherwise an in-flight recording gets torn down.
+        let _g = FN_STATE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset_physical_fn_tracking();
+
+        let generation = begin_tap_generation();
+        // Fn genuinely pressed.
+        observe_flags_changed(generation, KVK_FUNCTION, FLAG_SECONDARY_FN, false);
+        assert!(physical_fn_down());
+
+        // Spurious Fn-up: event claims released, but HID still reports held.
+        observe_flags_changed(generation, KVK_FUNCTION, 0, true);
+        assert!(
+            physical_fn_down(),
+            "spurious Fn-up with HID still held must not clear Fn"
+        );
+
+        // Genuine Fn-up: HID agrees Fn is up → clears.
+        observe_flags_changed(generation, KVK_FUNCTION, 0, false);
+        assert!(!physical_fn_down(), "real Fn-up (HID clear) must clear Fn");
+        reset_physical_fn_tracking();
+    }
+
+    #[test]
     fn restart_resumes_tracking() {
         let _g = FN_STATE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset_physical_fn_tracking();
 
         // Old monitor observed Fn down, then stopped (state cleared, gen retired).
         let old = begin_tap_generation();
-        observe_flags_changed(old, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        observe_flags_changed(old, KVK_FUNCTION, FLAG_SECONDARY_FN, false);
         reset_physical_fn_tracking();
         assert!(!physical_fn_down());
 
         // A fresh monitor claims a new generation and tracks correctly again.
         let new = begin_tap_generation();
         assert_ne!(old, new, "restart must claim a distinct generation");
-        observe_flags_changed(new, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        observe_flags_changed(new, KVK_FUNCTION, FLAG_SECONDARY_FN, false);
         assert!(physical_fn_down(), "restarted tap tracks Fn down");
-        observe_flags_changed(new, KVK_FUNCTION, 0);
+        observe_flags_changed(new, KVK_FUNCTION, 0, false);
         assert!(!physical_fn_down(), "restarted tap tracks Fn up");
 
         // The retired old generation still cannot publish after the restart.
-        observe_flags_changed(old, KVK_FUNCTION, FLAG_SECONDARY_FN);
+        observe_flags_changed(old, KVK_FUNCTION, FLAG_SECONDARY_FN, false);
         assert!(!physical_fn_down(), "retired generation stays inert");
         reset_physical_fn_tracking();
     }
