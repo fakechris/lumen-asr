@@ -42,7 +42,7 @@ use lumen_asr::{
     EngineKind, MeetingRecorder, QwenAsr, QwenAsrConfig, SenseVoiceSherpaAsr, WhisperAsr,
 };
 use lumen_platform::{default_data_dir, default_db_path};
-use lumen_store::Store;
+use lumen_store::{SessionArtifactPaths, Store};
 use mode_arbiter::CaptureArbiter;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -51,6 +51,161 @@ use std::time::{Duration, Instant};
 use tauri::Manager;
 
 const QWEN_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn remove_session_artifacts(
+    data_dir: &Path,
+    artifacts: &SessionArtifactPaths,
+) -> Result<(), String> {
+    if let Some(audio_path) = artifacts.audio_path.as_deref() {
+        let audio_path = Path::new(audio_path);
+        let artifact_exists = audio_path.exists() || audio_path.parent().is_some_and(Path::exists);
+        match session_debug::remove_session_debug_artifacts_from(
+            data_dir,
+            audio_path,
+            &artifacts.session_id.to_string(),
+        ) {
+            Ok(true) => {}
+            Ok(false) if !artifact_exists => {}
+            Ok(false) => return Err(format!("refused to remove debug artifact: {audio_path:?}")),
+            Err(error) => return Err(format!("remove debug artifact: {error}")),
+        }
+    }
+    for artifact in &artifacts.context_artifacts {
+        if artifact.manifest_path.is_empty() {
+            continue;
+        }
+        let manifest_path = Path::new(&artifact.manifest_path);
+        let artifact_exists =
+            manifest_path.exists() || manifest_path.parent().is_some_and(Path::exists);
+        match context_capture::remove_context_manifest_artifact(
+            data_dir,
+            artifact.capture_id,
+            &artifact.manifest_path,
+        ) {
+            Ok(true) => {}
+            Ok(false) if !artifact_exists => {}
+            Ok(false) => {
+                return Err(format!(
+                    "refused to remove context artifact: {}",
+                    artifact.manifest_path
+                ))
+            }
+            Err(error) => return Err(format!("remove context artifact: {error}")),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn purge_legacy_short_silent_sessions(store: &Store, data_dir: &Path) -> Result<usize, String> {
+    let discarded = store
+        .hidden_short_silent_session_artifacts()
+        .map_err(|error| error.to_string())?;
+    let mut removable = Vec::new();
+    for artifacts in &discarded {
+        match remove_session_artifacts(data_dir, artifacts) {
+            Ok(()) => removable.push(artifacts.session_id),
+            Err(error) => tracing::warn!(
+                session_id = %artifacts.session_id,
+                %error,
+                "legacy silent capture cleanup will retry on next startup"
+            ),
+        }
+    }
+    store
+        .delete_sessions(&removable)
+        .map_err(|error| error.to_string())
+}
+
+fn schedule_legacy_short_silent_session_purge(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let data_dir = default_data_dir();
+        let mut after_session_id = String::new();
+        let mut purged_count = 0;
+        loop {
+            let batch = {
+                let state = app.state::<AppState>();
+                let guard = match state.store.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        tracing::warn!("store lock poisoned during silent capture cleanup");
+                        return;
+                    }
+                };
+                let Some(store) = guard.as_ref() else {
+                    return;
+                };
+                match store.hidden_short_silent_session_artifact_batch(&after_session_id, 128) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to list legacy short silent captures");
+                        return;
+                    }
+                }
+            };
+            let Some(last_scanned_session_id) = batch.last_scanned_session_id else {
+                break;
+            };
+            after_session_id = last_scanned_session_id;
+
+            let mut removable = Vec::new();
+            for artifacts in &batch.artifacts {
+                match remove_session_artifacts(&data_dir, artifacts) {
+                    Ok(()) => removable.push(artifacts.session_id),
+                    Err(error) => tracing::warn!(
+                        session_id = %artifacts.session_id,
+                        %error,
+                        "legacy silent capture cleanup will retry on next startup"
+                    ),
+                }
+            }
+            if removable.is_empty() {
+                continue;
+            }
+            let state = app.state::<AppState>();
+            let guard = match state.store.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::warn!("store lock poisoned while deleting silent capture rows");
+                    return;
+                }
+            };
+            let Some(store) = guard.as_ref() else {
+                return;
+            };
+            match store.delete_sessions(&removable) {
+                Ok(deleted) => purged_count += deleted,
+                Err(error) => tracing::warn!(
+                    %error,
+                    "failed to delete cleaned legacy short silent capture rows"
+                ),
+            }
+        }
+        if purged_count > 0 {
+            tracing::info!(
+                count = purged_count,
+                "purged legacy short silent captures and local artifacts"
+            );
+        }
+    });
+}
+
+pub(crate) fn delete_session_with_artifacts(
+    store: &Store,
+    data_dir: &Path,
+    session_id: uuid::Uuid,
+) -> Result<bool, String> {
+    let Some(artifacts) = store
+        .session_artifacts(session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    remove_session_artifacts(data_dir, &artifacts)?;
+    store
+        .delete_session(session_id)
+        .map_err(|error| error.to_string())
+}
 
 #[derive(Debug, Clone)]
 pub struct QwenRuntimeStatus {
@@ -446,6 +601,7 @@ pub fn run() {
             // Salvage it (repair the header, transcribe the captured audio) or
             // mark it failed — off the launch path so the UI never blocks.
             meeting_cmd::recover_interrupted_meetings(app.handle().clone());
+            schedule_legacy_short_silent_session_purge(app.handle().clone());
 
             // Opt-in meeting detection: only start when the user enabled it AND
             // the OS capability is present. Off by default; failure to start
@@ -506,8 +662,160 @@ pub fn run() {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use lumen_core::{SessionRecord, SessionStatus};
+    use lumen_store::{
+        AttemptStatus, ContextSnapshotRecord, DictationAttemptRecord, PipelineIssueKind,
+        PipelineStage, PipelineStageIssue,
+    };
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
+
+    fn short_silent_marker(store: &Store, audio_path: Option<PathBuf>) -> Uuid {
+        let mut session = SessionRecord::new();
+        session.status = SessionStatus::Failed;
+        session.audio_path = audio_path.map(|path| path.display().to_string());
+        let mut attempt = DictationAttemptRecord::new(session.id);
+        attempt.status = AttemptStatus::Failed;
+        attempt.failed_stage = Some(PipelineStage::Capture);
+        attempt.pipeline_metrics.audio_duration_ms = 500;
+        attempt
+            .pipeline_metrics
+            .stage_issues
+            .push(PipelineStageIssue {
+                stage: PipelineStage::Capture,
+                kind: PipelineIssueKind::AbsoluteSilence,
+                message: "absolute_silence".into(),
+            });
+        store
+            .save_short_silent_cleanup_marker(&session, &attempt)
+            .unwrap();
+        session.id
+    }
+
+    #[test]
+    fn legacy_silence_purge_deletes_artifacts_and_retries_refused_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let store = Store::open(directory.path().join("history.sqlite")).unwrap();
+
+        let valid_session_dir = data_dir.join("debug/valid-session");
+        let valid_audio = valid_session_dir.join("audio_16k.wav");
+        std::fs::create_dir_all(&valid_session_dir).unwrap();
+        std::fs::write(&valid_audio, b"wav").unwrap();
+        let valid_id = short_silent_marker(&store, Some(valid_audio));
+        std::fs::write(
+            valid_session_dir.join("meta.json"),
+            format!(r#"{{"sessionId":"{valid_id}"}}"#),
+        )
+        .unwrap();
+        let capture_id = Uuid::new_v4();
+        let capture_dir = data_dir.join("context").join(capture_id.to_string());
+        let manifest_path = capture_dir.join("manifest.r0001.v1.sealed.json");
+        std::fs::create_dir_all(&capture_dir).unwrap();
+        std::fs::write(&manifest_path, b"sealed").unwrap();
+        let now = Utc::now();
+        store
+            .save_context_snapshot(&ContextSnapshotRecord {
+                capture_id,
+                session_id: valid_id,
+                revision: 1,
+                schema_version: 1,
+                profile: "metadata".into(),
+                target_generation: 1,
+                started_at: now,
+                frozen_at: now,
+                completed_at: Some(now),
+                manifest_path: manifest_path.display().to_string(),
+                source_presence_bitmap: 0,
+                source_status_json: "{}".into(),
+                sanitized_hash: "hash".into(),
+                encryption: "none".into(),
+                status: "complete".into(),
+            })
+            .unwrap();
+
+        let missing_id = short_silent_marker(
+            &store,
+            Some(data_dir.join("debug/missing-session/audio_16k.wav")),
+        );
+
+        let outside_dir = directory.path().join("outside");
+        let outside_audio = outside_dir.join("audio_16k.wav");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(&outside_audio, b"wav").unwrap();
+        let refused_id = short_silent_marker(&store, Some(outside_audio));
+        std::fs::write(
+            outside_dir.join("meta.json"),
+            format!(r#"{{"sessionId":"{refused_id}"}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(
+            purge_legacy_short_silent_sessions(&store, &data_dir).unwrap(),
+            2
+        );
+        assert!(!valid_session_dir.exists());
+        assert!(!capture_dir.exists());
+        assert!(store.get_session(valid_id).unwrap().is_none());
+        assert!(store.get_session(missing_id).unwrap().is_none());
+        assert!(store.get_session(refused_id).unwrap().is_some());
+        assert!(outside_dir.exists());
+    }
+
+    #[test]
+    fn explicit_session_deletion_removes_owned_audio_and_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let store = Store::open(directory.path().join("history.sqlite")).unwrap();
+        let mut session = SessionRecord::new();
+        session.status = SessionStatus::Completed;
+        session.asr_raw = Some("useful transcript".into());
+        let debug_dir = data_dir.join("debug/visible-session");
+        let audio_path = debug_dir.join("audio_16k.wav");
+        std::fs::create_dir_all(&debug_dir).unwrap();
+        std::fs::write(&audio_path, b"wav").unwrap();
+        std::fs::write(
+            debug_dir.join("meta.json"),
+            format!(r#"{{"sessionId":"{}"}}"#, session.id),
+        )
+        .unwrap();
+        session.audio_path = Some(audio_path.display().to_string());
+        store.save_session(&session).unwrap();
+
+        let capture_id = Uuid::new_v4();
+        let capture_dir = data_dir.join("context").join(capture_id.to_string());
+        let manifest_path = capture_dir.join("manifest.r0001.v1.sealed.json");
+        std::fs::create_dir_all(&capture_dir).unwrap();
+        std::fs::write(&manifest_path, b"sealed").unwrap();
+        let now = Utc::now();
+        store
+            .save_context_snapshot(&ContextSnapshotRecord {
+                capture_id,
+                session_id: session.id,
+                revision: 1,
+                schema_version: 1,
+                profile: "metadata".into(),
+                target_generation: 1,
+                started_at: now,
+                frozen_at: now,
+                completed_at: Some(now),
+                manifest_path: manifest_path.display().to_string(),
+                source_presence_bitmap: 0,
+                source_status_json: "{}".into(),
+                sanitized_hash: "hash".into(),
+                encryption: "none".into(),
+                status: "complete".into(),
+            })
+            .unwrap();
+
+        assert!(delete_session_with_artifacts(&store, &data_dir, session.id).unwrap());
+        assert!(!debug_dir.exists());
+        assert!(!capture_dir.exists());
+        assert!(store.get_session(session.id).unwrap().is_none());
+        assert!(store.list_context_snapshots(session.id).unwrap().is_empty());
+    }
 
     fn probe_script(name: &str, body: &str) -> PathBuf {
         let nonce = SystemTime::now()

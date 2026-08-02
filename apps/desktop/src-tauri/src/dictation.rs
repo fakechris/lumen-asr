@@ -23,8 +23,8 @@ use lumen_platform_macos::{
 };
 use lumen_prompts::IntentSpec;
 use lumen_store::{
-    AttemptStatus, ContextStageUsage, DictationAttemptRecord, InsertionOutcome, PipelineIssueKind,
-    PipelineStage, PipelineStageIssue,
+    should_discard_short_silent_capture, AttemptStatus, ContextStageUsage, DictationAttemptRecord,
+    InsertionOutcome, PipelineIssueKind, PipelineStage, PipelineStageIssue,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -105,8 +105,9 @@ static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Only discard as bounce if shorter than this *and* almost no audio.
 const BOUNCE_MS: u128 = 80;
-/// Reject only an exactly empty signal; any finite non-zero input reaches ASR.
-const ABSOLUTE_SILENCE_PEAK: f32 = 0.0;
+/// Reject only digital silence / sub-quantization noise. A peak above 1e-6 is
+/// still sent to ASR, so quiet human speech remains fail-open.
+const ABSOLUTE_SILENCE_PEAK: f32 = 1.0e-6;
 const ABSOLUTE_SILENCE_ISSUE: &str = "absolute_silence";
 const ABSOLUTE_SILENCE_MESSAGE: &str =
     "未检测到麦克风信号。请检查麦克风权限、输入设备或静音状态后重试。";
@@ -686,12 +687,29 @@ pub async fn stop_and_transcribe(
     stop_and_transcribe_inner(&state, save.unwrap_or(true), Some(&app)).await
 }
 
+struct FrozenContextAttachment {
+    corrector_projection: Option<CorrectorContextProjection>,
+    late_archive: Option<ActiveContextCapture>,
+}
+
+fn schedule_late_context_archive(active: Option<ActiveContextCapture>, app: Option<&AppHandle>) {
+    let (Some(active), Some(app)) = (active, app) else {
+        return;
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        if let Err(error) = active.archive(&state.store).await {
+            tracing::warn!(error = %error, "late context archive failed");
+        }
+    });
+}
+
 async fn attach_frozen_context(
     state: &AppState,
     active: Option<&ActiveContextCapture>,
     attempt: &mut DictationAttemptRecord,
-    app: Option<&AppHandle>,
-) -> Option<CorrectorContextProjection> {
+) -> FrozenContextAttachment {
     let Some(active) = active else {
         attempt
             .pipeline_inputs
@@ -703,7 +721,10 @@ async fn attach_frozen_context(
                 not_used_reason: Some("capture_session_missing".into()),
                 ..ContextStageUsage::default()
             });
-        return None;
+        return FrozenContextAttachment {
+            corrector_projection: None,
+            late_archive: None,
+        };
     };
 
     match active.freeze(&state.store).await {
@@ -727,19 +748,10 @@ async fn attach_frozen_context(
                 Ok(usage) => attempt.pipeline_inputs.stage_usages.push(usage),
                 Err(error) => tracing::warn!(error = %error, "failed to record ASR context usage"),
             }
-            if should_archive {
-                if let Some(app) = app {
-                    let active = active.clone();
-                    let app = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let state = app.state::<AppState>();
-                        if let Err(error) = active.archive(&state.store).await {
-                            tracing::warn!(error = %error, "late context archive failed");
-                        }
-                    });
-                }
+            FrozenContextAttachment {
+                corrector_projection: frozen.corrector_projection,
+                late_archive: should_archive.then(|| active.clone()),
             }
-            frozen.corrector_projection
         }
         Err(error) => {
             attempt
@@ -761,7 +773,10 @@ async fn attach_frozen_context(
                     ..ContextStageUsage::default()
                 });
             tracing::warn!(error = %error, "failed to freeze context input");
-            None
+            FrozenContextAttachment {
+                corrector_projection: None,
+                late_archive: None,
+            }
         }
     }
 }
@@ -816,8 +831,10 @@ pub async fn stop_and_transcribe_inner(
     // Dictation capture is done — return the arbiter to Idle so a meeting can
     // start again. State-only signal; the audio path already stopped above.
     state.capture.end_dictation();
-    let captured_context =
-        attach_frozen_context(state, active_context.as_ref(), &mut attempt, app).await;
+    let FrozenContextAttachment {
+        corrector_projection: captured_context,
+        late_archive: mut late_context_archive,
+    } = attach_frozen_context(state, active_context.as_ref(), &mut attempt).await;
     let capture = match capture_result {
         Ok(capture) => capture,
         Err(error) => {
@@ -830,6 +847,7 @@ pub async fn stop_and_transcribe_inner(
             );
             rec.status = SessionStatus::Failed;
             rec.asr_engine = Some(engine_kind.as_str().into());
+            schedule_late_context_archive(late_context_archive.take(), app);
             if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
                 tracing::warn!(error = %persist_error, "failed to persist capture stop failure");
             }
@@ -866,20 +884,24 @@ pub async fn stop_and_transcribe_inner(
         );
         rec.status = SessionStatus::Failed;
         rec.asr_engine = Some(engine_kind.as_str().into());
-        write_attempt_debug(
-            &mut rec,
-            &attempt,
-            AttemptDebug {
-                target: target.as_ref(),
-                frontmost_before_insert: None,
-                sample_rate_capture: sample_rate,
-                num_samples_capture: num_samples,
-                samples_asr: &[],
-                rms: 0.0,
-                peak: 0.0,
-                notes: vec!["empty capture".into()],
-            },
-        );
+        let discard = should_discard_short_silent_capture(&rec, &attempt);
+        if !discard {
+            write_attempt_debug(
+                &mut rec,
+                &attempt,
+                AttemptDebug {
+                    target: target.as_ref(),
+                    frontmost_before_insert: None,
+                    sample_rate_capture: sample_rate,
+                    num_samples_capture: num_samples,
+                    samples_asr: &[],
+                    rms: 0.0,
+                    peak: 0.0,
+                    notes: vec!["empty capture".into()],
+                },
+            );
+            schedule_late_context_archive(late_context_archive.take(), app);
+        }
         if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
             tracing::warn!(error = %persist_error, "failed to persist capture failure");
         }
@@ -902,20 +924,24 @@ pub async fn stop_and_transcribe_inner(
         );
         rec.status = SessionStatus::Failed;
         rec.asr_engine = Some(engine_kind.as_str().into());
-        write_attempt_debug(
-            &mut rec,
-            &attempt,
-            AttemptDebug {
-                target: target.as_ref(),
-                frontmost_before_insert: None,
-                sample_rate_capture: sample_rate,
-                num_samples_capture: num_samples,
-                samples_asr: &samples_16k,
-                rms,
-                peak,
-                notes: vec!["near-silent capture rejected before ASR".into()],
-            },
-        );
+        let discard = should_discard_short_silent_capture(&rec, &attempt);
+        if !discard {
+            write_attempt_debug(
+                &mut rec,
+                &attempt,
+                AttemptDebug {
+                    target: target.as_ref(),
+                    frontmost_before_insert: None,
+                    sample_rate_capture: sample_rate,
+                    num_samples_capture: num_samples,
+                    samples_asr: &samples_16k,
+                    rms,
+                    peak,
+                    notes: vec!["near-silent capture rejected before ASR".into()],
+                },
+            );
+            schedule_late_context_archive(late_context_archive.take(), app);
+        }
         if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
             tracing::warn!(error = %persist_error, "failed to persist silent capture failure");
         }
@@ -924,6 +950,7 @@ pub async fn stop_and_transcribe_inner(
 
     // Clone samples for debug dump (after ASR we still have this).
     let samples_for_debug = samples_16k.clone();
+    schedule_late_context_archive(late_context_archive.take(), app);
 
     let asr_started = Instant::now();
     let result = match run_asr(state, engine_kind, &asr_cfg, samples_16k, &mut attempt).await {
@@ -2134,7 +2161,15 @@ mod attempt_metric_tests {
             ensure_audible_capture(0.0, f32::INFINITY),
             Err(CaptureSignalIssue::InvalidSignal)
         );
-        assert!(ensure_audible_capture(1.0e-7, 1.0e-7).is_ok());
+        assert_eq!(
+            ensure_audible_capture(1.0e-7, 1.0e-7),
+            Err(CaptureSignalIssue::AbsoluteSilence)
+        );
+        assert_eq!(
+            ensure_audible_capture(1.0e-7, ABSOLUTE_SILENCE_PEAK),
+            Err(CaptureSignalIssue::AbsoluteSilence)
+        );
+        assert!(ensure_audible_capture(1.0e-7, 1.000_001e-6).is_ok());
         assert!(ensure_audible_capture(1.0e-6, 1.0e-5).is_ok());
         assert!(ensure_audible_capture(0.001, 0.005).is_ok());
     }

@@ -13,6 +13,18 @@ use uuid::Uuid;
 
 use crate::config::ContextCaptureConfig;
 
+pub(crate) fn remove_capture_artifacts(_capture_id: Uuid) -> Result<bool, String> {
+    Ok(false)
+}
+
+pub(crate) fn remove_context_manifest_artifact(
+    _data_dir: &Path,
+    _capture_id: Uuid,
+    _manifest_path: &str,
+) -> Result<bool, String> {
+    Ok(false)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TargetHint {
     pub app_name: Option<String>,

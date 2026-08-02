@@ -26,8 +26,6 @@ pub(crate) const SCHEMA_VERSION: i64 = 14;
 
 pub(crate) const HISTORY_TEXT_WHITESPACE: &str =
     "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
-const LEGACY_EMPTY_CAPTURE_MESSAGE: &str =
-    "no audio captured (0 samples) — hold longer or check mic";
 const HISTORY_MIGRATION_BATCH_SIZE: i64 = 128;
 const HISTORY_MIGRATION_MAX_METRICS_JSON_BYTES: i64 = 64 * 1024;
 
@@ -562,7 +560,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 else {
                     continue;
                 };
-                if metrics.audio_duration_ms >= super::HIDDEN_SILENT_CAPTURE_MAX_MS {
+                if metrics.audio_duration_ms >= super::SHORT_SILENT_CAPTURE_MAX_MS {
                     continue;
                 }
                 let structured_silence = metrics.stage_issues.iter().any(|issue| {
@@ -570,7 +568,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                         && issue.kind == super::PipelineIssueKind::AbsoluteSilence
                 });
                 let legacy_zero_samples = metrics.audio_duration_ms == 0
-                    && failure_message.as_deref() == Some(LEGACY_EMPTY_CAPTURE_MESSAGE);
+                    && failure_message.as_deref() == Some(super::LEGACY_EMPTY_CAPTURE_MESSAGE);
                 if structured_silence || legacy_zero_samples {
                     backfill.execute(
                         "UPDATE sessions SET history_visible=0 WHERE id=?1",

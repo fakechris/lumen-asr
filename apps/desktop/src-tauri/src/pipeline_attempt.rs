@@ -1,5 +1,5 @@
 use crate::config::{AppConfig, AsrServiceConfig};
-use crate::context_capture::{CorrectorContextProjection, StageUsageInput};
+use crate::context_capture::{self, CorrectorContextProjection, StageUsageInput};
 use crate::corrector_svc::{
     corrector_outcome_identity, dictionary_context, dictionary_run_identity,
     run_correct_with_intent_and_context, run_identity,
@@ -13,8 +13,8 @@ use lumen_corrector::CorrectorFallbackReason;
 use lumen_platform_macos::FrontmostTarget;
 use lumen_prompts::IntentSpec;
 use lumen_store::{
-    AttemptStatus, ContextStageUsage, DictationAttemptRecord, EnhancementMode, PipelineIdentity,
-    PipelineIssueKind, PipelineStage, PipelineStageIssue,
+    should_discard_short_silent_capture, AttemptStatus, ContextStageUsage, DictationAttemptRecord,
+    EnhancementMode, PipelineIdentity, PipelineIssueKind, PipelineStage, PipelineStageIssue,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -464,6 +464,75 @@ pub(crate) fn persist_attempt(
     session: &SessionRecord,
     attempt: DictationAttemptRecord,
 ) -> Result<DictationAttemptRecord, String> {
+    if should_discard_short_silent_capture(session, &attempt) {
+        let database_cleanup = || -> Result<(), String> {
+            let store_guard = state
+                .store
+                .lock()
+                .map_err(|_| "store lock poisoned".to_string())?;
+            if let Some(store) = store_guard.as_ref() {
+                store
+                    .delete_session(session.id)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        };
+
+        let mut cleanup_errors = Vec::new();
+        if let Some(audio_path) = session.audio_path.as_deref() {
+            let audio_path_ref = std::path::Path::new(audio_path);
+            let artifact_exists = audio_path_ref.exists()
+                || audio_path_ref.parent().is_some_and(std::path::Path::exists);
+            match session_debug::remove_session_debug_artifacts(
+                audio_path_ref,
+                &session.id.to_string(),
+            ) {
+                Ok(true) => {}
+                Ok(false) if !artifact_exists => {}
+                Ok(false) => cleanup_errors.push(format!(
+                    "refused to remove silent capture debug artifact: {audio_path}"
+                )),
+                Err(error) => cleanup_errors.push(format!("remove debug artifact: {error}")),
+            }
+        }
+        if let Some(context) = attempt.pipeline_inputs.context.as_ref() {
+            match context_capture::remove_capture_artifacts(context.capture_id) {
+                Ok(_) => {}
+                Err(error) => cleanup_errors.push(format!("remove context artifact: {error}")),
+            }
+        }
+        if cleanup_errors.is_empty() {
+            if let Err(error) = database_cleanup() {
+                cleanup_errors.push(format!("remove database rows: {error}"));
+            }
+        }
+
+        if !cleanup_errors.is_empty() {
+            let cleanup_error = cleanup_errors.join("; ");
+            let marker_result = state
+                .store
+                .lock()
+                .map_err(|_| "store lock poisoned".to_string())?
+                .as_ref()
+                .ok_or_else(|| "database unavailable for cleanup marker".to_string())?
+                .save_short_silent_cleanup_marker(session, &attempt)
+                .map_err(|error| error.to_string());
+            return match marker_result {
+                Ok(()) => Err(format!(
+                    "{cleanup_error}; cleanup marker saved for startup retry"
+                )),
+                Err(marker_error) => Err(format!(
+                    "{cleanup_error}; failed to save cleanup marker: {marker_error}"
+                )),
+            };
+        }
+        tracing::info!(
+            session_id = %session.id,
+            duration_ms = attempt.pipeline_metrics.audio_duration_ms,
+            "discarded short silent capture and its local artifacts"
+        );
+        return Ok(attempt);
+    }
     if !save {
         return Ok(attempt);
     }

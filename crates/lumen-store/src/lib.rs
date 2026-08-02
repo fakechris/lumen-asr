@@ -17,7 +17,9 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const HIDDEN_SILENT_CAPTURE_MAX_MS: u64 = 2_000;
+pub const SHORT_SILENT_CAPTURE_MAX_MS: u64 = 2_000;
+pub(crate) const LEGACY_EMPTY_CAPTURE_MESSAGE: &str =
+    "no audio captured (0 samples) — hold longer or check mic";
 pub const DEFAULT_ATTEMPT_PAGE_SIZE: u32 = 100;
 pub const MAX_ATTEMPT_PAGE_SIZE: u32 = 500;
 
@@ -259,6 +261,25 @@ pub struct ContextSnapshotRecord {
     pub sanitized_hash: String,
     pub encryption: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionArtifactPaths {
+    pub session_id: Uuid,
+    pub audio_path: Option<String>,
+    pub context_artifacts: Vec<ContextArtifactPath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextArtifactPath {
+    pub capture_id: Uuid,
+    pub manifest_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionArtifactBatch {
+    pub artifacts: Vec<SessionArtifactPaths>,
+    pub last_scanned_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -525,6 +546,9 @@ impl Store {
     }
 
     /// Append one immutable pipeline attempt and link it to the prior attempt.
+    /// A first attempt that proves a short textless absolute-silence capture is
+    /// deleted with its session in the same transaction, so the returned
+    /// record may no longer be queryable.
     pub fn append_dictation_attempt(
         &self,
         mut record: DictationAttemptRecord,
@@ -533,7 +557,7 @@ impl Store {
         record = append_dictation_attempt_on(&transaction, record)?;
         if record.attempt_ordinal == 1 {
             if let Some(session) = get_session_on(&transaction, record.session_id)? {
-                update_initial_history_visibility(&transaction, &session, &record)?;
+                apply_initial_session_retention_policy(&transaction, &session, &record)?;
             }
         }
         transaction.commit()?;
@@ -541,6 +565,9 @@ impl Store {
     }
 
     /// Persist the mutable session snapshot and its immutable attempt atomically.
+    /// A first attempt that proves a short textless absolute-silence capture is
+    /// deleted with its session in the same transaction, so the returned
+    /// record may no longer be queryable.
     pub fn save_session_and_append_attempt(
         &self,
         session: &SessionRecord,
@@ -557,7 +584,7 @@ impl Store {
         save_session_on(&transaction, session)?;
         let record = append_dictation_attempt_on(&transaction, record)?;
         if record.attempt_ordinal == 1 {
-            update_initial_history_visibility(&transaction, session, &record)?;
+            apply_initial_session_retention_policy(&transaction, session, &record)?;
         }
         transaction.commit()?;
         Ok(record)
@@ -693,11 +720,269 @@ impl Store {
     }
 
     pub fn delete_session(&self, id: Uuid) -> Result<bool> {
-        // edit_events cascade via FK
-        let n = self
+        Ok(self.delete_sessions(&[id])? > 0)
+    }
+
+    pub fn delete_sessions(&self, ids: &[Uuid]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut deleted = 0;
+        for id in ids {
+            deleted += usize::from(delete_session_on(&transaction, *id)?);
+        }
+        transaction.commit()?;
+        Ok(deleted)
+    }
+
+    /// Persist an invisible cleanup marker only when artifact deletion failed.
+    /// The next startup revalidates the immutable silence evidence before
+    /// retrying filesystem cleanup and deleting this row.
+    pub fn save_short_silent_cleanup_marker(
+        &self,
+        session: &SessionRecord,
+        attempt: &DictationAttemptRecord,
+    ) -> Result<()> {
+        if !should_discard_short_silent_capture(session, attempt) {
+            anyhow::bail!("cleanup marker requires short absolute-silence evidence");
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        save_session_on(&transaction, session)?;
+        append_dictation_attempt_on(&transaction, attempt.clone())?;
+        transaction.execute(
+            "UPDATE sessions SET history_visible=0 WHERE id=?1",
+            params![session.id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Return rows hidden by the v14 short-silence migration together with
+    /// their filesystem artifacts. The desktop removes files first, then calls
+    /// `delete_session`, so transient filesystem failures remain retryable.
+    pub fn hidden_short_silent_session_artifacts(&self) -> Result<Vec<SessionArtifactPaths>> {
+        let mut artifacts = Vec::new();
+        let mut after_session_id = String::new();
+        loop {
+            let batch = self.hidden_short_silent_session_artifact_batch(&after_session_id, 128)?;
+            artifacts.extend(batch.artifacts);
+            let Some(last_scanned_session_id) = batch.last_scanned_session_id else {
+                break;
+            };
+            after_session_id = last_scanned_session_id;
+        }
+        Ok(artifacts)
+    }
+
+    pub fn hidden_short_silent_session_artifact_batch(
+        &self,
+        after_session_id: &str,
+        limit: u32,
+    ) -> Result<SessionArtifactBatch> {
+        let limit = limit.clamp(1, MAX_ATTEMPT_PAGE_SIZE);
+        let mut statement = self.conn.prepare(
+            r#"
+            WITH candidate_sessions AS (
+              SELECT id
+              FROM sessions
+              WHERE history_visible=0 AND id > ?1
+              ORDER BY id
+              LIMIT ?2
+            )
+            SELECT sessions.id, sessions.audio_path, sessions.status,
+                   sessions.asr_raw, sessions.corrected, sessions.pasted,
+                   first_attempt.status, first_attempt.failed_stage,
+                   first_attempt.pipeline_metrics_json, first_attempt.failure_message,
+                   context_snapshots.capture_id, context_snapshots.manifest_path
+            FROM sessions
+            JOIN candidate_sessions ON candidate_sessions.id = sessions.id
+            LEFT JOIN dictation_attempts AS first_attempt
+              ON first_attempt.session_id = sessions.id
+             AND first_attempt.attempt_ordinal = 1
+            LEFT JOIN context_snapshots
+              ON context_snapshots.session_id = sessions.id
+             AND NOT EXISTS (
+                   SELECT 1
+                   FROM context_snapshots AS other_context
+                   WHERE other_context.capture_id = context_snapshots.capture_id
+                     AND other_context.session_id <> sessions.id
+                 )
+            ORDER BY sessions.id, context_snapshots.revision
+            "#,
+        )?;
+        let rows = statement.query_map(params![after_session_id, i64::from(limit)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+            ))
+        })?;
+
+        let mut artifacts: Vec<SessionArtifactPaths> = Vec::new();
+        let mut last_scanned_session_id = None;
+        let mut unsafe_session_id = None;
+        for row in rows {
+            let Ok(row) = row else {
+                tracing::warn!("skipping malformed hidden session artifact row");
+                continue;
+            };
+            let (
+                session_id_raw,
+                audio_path,
+                session_status,
+                asr_raw,
+                corrected,
+                pasted,
+                attempt_status,
+                failed_stage,
+                metrics_json,
+                failure_message,
+                capture_id_raw,
+                manifest_path,
+            ) = row;
+            last_scanned_session_id = Some(session_id_raw.clone());
+            let (Some(attempt_status), Some(metrics_json)) = (attempt_status, metrics_json) else {
+                tracing::warn!(
+                    session_id = session_id_raw,
+                    "skipping hidden session without a first attempt"
+                );
+                continue;
+            };
+            let Ok(session_id) = Uuid::parse_str(&session_id_raw) else {
+                tracing::warn!(
+                    session_id = session_id_raw,
+                    "skipping malformed hidden session id"
+                );
+                continue;
+            };
+            if unsafe_session_id == Some(session_id) {
+                continue;
+            }
+            let Ok(metrics) = serde_json::from_str::<PipelineMetrics>(&metrics_json) else {
+                tracing::warn!(%session_id, "skipping malformed hidden session metrics");
+                continue;
+            };
+            let session = SessionRecord {
+                id: session_id,
+                status: parse_status(&session_status),
+                asr_raw,
+                corrected,
+                pasted,
+                audio_path: audio_path.clone(),
+                ..SessionRecord::new()
+            };
+            if !should_discard_short_silent_evidence(
+                &session,
+                parse_attempt_status(&attempt_status),
+                failed_stage.as_deref().and_then(parse_pipeline_stage),
+                &metrics,
+                failure_message.as_deref(),
+                true,
+            ) {
+                continue;
+            }
+
+            if artifacts.last().map(|value| value.session_id) != Some(session_id) {
+                artifacts.push(SessionArtifactPaths {
+                    session_id,
+                    audio_path,
+                    context_artifacts: Vec::new(),
+                });
+            }
+            if let (Some(capture_id_raw), Some(manifest_path)) = (capture_id_raw, manifest_path) {
+                let Ok(capture_id) = Uuid::parse_str(&capture_id_raw) else {
+                    tracing::warn!(
+                        %session_id,
+                        capture_id = capture_id_raw,
+                        "skipping malformed hidden context capture id"
+                    );
+                    if artifacts.last().map(|artifact| artifact.session_id) == Some(session_id) {
+                        artifacts.pop();
+                    }
+                    unsafe_session_id = Some(session_id);
+                    continue;
+                };
+                let candidate = artifacts
+                    .last_mut()
+                    .expect("validated candidate was just inserted");
+                if !candidate
+                    .context_artifacts
+                    .iter()
+                    .any(|artifact| artifact.capture_id == capture_id)
+                {
+                    candidate.context_artifacts.push(ContextArtifactPath {
+                        capture_id,
+                        manifest_path,
+                    });
+                }
+            }
+        }
+        Ok(SessionArtifactBatch {
+            artifacts,
+            last_scanned_session_id,
+        })
+    }
+
+    pub fn session_artifacts(&self, session_id: Uuid) -> Result<Option<SessionArtifactPaths>> {
+        let audio_path = self
             .conn
-            .execute("DELETE FROM sessions WHERE id=?1", params![id.to_string()])?;
-        Ok(n > 0)
+            .query_row(
+                "SELECT audio_path FROM sessions WHERE id=?1",
+                params![session_id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(audio_path) = audio_path else {
+            return Ok(None);
+        };
+
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT context_snapshots.capture_id, context_snapshots.manifest_path
+            FROM context_snapshots
+            WHERE context_snapshots.session_id=?1
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM context_snapshots AS other_context
+                    WHERE other_context.capture_id = context_snapshots.capture_id
+                      AND other_context.session_id <> context_snapshots.session_id
+                  )
+            ORDER BY context_snapshots.revision
+            "#,
+        )?;
+        let rows = statement.query_map(params![session_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut context_artifacts = Vec::new();
+        for row in rows {
+            let (capture_id, manifest_path) = row?;
+            let capture_id = Uuid::parse_str(&capture_id)
+                .map_err(|error| anyhow::anyhow!("invalid context capture id: {error}"))?;
+            if !context_artifacts
+                .iter()
+                .any(|artifact: &ContextArtifactPath| artifact.capture_id == capture_id)
+            {
+                context_artifacts.push(ContextArtifactPath {
+                    capture_id,
+                    manifest_path,
+                });
+            }
+        }
+        Ok(Some(SessionArtifactPaths {
+            session_id,
+            audio_path,
+            context_artifacts,
+        }))
     }
 
     pub fn add_edit_event(
@@ -1236,31 +1521,64 @@ fn session_must_be_visible(session: &SessionRecord) -> bool {
     ) || session_has_history_text(session)
 }
 
-fn initial_attempt_is_short_absolute_silence(
+pub fn should_discard_short_silent_capture(
     session: &SessionRecord,
     attempt: &DictationAttemptRecord,
 ) -> bool {
-    !session_must_be_visible(session)
-        && attempt.status == AttemptStatus::Failed
-        && attempt.failed_stage == Some(PipelineStage::Capture)
-        && attempt.pipeline_metrics.audio_duration_ms < HIDDEN_SILENT_CAPTURE_MAX_MS
-        && attempt.pipeline_metrics.stage_issues.iter().any(|issue| {
-            issue.stage == PipelineStage::Capture
-                && issue.kind == PipelineIssueKind::AbsoluteSilence
-        })
+    should_discard_short_silent_evidence(
+        session,
+        attempt.status,
+        attempt.failed_stage,
+        &attempt.pipeline_metrics,
+        attempt.failure_message.as_deref(),
+        false,
+    )
 }
 
-fn update_initial_history_visibility(
+fn should_discard_short_silent_evidence(
+    session: &SessionRecord,
+    attempt_status: AttemptStatus,
+    failed_stage: Option<PipelineStage>,
+    metrics: &PipelineMetrics,
+    failure_message: Option<&str>,
+    accept_legacy_zero_samples: bool,
+) -> bool {
+    !session_must_be_visible(session)
+        && attempt_status == AttemptStatus::Failed
+        && failed_stage == Some(PipelineStage::Capture)
+        && metrics.audio_duration_ms < SHORT_SILENT_CAPTURE_MAX_MS
+        && (metrics.stage_issues.iter().any(|issue| {
+            issue.stage == PipelineStage::Capture
+                && issue.kind == PipelineIssueKind::AbsoluteSilence
+        }) || (accept_legacy_zero_samples
+            && metrics.audio_duration_ms == 0
+            && failure_message == Some(LEGACY_EMPTY_CAPTURE_MESSAGE)))
+}
+
+fn apply_initial_session_retention_policy(
     conn: &Connection,
     session: &SessionRecord,
     attempt: &DictationAttemptRecord,
 ) -> Result<()> {
-    let history_visible = !initial_attempt_is_short_absolute_silence(session, attempt);
-    conn.execute(
-        "UPDATE sessions SET history_visible=?1 WHERE id=?2",
-        params![history_visible, session.id.to_string()],
-    )?;
+    if should_discard_short_silent_capture(session, attempt) {
+        delete_session_on(conn, session.id)?;
+    } else {
+        conn.execute(
+            "UPDATE sessions SET history_visible=1 WHERE id=?1",
+            params![session.id.to_string()],
+        )?;
+    }
     Ok(())
+}
+
+fn delete_session_on(conn: &Connection, id: Uuid) -> Result<bool> {
+    conn.execute(
+        "DELETE FROM context_snapshots WHERE session_id=?1",
+        params![id.to_string()],
+    )?;
+    // Attempts, edit observations, and edit events cascade via foreign keys.
+    let deleted = conn.execute("DELETE FROM sessions WHERE id=?1", params![id.to_string()])?;
+    Ok(deleted > 0)
 }
 
 fn append_dictation_attempt_on(
@@ -1515,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn history_sessions_filter_only_short_textless_absolute_silence() {
+    fn short_textless_absolute_silence_is_deleted_instead_of_hidden() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("history.sqlite")).unwrap();
 
@@ -1591,35 +1909,150 @@ mod tests {
         assert!(ids.contains(&other_failure_visible));
         assert!(!ids.contains(&whitespace_hidden));
         assert!(ids.contains(&inconsistent_attempt_visible));
-        assert_eq!(store.list_sessions(10).unwrap().len(), 6);
+        assert!(store.get_session(structured_hidden).unwrap().is_none());
+        assert!(store.get_session(whitespace_hidden).unwrap().is_none());
+        assert!(store
+            .list_dictation_attempts(structured_hidden, 10, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.list_sessions(10).unwrap().len(), 4);
     }
 
     #[test]
-    fn later_success_unhides_an_initial_silent_capture() {
+    fn legacy_hidden_silence_lists_artifacts_before_database_deletion() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("history-retry.sqlite")).unwrap();
-        let hidden = save_history_case(
+        let store = Store::open(dir.path().join("history-purge.sqlite")).unwrap();
+        let audio_path = dir.path().join("debug/capture/audio_16k.wav");
+        let mut session = SessionRecord::new();
+        session.status = SessionStatus::Failed;
+        session.audio_path = Some(audio_path.display().to_string());
+        let hidden = session.id;
+        let mut attempt = DictationAttemptRecord::new(hidden);
+        attempt.status = AttemptStatus::Failed;
+        attempt.failed_stage = Some(PipelineStage::Capture);
+        attempt.pipeline_metrics.audio_duration_ms = 500;
+        attempt
+            .pipeline_metrics
+            .stage_issues
+            .push(PipelineStageIssue {
+                stage: PipelineStage::Capture,
+                kind: PipelineIssueKind::AbsoluteSilence,
+                message: "absolute_silence".into(),
+            });
+        store
+            .save_short_silent_cleanup_marker(&session, &attempt)
+            .unwrap();
+
+        let non_silent_hidden = save_history_case(
             &store,
             SessionRecord::new(),
             500,
-            Some(PipelineIssueKind::AbsoluteSilence),
-            None,
+            Some(PipelineIssueKind::InputUnavailable),
+            Some("device unavailable"),
         );
-        assert!(store.list_history_sessions(10).unwrap().is_empty());
-
-        let mut recovered = store.get_session(hidden).unwrap().unwrap();
-        recovered.status = SessionStatus::Completed;
-        recovered.corrected = Some("retry succeeded".into());
-        let mut retry = DictationAttemptRecord::new(hidden);
-        retry.status = AttemptStatus::Completed;
-        retry.pipeline_metrics.audio_duration_ms = 9_000;
         store
-            .save_session_and_append_attempt(&recovered, retry)
+            .conn
+            .execute(
+                "UPDATE sessions SET history_visible=0 WHERE id=?1",
+                params![non_silent_hidden.to_string()],
+            )
             .unwrap();
+        store
+            .conn
+            .execute_batch(
+                r#"
+                INSERT INTO sessions (id, created_at, status, history_visible)
+                VALUES ('!not-a-uuid', '2026-08-02T00:00:00Z', 'failed', 0);
+                INSERT INTO dictation_attempts (
+                  id, session_id, attempt_ordinal, created_at,
+                  pipeline_identity_json, pipeline_metrics_json,
+                  status, failed_stage
+                ) VALUES (
+                  'malformed-attempt', '!not-a-uuid', 1, '2026-08-02T00:00:00Z',
+                  '{}',
+                  '{"audio_duration_ms":500,"stage_issues":[{"stage":"capture","kind":"absolute_silence","message":"absolute_silence"}]}',
+                  'failed', 'capture'
+                );
+                "#,
+            )
+            .unwrap();
+        let capture_id = Uuid::new_v4();
+        let manifest_path = dir.path().join(format!(
+            "context/{capture_id}/manifest.r0001.v1.sealed.json"
+        ));
+        let now = Utc::now();
+        store
+            .save_context_snapshot(&ContextSnapshotRecord {
+                capture_id,
+                session_id: hidden,
+                revision: 1,
+                schema_version: 1,
+                profile: "metadata".into(),
+                target_generation: 1,
+                started_at: now,
+                frozen_at: now,
+                completed_at: Some(now),
+                manifest_path: manifest_path.display().to_string(),
+                source_presence_bitmap: 0,
+                source_status_json: "{}".into(),
+                sanitized_hash: "hash".into(),
+                encryption: "none".into(),
+                status: "complete".into(),
+            })
+            .unwrap();
+        let mut visible_session = SessionRecord::new();
+        visible_session.status = SessionStatus::Completed;
+        visible_session.asr_raw = Some("keep shared context".into());
+        store.save_session(&visible_session).unwrap();
+        let shared_capture_id = Uuid::new_v4();
+        for (session_id, revision) in [(hidden, 1), (visible_session.id, 2)] {
+            store
+                .save_context_snapshot(&ContextSnapshotRecord {
+                    capture_id: shared_capture_id,
+                    session_id,
+                    revision,
+                    schema_version: 1,
+                    profile: "metadata".into(),
+                    target_generation: 1,
+                    started_at: now,
+                    frozen_at: now,
+                    completed_at: Some(now),
+                    manifest_path: dir
+                        .path()
+                        .join(format!(
+                            "context/{shared_capture_id}/manifest.r{revision:04}.v1.sealed.json"
+                        ))
+                        .display()
+                        .to_string(),
+                    source_presence_bitmap: 0,
+                    source_status_json: "{}".into(),
+                    sanitized_hash: "shared".into(),
+                    encryption: "none".into(),
+                    status: "complete".into(),
+                })
+                .unwrap();
+        }
 
-        let history = store.list_history_sessions(10).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].id, hidden);
+        let artifacts = store.hidden_short_silent_session_artifacts().unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].session_id, hidden);
+        assert_eq!(artifacts[0].audio_path.as_deref(), audio_path.to_str());
+        assert_eq!(
+            artifacts[0].context_artifacts,
+            vec![ContextArtifactPath {
+                capture_id,
+                manifest_path: manifest_path.display().to_string(),
+            }]
+        );
+        assert!(store.get_session(non_silent_hidden).unwrap().is_some());
+        assert!(store.get_session(hidden).unwrap().is_some());
+        assert!(store.delete_session(hidden).unwrap());
+        assert!(store.get_session(hidden).unwrap().is_none());
+        assert!(store
+            .list_dictation_attempts(hidden, 10, None)
+            .unwrap()
+            .is_empty());
+        assert!(store.list_context_snapshots(hidden).unwrap().is_empty());
     }
 
     #[test]
