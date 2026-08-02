@@ -466,9 +466,6 @@ pub(crate) fn persist_attempt(
 ) -> Result<DictationAttemptRecord, String> {
     if should_discard_short_silent_capture(session, &attempt) {
         let database_cleanup = || -> Result<(), String> {
-            if !save {
-                return Ok(());
-            }
             let store_guard = state
                 .store
                 .lock()
@@ -481,20 +478,54 @@ pub(crate) fn persist_attempt(
             Ok(())
         };
 
+        let mut cleanup_errors = Vec::new();
         if let Some(audio_path) = session.audio_path.as_deref() {
-            let removed =
-                session_debug::remove_session_debug_artifacts(std::path::Path::new(audio_path))?;
-            if !removed {
-                tracing::warn!(
-                    audio_path,
-                    "refused to remove non-debug silent capture audio"
-                );
+            let audio_path_ref = std::path::Path::new(audio_path);
+            let artifact_exists = audio_path_ref.exists()
+                || audio_path_ref.parent().is_some_and(std::path::Path::exists);
+            match session_debug::remove_session_debug_artifacts(
+                audio_path_ref,
+                &session.id.to_string(),
+            ) {
+                Ok(true) => {}
+                Ok(false) if !artifact_exists => {}
+                Ok(false) => cleanup_errors.push(format!(
+                    "refused to remove silent capture debug artifact: {audio_path}"
+                )),
+                Err(error) => cleanup_errors.push(format!("remove debug artifact: {error}")),
             }
         }
         if let Some(context) = attempt.pipeline_inputs.context.as_ref() {
-            context_capture::remove_capture_artifacts(context.capture_id)?;
+            match context_capture::remove_capture_artifacts(context.capture_id) {
+                Ok(_) => {}
+                Err(error) => cleanup_errors.push(format!("remove context artifact: {error}")),
+            }
         }
-        database_cleanup()?;
+        if cleanup_errors.is_empty() {
+            if let Err(error) = database_cleanup() {
+                cleanup_errors.push(format!("remove database rows: {error}"));
+            }
+        }
+
+        if !cleanup_errors.is_empty() {
+            let cleanup_error = cleanup_errors.join("; ");
+            let marker_result = state
+                .store
+                .lock()
+                .map_err(|_| "store lock poisoned".to_string())?
+                .as_ref()
+                .ok_or_else(|| "database unavailable for cleanup marker".to_string())?
+                .save_short_silent_cleanup_marker(session, &attempt)
+                .map_err(|error| error.to_string());
+            return match marker_result {
+                Ok(()) => Err(format!(
+                    "{cleanup_error}; cleanup marker saved for startup retry"
+                )),
+                Err(marker_error) => Err(format!(
+                    "{cleanup_error}; failed to save cleanup marker: {marker_error}"
+                )),
+            };
+        }
         tracing::info!(
             session_id = %session.id,
             duration_ms = attempt.pipeline_metrics.audio_duration_ms,

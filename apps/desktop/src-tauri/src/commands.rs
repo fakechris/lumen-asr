@@ -163,7 +163,9 @@ pub fn list_context_snapshots(
 #[tauri::command]
 pub fn delete_session(state: State<'_, AppState>, id: String) -> Result<bool, String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    with_store(&state, |s| s.delete_session(id).map_err(|e| e.to_string()))
+    with_store(&state, |store| {
+        crate::delete_session_with_artifacts(store, &default_data_dir(), id)
+    })
 }
 
 /// Export one session as a pretty-printed `lumen-transcript.v1` JSON string.

@@ -2165,6 +2165,11 @@ mod attempt_metric_tests {
             ensure_audible_capture(1.0e-7, 1.0e-7),
             Err(CaptureSignalIssue::AbsoluteSilence)
         );
+        assert_eq!(
+            ensure_audible_capture(1.0e-7, ABSOLUTE_SILENCE_PEAK),
+            Err(CaptureSignalIssue::AbsoluteSilence)
+        );
+        assert!(ensure_audible_capture(1.0e-7, 1.000_001e-6).is_ok());
         assert!(ensure_audible_capture(1.0e-6, 1.0e-5).is_ok());
         assert!(ensure_audible_capture(0.001, 0.005).is_ok());
     }

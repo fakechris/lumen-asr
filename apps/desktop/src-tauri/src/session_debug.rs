@@ -95,11 +95,26 @@ pub fn write_session_debug(
 /// Delete one generated session debug directory. The path must be the
 /// `audio_16k.wav` directly inside a child of Lumen's debug root; arbitrary
 /// paths from the database are deliberately refused.
-pub fn remove_session_debug_artifacts(audio_path: &Path) -> Result<bool, String> {
-    remove_session_debug_artifacts_in(&debug_root(), audio_path)
+pub fn remove_session_debug_artifacts(
+    audio_path: &Path,
+    expected_session_id: &str,
+) -> Result<bool, String> {
+    remove_session_debug_artifacts_in(&debug_root(), audio_path, expected_session_id)
 }
 
-fn remove_session_debug_artifacts_in(root: &Path, audio_path: &Path) -> Result<bool, String> {
+pub(crate) fn remove_session_debug_artifacts_from(
+    data_dir: &Path,
+    audio_path: &Path,
+    expected_session_id: &str,
+) -> Result<bool, String> {
+    remove_session_debug_artifacts_in(&data_dir.join("debug"), audio_path, expected_session_id)
+}
+
+fn remove_session_debug_artifacts_in(
+    root: &Path,
+    audio_path: &Path,
+    expected_session_id: &str,
+) -> Result<bool, String> {
     let Some(session_dir) = audio_path.parent() else {
         return Ok(false);
     };
@@ -109,6 +124,16 @@ fn remove_session_debug_artifacts_in(root: &Path, audio_path: &Path) -> Result<b
         return Ok(false);
     }
     if !session_dir.exists() {
+        return Ok(false);
+    }
+    let metadata: serde_json::Value = match fs::read(session_dir.join("meta.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(metadata) => metadata,
+        None => return Ok(false),
+    };
+    if metadata.get("sessionId").and_then(|value| value.as_str()) != Some(expected_session_id) {
         return Ok(false);
     }
 
@@ -251,21 +276,38 @@ mod tests {
         let audio_path = session_dir.join("audio_16k.wav");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(&audio_path, b"wav").unwrap();
-        fs::write(session_dir.join("meta.json"), b"{}").unwrap();
+        let session_id = "bff7c108-e8f2-4f41-885b-30b223bead01";
+        fs::write(
+            session_dir.join("meta.json"),
+            format!(r#"{{"sessionId":"{session_id}"}}"#),
+        )
+        .unwrap();
         fs::write(
             root.join("LATEST.txt"),
             format!("{}\n", session_dir.display()),
         )
         .unwrap();
 
-        assert!(remove_session_debug_artifacts_in(&root, &audio_path).unwrap());
+        assert!(remove_session_debug_artifacts_in(&root, &audio_path, session_id).unwrap());
         assert!(!session_dir.exists());
         assert!(!root.join("LATEST.txt").exists());
 
         let outside = directory.path().join("outside/audio_16k.wav");
         fs::create_dir_all(outside.parent().unwrap()).unwrap();
         fs::write(&outside, b"keep").unwrap();
-        assert!(!remove_session_debug_artifacts_in(&root, &outside).unwrap());
+        assert!(!remove_session_debug_artifacts_in(&root, &outside, session_id).unwrap());
         assert!(outside.exists());
+
+        let other_dir = root.join("456-session");
+        let other_audio = other_dir.join("audio_16k.wav");
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(&other_audio, b"wav").unwrap();
+        fs::write(
+            other_dir.join("meta.json"),
+            r#"{"sessionId":"a-different-session"}"#,
+        )
+        .unwrap();
+        assert!(!remove_session_debug_artifacts_in(&root, &other_audio, session_id).unwrap());
+        assert!(other_dir.exists());
     }
 }

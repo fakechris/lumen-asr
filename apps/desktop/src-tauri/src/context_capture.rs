@@ -40,6 +40,7 @@ pub(crate) fn remove_capture_artifacts(capture_id: Uuid) -> Result<bool, String>
 
 pub(crate) fn remove_context_manifest_artifact(
     data_dir: &Path,
+    capture_id: Uuid,
     manifest_path: &str,
 ) -> Result<bool, String> {
     let root = data_dir.join("context");
@@ -47,6 +48,14 @@ pub(crate) fn remove_context_manifest_artifact(
     let Some(capture_dir) = path.parent() else {
         return Ok(false);
     };
+    if capture_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| Uuid::parse_str(name).ok())
+        != Some(capture_id)
+    {
+        return Ok(false);
+    }
     remove_capture_dir(&root, capture_dir)
 }
 
@@ -1335,6 +1344,19 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         assert!(!remove_capture_dir(&root, &outside).unwrap());
         assert!(outside.exists());
+
+        let owned_id = Uuid::new_v4();
+        let owned_dir = root.join(owned_id.to_string());
+        let owned_manifest = owned_dir.join("manifest.r0001.v1.sealed.json");
+        fs::create_dir_all(&owned_dir).unwrap();
+        fs::write(&owned_manifest, b"sealed").unwrap();
+        assert!(!remove_context_manifest_artifact(
+            directory.path(),
+            Uuid::new_v4(),
+            owned_manifest.to_str().unwrap(),
+        )
+        .unwrap());
+        assert!(owned_dir.exists());
     }
 
     fn test_recorder(config: &ContextCaptureConfig, root: &Path) -> ContextRecorder {
