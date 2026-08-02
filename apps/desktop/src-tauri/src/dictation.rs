@@ -884,21 +884,22 @@ pub async fn stop_and_transcribe_inner(
         );
         rec.status = SessionStatus::Failed;
         rec.asr_engine = Some(engine_kind.as_str().into());
-        write_attempt_debug(
-            &mut rec,
-            &attempt,
-            AttemptDebug {
-                target: target.as_ref(),
-                frontmost_before_insert: None,
-                sample_rate_capture: sample_rate,
-                num_samples_capture: num_samples,
-                samples_asr: &[],
-                rms: 0.0,
-                peak: 0.0,
-                notes: vec!["empty capture".into()],
-            },
-        );
-        if !should_discard_short_silent_capture(&rec, &attempt) {
+        let discard = should_discard_short_silent_capture(&rec, &attempt);
+        if !discard {
+            write_attempt_debug(
+                &mut rec,
+                &attempt,
+                AttemptDebug {
+                    target: target.as_ref(),
+                    frontmost_before_insert: None,
+                    sample_rate_capture: sample_rate,
+                    num_samples_capture: num_samples,
+                    samples_asr: &[],
+                    rms: 0.0,
+                    peak: 0.0,
+                    notes: vec!["empty capture".into()],
+                },
+            );
             schedule_late_context_archive(late_context_archive.take(), app);
         }
         if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
@@ -923,21 +924,22 @@ pub async fn stop_and_transcribe_inner(
         );
         rec.status = SessionStatus::Failed;
         rec.asr_engine = Some(engine_kind.as_str().into());
-        write_attempt_debug(
-            &mut rec,
-            &attempt,
-            AttemptDebug {
-                target: target.as_ref(),
-                frontmost_before_insert: None,
-                sample_rate_capture: sample_rate,
-                num_samples_capture: num_samples,
-                samples_asr: &samples_16k,
-                rms,
-                peak,
-                notes: vec!["near-silent capture rejected before ASR".into()],
-            },
-        );
-        if !should_discard_short_silent_capture(&rec, &attempt) {
+        let discard = should_discard_short_silent_capture(&rec, &attempt);
+        if !discard {
+            write_attempt_debug(
+                &mut rec,
+                &attempt,
+                AttemptDebug {
+                    target: target.as_ref(),
+                    frontmost_before_insert: None,
+                    sample_rate_capture: sample_rate,
+                    num_samples_capture: num_samples,
+                    samples_asr: &samples_16k,
+                    rms,
+                    peak,
+                    notes: vec!["near-silent capture rejected before ASR".into()],
+                },
+            );
             schedule_late_context_archive(late_context_archive.take(), app);
         }
         if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
