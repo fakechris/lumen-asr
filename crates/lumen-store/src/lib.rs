@@ -546,6 +546,9 @@ impl Store {
     }
 
     /// Append one immutable pipeline attempt and link it to the prior attempt.
+    /// A first attempt that proves a short textless absolute-silence capture is
+    /// deleted with its session in the same transaction, so the returned
+    /// record may no longer be queryable.
     pub fn append_dictation_attempt(
         &self,
         mut record: DictationAttemptRecord,
@@ -562,6 +565,9 @@ impl Store {
     }
 
     /// Persist the mutable session snapshot and its immutable attempt atomically.
+    /// A first attempt that proves a short textless absolute-silence capture is
+    /// deleted with its session in the same transaction, so the returned
+    /// record may no longer be queryable.
     pub fn save_session_and_append_attempt(
         &self,
         session: &SessionRecord,
