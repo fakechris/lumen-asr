@@ -14,6 +14,7 @@ use lumen_context::{
     ContextCollector, ContextConfig, ContextManifest, ContextSealer, ContextSnapshot,
     PrivacyPolicy, SealedContextEnvelope, SourceKind, SourceSelection, SourceState, TriggerKind,
 };
+use lumen_platform::default_data_dir;
 use lumen_store::{
     ContextInputRef, ContextSnapshotRecord, ContextStageUsage, PipelineStage, Store,
 };
@@ -31,6 +32,36 @@ const VISIBLE_TEXT_LIMIT: usize = 2_000;
 const KEYCHAIN_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(8);
 const KEYCHAIN_SERVICE: &str = "com.lumenopen.asr.context";
 const KEYCHAIN_ACCOUNT: &str = "capture-key-v1";
+
+pub(crate) fn remove_capture_artifacts(capture_id: Uuid) -> Result<bool, String> {
+    let root = default_data_dir().join("context");
+    remove_capture_dir(&root, &root.join(capture_id.to_string()))
+}
+
+pub(crate) fn remove_context_manifest_artifact(
+    data_dir: &Path,
+    manifest_path: &str,
+) -> Result<bool, String> {
+    let root = data_dir.join("context");
+    let path = Path::new(manifest_path);
+    let Some(capture_dir) = path.parent() else {
+        return Ok(false);
+    };
+    remove_capture_dir(&root, capture_dir)
+}
+
+fn remove_capture_dir(root: &Path, capture_dir: &Path) -> Result<bool, String> {
+    let valid_capture_dir = capture_dir.parent() == Some(root)
+        && capture_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| Uuid::parse_str(name).is_ok());
+    if !valid_capture_dir || !capture_dir.exists() {
+        return Ok(false);
+    }
+    fs::remove_dir_all(capture_dir).map_err(|error| error.to_string())?;
+    Ok(true)
+}
 
 enum ExistingKeychainKey {
     Found(ContextSealer),
@@ -1287,6 +1318,24 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::process::Command;
+
+    #[test]
+    fn context_cleanup_refuses_paths_outside_the_context_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("context");
+        let capture_id = Uuid::new_v4();
+        let capture_dir = root.join(capture_id.to_string());
+        fs::create_dir_all(&capture_dir).unwrap();
+        fs::write(capture_dir.join("manifest.r0001.v1.sealed.json"), b"sealed").unwrap();
+
+        assert!(remove_capture_dir(&root, &capture_dir).unwrap());
+        assert!(!capture_dir.exists());
+
+        let outside = directory.path().join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&outside).unwrap();
+        assert!(!remove_capture_dir(&root, &outside).unwrap());
+        assert!(outside.exists());
+    }
 
     fn test_recorder(config: &ContextCaptureConfig, root: &Path) -> ContextRecorder {
         ContextRecorder::new_with_components(

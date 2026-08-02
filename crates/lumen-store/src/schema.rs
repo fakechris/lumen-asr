@@ -562,7 +562,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 else {
                     continue;
                 };
-                if metrics.audio_duration_ms >= super::HIDDEN_SILENT_CAPTURE_MAX_MS {
+                if metrics.audio_duration_ms >= super::SHORT_SILENT_CAPTURE_MAX_MS {
                     continue;
                 }
                 let structured_silence = metrics.stage_issues.iter().any(|issue| {

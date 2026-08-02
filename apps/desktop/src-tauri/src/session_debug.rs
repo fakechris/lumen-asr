@@ -92,6 +92,37 @@ pub fn write_session_debug(
     Ok(())
 }
 
+/// Delete one generated session debug directory. The path must be the
+/// `audio_16k.wav` directly inside a child of Lumen's debug root; arbitrary
+/// paths from the database are deliberately refused.
+pub fn remove_session_debug_artifacts(audio_path: &Path) -> Result<bool, String> {
+    remove_session_debug_artifacts_in(&debug_root(), audio_path)
+}
+
+fn remove_session_debug_artifacts_in(root: &Path, audio_path: &Path) -> Result<bool, String> {
+    let Some(session_dir) = audio_path.parent() else {
+        return Ok(false);
+    };
+    if audio_path.file_name().and_then(|name| name.to_str()) != Some("audio_16k.wav")
+        || session_dir.parent() != Some(root)
+    {
+        return Ok(false);
+    }
+    if !session_dir.exists() {
+        return Ok(false);
+    }
+
+    fs::remove_dir_all(session_dir).map_err(|error| error.to_string())?;
+    let latest = root.join("LATEST.txt");
+    if fs::read_to_string(&latest)
+        .ok()
+        .is_some_and(|value| value.trim() == session_dir.to_string_lossy())
+    {
+        fs::remove_file(latest).map_err(|error| error.to_string())?;
+    }
+    Ok(true)
+}
+
 pub fn audio_stats(samples: &[f32]) -> (f32, f32) {
     if samples.is_empty() {
         return (0.0, 0.0);
@@ -205,4 +236,36 @@ fn write_wav_f32_as_i16(path: &Path, samples: &[f32], sample_rate: u32) -> Resul
         f.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_session_debug_artifacts_in;
+    use std::fs;
+
+    #[test]
+    fn artifact_cleanup_removes_only_a_generated_session_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("debug");
+        let session_dir = root.join("123-session");
+        let audio_path = session_dir.join("audio_16k.wav");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(&audio_path, b"wav").unwrap();
+        fs::write(session_dir.join("meta.json"), b"{}").unwrap();
+        fs::write(
+            root.join("LATEST.txt"),
+            format!("{}\n", session_dir.display()),
+        )
+        .unwrap();
+
+        assert!(remove_session_debug_artifacts_in(&root, &audio_path).unwrap());
+        assert!(!session_dir.exists());
+        assert!(!root.join("LATEST.txt").exists());
+
+        let outside = directory.path().join("outside/audio_16k.wav");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        fs::write(&outside, b"keep").unwrap();
+        assert!(!remove_session_debug_artifacts_in(&root, &outside).unwrap());
+        assert!(outside.exists());
+    }
 }

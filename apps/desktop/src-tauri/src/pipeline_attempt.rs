@@ -1,5 +1,5 @@
 use crate::config::{AppConfig, AsrServiceConfig};
-use crate::context_capture::{CorrectorContextProjection, StageUsageInput};
+use crate::context_capture::{self, CorrectorContextProjection, StageUsageInput};
 use crate::corrector_svc::{
     corrector_outcome_identity, dictionary_context, dictionary_run_identity,
     run_correct_with_intent_and_context, run_identity,
@@ -13,8 +13,8 @@ use lumen_corrector::CorrectorFallbackReason;
 use lumen_platform_macos::FrontmostTarget;
 use lumen_prompts::IntentSpec;
 use lumen_store::{
-    AttemptStatus, ContextStageUsage, DictationAttemptRecord, EnhancementMode, PipelineIdentity,
-    PipelineIssueKind, PipelineStage, PipelineStageIssue,
+    should_discard_short_silent_capture, AttemptStatus, ContextStageUsage, DictationAttemptRecord,
+    EnhancementMode, PipelineIdentity, PipelineIssueKind, PipelineStage, PipelineStageIssue,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -464,6 +464,44 @@ pub(crate) fn persist_attempt(
     session: &SessionRecord,
     attempt: DictationAttemptRecord,
 ) -> Result<DictationAttemptRecord, String> {
+    if should_discard_short_silent_capture(session, &attempt) {
+        let database_cleanup = || -> Result<(), String> {
+            if !save {
+                return Ok(());
+            }
+            let store_guard = state
+                .store
+                .lock()
+                .map_err(|_| "store lock poisoned".to_string())?;
+            if let Some(store) = store_guard.as_ref() {
+                store
+                    .delete_session(session.id)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        };
+
+        if let Some(audio_path) = session.audio_path.as_deref() {
+            let removed =
+                session_debug::remove_session_debug_artifacts(std::path::Path::new(audio_path))?;
+            if !removed {
+                tracing::warn!(
+                    audio_path,
+                    "refused to remove non-debug silent capture audio"
+                );
+            }
+        }
+        if let Some(context) = attempt.pipeline_inputs.context.as_ref() {
+            context_capture::remove_capture_artifacts(context.capture_id)?;
+        }
+        database_cleanup()?;
+        tracing::info!(
+            session_id = %session.id,
+            duration_ms = attempt.pipeline_metrics.audio_duration_ms,
+            "discarded short silent capture and its local artifacts"
+        );
+        return Ok(attempt);
+    }
     if !save {
         return Ok(attempt);
     }

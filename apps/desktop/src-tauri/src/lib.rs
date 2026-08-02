@@ -256,6 +256,94 @@ pub fn run() {
     let store = match Store::open(default_db_path()) {
         Ok(s) => {
             tracing::info!(path = %s.path().display(), "store opened");
+            match s.hidden_short_silent_session_artifacts() {
+                Ok(discarded) => {
+                    let mut purged_count = 0;
+                    for artifacts in &discarded {
+                        let mut cleanup_succeeded = true;
+                        if let Some(audio_path) = artifacts.audio_path.as_deref() {
+                            let audio_path = Path::new(audio_path);
+                            let artifact_exists = audio_path.exists()
+                                || audio_path.parent().is_some_and(Path::exists);
+                            match session_debug::remove_session_debug_artifacts(Path::new(
+                                audio_path,
+                            )) {
+                                Ok(true) => {}
+                                Ok(false) if !artifact_exists => {}
+                                Ok(false) => {
+                                    cleanup_succeeded = false;
+                                    tracing::warn!(
+                                        session_id = %artifacts.session_id,
+                                        audio_path = %audio_path.display(),
+                                        "refused to remove non-debug legacy silent capture audio"
+                                    );
+                                }
+                                Err(error) => {
+                                    cleanup_succeeded = false;
+                                    tracing::warn!(
+                                        session_id = %artifacts.session_id,
+                                        audio_path = %audio_path.display(),
+                                        %error,
+                                        "failed to remove legacy silent capture audio"
+                                    );
+                                }
+                            }
+                        }
+                        for manifest_path in &artifacts.context_manifest_paths {
+                            if manifest_path.is_empty() {
+                                continue;
+                            }
+                            let manifest_path_ref = Path::new(manifest_path);
+                            let artifact_exists = manifest_path_ref.exists()
+                                || manifest_path_ref.parent().is_some_and(Path::exists);
+                            match context_capture::remove_context_manifest_artifact(
+                                &data_dir,
+                                manifest_path,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) if !artifact_exists => {}
+                                Ok(false) => {
+                                    cleanup_succeeded = false;
+                                    tracing::warn!(
+                                        session_id = %artifacts.session_id,
+                                        manifest_path,
+                                        "refused to remove out-of-root legacy silent capture context"
+                                    );
+                                }
+                                Err(error) => {
+                                    cleanup_succeeded = false;
+                                    tracing::warn!(
+                                        session_id = %artifacts.session_id,
+                                        manifest_path,
+                                        %error,
+                                        "failed to remove legacy silent capture context"
+                                    );
+                                }
+                            }
+                        }
+                        if cleanup_succeeded {
+                            match s.delete_session(artifacts.session_id) {
+                                Ok(true) => purged_count += 1,
+                                Ok(false) => {}
+                                Err(error) => tracing::warn!(
+                                    session_id = %artifacts.session_id,
+                                    %error,
+                                    "failed to delete legacy short silent capture row"
+                                ),
+                            }
+                        }
+                    }
+                    if purged_count > 0 {
+                        tracing::info!(
+                            count = purged_count,
+                            "purged legacy short silent captures and local artifacts"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to purge legacy short silent captures")
+                }
+            }
             Some(s)
         }
         Err(e) => {

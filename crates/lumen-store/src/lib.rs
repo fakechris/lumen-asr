@@ -17,7 +17,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const HIDDEN_SILENT_CAPTURE_MAX_MS: u64 = 2_000;
+pub const SHORT_SILENT_CAPTURE_MAX_MS: u64 = 2_000;
 pub const DEFAULT_ATTEMPT_PAGE_SIZE: u32 = 100;
 pub const MAX_ATTEMPT_PAGE_SIZE: u32 = 500;
 
@@ -259,6 +259,13 @@ pub struct ContextSnapshotRecord {
     pub sanitized_hash: String,
     pub encryption: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionArtifactPaths {
+    pub session_id: Uuid,
+    pub audio_path: Option<String>,
+    pub context_manifest_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -533,7 +540,7 @@ impl Store {
         record = append_dictation_attempt_on(&transaction, record)?;
         if record.attempt_ordinal == 1 {
             if let Some(session) = get_session_on(&transaction, record.session_id)? {
-                update_initial_history_visibility(&transaction, &session, &record)?;
+                apply_initial_session_retention_policy(&transaction, &session, &record)?;
             }
         }
         transaction.commit()?;
@@ -557,7 +564,7 @@ impl Store {
         save_session_on(&transaction, session)?;
         let record = append_dictation_attempt_on(&transaction, record)?;
         if record.attempt_ordinal == 1 {
-            update_initial_history_visibility(&transaction, session, &record)?;
+            apply_initial_session_retention_policy(&transaction, session, &record)?;
         }
         transaction.commit()?;
         Ok(record)
@@ -693,11 +700,46 @@ impl Store {
     }
 
     pub fn delete_session(&self, id: Uuid) -> Result<bool> {
-        // edit_events cascade via FK
-        let n = self
-            .conn
-            .execute("DELETE FROM sessions WHERE id=?1", params![id.to_string()])?;
-        Ok(n > 0)
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let deleted = delete_session_on(&transaction, id)?;
+        transaction.commit()?;
+        Ok(deleted)
+    }
+
+    /// Return rows hidden by the v14 short-silence migration together with
+    /// their filesystem artifacts. The desktop removes files first, then calls
+    /// `delete_session`, so transient filesystem failures remain retryable.
+    pub fn hidden_short_silent_session_artifacts(&self) -> Result<Vec<SessionArtifactPaths>> {
+        let candidates = {
+            let mut statement = self.conn.prepare(
+                "SELECT id, audio_path FROM sessions WHERE history_visible=0 ORDER BY id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((parse_uuid_column(row, 0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut artifacts = Vec::with_capacity(candidates.len());
+        for (session_id, audio_path) in candidates {
+            let context_manifest_paths = {
+                let mut statement = self
+                    .conn
+                    .prepare("SELECT manifest_path FROM context_snapshots WHERE session_id=?1")?;
+                let rows =
+                    statement.query_map(params![session_id.to_string()], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<String>>>()?
+            };
+            artifacts.push(SessionArtifactPaths {
+                session_id,
+                audio_path,
+                context_manifest_paths,
+            });
+        }
+        Ok(artifacts)
     }
 
     pub fn add_edit_event(
@@ -1236,31 +1278,44 @@ fn session_must_be_visible(session: &SessionRecord) -> bool {
     ) || session_has_history_text(session)
 }
 
-fn initial_attempt_is_short_absolute_silence(
+pub fn should_discard_short_silent_capture(
     session: &SessionRecord,
     attempt: &DictationAttemptRecord,
 ) -> bool {
     !session_must_be_visible(session)
         && attempt.status == AttemptStatus::Failed
         && attempt.failed_stage == Some(PipelineStage::Capture)
-        && attempt.pipeline_metrics.audio_duration_ms < HIDDEN_SILENT_CAPTURE_MAX_MS
+        && attempt.pipeline_metrics.audio_duration_ms < SHORT_SILENT_CAPTURE_MAX_MS
         && attempt.pipeline_metrics.stage_issues.iter().any(|issue| {
             issue.stage == PipelineStage::Capture
                 && issue.kind == PipelineIssueKind::AbsoluteSilence
         })
 }
 
-fn update_initial_history_visibility(
+fn apply_initial_session_retention_policy(
     conn: &Connection,
     session: &SessionRecord,
     attempt: &DictationAttemptRecord,
 ) -> Result<()> {
-    let history_visible = !initial_attempt_is_short_absolute_silence(session, attempt);
-    conn.execute(
-        "UPDATE sessions SET history_visible=?1 WHERE id=?2",
-        params![history_visible, session.id.to_string()],
-    )?;
+    if should_discard_short_silent_capture(session, attempt) {
+        delete_session_on(conn, session.id)?;
+    } else {
+        conn.execute(
+            "UPDATE sessions SET history_visible=1 WHERE id=?1",
+            params![session.id.to_string()],
+        )?;
+    }
     Ok(())
+}
+
+fn delete_session_on(conn: &Connection, id: Uuid) -> Result<bool> {
+    conn.execute(
+        "DELETE FROM context_snapshots WHERE session_id=?1",
+        params![id.to_string()],
+    )?;
+    // Attempts, edit observations, and edit events cascade via foreign keys.
+    let deleted = conn.execute("DELETE FROM sessions WHERE id=?1", params![id.to_string()])?;
+    Ok(deleted > 0)
 }
 
 fn append_dictation_attempt_on(
@@ -1515,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn history_sessions_filter_only_short_textless_absolute_silence() {
+    fn short_textless_absolute_silence_is_deleted_instead_of_hidden() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("history.sqlite")).unwrap();
 
@@ -1591,35 +1646,77 @@ mod tests {
         assert!(ids.contains(&other_failure_visible));
         assert!(!ids.contains(&whitespace_hidden));
         assert!(ids.contains(&inconsistent_attempt_visible));
-        assert_eq!(store.list_sessions(10).unwrap().len(), 6);
+        assert!(store.get_session(structured_hidden).unwrap().is_none());
+        assert!(store.get_session(whitespace_hidden).unwrap().is_none());
+        assert!(store
+            .list_dictation_attempts(structured_hidden, 10, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.list_sessions(10).unwrap().len(), 4);
     }
 
     #[test]
-    fn later_success_unhides_an_initial_silent_capture() {
+    fn legacy_hidden_silence_lists_artifacts_before_database_deletion() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("history-retry.sqlite")).unwrap();
+        let store = Store::open(dir.path().join("history-purge.sqlite")).unwrap();
+        let audio_path = dir.path().join("debug/capture/audio_16k.wav");
+        let mut session = SessionRecord::new();
+        session.audio_path = Some(audio_path.display().to_string());
         let hidden = save_history_case(
             &store,
-            SessionRecord::new(),
+            session,
             500,
-            Some(PipelineIssueKind::AbsoluteSilence),
-            None,
+            Some(PipelineIssueKind::InputUnavailable),
+            Some("legacy placeholder"),
         );
-        assert!(store.list_history_sessions(10).unwrap().is_empty());
-
-        let mut recovered = store.get_session(hidden).unwrap().unwrap();
-        recovered.status = SessionStatus::Completed;
-        recovered.corrected = Some("retry succeeded".into());
-        let mut retry = DictationAttemptRecord::new(hidden);
-        retry.status = AttemptStatus::Completed;
-        retry.pipeline_metrics.audio_duration_ms = 9_000;
         store
-            .save_session_and_append_attempt(&recovered, retry)
+            .conn
+            .execute(
+                "UPDATE sessions SET history_visible=0 WHERE id=?1",
+                params![hidden.to_string()],
+            )
+            .unwrap();
+        let capture_id = Uuid::new_v4();
+        let manifest_path = dir.path().join(format!(
+            "context/{capture_id}/manifest.r0001.v1.sealed.json"
+        ));
+        let now = Utc::now();
+        store
+            .save_context_snapshot(&ContextSnapshotRecord {
+                capture_id,
+                session_id: hidden,
+                revision: 1,
+                schema_version: 1,
+                profile: "metadata".into(),
+                target_generation: 1,
+                started_at: now,
+                frozen_at: now,
+                completed_at: Some(now),
+                manifest_path: manifest_path.display().to_string(),
+                source_presence_bitmap: 0,
+                source_status_json: "{}".into(),
+                sanitized_hash: "hash".into(),
+                encryption: "none".into(),
+                status: "complete".into(),
+            })
             .unwrap();
 
-        let history = store.list_history_sessions(10).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].id, hidden);
+        let artifacts = store.hidden_short_silent_session_artifacts().unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].session_id, hidden);
+        assert_eq!(artifacts[0].audio_path.as_deref(), audio_path.to_str());
+        assert_eq!(
+            artifacts[0].context_manifest_paths,
+            vec![manifest_path.display().to_string()]
+        );
+        assert!(store.get_session(hidden).unwrap().is_some());
+        assert!(store.delete_session(hidden).unwrap());
+        assert!(store.get_session(hidden).unwrap().is_none());
+        assert!(store
+            .list_dictation_attempts(hidden, 10, None)
+            .unwrap()
+            .is_empty());
+        assert!(store.list_context_snapshots(hidden).unwrap().is_empty());
     }
 
     #[test]
