@@ -505,10 +505,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     if !has_v14 {
+        let backfill = conn.unchecked_transaction()?;
         let mut after_session_id = String::new();
         loop {
             let candidates = {
-                let mut statement = conn.prepare(
+                let mut statement = backfill.prepare(
                     r#"
                 SELECT sessions.id, first_attempt.pipeline_metrics_json,
                        first_attempt.failure_message
@@ -561,7 +562,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 else {
                     continue;
                 };
-                if metrics.audio_duration_ms >= 2_000 {
+                if metrics.audio_duration_ms >= super::HIDDEN_SILENT_CAPTURE_MAX_MS {
                     continue;
                 }
                 let structured_silence = metrics.stage_issues.iter().any(|issue| {
@@ -571,13 +572,23 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 let legacy_zero_samples = metrics.audio_duration_ms == 0
                     && failure_message.as_deref() == Some(LEGACY_EMPTY_CAPTURE_MESSAGE);
                 if structured_silence || legacy_zero_samples {
-                    conn.execute(
+                    backfill.execute(
                         "UPDATE sessions SET history_visible=0 WHERE id=?1",
                         params![session_id],
                     )?;
                 }
             }
         }
+        backfill.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_history_visible_created_at
+             ON sessions(history_visible, created_at DESC)",
+            [],
+        )?;
+        backfill.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+            [SCHEMA_VERSION],
+        )?;
+        backfill.commit()?;
     }
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_history_visible_created_at

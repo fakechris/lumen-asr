@@ -5,17 +5,19 @@ export type LatestRequestOutcome<T> =
 export class LatestRequestGate<T> {
   private revision = 0;
   private cycle: Promise<LatestRequestOutcome<T>> | null = null;
+  private cycleRevision = 0;
   private rerunRequested = false;
   private nextRequest: (() => Promise<T>) | null = null;
 
   run(request: () => Promise<T>): Promise<LatestRequestOutcome<T>> {
     this.nextRequest = request;
-    if (this.cycle) {
+    if (this.cycle && this.cycleRevision === this.revision) {
       this.rerunRequested = true;
       return this.cycle;
     }
 
     const revision = ++this.revision;
+    this.cycleRevision = revision;
     let tracked!: Promise<LatestRequestOutcome<T>>;
     tracked = this.runCycle(revision).finally(() => {
       if (this.cycle === tracked) this.cycle = null;

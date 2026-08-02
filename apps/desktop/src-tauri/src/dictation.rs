@@ -107,6 +107,7 @@ static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 const BOUNCE_MS: u128 = 80;
 /// Reject only an exactly empty signal; any finite non-zero input reaches ASR.
 const ABSOLUTE_SILENCE_PEAK: f32 = 0.0;
+const ABSOLUTE_SILENCE_ISSUE: &str = "absolute_silence";
 const ABSOLUTE_SILENCE_MESSAGE: &str =
     "未检测到麦克风信号。请检查麦克风权限、输入设备或静音状态后重试。";
 const INVALID_CAPTURE_MESSAGE: &str = "录音数据无效，请检查输入设备后重试。";
@@ -362,7 +363,7 @@ fn ensure_audible_capture(rms: f32, peak: f32) -> Result<(), CaptureSignalIssue>
 fn record_capture_signal_issue(attempt: &mut DictationAttemptRecord, issue: CaptureSignalIssue) {
     let (kind, message) = match issue {
         CaptureSignalIssue::AbsoluteSilence => {
-            (PipelineIssueKind::AbsoluteSilence, ABSOLUTE_SILENCE_MESSAGE)
+            (PipelineIssueKind::AbsoluteSilence, ABSOLUTE_SILENCE_ISSUE)
         }
         CaptureSignalIssue::InvalidSignal => {
             (PipelineIssueKind::InputUnavailable, INVALID_CAPTURE_ISSUE)
@@ -2147,7 +2148,7 @@ mod attempt_metric_tests {
         let issue = &attempt.pipeline_metrics.stage_issues[0];
         assert_eq!(issue.stage, PipelineStage::Capture);
         assert_eq!(issue.kind, PipelineIssueKind::AbsoluteSilence);
-        assert_eq!(issue.message, ABSOLUTE_SILENCE_MESSAGE);
+        assert_eq!(issue.message, ABSOLUTE_SILENCE_ISSUE);
     }
 
     #[test]

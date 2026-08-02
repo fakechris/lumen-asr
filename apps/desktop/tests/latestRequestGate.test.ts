@@ -57,3 +57,28 @@ test("cancelled requests suppress both values and errors", async () => {
     /current failure/,
   );
 });
+
+test("a fresh request starts immediately after cancelling an older cycle", async () => {
+  const gate = new LatestRequestGate<string>();
+  const oldRequest = deferred<string>();
+  const freshRequest = deferred<string>();
+  let calls = 0;
+  const oldResult = gate.run(() => {
+    calls += 1;
+    return oldRequest.promise;
+  });
+  gate.cancelPending();
+  const freshResult = gate.run(() => {
+    calls += 1;
+    return freshRequest.promise;
+  });
+
+  assert.equal(calls, 2);
+  freshRequest.resolve("fresh snapshot");
+  assert.deepEqual(await freshResult, {
+    status: "current",
+    value: "fresh snapshot",
+  });
+  oldRequest.resolve("cancelled snapshot");
+  assert.deepEqual(await oldResult, { status: "stale" });
+});

@@ -17,7 +17,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const HIDDEN_SILENT_CAPTURE_MAX_MS: u64 = 2_000;
+pub(crate) const HIDDEN_SILENT_CAPTURE_MAX_MS: u64 = 2_000;
 pub const DEFAULT_ATTEMPT_PAGE_SIZE: u32 = 100;
 pub const MAX_ATTEMPT_PAGE_SIZE: u32 = 500;
 
