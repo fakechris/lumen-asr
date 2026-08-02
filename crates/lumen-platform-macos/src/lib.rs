@@ -268,3 +268,89 @@ pub fn is_self_target(t: &FrontmostTarget) -> bool {
             .map(|b| b.to_ascii_lowercase().contains("lumenasr"))
             .unwrap_or(false)
 }
+
+/// Run a closure on the main run-loop thread. AppKit window mutations must
+/// happen on the main thread; this lets callers on background tasks (e.g. the
+/// dictation pipeline showing the capsule) safely touch an NSWindow. Uses
+/// libdispatch directly — the closure is boxed and consumed by a C trampoline,
+/// so no extra crates are needed.
+#[cfg(target_os = "macos")]
+fn run_on_main(f: impl FnOnce() + Send + 'static) {
+    use std::ffi::c_void;
+    extern "C" fn trampoline(ctx: *mut c_void) {
+        // SAFETY: `ctx` was created just below via `Box::into_raw` and is
+        // consumed exactly once by this single `dispatch_async_f` submission.
+        let outer: Box<Box<dyn FnOnce()>> = unsafe { Box::from_raw(ctx as *mut Box<dyn FnOnce()>) };
+        let inner: Box<dyn FnOnce()> = *outer;
+        inner();
+    }
+    extern "C" {
+        // `dispatch_get_main_queue()` is an inline header function with no
+        // exported symbol, so reference its backing global directly. The main
+        // queue handle is the ADDRESS of `_dispatch_main_q` (that's what the
+        // DISPATCH_GLOBAL_OBJECT macro returns); the type is opaque — we only
+        // ever take its address, never dereference.
+        static _dispatch_main_q: u8;
+        fn dispatch_async_f(queue: *mut c_void, ctx: *mut c_void, work: extern "C" fn(*mut c_void));
+    }
+    let boxed: Box<dyn FnOnce()> = Box::new(f);
+    let b: Box<Box<dyn FnOnce()>> = Box::new(boxed);
+    let ctx = Box::into_raw(b) as *mut c_void;
+    // SAFETY: reading the extern static's address; the symbol is provided by
+    // libdispatch. The type is opaque — only its address is used.
+    let main_queue = unsafe { &_dispatch_main_q as *const u8 as *mut c_void };
+    // SAFETY: hands `ctx` to libdispatch; the trampoline frees it on the main
+    // queue exactly once.
+    unsafe {
+        dispatch_async_f(main_queue, ctx, trampoline);
+    }
+}
+
+/// Make the window that owns `ns_view` (a webview's content-view pointer) appear
+/// on **every** Space, like a system overlay. Sets `NSWindowCollectionBehavior`
+/// `canJoinAllSpaces | fullScreenAuxiliary` so the dictation capsule follows the
+/// user across Spaces instead of vanishing the moment they switch away from the
+/// Space it was created on. Always dispatched to the main thread.
+///
+/// The NSView is retained (+1) before the async hop and released inside the
+/// closure: the raw-window-handle contract only guarantees the pointer while the
+/// handle provider is alive, which we can't assume across the thread boundary.
+/// `retain`/`release` are thread-safe refcount ops.
+#[cfg(target_os = "macos")]
+pub fn set_window_visible_on_all_spaces(ns_view: *mut std::ffi::c_void) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    if ns_view.is_null() {
+        return;
+    }
+    // Retain (+1) so the pointer stays valid across the dispatch regardless of
+    // the handle provider's lifetime. Released at the end of the closure. Raw
+    // pointers are `!Send`, so ferry the retained address through a `usize`.
+    let retained: *mut AnyObject = unsafe { msg_send![ns_view as *mut AnyObject, retain] };
+    if retained.is_null() {
+        return;
+    }
+    let addr = retained as usize;
+    run_on_main(move || {
+        // NSWindowCollectionBehavior bits (AppKit/NSWindow.h):
+        const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+        const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+        unsafe {
+            let view = addr as *mut AnyObject;
+            // [view window]
+            let window: *mut AnyObject = msg_send![view, window];
+            if !window.is_null() {
+                // [window collectionBehavior] → OR in the bits → setCollectionBehavior:
+                let behavior: usize = msg_send![window, collectionBehavior];
+                let new_behavior = behavior | CAN_JOIN_ALL_SPACES | FULL_SCREEN_AUXILIARY;
+                let _: () = msg_send![window, setCollectionBehavior: new_behavior];
+            }
+            // Balance the retain taken before dispatch.
+            let _: () = msg_send![view, release];
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_window_visible_on_all_spaces(_ns_view: *mut std::ffi::c_void) {}

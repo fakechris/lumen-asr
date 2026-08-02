@@ -48,6 +48,7 @@ pub fn ensure_capsule(app: &AppHandle) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let _ = win.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
+        show_on_all_spaces(&win);
     }
     tracing::info!("capsule window created (transparent)");
     Ok(())
@@ -61,6 +62,22 @@ fn position_top_center(win: &tauri::WebviewWindow) {
         let x = (size.width as f64 - w) / 2.0 / scale;
         let y = 56.0;
         let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+    }
+}
+
+/// Show the capsule on every Space so it follows the user across a Space switch
+/// mid-record (instead of being pinned to the Space it was created on). Cheap
+/// and idempotent — safe to call on every show. macOS-only.
+#[cfg(target_os = "macos")]
+fn show_on_all_spaces(win: &tauri::WebviewWindow) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = win.window_handle() else {
+        return;
+    };
+    if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
+        lumen_platform_macos::set_window_visible_on_all_spaces(
+            appkit.ns_view.as_ptr() as *mut std::ffi::c_void
+        );
     }
 }
 
@@ -80,6 +97,8 @@ pub fn set_capsule_visible(app: &AppHandle, visible: bool, phase: &str) {
     let _ = win.set_focusable(false);
     if visible {
         position_top_center(&win);
+        #[cfg(target_os = "macos")]
+        show_on_all_spaces(&win);
         match win.show() {
             Ok(()) => tracing::info!(%phase, "capsule shown"),
             Err(e) => tracing::warn!(error = %e, %phase, "capsule show failed"),

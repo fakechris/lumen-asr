@@ -42,6 +42,9 @@ blake3 = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 security-framework-sys = "2.17"
+# For reading the capsule window's NSView so we can tune its NSWindow (e.g. show
+# on all Spaces). Must match Tauri 2's raw-window-handle 0.6.
+raw-window-handle = "0.6"
 lumen-context = { workspace = true }
 # Enable the real on-device diarization path only on macOS (diar-rs -> ONNX
 # Runtime + C++). The base dependency above stays feature-free, so non-macOS
