@@ -157,6 +157,7 @@ export type PipelineStage =
 export type PipelineIssueKind =
   | "fallback"
   | "input_unavailable"
+  | "absolute_silence"
   | "clipboard_failure"
   | "injection_failure"
   | "unknown";

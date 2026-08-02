@@ -869,8 +869,6 @@ code {
 }
 
 .session-copy {
-  width: 28px;
-  height: 28px;
   padding: 0;
   opacity: 0.72;
   color: var(--muted);
