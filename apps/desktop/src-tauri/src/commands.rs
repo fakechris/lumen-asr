@@ -6,7 +6,7 @@ use lumen_dictionary::{candidates_from_edit, DictionaryEntry, LearnCandidate};
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::{
     ContextSnapshotRecord, DictationAttemptRecord, EditEventRecord, EditObservationRecord,
-    DEFAULT_ATTEMPT_PAGE_SIZE,
+    PipelineIssueKind, PipelineStage, SessionHistoryRecord, DEFAULT_ATTEMPT_PAGE_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -107,14 +107,61 @@ pub fn build_info() -> BuildInfo {
 
 // ── Sessions ──────────────────────────────────────────────────────────────
 
+const HIDDEN_SILENT_CAPTURE_MAX_MS: u64 = 2_000;
+
+fn should_hide_session_from_history(record: &SessionHistoryRecord) -> bool {
+    if !matches!(
+        record.session.status,
+        SessionStatus::Failed | SessionStatus::Cancelled
+    ) || record
+        .session
+        .corrected
+        .as_deref()
+        .or(record.session.pasted.as_deref())
+        .or(record.session.asr_raw.as_deref())
+        .is_some_and(|text| !text.trim().is_empty())
+    {
+        return false;
+    }
+
+    let Some(attempt) = record.initial_attempt.as_ref() else {
+        return false;
+    };
+    if attempt.pipeline_metrics.audio_duration_ms >= HIDDEN_SILENT_CAPTURE_MAX_MS {
+        return false;
+    }
+
+    let structured_silence = attempt.pipeline_metrics.stage_issues.iter().any(|issue| {
+        issue.stage == PipelineStage::Capture
+            && issue.kind == PipelineIssueKind::InputUnavailable
+            && issue.message == crate::dictation::ABSOLUTE_SILENCE_ISSUE
+    });
+    let legacy_silence = attempt.failed_stage == Some(PipelineStage::Capture)
+        && attempt.failure_message.as_deref() == Some(crate::dictation::ABSOLUTE_SILENCE_MESSAGE);
+    structured_silence || legacy_silence
+}
+
 #[tauri::command]
 pub fn list_sessions(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> Result<Vec<SessionRecord>, String> {
     let limit = limit.unwrap_or(50).clamp(1, 500);
+    // Filtering happens after loading capture evidence, so scan beyond the
+    // requested visible count; otherwise a burst of accidental taps could
+    // crowd older useful sessions out of the result.
+    let scan_limit = limit.saturating_mul(5).min(500);
     with_store(&state, |s| {
-        s.list_sessions(limit).map_err(|e| e.to_string())
+        s.list_history_sessions(scan_limit)
+            .map(|records| {
+                records
+                    .into_iter()
+                    .filter(|record| !should_hide_session_from_history(record))
+                    .map(|record| record.session)
+                    .take(limit as usize)
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
     })
 }
 
@@ -442,4 +489,77 @@ pub fn delete_dictionary_entry(state: State<'_, AppState>, id: String) -> Result
     with_store(&state, |s| {
         s.delete_dictionary_entry(id).map_err(|e| e.to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_hide_session_from_history, HIDDEN_SILENT_CAPTURE_MAX_MS};
+    use lumen_core::{SessionRecord, SessionStatus};
+    use lumen_store::{
+        PipelineIssueKind, PipelineMetrics, PipelineStage, PipelineStageIssue,
+        SessionHistoryAttempt, SessionHistoryRecord,
+    };
+
+    fn failed_history_record(duration_ms: u64) -> SessionHistoryRecord {
+        let mut session = SessionRecord::new();
+        session.status = SessionStatus::Failed;
+        let mut pipeline_metrics = PipelineMetrics {
+            audio_duration_ms: duration_ms,
+            ..PipelineMetrics::default()
+        };
+        pipeline_metrics.stage_issues.push(PipelineStageIssue {
+            stage: PipelineStage::Capture,
+            kind: PipelineIssueKind::InputUnavailable,
+            message: crate::dictation::ABSOLUTE_SILENCE_ISSUE.into(),
+        });
+        SessionHistoryRecord {
+            session,
+            initial_attempt: Some(SessionHistoryAttempt {
+                pipeline_metrics,
+                failed_stage: Some(PipelineStage::Capture),
+                failure_message: Some(crate::dictation::ABSOLUTE_SILENCE_MESSAGE.into()),
+            }),
+        }
+    }
+
+    #[test]
+    fn hides_only_short_empty_absolute_silence() {
+        let short = failed_history_record(HIDDEN_SILENT_CAPTURE_MAX_MS - 1);
+        assert!(should_hide_session_from_history(&short));
+
+        let at_boundary = failed_history_record(HIDDEN_SILENT_CAPTURE_MAX_MS);
+        assert!(!should_hide_session_from_history(&at_boundary));
+
+        let mut with_text = failed_history_record(500);
+        with_text.session.asr_raw = Some("保留这条".into());
+        assert!(!should_hide_session_from_history(&with_text));
+
+        let mut other_capture_failure = failed_history_record(500);
+        other_capture_failure
+            .initial_attempt
+            .as_mut()
+            .unwrap()
+            .pipeline_metrics
+            .stage_issues
+            .clear();
+        other_capture_failure
+            .initial_attempt
+            .as_mut()
+            .unwrap()
+            .failure_message = Some("device disconnected".into());
+        assert!(!should_hide_session_from_history(&other_capture_failure));
+    }
+
+    #[test]
+    fn legacy_silence_failure_is_hidden_without_structured_issue() {
+        let mut record = failed_history_record(600);
+        record
+            .initial_attempt
+            .as_mut()
+            .unwrap()
+            .pipeline_metrics
+            .stage_issues
+            .clear();
+        assert!(should_hide_session_from_history(&record));
+    }
 }

@@ -845,6 +845,13 @@ code {
   overflow: auto;
 }
 
+.session-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 2px;
+}
+
 .session-item {
   width: 100%;
   text-align: left;
@@ -859,6 +866,34 @@ code {
   flex-direction: column;
   gap: 4px;
   transition: background 0.12s var(--ease), border-color 0.12s var(--ease);
+}
+
+.session-copy {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  opacity: 0.72;
+  color: var(--muted);
+  transition:
+    opacity 0.12s var(--ease),
+    color 0.12s var(--ease),
+    background 0.12s var(--ease);
+}
+
+.session-row:hover .session-copy,
+.session-copy:focus-visible,
+.session-copy.copied {
+  opacity: 1;
+}
+
+.session-copy:hover,
+.session-copy:focus-visible {
+  color: var(--text);
+}
+
+.session-copy.copied {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
 }
 
 .session-item:hover {

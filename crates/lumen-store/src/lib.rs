@@ -494,6 +494,22 @@ impl DictationAttemptRecord {
     }
 }
 
+/// Session plus the capture evidence needed to decide whether it belongs in a
+/// user-facing history list. The session and attempt remain persisted even
+/// when a caller chooses not to display them.
+#[derive(Debug, Clone)]
+pub struct SessionHistoryRecord {
+    pub session: SessionRecord,
+    pub initial_attempt: Option<SessionHistoryAttempt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionHistoryAttempt {
+    pub pipeline_metrics: PipelineMetrics,
+    pub failed_stage: Option<PipelineStage>,
+    pub failure_message: Option<String>,
+}
+
 pub struct Store {
     conn: Connection,
     path: PathBuf,
@@ -645,6 +661,37 @@ impl Store {
             "#,
         )?;
         let rows = stmt.query_map(params![limit], map_session)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// List sessions with the first capture attempt in one query. History
+    /// presentation uses the initial attempt because later retries describe
+    /// reprocessing, not what the microphone originally captured.
+    pub fn list_history_sessions(&self, limit: u32) -> Result<Vec<SessionHistoryRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT sessions.id, sessions.created_at, sessions.focused_app,
+                   sessions.focused_bundle_id, sessions.asr_raw,
+                   sessions.corrected, sessions.pasted, sessions.asr_engine,
+                   sessions.corrector_engine, sessions.insert_strategy,
+                   sessions.audio_path, sessions.status,
+                   first_attempt.pipeline_metrics_json,
+                   first_attempt.failed_stage,
+                   first_attempt.failure_message
+            FROM sessions
+            LEFT JOIN dictation_attempts AS first_attempt
+              ON first_attempt.id = (
+                SELECT id
+                FROM dictation_attempts
+                WHERE session_id = sessions.id
+                ORDER BY attempt_ordinal ASC
+                LIMIT 1
+              )
+            ORDER BY sessions.created_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit], map_session_history)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -997,6 +1044,24 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         insert_strategy: parse_strategy(&row.get::<_, String>(9)?),
         audio_path: row.get(10)?,
         status: parse_status(&row.get::<_, String>(11)?),
+    })
+}
+
+fn map_session_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionHistoryRecord> {
+    let session = map_session(row)?;
+    let metrics_json: Option<String> = row.get(12)?;
+    let failed_stage: Option<String> = row.get(13)?;
+    let failure_message: Option<String> = row.get(14)?;
+    let initial_attempt = metrics_json
+        .and_then(|json| serde_json::from_str::<PipelineMetrics>(&json).ok())
+        .map(|pipeline_metrics| SessionHistoryAttempt {
+            pipeline_metrics,
+            failed_stage: failed_stage.and_then(|value| parse_pipeline_stage(&value)),
+            failure_message,
+        });
+    Ok(SessionHistoryRecord {
+        session,
+        initial_attempt,
     })
 }
 
@@ -1388,6 +1453,36 @@ mod tests {
         assert!(store.delete_session(rec.id).unwrap());
         assert!(store.get_session(rec.id).unwrap().is_none());
         assert!(store.list_edit_events(rec.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_sessions_include_initial_capture_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("history.sqlite")).unwrap();
+        let mut session = SessionRecord::new();
+        session.status = SessionStatus::Failed;
+        store.save_session(&session).unwrap();
+
+        let mut initial = DictationAttemptRecord::new(session.id);
+        initial.status = AttemptStatus::Failed;
+        initial.failed_stage = Some(PipelineStage::Capture);
+        initial.failure_message = Some("silent".into());
+        initial.pipeline_metrics.audio_duration_ms = 750;
+        store.append_dictation_attempt(initial).unwrap();
+
+        let mut retry = DictationAttemptRecord::new(session.id);
+        retry.status = AttemptStatus::Completed;
+        retry.pipeline_metrics.audio_duration_ms = 9_000;
+        store.append_dictation_attempt(retry).unwrap();
+
+        let history = store.list_history_sessions(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].session.id, session.id);
+        let evidence = history[0].initial_attempt.as_ref().unwrap();
+        assert_eq!(evidence.pipeline_metrics.audio_duration_ms, 750);
+        assert_eq!(evidence.failed_stage, Some(PipelineStage::Capture));
+        assert_eq!(evidence.failure_message.as_deref(), Some("silent"));
+        assert_eq!(store.list_sessions(10).unwrap().len(), 1);
     }
 
     #[test]

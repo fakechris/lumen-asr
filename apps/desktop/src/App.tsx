@@ -3003,6 +3003,7 @@ function HistoryPanel({
 }) {
   const [playing, setPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [copiedSessionId, setCopiedSessionId] = useState<string | null>(null);
   const [showPipeline, setShowPipeline] = useState(false);
   const [retryNote, setRetryNote] = useState<string | null>(null);
   const [attempts, setAttempts] = useState<DictationAttemptRecord[]>([]);
@@ -3010,6 +3011,7 @@ function HistoryPanel({
   const [editObservations, setEditObservations] = useState<EditObservation[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
+  const copyFeedbackTimerRef = useRef<number | null>(null);
 
   const stopAudio = useCallback(() => {
     if (audioRef.current) {
@@ -3058,19 +3060,43 @@ function HistoryPanel({
     };
   }, [editFeedbackRevision, onError, selected]);
 
-  useEffect(() => () => stopAudio(), [stopAudio]);
+  useEffect(
+    () => () => {
+      stopAudio();
+      if (copyFeedbackTimerRef.current != null) {
+        window.clearTimeout(copyFeedbackTimerRef.current);
+      }
+    },
+    [stopAudio],
+  );
 
-  async function copyMain() {
-    if (!selected) return;
-    const text = sessionMainText(selected);
+  function showCopyFeedback(sessionId: string, detail: boolean) {
+    if (copyFeedbackTimerRef.current != null) {
+      window.clearTimeout(copyFeedbackTimerRef.current);
+    }
+    setCopied(detail);
+    setCopiedSessionId(detail ? null : sessionId);
+    copyFeedbackTimerRef.current = window.setTimeout(() => {
+      setCopied(false);
+      setCopiedSessionId(null);
+      copyFeedbackTimerRef.current = null;
+    }, 1600);
+  }
+
+  async function copySession(session: SessionRecord, detail = false) {
+    const text = sessionMainText(session);
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
+      showCopyFeedback(session.id, detail);
     } catch (e) {
       onError(`复制失败: ${String(e)}`);
     }
+  }
+
+  async function copyMain() {
+    if (!selected) return;
+    await copySession(selected, true);
   }
 
   async function playAudio() {
@@ -3179,8 +3205,9 @@ function HistoryPanel({
             {sessions.map((s) => {
               const body = sessionMainText(s);
               const quality = sessionQuality(s);
+              const copiedFromList = copiedSessionId === s.id;
               return (
-                <li key={s.id}>
+                <li key={s.id} className="session-row">
                   <button
                     type="button"
                     className={[
@@ -3208,6 +3235,16 @@ function HistoryPanel({
                     {s.focus?.app_name ? (
                       <span className="session-context muted-text">{s.focus.app_name}</span>
                     ) : null}
+                  </button>
+                  <button
+                    type="button"
+                    className={`icon-btn session-copy ${copiedFromList ? "copied" : ""}`}
+                    disabled={!body}
+                    onClick={() => void copySession(s)}
+                    title={copiedFromList ? "已复制" : "复制文本"}
+                    aria-label={copiedFromList ? "已复制" : "复制这条文本"}
+                  >
+                    <Icon name={copiedFromList ? "copy-check" : "copy"} size={15} />
                   </button>
                 </li>
               );

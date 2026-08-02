@@ -107,6 +107,9 @@ static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 const BOUNCE_MS: u128 = 80;
 /// Reject only a missing/invalid signal; low-gain speech must still reach ASR.
 const ABSOLUTE_SILENCE_PEAK: f32 = 1.0e-6;
+pub(crate) const ABSOLUTE_SILENCE_ISSUE: &str = "absolute_silence";
+pub(crate) const ABSOLUTE_SILENCE_MESSAGE: &str =
+    "未检测到麦克风信号。请检查麦克风权限、输入设备或静音状态后重试。";
 
 /// Snapshot frontmost app into process-local cache (sync, preferred at press).
 fn remember_target_app() -> (Option<FrontmostTarget>, PaneDiscoveryStart) {
@@ -334,7 +337,7 @@ fn ensure_audible_capture(peak: f32) -> Result<(), &'static str> {
     if peak.is_finite() && peak > ABSOLUTE_SILENCE_PEAK {
         Ok(())
     } else {
-        Err("未检测到麦克风信号。请检查麦克风权限、输入设备或静音状态后重试。")
+        Err(ABSOLUTE_SILENCE_MESSAGE)
     }
 }
 
@@ -850,6 +853,14 @@ pub async fn stop_and_transcribe_inner(
     let (rms, peak) = session_debug::audio_stats(&samples_16k);
     if let Err(error) = ensure_audible_capture(peak) {
         tracing::error!(peak, rms, "audio capture rejected before ASR");
+        attempt
+            .pipeline_metrics
+            .stage_issues
+            .push(PipelineStageIssue {
+                stage: PipelineStage::Capture,
+                kind: PipelineIssueKind::InputUnavailable,
+                message: ABSOLUTE_SILENCE_ISSUE.into(),
+            });
         mark_attempt_failed(
             &mut attempt,
             PipelineStage::Capture,
