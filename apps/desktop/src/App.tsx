@@ -5,6 +5,9 @@ import { HotkeyRecorder } from "./HotkeyRecorder";
 import { OnboardingWizard } from "./OnboardingWizard";
 import { formatHotkeyLabel } from "./hotkeyFormat";
 import { chooseAudioDevice } from "./audioDeviceSelection";
+import { ClipboardWriteGate } from "./clipboardWriteGate";
+import { firstNonBlankText } from "./sessionText";
+import { LatestRequestGate } from "./latestRequestGate";
 import { Icon, type IconName } from "./Icons";
 import { ThemeToggle } from "./ThemeToggle";
 import { ChordCaptureChip } from "./ChordCaptureChip";
@@ -170,6 +173,9 @@ export default function App() {
 
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [sessionsRequestGate] = useState(
+    () => new LatestRequestGate<SessionRecord[]>(),
+  );
 
   const [dict, setDict] = useState<DictionaryEntry[]>([]);
   const [termInput, setTermInput] = useState("");
@@ -195,11 +201,19 @@ export default function App() {
 
   const refreshSessions = useCallback(async () => {
     try {
-      setSessions(await api.listSessions(100));
+      const outcome = await sessionsRequestGate.run(() => api.listSessions(100));
+      if (outcome.status === "current") setSessions(outcome.value);
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [sessionsRequestGate]);
+
+  useEffect(
+    () => () => {
+      sessionsRequestGate.cancelPending();
+    },
+    [sessionsRequestGate],
+  );
 
   const refreshDict = useCallback(async () => {
     try {
@@ -781,7 +795,7 @@ export default function App() {
         )}
         <span style={{ flex: 1 }} />
         <span>
-          {health ? `${health.session_count} 会话 · ${health.dictionary_count} 词条` : ""}
+          {health ? `${health.session_count} 条已保存 · ${health.dictionary_count} 词条` : ""}
         </span>
       </footer>
     </div>
@@ -2897,7 +2911,7 @@ function Overview({
             <dd>
               <code>{health.db_path}</code>
             </dd>
-            <dt>会话</dt>
+            <dt>已保存会话</dt>
             <dd>{health.session_count}</dd>
             <dt>词典条目</dt>
             <dd>{health.dictionary_count}</dd>
@@ -2940,7 +2954,7 @@ function Overview({
             {sessions.slice(0, 5).map((s) => (
               <li key={s.id}>
                 <span className="list-time">{formatTime(s.created_at)}</span>
-                <span>{previewText(s.pasted || s.corrected || s.asr_raw)}</span>
+                <span>{previewText(sessionMainText(s))}</span>
               </li>
             ))}
           </ul>
@@ -2968,14 +2982,14 @@ function Overview({
 
 /** Quality of a session result — drives recovery UI, not decoration. */
 function sessionQuality(s: SessionRecord): "ok" | "weak" | "empty" {
-  const t = (s.corrected || s.pasted || s.asr_raw || "").trim();
+  const t = sessionMainText(s);
   if (!t) return "empty";
   if (t.length <= 2 || t === "。" || t === "." || t === "…") return "weak";
   return "ok";
 }
 
 function sessionMainText(s: SessionRecord): string {
-  return (s.corrected || s.pasted || s.asr_raw || "").trim();
+  return firstNonBlankText(s.corrected, s.pasted, s.asr_raw);
 }
 
 function HistoryPanel({
@@ -3002,7 +3016,11 @@ function HistoryPanel({
   onDelete: (id: string) => void;
 }) {
   const [playing, setPlaying] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copiedDetailTarget, setCopiedDetailTarget] = useState<"main" | "raw" | null>(
+    null,
+  );
+  const [copyPending, setCopyPending] = useState(false);
+  const [copiedSessionId, setCopiedSessionId] = useState<string | null>(null);
   const [showPipeline, setShowPipeline] = useState(false);
   const [retryNote, setRetryNote] = useState<string | null>(null);
   const [attempts, setAttempts] = useState<DictationAttemptRecord[]>([]);
@@ -3010,6 +3028,8 @@ function HistoryPanel({
   const [editObservations, setEditObservations] = useState<EditObservation[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
+  const copyFeedbackTimerRef = useRef<number | null>(null);
+  const [clipboardWriteGate] = useState(() => new ClipboardWriteGate());
 
   const stopAudio = useCallback(() => {
     if (audioRef.current) {
@@ -3025,7 +3045,7 @@ function HistoryPanel({
 
   useEffect(() => {
     stopAudio();
-    setCopied(false);
+    setCopiedDetailTarget(null);
     setShowPipeline(false);
     setRetryNote(null);
   }, [selected?.id, stopAudio]);
@@ -3058,19 +3078,64 @@ function HistoryPanel({
     };
   }, [editFeedbackRevision, onError, selected]);
 
-  useEffect(() => () => stopAudio(), [stopAudio]);
+  useEffect(
+    () => () => {
+      stopAudio();
+      clipboardWriteGate.cancelPending();
+      if (copyFeedbackTimerRef.current != null) {
+        window.clearTimeout(copyFeedbackTimerRef.current);
+      }
+    },
+    [clipboardWriteGate, stopAudio],
+  );
+
+  useEffect(() => {
+    clipboardWriteGate.cancelPending();
+    setCopiedDetailTarget(null);
+    setCopiedSessionId(null);
+    if (copyFeedbackTimerRef.current != null) {
+      window.clearTimeout(copyFeedbackTimerRef.current);
+      copyFeedbackTimerRef.current = null;
+    }
+  }, [clipboardWriteGate, selected?.id]);
+
+  function showCopyFeedback(sessionId: string, detailTarget: "main" | "raw" | null) {
+    if (copyFeedbackTimerRef.current != null) {
+      window.clearTimeout(copyFeedbackTimerRef.current);
+    }
+    setCopiedDetailTarget(detailTarget);
+    setCopiedSessionId(detailTarget ? null : sessionId);
+    copyFeedbackTimerRef.current = window.setTimeout(() => {
+      setCopiedDetailTarget(null);
+      setCopiedSessionId(null);
+      copyFeedbackTimerRef.current = null;
+    }, 1600);
+  }
+
+  async function copySession(
+    session: SessionRecord,
+    detailTarget: "main" | "raw" | null = null,
+    textOverride?: string,
+  ) {
+    const text = (textOverride ?? sessionMainText(session)).trim();
+    if (clipboardWriteGate.isPending()) return;
+    setCopyPending(true);
+    try {
+      const outcome = await clipboardWriteGate.write(text, (value) =>
+        navigator.clipboard.writeText(value),
+      );
+      if (outcome !== "copied") return;
+      showCopyFeedback(session.id, detailTarget);
+    } catch (e) {
+      onError(`复制失败: ${String(e)}`);
+    } finally {
+      setCopyPending(false);
+    }
+  }
 
   async function copyMain() {
     if (!selected) return;
-    const text = sessionMainText(selected);
-    if (!text) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    } catch (e) {
-      onError(`复制失败: ${String(e)}`);
-    }
+    await copySession(selected, "main");
   }
 
   async function playAudio() {
@@ -3179,8 +3244,9 @@ function HistoryPanel({
             {sessions.map((s) => {
               const body = sessionMainText(s);
               const quality = sessionQuality(s);
+              const copiedFromList = copiedSessionId === s.id;
               return (
-                <li key={s.id}>
+                <li key={s.id} className="session-row">
                   <button
                     type="button"
                     className={[
@@ -3208,6 +3274,16 @@ function HistoryPanel({
                     {s.focus?.app_name ? (
                       <span className="session-context muted-text">{s.focus.app_name}</span>
                     ) : null}
+                  </button>
+                  <button
+                    type="button"
+                    className={`icon-btn session-copy ${copiedFromList ? "copied" : ""}`}
+                    disabled={!body || copyPending}
+                    onClick={() => void copySession(s)}
+                    title={copiedFromList ? "已复制" : "复制文本"}
+                    aria-label={copiedFromList ? "已复制" : "复制这条文本"}
+                  >
+                    <Icon name={copiedFromList ? "copy-check" : "copy"} size={15} />
                   </button>
                 </li>
               );
@@ -3242,37 +3318,42 @@ function HistoryPanel({
               <div className="history-toolbar">
                 <button
                   type="button"
-                  className={`icon-btn ${copied ? "copied" : ""}`}
-                  disabled={busy || !text}
+                  className={`icon-btn ${copiedDetailTarget === "main" ? "copied" : ""}`}
+                  disabled={busy || copyPending || !text}
                   onClick={() => void copyMain()}
-                  title={copied ? "已复制" : "复制文本（双击正文亦可）"}
-                  aria-label={copied ? "已复制" : "复制文本"}
+                  title={
+                    copiedDetailTarget === "main" ? "已复制" : "复制文本（双击正文亦可）"
+                  }
+                  aria-label={copiedDetailTarget === "main" ? "已复制" : "复制文本"}
                 >
-                  <Icon name={copied ? "copy-check" : "copy"} size={16} />
+                  <Icon
+                    name={copiedDetailTarget === "main" ? "copy-check" : "copy"}
+                    size={16}
+                  />
                 </button>
                 {selected.asr_raw &&
                   selected.asr_raw.trim() &&
                   selected.asr_raw.trim() !== text && (
                     <button
                       type="button"
-                      className="icon-btn"
-                      disabled={busy}
+                      className={`icon-btn ${copiedDetailTarget === "raw" ? "copied" : ""}`}
+                      disabled={busy || copyPending}
                       onClick={() =>
-                        void (async () => {
-                          try {
-                            await navigator.clipboard.writeText(selected.asr_raw!.trim());
-                            setCopied(true);
-                            setRetryNote("已复制识别原文（未整理）");
-                            window.setTimeout(() => setCopied(false), 1600);
-                          } catch (e) {
-                            onError(String(e));
-                          }
-                        })()
+                        void copySession(
+                          selected,
+                          "raw",
+                          selected.asr_raw!,
+                        )
                       }
-                      title="复制识别原文（未整理）"
-                      aria-label="复制原文"
+                      title={
+                        copiedDetailTarget === "raw" ? "已复制原文" : "复制识别原文（未整理）"
+                      }
+                      aria-label={copiedDetailTarget === "raw" ? "已复制原文" : "复制原文"}
                     >
-                      <Icon name="clipboard" size={16} />
+                      <Icon
+                        name={copiedDetailTarget === "raw" ? "copy-check" : "clipboard"}
+                        size={16}
+                      />
                     </button>
                   )}
                 {hasAudio && (

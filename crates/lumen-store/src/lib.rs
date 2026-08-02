@@ -17,6 +17,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const HIDDEN_SILENT_CAPTURE_MAX_MS: u64 = 2_000;
 pub const DEFAULT_ATTEMPT_PAGE_SIZE: u32 = 100;
 pub const MAX_ATTEMPT_PAGE_SIZE: u32 = 500;
 
@@ -171,6 +172,7 @@ pub enum EnhancementMode {
 pub enum PipelineIssueKind {
     Fallback,
     InputUnavailable,
+    AbsoluteSilence,
     ClipboardFailure,
     InjectionFailure,
     #[serde(other)]
@@ -529,6 +531,11 @@ impl Store {
     ) -> Result<DictationAttemptRecord> {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         record = append_dictation_attempt_on(&transaction, record)?;
+        if record.attempt_ordinal == 1 {
+            if let Some(session) = get_session_on(&transaction, record.session_id)? {
+                update_initial_history_visibility(&transaction, &session, &record)?;
+            }
+        }
         transaction.commit()?;
         Ok(record)
     }
@@ -549,6 +556,9 @@ impl Store {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         save_session_on(&transaction, session)?;
         let record = append_dictation_attempt_on(&transaction, record)?;
+        if record.attempt_ordinal == 1 {
+            update_initial_history_visibility(&transaction, session, &record)?;
+        }
         transaction.commit()?;
         Ok(record)
     }
@@ -640,6 +650,24 @@ impl Store {
                    asr_raw, corrected, pasted, asr_engine, corrector_engine,
                    insert_strategy, audio_path, status
             FROM sessions
+            ORDER BY created_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit], map_session)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// List user-visible sessions. Visibility is persisted when the first
+    /// immutable attempt arrives, keeping this hot path bounded by its index.
+    pub fn list_history_sessions(&self, limit: u32) -> Result<Vec<SessionRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, created_at, focused_app, focused_bundle_id,
+                   asr_raw, corrected, pasted, asr_engine, corrector_engine,
+                   insert_strategy, audio_path, status
+            FROM sessions
+            WHERE history_visible=1
             ORDER BY created_at DESC
             LIMIT ?1
             "#,
@@ -1166,6 +1194,72 @@ fn save_session_on(conn: &Connection, rec: &SessionRecord) -> Result<()> {
             status_str(rec.status),
         ],
     )?;
+    if session_must_be_visible(rec) {
+        conn.execute(
+            "UPDATE sessions SET history_visible=1 WHERE id=?1",
+            params![rec.id.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn get_session_on(conn: &Connection, id: Uuid) -> Result<Option<SessionRecord>> {
+    conn.query_row(
+        r#"
+        SELECT id, created_at, focused_app, focused_bundle_id,
+               asr_raw, corrected, pasted, asr_engine, corrector_engine,
+               insert_strategy, audio_path, status
+        FROM sessions WHERE id=?1
+        "#,
+        params![id.to_string()],
+        map_session,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn session_has_history_text(session: &SessionRecord) -> bool {
+    [&session.corrected, &session.pasted, &session.asr_raw]
+        .into_iter()
+        .flatten()
+        .any(|text| {
+            !text
+                .trim_matches(|character| schema::HISTORY_TEXT_WHITESPACE.contains(character))
+                .is_empty()
+        })
+}
+
+fn session_must_be_visible(session: &SessionRecord) -> bool {
+    !matches!(
+        session.status,
+        SessionStatus::Failed | SessionStatus::Cancelled
+    ) || session_has_history_text(session)
+}
+
+fn initial_attempt_is_short_absolute_silence(
+    session: &SessionRecord,
+    attempt: &DictationAttemptRecord,
+) -> bool {
+    !session_must_be_visible(session)
+        && attempt.status == AttemptStatus::Failed
+        && attempt.failed_stage == Some(PipelineStage::Capture)
+        && attempt.pipeline_metrics.audio_duration_ms < HIDDEN_SILENT_CAPTURE_MAX_MS
+        && attempt.pipeline_metrics.stage_issues.iter().any(|issue| {
+            issue.stage == PipelineStage::Capture
+                && issue.kind == PipelineIssueKind::AbsoluteSilence
+        })
+}
+
+fn update_initial_history_visibility(
+    conn: &Connection,
+    session: &SessionRecord,
+    attempt: &DictationAttemptRecord,
+) -> Result<()> {
+    let history_visible = !initial_attempt_is_short_absolute_silence(session, attempt);
+    conn.execute(
+        "UPDATE sessions SET history_visible=?1 WHERE id=?2",
+        params![history_visible, session.id.to_string()],
+    )?;
     Ok(())
 }
 
@@ -1388,6 +1482,169 @@ mod tests {
         assert!(store.delete_session(rec.id).unwrap());
         assert!(store.get_session(rec.id).unwrap().is_none());
         assert!(store.list_edit_events(rec.id).unwrap().is_empty());
+    }
+
+    fn save_history_case(
+        store: &Store,
+        mut session: SessionRecord,
+        duration_ms: u64,
+        issue_kind: Option<PipelineIssueKind>,
+        failure_message: Option<&str>,
+    ) -> Uuid {
+        session.status = SessionStatus::Failed;
+        let session_id = session.id;
+        store.save_session(&session).unwrap();
+
+        let mut attempt = DictationAttemptRecord::new(session_id);
+        attempt.status = AttemptStatus::Failed;
+        attempt.failed_stage = Some(PipelineStage::Capture);
+        attempt.failure_message = failure_message.map(str::to_owned);
+        attempt.pipeline_metrics.audio_duration_ms = duration_ms;
+        if let Some(kind) = issue_kind {
+            attempt
+                .pipeline_metrics
+                .stage_issues
+                .push(PipelineStageIssue {
+                    stage: PipelineStage::Capture,
+                    kind,
+                    message: "capture issue".into(),
+                });
+        }
+        store.append_dictation_attempt(attempt).unwrap();
+        session_id
+    }
+
+    #[test]
+    fn history_sessions_filter_only_short_textless_absolute_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("history.sqlite")).unwrap();
+
+        let structured_hidden = save_history_case(
+            &store,
+            SessionRecord::new(),
+            750,
+            Some(PipelineIssueKind::AbsoluteSilence),
+            None,
+        );
+
+        let boundary_visible = save_history_case(
+            &store,
+            SessionRecord::new(),
+            2_000,
+            Some(PipelineIssueKind::AbsoluteSilence),
+            None,
+        );
+
+        let mut with_fallback_text = SessionRecord::new();
+        with_fallback_text.corrected = Some("  ".into());
+        with_fallback_text.pasted = Some("保留粘贴文本".into());
+        let text_visible = save_history_case(
+            &store,
+            with_fallback_text,
+            500,
+            Some(PipelineIssueKind::AbsoluteSilence),
+            None,
+        );
+
+        let other_failure_visible = save_history_case(
+            &store,
+            SessionRecord::new(),
+            500,
+            Some(PipelineIssueKind::InputUnavailable),
+            Some("device disconnected"),
+        );
+
+        let mut whitespace_only = SessionRecord::new();
+        whitespace_only.corrected = Some("\t\n\u{00a0}\u{feff}".into());
+        let whitespace_hidden = save_history_case(
+            &store,
+            whitespace_only,
+            500,
+            Some(PipelineIssueKind::AbsoluteSilence),
+            None,
+        );
+
+        let mut inconsistent_session = SessionRecord::new();
+        let mut inconsistent_attempt = DictationAttemptRecord::new(inconsistent_session.id);
+        inconsistent_attempt.status = AttemptStatus::Completed;
+        inconsistent_attempt.failed_stage = Some(PipelineStage::Capture);
+        inconsistent_attempt.pipeline_metrics.audio_duration_ms = 500;
+        inconsistent_attempt
+            .pipeline_metrics
+            .stage_issues
+            .push(PipelineStageIssue {
+                stage: PipelineStage::Capture,
+                kind: PipelineIssueKind::AbsoluteSilence,
+                message: "inconsistent evidence".into(),
+            });
+        inconsistent_session.status = SessionStatus::Failed;
+        let inconsistent_attempt_visible = inconsistent_session.id;
+        store
+            .save_session_and_append_attempt(&inconsistent_session, inconsistent_attempt)
+            .unwrap();
+
+        let history = store.list_history_sessions(10).unwrap();
+        let ids = history.iter().map(|session| session.id).collect::<Vec<_>>();
+        assert!(!ids.contains(&structured_hidden));
+        assert!(ids.contains(&boundary_visible));
+        assert!(ids.contains(&text_visible));
+        assert!(ids.contains(&other_failure_visible));
+        assert!(!ids.contains(&whitespace_hidden));
+        assert!(ids.contains(&inconsistent_attempt_visible));
+        assert_eq!(store.list_sessions(10).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn later_success_unhides_an_initial_silent_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("history-retry.sqlite")).unwrap();
+        let hidden = save_history_case(
+            &store,
+            SessionRecord::new(),
+            500,
+            Some(PipelineIssueKind::AbsoluteSilence),
+            None,
+        );
+        assert!(store.list_history_sessions(10).unwrap().is_empty());
+
+        let mut recovered = store.get_session(hidden).unwrap().unwrap();
+        recovered.status = SessionStatus::Completed;
+        recovered.corrected = Some("retry succeeded".into());
+        let mut retry = DictationAttemptRecord::new(hidden);
+        retry.status = AttemptStatus::Completed;
+        retry.pipeline_metrics.audio_duration_ms = 9_000;
+        store
+            .save_session_and_append_attempt(&recovered, retry)
+            .unwrap();
+
+        let history = store.list_history_sessions(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, hidden);
+    }
+
+    #[test]
+    fn history_limit_applies_after_silent_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("history-limit.sqlite")).unwrap();
+        let mut visible = SessionRecord::new();
+        visible.status = SessionStatus::Completed;
+        visible.asr_raw = Some("older useful result".into());
+        let visible_id = visible.id;
+        store.save_session(&visible).unwrap();
+
+        for _ in 0..5 {
+            save_history_case(
+                &store,
+                SessionRecord::new(),
+                400,
+                Some(PipelineIssueKind::AbsoluteSilence),
+                None,
+            );
+        }
+
+        let history = store.list_history_sessions(1).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, visible_id);
     }
 
     #[test]

@@ -114,7 +114,8 @@ pub fn list_sessions(
 ) -> Result<Vec<SessionRecord>, String> {
     let limit = limit.unwrap_or(50).clamp(1, 500);
     with_store(&state, |s| {
-        s.list_sessions(limit).map_err(|e| e.to_string())
+        s.list_history_sessions(limit)
+            .map_err(|error| error.to_string())
     })
 }
 

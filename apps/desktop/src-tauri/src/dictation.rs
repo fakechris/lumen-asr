@@ -105,8 +105,28 @@ static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Only discard as bounce if shorter than this *and* almost no audio.
 const BOUNCE_MS: u128 = 80;
-/// Reject only a missing/invalid signal; low-gain speech must still reach ASR.
-const ABSOLUTE_SILENCE_PEAK: f32 = 1.0e-6;
+/// Reject only an exactly empty signal; any finite non-zero input reaches ASR.
+const ABSOLUTE_SILENCE_PEAK: f32 = 0.0;
+const ABSOLUTE_SILENCE_ISSUE: &str = "absolute_silence";
+const ABSOLUTE_SILENCE_MESSAGE: &str =
+    "未检测到麦克风信号。请检查麦克风权限、输入设备或静音状态后重试。";
+const INVALID_CAPTURE_MESSAGE: &str = "录音数据无效，请检查输入设备后重试。";
+const INVALID_CAPTURE_ISSUE: &str = "invalid_audio_signal";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureSignalIssue {
+    AbsoluteSilence,
+    InvalidSignal,
+}
+
+impl CaptureSignalIssue {
+    fn message(self) -> &'static str {
+        match self {
+            Self::AbsoluteSilence => ABSOLUTE_SILENCE_MESSAGE,
+            Self::InvalidSignal => INVALID_CAPTURE_MESSAGE,
+        }
+    }
+}
 
 /// Snapshot frontmost app into process-local cache (sync, preferred at press).
 fn remember_target_app() -> (Option<FrontmostTarget>, PaneDiscoveryStart) {
@@ -330,12 +350,33 @@ pub fn set_audio_device(state: State<'_, AppState>, name: Option<String>) -> Res
     Ok(())
 }
 
-fn ensure_audible_capture(peak: f32) -> Result<(), &'static str> {
-    if peak.is_finite() && peak > ABSOLUTE_SILENCE_PEAK {
+fn ensure_audible_capture(rms: f32, peak: f32) -> Result<(), CaptureSignalIssue> {
+    if !rms.is_finite() || !peak.is_finite() {
+        Err(CaptureSignalIssue::InvalidSignal)
+    } else if peak > ABSOLUTE_SILENCE_PEAK {
         Ok(())
     } else {
-        Err("未检测到麦克风信号。请检查麦克风权限、输入设备或静音状态后重试。")
+        Err(CaptureSignalIssue::AbsoluteSilence)
     }
+}
+
+fn record_capture_signal_issue(attempt: &mut DictationAttemptRecord, issue: CaptureSignalIssue) {
+    let (kind, message) = match issue {
+        CaptureSignalIssue::AbsoluteSilence => {
+            (PipelineIssueKind::AbsoluteSilence, ABSOLUTE_SILENCE_ISSUE)
+        }
+        CaptureSignalIssue::InvalidSignal => {
+            (PipelineIssueKind::InputUnavailable, INVALID_CAPTURE_ISSUE)
+        }
+    };
+    attempt
+        .pipeline_metrics
+        .stage_issues
+        .push(PipelineStageIssue {
+            stage: PipelineStage::Capture,
+            kind,
+            message: message.into(),
+        });
 }
 
 pub(crate) fn canonical_asr_provider(provider: &str) -> String {
@@ -815,6 +856,7 @@ pub async fn stop_and_transcribe_inner(
     attempt.pipeline_metrics.audio_duration_ms = duration_ms;
 
     if capture.samples.is_empty() {
+        record_capture_signal_issue(&mut attempt, CaptureSignalIssue::AbsoluteSilence);
         let error = "no audio captured (0 samples) — hold longer or check mic".to_string();
         mark_attempt_failed(
             &mut attempt,
@@ -848,8 +890,10 @@ pub async fn stop_and_transcribe_inner(
     let samples_16k = prepare_for_asr(&capture.samples, capture.sample_rate);
     attempt.pipeline_metrics.preprocess_ms = elapsed_ms(preprocess_started);
     let (rms, peak) = session_debug::audio_stats(&samples_16k);
-    if let Err(error) = ensure_audible_capture(peak) {
-        tracing::error!(peak, rms, "audio capture rejected before ASR");
+    if let Err(issue) = ensure_audible_capture(rms, peak) {
+        let error = issue.message();
+        tracing::error!(peak, rms, ?issue, "audio capture rejected before ASR");
+        record_capture_signal_issue(&mut attempt, issue);
         mark_attempt_failed(
             &mut attempt,
             PipelineStage::Capture,
@@ -2004,6 +2048,7 @@ mod attempt_metric_tests {
     use lumen_store::{Store, MAX_ATTEMPT_PAGE_SIZE};
     use std::path::Path;
     use std::sync::Mutex;
+    use uuid::Uuid;
 
     /// Minimal `AppState` for meeting-engine selection tests, pointing SenseVoice
     /// at `sensevoice_dir`. All other engines/dirs are placeholders under `dir`.
@@ -2077,11 +2122,44 @@ mod attempt_metric_tests {
 
     #[test]
     fn near_silent_capture_threshold_rejects_invalid_or_inaudible_peaks() {
-        assert!(ensure_audible_capture(0.0).is_err());
-        assert!(ensure_audible_capture(f32::NAN).is_err());
-        assert!(ensure_audible_capture(1.0e-7).is_err());
-        assert!(ensure_audible_capture(1.0e-5).is_ok());
-        assert!(ensure_audible_capture(0.005).is_ok());
+        assert_eq!(
+            ensure_audible_capture(0.0, 0.0),
+            Err(CaptureSignalIssue::AbsoluteSilence)
+        );
+        assert_eq!(
+            ensure_audible_capture(f32::NAN, 0.0),
+            Err(CaptureSignalIssue::InvalidSignal)
+        );
+        assert_eq!(
+            ensure_audible_capture(0.0, f32::INFINITY),
+            Err(CaptureSignalIssue::InvalidSignal)
+        );
+        assert!(ensure_audible_capture(1.0e-7, 1.0e-7).is_ok());
+        assert!(ensure_audible_capture(1.0e-6, 1.0e-5).is_ok());
+        assert!(ensure_audible_capture(0.001, 0.005).is_ok());
+    }
+
+    #[test]
+    fn absolute_silence_uses_a_stable_structured_issue() {
+        let mut attempt = DictationAttemptRecord::new(Uuid::new_v4());
+        record_capture_signal_issue(&mut attempt, CaptureSignalIssue::AbsoluteSilence);
+
+        assert_eq!(attempt.pipeline_metrics.stage_issues.len(), 1);
+        let issue = &attempt.pipeline_metrics.stage_issues[0];
+        assert_eq!(issue.stage, PipelineStage::Capture);
+        assert_eq!(issue.kind, PipelineIssueKind::AbsoluteSilence);
+        assert_eq!(issue.message, ABSOLUTE_SILENCE_ISSUE);
+    }
+
+    #[test]
+    fn invalid_audio_signal_is_not_classified_as_absolute_silence() {
+        let mut attempt = DictationAttemptRecord::new(Uuid::new_v4());
+        record_capture_signal_issue(&mut attempt, CaptureSignalIssue::InvalidSignal);
+
+        let issue = &attempt.pipeline_metrics.stage_issues[0];
+        assert_eq!(issue.stage, PipelineStage::Capture);
+        assert_eq!(issue.kind, PipelineIssueKind::InputUnavailable);
+        assert_eq!(issue.message, INVALID_CAPTURE_ISSUE);
     }
 
     #[test]

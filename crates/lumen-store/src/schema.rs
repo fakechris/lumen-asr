@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"attempt_id":null,"target_app_name":null,"target_bundle_id":null,"observer":null,"target_fingerprint_hash":null,"field_before_hash":null,"field_after_hash":null,"status":"unattributed"}"#;
 
@@ -20,8 +20,16 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// identity behind the name), `speakers.attribution_origin`
 /// ('manual' | 'verification' | 'offline_diarization'), and
 /// `speakers.attribution_confidence` (verification match score) — the ground
-/// for conflict handling between manual/verified/offline attribution.
-pub(crate) const SCHEMA_VERSION: i64 = 13;
+/// for conflict handling between manual/verified/offline attribution; v14 adds
+/// indexed history visibility for short absolute-silence captures.
+pub(crate) const SCHEMA_VERSION: i64 = 14;
+
+pub(crate) const HISTORY_TEXT_WHITESPACE: &str =
+    "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
+const LEGACY_EMPTY_CAPTURE_MESSAGE: &str =
+    "no audio captured (0 samples) — hold longer or check mic";
+const HISTORY_MIGRATION_BATCH_SIZE: i64 = 128;
+const HISTORY_MIGRATION_MAX_METRICS_JSON_BYTES: i64 = 64 * 1024;
 
 /// Failure reason written by the v11 migration onto surplus stale `recording`
 /// rows (older duplicates that would violate the new single-active index).
@@ -104,7 +112,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
           corrector_engine TEXT,
           insert_strategy TEXT NOT NULL DEFAULT 'none',
           audio_path TEXT,
-          status TEXT NOT NULL DEFAULT 'in_progress'
+          status TEXT NOT NULL DEFAULT 'in_progress',
+          history_visible INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at DESC);
@@ -466,6 +475,126 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (13)",
+        [],
+    )?;
+
+    // v14: persist history visibility so list queries remain index-bounded even
+    // if a database contains a very large run of accidental silent captures.
+    // Existing rows default visible; the one-time backfill hides only rows with
+    // complete, internally consistent silence evidence. Corrupt/unknown rows
+    // fail open and remain visible.
+    let has_history_visible = {
+        let mut statement = conn.prepare("PRAGMA table_info(sessions)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "history_visible")
+    };
+    if !has_history_visible {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN history_visible INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    let has_v14: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=14)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_v14 {
+        let backfill = conn.unchecked_transaction()?;
+        let mut after_session_id = String::new();
+        loop {
+            let candidates = {
+                let mut statement = backfill.prepare(
+                    r#"
+                SELECT sessions.id, first_attempt.pipeline_metrics_json,
+                       first_attempt.failure_message
+                FROM sessions
+                JOIN dictation_attempts AS first_attempt
+                  ON first_attempt.id = (
+                    SELECT id
+                    FROM dictation_attempts
+                    WHERE session_id = sessions.id
+                    ORDER BY attempt_ordinal ASC
+                    LIMIT 1
+                  )
+                WHERE sessions.id > ?2
+                  AND sessions.status IN ('failed', 'cancelled')
+                  AND trim(COALESCE(sessions.corrected, ''), ?1) = ''
+                  AND trim(COALESCE(sessions.pasted, ''), ?1) = ''
+                  AND trim(COALESCE(sessions.asr_raw, ''), ?1) = ''
+                  AND first_attempt.status = 'failed'
+                  AND first_attempt.failed_stage = 'capture'
+                  AND typeof(first_attempt.pipeline_metrics_json) = 'text'
+                  AND length(CAST(first_attempt.pipeline_metrics_json AS BLOB)) <= ?3
+                ORDER BY sessions.id ASC
+                LIMIT ?4
+                "#,
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        HISTORY_TEXT_WHITESPACE,
+                        after_session_id,
+                        HISTORY_MIGRATION_MAX_METRICS_JSON_BYTES,
+                        HISTORY_MIGRATION_BATCH_SIZE,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let Some((last_session_id, _, _)) = candidates.last() else {
+                break;
+            };
+            after_session_id.clone_from(last_session_id);
+
+            for (session_id, metrics_json, failure_message) in candidates {
+                let Ok(metrics) = serde_json::from_str::<super::PipelineMetrics>(&metrics_json)
+                else {
+                    continue;
+                };
+                if metrics.audio_duration_ms >= super::HIDDEN_SILENT_CAPTURE_MAX_MS {
+                    continue;
+                }
+                let structured_silence = metrics.stage_issues.iter().any(|issue| {
+                    issue.stage == super::PipelineStage::Capture
+                        && issue.kind == super::PipelineIssueKind::AbsoluteSilence
+                });
+                let legacy_zero_samples = metrics.audio_duration_ms == 0
+                    && failure_message.as_deref() == Some(LEGACY_EMPTY_CAPTURE_MESSAGE);
+                if structured_silence || legacy_zero_samples {
+                    backfill.execute(
+                        "UPDATE sessions SET history_visible=0 WHERE id=?1",
+                        params![session_id],
+                    )?;
+                }
+            }
+        }
+        backfill.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_history_visible_created_at
+             ON sessions(history_visible, created_at DESC)",
+            [],
+        )?;
+        backfill.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+            [SCHEMA_VERSION],
+        )?;
+        backfill.commit()?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_history_visible_created_at
+         ON sessions(history_visible, created_at DESC)",
+        [],
+    )?;
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
         [SCHEMA_VERSION],
@@ -1356,6 +1485,194 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_fourteen_backfills_only_consistent_silent_capture_evidence() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version)
+                VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13);
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  focused_app TEXT,
+                  focused_bundle_id TEXT,
+                  asr_raw TEXT,
+                  corrected TEXT,
+                  pasted TEXT,
+                  asr_engine TEXT,
+                  corrector_engine TEXT,
+                  insert_strategy TEXT NOT NULL DEFAULT 'none',
+                  audio_path TEXT,
+                  status TEXT NOT NULL DEFAULT 'in_progress'
+                );
+                CREATE TABLE dictation_attempts (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  session_id TEXT NOT NULL,
+                  attempt_ordinal INTEGER NOT NULL,
+                  created_at TEXT NOT NULL,
+                  asr_raw TEXT,
+                  asr_enhanced TEXT,
+                  corrected TEXT,
+                  inserted TEXT,
+                  pipeline_identity_json TEXT NOT NULL,
+                  pipeline_metrics_json TEXT NOT NULL,
+                  pipeline_inputs_json TEXT NOT NULL DEFAULT '{"schema_version":1,"context":null,"stage_usages":[]}',
+                  status TEXT NOT NULL,
+                  failed_stage TEXT,
+                  failure_message TEXT,
+                  supersedes_attempt_id TEXT,
+                  UNIQUE(session_id, attempt_ordinal)
+                );
+
+                INSERT INTO sessions (id, created_at, status) VALUES
+                  ('structured', '2026-07-31T00:00:07Z', 'failed'),
+                  ('legacy',     '2026-07-31T00:00:06Z', 'cancelled'),
+                  ('other',      '2026-07-31T00:00:05Z', 'failed'),
+                  ('boundary',   '2026-07-31T00:00:04Z', 'failed'),
+                  ('corrupt',    '2026-07-31T00:00:03Z', 'failed'),
+                  ('mismatch',   '2026-07-31T00:00:02Z', 'failed'),
+                  ('ambiguous-legacy', '2026-07-31T00:00:00Z', 'failed'),
+                  ('fractional', '2026-07-30T23:59:59Z', 'failed'),
+                  ('object-issues', '2026-07-30T23:59:58Z', 'failed'),
+                  ('missing-message', '2026-07-30T23:59:57Z', 'failed'),
+                  ('oversized', '2026-07-30T23:59:56Z', 'failed');
+                INSERT INTO sessions (id, created_at, corrected, status)
+                VALUES ('with-text', '2026-07-31T00:00:01Z', '保留', 'failed');
+
+                INSERT INTO dictation_attempts (
+                  id, session_id, attempt_ordinal, created_at,
+                  pipeline_identity_json, pipeline_metrics_json,
+                  status, failed_stage, failure_message
+                ) VALUES
+                  ('a-structured', 'structured', 1, '2026-07-31T00:00:07Z', '{}',
+                   '{"audio_duration_ms":500,"stage_issues":[{"stage":"capture","kind":"absolute_silence","message":"absolute_silence"}]}',
+                   'failed', 'capture', NULL),
+                  ('a-legacy', 'legacy', 1, '2026-07-31T00:00:06Z', '{}',
+                   '{"audio_duration_ms":0,"stage_issues":[]}',
+                   'failed', 'capture', 'no audio captured (0 samples) — hold longer or check mic'),
+                  ('a-other', 'other', 1, '2026-07-31T00:00:05Z', '{}',
+                   '{"audio_duration_ms":500,"stage_issues":[{"stage":"capture","kind":"input_unavailable","message":"device unavailable"}]}',
+                   'failed', 'capture', NULL),
+                  ('a-boundary', 'boundary', 1, '2026-07-31T00:00:04Z', '{}',
+                   '{"audio_duration_ms":2000,"stage_issues":[{"stage":"capture","kind":"absolute_silence","message":"absolute_silence"}]}',
+                   'failed', 'capture', NULL),
+                  ('a-corrupt', 'corrupt', 1, '2026-07-31T00:00:03Z', '{}',
+                   '{"audio_duration_ms":500,"stage_issues":["{\"stage\":\"capture\",\"kind\":\"absolute_silence\"}"]}',
+                   'failed', 'capture', NULL),
+                  ('a-mismatch', 'mismatch', 1, '2026-07-31T00:00:02Z', '{}',
+                   '{"audio_duration_ms":500,"stage_issues":[{"stage":"capture","kind":"absolute_silence","message":"absolute_silence"}]}',
+                   'completed', 'capture', NULL),
+                  ('a-with-text', 'with-text', 1, '2026-07-31T00:00:01Z', '{}',
+                   '{"audio_duration_ms":500,"stage_issues":[{"stage":"capture","kind":"absolute_silence","message":"absolute_silence"}]}',
+                   'failed', 'capture', NULL),
+                  ('a-ambiguous-legacy', 'ambiguous-legacy', 1, '2026-07-31T00:00:00Z', '{}',
+                   '{"audio_duration_ms":500,"stage_issues":[]}',
+                   'failed', 'capture', '未检测到麦克风信号。请检查麦克风权限、输入设备或静音状态后重试。'),
+                  ('a-fractional', 'fractional', 1, '2026-07-30T23:59:59Z', '{}',
+                   '{"audio_duration_ms":500.5,"stage_issues":[{"stage":"capture","kind":"absolute_silence","message":"absolute_silence"}]}',
+                   'failed', 'capture', NULL),
+                  ('a-object-issues', 'object-issues', 1, '2026-07-30T23:59:58Z', '{}',
+                   '{"audio_duration_ms":500,"stage_issues":{"stage":"capture","kind":"absolute_silence","message":"absolute_silence"}}',
+                   'failed', 'capture', NULL),
+                  ('a-missing-message', 'missing-message', 1, '2026-07-30T23:59:57Z', '{}',
+                   '{"audio_duration_ms":500,"stage_issues":[{"stage":"capture","kind":"absolute_silence"}]}',
+                   'failed', 'capture', NULL),
+                  ('a-oversized', 'oversized', 1, '2026-07-30T23:59:56Z', '{}',
+                   '{"audio_duration_ms":500,"stage_issues":[{"stage":"capture","kind":"absolute_silence","message":"absolute_silence"}]}',
+                   'failed', 'capture', NULL);
+                "#,
+            )
+            .unwrap();
+
+        let oversized_metrics = format!(
+            r#"{{"audio_duration_ms":500,"stage_issues":[{{"stage":"capture","kind":"absolute_silence","message":"absolute_silence"}}],"padding":"{}"}}"#,
+            "x".repeat(HISTORY_MIGRATION_MAX_METRICS_JSON_BYTES as usize),
+        );
+        connection
+            .execute(
+                "UPDATE dictation_attempts SET pipeline_metrics_json=?1 WHERE id='a-oversized'",
+                params![oversized_metrics],
+            )
+            .unwrap();
+        for index in 0..=HISTORY_MIGRATION_BATCH_SIZE {
+            let session_id = format!("batch-{index:03}");
+            connection
+                .execute(
+                    "INSERT INTO sessions (id, created_at, status) VALUES (?1, '2026-07-30T23:00:00Z', 'failed')",
+                    params![session_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO dictation_attempts (
+                      id, session_id, attempt_ordinal, created_at,
+                      pipeline_identity_json, pipeline_metrics_json,
+                      status, failed_stage
+                    ) VALUES (?1, ?2, 1, '2026-07-30T23:00:00Z', '{}',
+                      '{"audio_duration_ms":500,"stage_issues":[{"stage":"capture","kind":"absolute_silence","message":"absolute_silence"}]}',
+                      'failed', 'capture')
+                    "#,
+                    params![format!("attempt-{index:03}"), session_id],
+                )
+                .unwrap();
+        }
+
+        migrate(&connection).unwrap();
+
+        let visibility = |id: &str| -> i64 {
+            connection
+                .query_row(
+                    "SELECT history_visible FROM sessions WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(visibility("structured"), 0);
+        assert_eq!(visibility("legacy"), 0);
+        for visible in [
+            "other",
+            "boundary",
+            "corrupt",
+            "mismatch",
+            "with-text",
+            "ambiguous-legacy",
+            "fractional",
+            "object-issues",
+            "missing-message",
+            "oversized",
+        ] {
+            assert_eq!(visibility(visible), 1, "{visible} must fail open");
+        }
+        assert_eq!(visibility("batch-000"), 0);
+        assert_eq!(visibility("batch-128"), 0);
+
+        let index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_sessions_history_visible_created_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+        let version_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=14",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_count, 1);
+
+        migrate(&connection).unwrap();
+        assert_eq!(visibility("structured"), 0);
+        assert_eq!(visibility("other"), 1);
     }
 
     #[test]
