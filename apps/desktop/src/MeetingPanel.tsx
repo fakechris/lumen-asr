@@ -766,6 +766,20 @@ const LIVE_TRACK_LABEL: Record<LiveEvent["track"], string> = {
   system: "远端",
 };
 
+/** One quick-pick entry in the annotate menu: a name the user can apply with a
+ * single click. Merged + deduped from the enrolled identity library and every
+ * name already used this meeting (see the `candidates` builder). */
+type MenuCandidate = {
+  /** Canonical name (the annotate payload + the match/filter key). */
+  name: string;
+  /** Enrolled identity behind the name, when it is library-backed. */
+  identityId?: string;
+  /** The self identity ("这是我"): rendered as "我" and pinned first. */
+  isSelf: boolean;
+  /** ms of the newest use this meeting; 0 = library entry not yet used. */
+  lastUsedAt: number;
+};
+
 // Front-end mirror of the reconciliation model (annotate.rs, timeline
 // boundaries). Used only to label chips locally — the authoritative split +
 // attribution happens offline after stop.
@@ -846,8 +860,11 @@ function LiveTranscript({
     top?: number;
     bottom?: number;
   } | null>(null);
-  const [customFor, setCustomFor] = useState<string | null>(null);
-  const [customName, setCustomName] = useState("");
+  // A single search/name box at the top of the open menu: it filters the
+  // quick-pick candidates by prefix AND doubles as the free-text entry for a
+  // brand-new name (Enter → first match, or create). Only one menu is open at
+  // a time, so one query string suffices; it resets on open/close.
+  const [menuQuery, setMenuQuery] = useState("");
 
   useEffect(() => {
     let disposed = false;
@@ -880,15 +897,15 @@ function LiveTranscript({
   const closeMenus = useCallback(() => {
     setMenuFor(null);
     setMenuPos(null);
-    setCustomFor(null);
-    setCustomName("");
+    setMenuQuery("");
   }, []);
 
   /** Open the annotate menu for a line, positioned from the chip's viewport
    * rect: downward by default, upward only when the space below is tight. */
   const openMenu = useCallback((seg: LiveEvent, chip: HTMLElement) => {
     const rect = chip.getBoundingClientRect();
-    // Generous estimate of the tallest menu (names + input + 无 + clear).
+    // Generous estimate of the tallest menu (search input + candidates +
+    // 不指定 + clear).
     const estimatedHeight = 260;
     const spaceBelow = window.innerHeight - rect.bottom;
     const openDown = spaceBelow >= estimatedHeight || spaceBelow >= rect.top;
@@ -902,8 +919,7 @@ function LiveTranscript({
         ? { left, top: rect.bottom + 4 }
         : { left, bottom: window.innerHeight - rect.top + 4 },
     );
-    setCustomFor(null);
-    setCustomName("");
+    setMenuQuery("");
   }, []);
 
   // Esc or a click outside the open menu closes it without submitting. (The
@@ -1038,14 +1054,58 @@ function LiveTranscript({
     if (el) el.scrollTop = el.scrollHeight;
   }, [ordered, menuFor]);
 
-  // "我" is the self identity surfaced as its own menu entry; the remaining
-  // enrolled identities fill the list below it (self excluded to avoid a dup).
-  const selfSpeaker = selfIdentityId
-    ? identities.find((p) => p.id === selfIdentityId)
-    : undefined;
-  const otherIdentities = selfIdentityId
-    ? identities.filter((p) => p.id !== selfIdentityId)
-    : identities;
+  // Quick-pick candidates for the annotate menu = the enrolled identity library
+  // PLUS every name already used this meeting (manual annotations + live
+  // voiceprint guesses), deduped by name. This is the fix for the core pain:
+  // a custom/session-only name typed once becomes a one-click pick next time,
+  // instead of forcing the user to retype it. Ordering: self ("我") first, then
+  // most-recently-used this session (whoever just spoke floats up), then the
+  // rest alphabetically. Recomputes from live state, so a name annotated now
+  // appears in the next menu immediately.
+  const candidates = useMemo<MenuCandidate[]>(() => {
+    const byKey = new Map<string, MenuCandidate>();
+    const add = (
+      rawName: string,
+      opts: { identityId?: string | null; usedAt?: number },
+    ) => {
+      const name = rawName.trim();
+      if (!name) return;
+      const key = name.toLowerCase();
+      const existing = byKey.get(key);
+      const identityId = opts.identityId ?? existing?.identityId ?? undefined;
+      const isSelf =
+        (existing?.isSelf ?? false) ||
+        (identityId != null && identityId === selfIdentityId);
+      byKey.set(key, {
+        name: existing?.name ?? name,
+        identityId: identityId ?? undefined,
+        isSelf,
+        lastUsedAt: Math.max(existing?.lastUsedAt ?? 0, opts.usedAt ?? 0),
+      });
+    };
+    // 1) Enrolled identity library (name-ordered from the backend).
+    for (const p of identities) add(p.name, { identityId: p.id });
+    // 2) Names already annotated this meeting — the key addition. A "无"
+    //    boundary carries no name, so it is skipped.
+    for (const a of annotations) {
+      if (a.unassigned) continue;
+      add(a.display_name, {
+        identityId: a.identity_id,
+        usedAt: Date.parse(a.created_at) || 0,
+      });
+    }
+    // 3) Live voiceprint guesses seen this meeting (optional; no "?" suffix).
+    for (const seg of segments.values()) {
+      if (seg.speaker)
+        add(seg.speaker.displayName, { identityId: seg.speaker.identityId });
+    }
+    return [...byKey.values()].sort(
+      (a, b) =>
+        Number(b.isSelf) - Number(a.isSelf) ||
+        b.lastUsedAt - a.lastUsedAt ||
+        a.name.localeCompare(b.name),
+    );
+  }, [identities, annotations, segments, selfIdentityId]);
 
   return (
     <div className="meeting-live" aria-live="polite">
@@ -1128,83 +1188,106 @@ function LiveTranscript({
                       >
                         {chipLabel}
                       </button>
-                      {menuFor === seg.segmentId && menuPos && (
-                        <span
-                          className="meeting-live-annotate-menu"
-                          role="menu"
-                          style={{
-                            left: menuPos.left,
-                            top: menuPos.top,
-                            bottom: menuPos.bottom,
-                          }}
-                        >
-                          {selfSpeaker && (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                void annotate(seg, selfSpeaker.name, {
-                                  identityId: selfSpeaker.id,
-                                })
-                              }
-                            >
-                              我
-                            </button>
-                          )}
-                          {otherIdentities.map((p) => (
-                            <button
-                              key={p.id}
-                              type="button"
-                              onClick={() =>
-                                void annotate(seg, p.name, { identityId: p.id })
-                              }
-                            >
-                              {p.name}
-                            </button>
-                          ))}
-                          {customFor === seg.segmentId ? (
-                            <input
-                              className="meeting-live-annotate-input"
-                              autoFocus
-                              value={customName}
-                              placeholder="输入名字后回车"
-                              onChange={(e) => setCustomName(e.target.value)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter" && customName.trim()) {
-                                  void annotate(seg, customName.trim());
-                                } else if (e.key === "Escape") {
-                                  // Cancel just the input, not the whole menu.
-                                  e.stopPropagation();
-                                  setCustomFor(null);
-                                  setCustomName("");
-                                }
+                      {menuFor === seg.segmentId &&
+                        menuPos &&
+                        (() => {
+                          // Prefix-filter the merged candidates by the search
+                          // box (case-insensitive). Self also matches when the
+                          // query is a prefix of "我". Enter applies the first
+                          // match, or creates the typed name when nothing
+                          // matches — so the keyboard alone can pick-or-create.
+                          const q = menuQuery.trim().toLowerCase();
+                          const shown =
+                            q === ""
+                              ? candidates
+                              : candidates.filter(
+                                  (c) =>
+                                    c.name.toLowerCase().startsWith(q) ||
+                                    (c.isSelf && "我".startsWith(q)),
+                                );
+                          const exact = candidates.find(
+                            (c) => c.name.toLowerCase() === q,
+                          );
+                          const canCreate = q !== "" && !exact;
+                          return (
+                            <span
+                              className="meeting-live-annotate-menu"
+                              role="menu"
+                              style={{
+                                left: menuPos.left,
+                                top: menuPos.top,
+                                bottom: menuPos.bottom,
                               }}
-                            />
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => setCustomFor(seg.segmentId)}
                             >
-                              自定义名字…
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void annotate(seg, "", { unassigned: true })
-                            }
-                          >
-                            无（之后无人）
-                          </button>
-                          {anchored.length > 0 && (
-                            <button
-                              type="button"
-                              onClick={() => void clearAnnotation(seg)}
-                            >
-                              清除
-                            </button>
-                          )}
-                        </span>
-                      )}
+                              <input
+                                className="meeting-live-annotate-input"
+                                autoFocus
+                                value={menuQuery}
+                                placeholder="选择或输入名字…"
+                                onChange={(e) => setMenuQuery(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key !== "Enter") return;
+                                  e.preventDefault();
+                                  const raw = menuQuery.trim();
+                                  if (!raw) return;
+                                  const pick = exact ?? shown[0];
+                                  if (pick) {
+                                    void annotate(seg, pick.name, {
+                                      identityId: pick.identityId,
+                                    });
+                                  } else {
+                                    void annotate(seg, raw);
+                                  }
+                                }}
+                              />
+                              {shown.map((c) => (
+                                <button
+                                  key={c.identityId ?? `name:${c.name}`}
+                                  type="button"
+                                  onClick={() =>
+                                    void annotate(seg, c.name, {
+                                      identityId: c.identityId,
+                                    })
+                                  }
+                                >
+                                  {c.isSelf ? "我" : c.name}
+                                </button>
+                              ))}
+                              {canCreate && (
+                                <button
+                                  type="button"
+                                  className="meeting-live-annotate-new"
+                                  onClick={() =>
+                                    void annotate(seg, menuQuery.trim())
+                                  }
+                                >
+                                  新建「{menuQuery.trim()}」
+                                </button>
+                              )}
+                              {shown.length === 0 && !canCreate && (
+                                <span className="muted-text meeting-live-annotate-empty">
+                                  输入名字以新建
+                                </span>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void annotate(seg, "", { unassigned: true })
+                                }
+                              >
+                                从这里起不指定
+                              </button>
+                              {anchored.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => void clearAnnotation(seg)}
+                                >
+                                  清除
+                                </button>
+                              )}
+                            </span>
+                          );
+                        })()}
                     </span>
                   )}
                 </p>
