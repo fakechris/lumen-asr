@@ -537,9 +537,11 @@ export const api = {
   // immediately; the offline pipeline reconciles them into speaker
   // attribution after stop (manual always wins).
 
-  /** Annotate one live caption line. `segmentId` is the transient live
-   * segment id (tracing only); the persisted anchor is the unified-timeline
-   * range + track. Resolves the stored annotation row. */
+  /** Annotate one live caption line with a speaker **boundary** at its start
+   * time. `segmentId` is the transient live segment id (tracing only); the
+   * persisted anchor is the unified-timeline boundary + track. Pass
+   * `unassigned: true` for a "无" boundary (no manual speaker from here on) —
+   * `displayName`/`identityId` are then ignored. Resolves the stored row. */
   annotateLiveSegment: (input: {
     meetingId: string;
     segmentId: string;
@@ -548,6 +550,7 @@ export const api = {
     channel: "mic" | "system";
     identityId?: string | null;
     displayName: string;
+    unassigned?: boolean;
   }) =>
     invoke<LiveAnnotation>("annotate_live_segment", {
       meetingId: input.meetingId,
@@ -557,6 +560,7 @@ export const api = {
       channel: input.channel,
       identityId: input.identityId ?? null,
       displayName: input.displayName,
+      unassigned: input.unassigned ?? false,
     }),
 
   /** List a meeting's live annotations, oldest first (restores chip labels
