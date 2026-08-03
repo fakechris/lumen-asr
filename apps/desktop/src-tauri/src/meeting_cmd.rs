@@ -1276,16 +1276,18 @@ pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<
 // timeline plus its capture track. The offline pipeline reconciles them into
 // speaker attribution after stop (manual always wins).
 
-/// Annotate one live caption line with "who is speaking". Appends a new
-/// annotation row (repeat annotations on the same range are resolved
-/// last-write-wins by `created_at` at reconciliation time) and returns it.
-/// `segment_id` is the transient live segment id (e.g. `mic-3`) — used for
-/// tracing only, never persisted. `end_seconds` absent stores an
-/// **open-ended** annotation ("此句及之后"): it applies from `start_seconds`
-/// until the next open-ended annotation begins on the same track (also used
-/// when the live line has not finalized yet). `identity_id` links an enrolled
-/// identity from the local voiceprint library; `display_name` is the name
-/// snapshot shown on the chip (required either way).
+/// Annotate one live caption line with a speaker **boundary** on the meeting's
+/// unified timeline. Appends a new `live_annotations` row (two boundaries at the
+/// same `start_seconds` are resolved last-write-wins by `created_at` at
+/// reconciliation time) and returns it. `segment_id` is the transient live
+/// segment id (e.g. `mic-3`) — used for tracing only, never persisted. The
+/// boundary opens a range from `start_seconds` until the next boundary on the
+/// same track (the user's real pattern: one person speaks for a long stretch,
+/// occasionally interrupted). When `unassigned` is set this is a "无" boundary —
+/// from here on no manual speaker — and `identity_id`/`display_name` are
+/// ignored; otherwise `display_name` is required (the name snapshot shown on the
+/// chip) and `identity_id` optionally links an enrolled voiceprint identity.
+/// `end_seconds` is retained for provenance only and is not used as a range end.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // the IPC payload is exactly these fields
 pub fn annotate_live_segment(
@@ -1297,27 +1299,30 @@ pub fn annotate_live_segment(
     channel: String,
     identity_id: Option<String>,
     display_name: String,
+    unassigned: bool,
 ) -> Result<LiveAnnotation, String> {
     let meeting = parse_id(&meeting_id, "meeting")?;
-    let identity = identity_id
-        .as_deref()
-        .map(|id| parse_id(id, "identity"))
-        .transpose()?;
-    let name = display_name.trim();
-    if name.is_empty() {
-        return Err("说话人名字不能为空".to_string());
-    }
     if !start_seconds.is_finite() || end_seconds.is_some_and(|end| !end.is_finite()) {
         return Err("invalid annotation time range".to_string());
     }
-    let annotation = LiveAnnotation::new(
-        meeting,
-        start_seconds,
-        end_seconds,
-        SegmentChannel::from_str_or_mic(&channel),
-        identity,
-        name,
-    );
+    let channel = SegmentChannel::from_str_or_mic(&channel);
+    // A "无" boundary carries no name or identity; a named boundary requires a
+    // non-empty name and may link an enrolled identity.
+    let annotation = if unassigned {
+        let mut a = LiveAnnotation::none_boundary(meeting, start_seconds, channel);
+        a.end_seconds = end_seconds;
+        a
+    } else {
+        let identity = identity_id
+            .as_deref()
+            .map(|id| parse_id(id, "identity"))
+            .transpose()?;
+        let name = display_name.trim();
+        if name.is_empty() {
+            return Err("说话人名字不能为空".to_string());
+        }
+        LiveAnnotation::new(meeting, start_seconds, end_seconds, channel, identity, name)
+    };
     with_store(&state, |s| {
         s.add_live_annotation(&annotation)
             .map_err(|e| e.to_string())
@@ -1325,17 +1330,20 @@ pub fn annotate_live_segment(
     // L3.5: let the running live worker seed a session voiceprint from this
     // annotation's audio, so later utterances by the same (unregistered)
     // person auto-label for the rest of the recording. Purely advisory —
-    // silently a no-op when no worker is running.
-    state.meeting_live.notify_annotation(
-        &meeting_id,
-        crate::meeting_live::AnnotationNotice::Annotated {
-            channel: annotation.channel.as_str().to_string(),
-            start_seconds: annotation.start_seconds,
-            end_seconds: annotation.end_seconds,
-            identity_id: annotation.identity_id,
-            display_name: annotation.display_name.clone(),
-        },
-    );
+    // silently a no-op when no worker is running. A "无" boundary carries no
+    // speaker, so it never seeds a voiceprint.
+    if !annotation.unassigned {
+        state.meeting_live.notify_annotation(
+            &meeting_id,
+            crate::meeting_live::AnnotationNotice::Annotated {
+                channel: annotation.channel.as_str().to_string(),
+                start_seconds: annotation.start_seconds,
+                end_seconds: annotation.end_seconds,
+                identity_id: annotation.identity_id,
+                display_name: annotation.display_name.clone(),
+            },
+        );
+    }
     // Ids and times only — the annotated name is PII.
     tracing::info!(
         meeting_id = %meeting,
