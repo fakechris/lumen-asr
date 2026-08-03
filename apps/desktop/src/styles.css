@@ -3485,6 +3485,22 @@ button.meeting-seg-text.seekable:hover {
   font: inherit;
   font-size: 0.82rem;
   min-width: 120px;
+  /* Keep the search/name box pinned while the candidate list scrolls, so the
+   * user can always see what they typed. */
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+/* "新建「…」": the create-new action, tinted so it reads as distinct from the
+ * existing quick-pick names above it. */
+.meeting-live-annotate-menu button.meeting-live-annotate-new {
+  color: var(--accent, #4a7dbd);
+}
+
+.meeting-live-annotate-empty {
+  padding: 6px 9px;
+  font-size: 0.78rem;
 }
 
 .meeting-live-empty {
