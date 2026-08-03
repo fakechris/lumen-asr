@@ -220,7 +220,20 @@ async fn run(
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (a, b) => a.or(b),
                 };
-                Some((take, sys_embeddings))
+                if take.turns.is_empty() {
+                    // The silence preflight skipped the track (remote audio was
+                    // never played / stayed muted): fall back to the mic-only
+                    // merge instead of dragging an empty take through echo
+                    // suppression and cross-track unification.
+                    tracing::info!(
+                        meeting_id = %meeting_id,
+                        system_wav = %sys.display(),
+                        "system track produced no speech segments; continuing mic-only"
+                    );
+                    None
+                } else {
+                    Some((take, sys_embeddings))
+                }
             }
             Err(err) => {
                 tracing::warn!(
@@ -234,6 +247,13 @@ async fn run(
         },
         None => None,
     };
+
+    // Layer 3 — only when *no* track carried any speech is the meeting failed,
+    // with an explicit reason ("no speech detected on any track"). A silent
+    // track alone (either side) merely degrades to the other track's content.
+    if mic_take.turns.is_empty() && system_take.is_none() {
+        return Err(ProcessError::Transcribe(MeetingError::NoSpeech));
+    }
 
     // Cross-track echo duplicate suppression (config `meeting.echo_suppression`):
     // without headphones the remote voice plays through the loudspeaker and is

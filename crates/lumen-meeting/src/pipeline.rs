@@ -112,6 +112,12 @@ pub enum MeetingError {
     /// The diarization step failed.
     #[error("diarization failed: {0}")]
     Diarize(String),
+    /// No track carried any audible speech (all-silent recording), so there is
+    /// nothing to transcribe. Distinct from [`MeetingError::Diarize`] so the UI
+    /// can show an actionable "the recording was silent" reason instead of an
+    /// internal pipeline error.
+    #[error("no speech detected on any track")]
+    NoSpeech,
     /// A per-turn ASR call failed.
     #[error("asr failed: {0}")]
     Asr(#[source] AsrError),
@@ -149,6 +155,11 @@ pub async fn transcribe_meeting(
     opts: &MeetingOptions,
 ) -> Result<Uuid, MeetingError> {
     let diar = diarize_wav(wav, diar_models, opts)?;
+    // A silent wav is skipped by the preflight (zero turns): fail explicitly
+    // rather than storing an empty "ready" meeting nobody asked for.
+    if diar.turns.is_empty() {
+        return Err(MeetingError::NoSpeech);
+    }
     let duration =
         (diar.sample_rate > 0).then(|| diar.samples.len() as f64 / diar.sample_rate as f64);
 
@@ -289,13 +300,51 @@ pub(crate) fn diarize_wav(
     // Decode once for slicing; diarize() reloads internally (offline, cheap).
     let (samples, sample_rate) =
         audio::load_wav_mono16k(wav).map_err(|e| MeetingError::Diarize(e.to_string()))?;
-    let result =
-        diarize(wav, &model_paths, &cfg).map_err(|e| MeetingError::Diarize(e.to_string()))?;
-    let turns: Vec<DiarTurn> = result
-        .timeline
-        .iter()
-        .map(|t| DiarTurn::new(t.start, t.end, t.speaker))
-        .collect();
+
+    // Layer 1 — silence preflight: a track with (almost) no voiced audio is
+    // skipped outright instead of being diarized. diar-rs hard-fails on such
+    // tracks ("pipeline: too few x-vectors"); before this check a fully silent
+    // system track (remote audio never played) failed the *whole* meeting even
+    // though the mic track transcribed fine. Zero turns → the caller stores no
+    // segments for this track and moves on.
+    let scan = crate::preflight::scan_speech(&samples, sample_rate);
+    if !scan.has_enough_speech() {
+        tracing::info!(
+            wav = %wav.display(),
+            voiced_seconds = scan.voiced_seconds,
+            total_seconds = scan.total_seconds,
+            "track skipped: effectively silent"
+        );
+        return Ok(DiarOutput {
+            samples,
+            sample_rate,
+            turns: Vec::new(),
+            speaker_embeddings: BTreeMap::new(),
+        });
+    }
+
+    // Layer 2 — per-track fail-open: when the preflight found audible speech
+    // but diarization still errors (borderline-short speech can yield too few
+    // x-vectors to cluster), the track degrades to a single speaker over the
+    // preflight's voiced spans instead of failing the run: the per-turn ASR
+    // loop then transcribes exactly the audible audio, attributed to one
+    // "说话人" cluster. Clustering quality is lost; the content is not.
+    let turns: Vec<DiarTurn> = match diarize(wav, &model_paths, &cfg) {
+        Ok(result) => result
+            .timeline
+            .iter()
+            .map(|t| DiarTurn::new(t.start, t.end, t.speaker))
+            .collect(),
+        Err(error) => {
+            tracing::warn!(
+                wav = %wav.display(),
+                error = %error,
+                voiced_seconds = scan.voiced_seconds,
+                "diarization failed on a voiced track; degrading to a single speaker over voiced spans"
+            );
+            scan.fallback_turns()
+        }
+    };
 
     // Best-effort per-speaker voiceprint centroids for enrollment/matching.
     // A failure here degrades to "no embeddings" (no enrollment for this
@@ -514,12 +563,36 @@ impl LiveVoiceprintEmbedder {
 /// Stub for every non-diarizing build (Windows CI, or macOS without the
 /// `diarize` feature). Keeps the crate compiling and callable everywhere while
 /// never referencing `diar-rs`.
+///
+/// The silence preflight (layer 1) still runs here: an effectively silent
+/// track is "skipped" (zero turns) on **every** build, which keeps the
+/// dual-track silent-system behavior — and the "no speech on any track"
+/// failure — identical and testable cross-platform. A *voiced* track still
+/// needs real diarization and yields [`MeetingError::Unsupported`], exactly as
+/// before (an unreadable wav lands there too).
 #[cfg(not(all(target_os = "macos", feature = "diarize")))]
 pub(crate) fn diarize_wav(
-    _wav: &Path,
+    wav: &Path,
     _models: &DiarModels,
     _opts: &MeetingOptions,
 ) -> Result<DiarOutput, MeetingError> {
+    if let Some(samples) = crate::echo::read_full_wav_mono_16k(wav) {
+        let scan = crate::preflight::scan_speech(&samples, 16_000);
+        if !scan.has_enough_speech() {
+            tracing::info!(
+                wav = %wav.display(),
+                voiced_seconds = scan.voiced_seconds,
+                total_seconds = scan.total_seconds,
+                "track skipped: effectively silent"
+            );
+            return Ok(DiarOutput {
+                samples,
+                sample_rate: 16_000,
+                turns: Vec::new(),
+                speaker_embeddings: BTreeMap::new(),
+            });
+        }
+    }
     // Note: `DiarOutput.speaker_embeddings` stays empty on this path by
     // construction, so voiceprint enrollment/matching is naturally unavailable
     // wherever diarization is.
