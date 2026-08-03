@@ -21,8 +21,10 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// ('manual' | 'verification' | 'offline_diarization'), and
 /// `speakers.attribution_confidence` (verification match score) — the ground
 /// for conflict handling between manual/verified/offline attribution; v14 adds
-/// indexed history visibility for short absolute-silence captures.
-pub(crate) const SCHEMA_VERSION: i64 = 14;
+/// indexed history visibility for short absolute-silence captures; v15 adds the
+/// additive `live_annotations.unassigned` column (a "无" boundary — from here on
+/// no manual speaker — for the timeline-based annotation model).
+pub(crate) const SCHEMA_VERSION: i64 = 15;
 
 pub(crate) const HISTORY_TEXT_WHITESPACE: &str =
     "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
@@ -583,8 +585,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
         backfill.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-            [SCHEMA_VERSION],
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (14)",
+            [],
         )?;
         backfill.commit()?;
     }
@@ -593,6 +595,27 @@ pub fn migrate(conn: &Connection) -> Result<()> {
          ON sessions(history_visible, created_at DESC)",
         [],
     )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (14)",
+        [],
+    )?;
+
+    // v15: additive `live_annotations.unassigned` column for the timeline-based
+    // annotation model. A boundary either names a speaker or, when this flag is
+    // set, marks "无" — from here on no manual speaker until the next boundary.
+    // NULL/0 for every pre-v15 row (all named boundaries). Guarded by a column
+    // check (SQLite has no `ADD COLUMN IF NOT EXISTS`) so re-running is a no-op.
+    let live_annotation_columns: Vec<String> = {
+        let mut statement = conn.prepare("PRAGMA table_info(live_annotations)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns.collect::<Result<Vec<_>, _>>()?
+    };
+    if !live_annotation_columns.iter().any(|c| c == "unassigned") {
+        conn.execute(
+            "ALTER TABLE live_annotations ADD COLUMN unassigned INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
         [SCHEMA_VERSION],
@@ -1671,6 +1694,72 @@ mod tests {
         migrate(&connection).unwrap();
         assert_eq!(visibility("structured"), 0);
         assert_eq!(visibility("other"), 1);
+    }
+
+    #[test]
+    fn version_fifteen_adds_unassigned_column_defaulting_zero_without_touching_v14_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        // Stand up a v14 database with a pre-v15 `live_annotations` table (no
+        // `unassigned` column) holding one named boundary.
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations (version)
+                VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14);
+                CREATE TABLE meetings (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  created_at TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'recording'
+                );
+                INSERT INTO meetings (id, created_at, status)
+                VALUES ('m1', '2026-07-29T00:00:00Z', 'ready');
+                CREATE TABLE live_annotations (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  meeting_id TEXT NOT NULL,
+                  start_seconds REAL NOT NULL,
+                  end_seconds REAL,
+                  channel TEXT NOT NULL,
+                  identity_id TEXT,
+                  display_name TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                INSERT INTO live_annotations
+                  (id, meeting_id, start_seconds, end_seconds, channel, display_name, created_at)
+                VALUES ('a1', 'm1', 3.0, NULL, 'mic', '张三', '2026-07-29T00:00:01Z');
+                "#,
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        // The new column exists…
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(live_annotations)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"unassigned".to_owned()));
+
+        // …and the pre-existing row defaults to a named (not unassigned) boundary.
+        let (name, unassigned): (String, i64) = connection
+            .query_row(
+                "SELECT display_name, unassigned FROM live_annotations WHERE id='a1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "张三");
+        assert_eq!(unassigned, 0);
+
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

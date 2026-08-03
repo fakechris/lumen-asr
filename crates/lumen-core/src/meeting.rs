@@ -280,30 +280,46 @@ impl Speaker {
 /// while a meeting is still recording (maps to the `live_annotations` table).
 ///
 /// Recording-time speaker rows do not exist yet (the offline pipeline creates
-/// them after stop), so a live annotation is anchored to a *time range on the
-/// meeting's unified timeline* plus the capture track it was made on. After
-/// stop, offline reconciliation matches these ranges against the diarized
-/// segments and applies the manual names (manual attribution always wins).
+/// them after stop), so a live annotation is anchored to a **boundary on the
+/// meeting's unified timeline** (`start_seconds`) plus the capture track it was
+/// made on. Each annotation opens a range that runs from its `start_seconds`
+/// until the next annotation (boundary) on the same track — the user's real
+/// pattern is one person speaking for a long stretch, occasionally interrupted.
+/// A boundary either names a speaker or, when [`unassigned`](Self::unassigned)
+/// is set, marks "no one from here on" ("无"). After stop, offline
+/// reconciliation partitions the track by these boundaries and splits the
+/// diarized segments at the boundary times (manual attribution always wins).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LiveAnnotation {
     pub id: Uuid,
     pub meeting_id: Uuid,
-    /// Annotated range start, seconds on the meeting's unified timeline (`t0`).
+    /// Boundary time, seconds on the meeting's unified timeline (`t0`). The
+    /// annotation's range runs from here until the next boundary on the same
+    /// track. This exact time is authoritative for reconciliation — live and
+    /// offline segmentation do not align, so only the timeline aligns them.
     pub start_seconds: f64,
-    /// Annotated range end on the unified timeline. Absent when the live
-    /// segment had not finalized yet at annotate time; reconciliation then
-    /// treats the annotation as the point `start_seconds`.
+    /// Retained for provenance/back-compat; **not** used as a range end in the
+    /// timeline model (a range ends at the next boundary, never here). Absent
+    /// for boundaries written under the timeline model.
     pub end_seconds: Option<f64>,
     /// Capture track the annotated caption line came from.
     pub channel: SegmentChannel,
-    /// The enrolled identity this range was attributed to, when the user
-    /// picked one from the local library; `None` for an ad-hoc typed name.
+    /// The enrolled identity this boundary was attributed to, when the user
+    /// picked one from the local library; `None` for an ad-hoc typed name or an
+    /// [`unassigned`](Self::unassigned) boundary.
     pub identity_id: Option<Uuid>,
     /// Name snapshot at annotate time. Reconciliation prefers the identity's
-    /// current name (via `identity_id`) and falls back to this snapshot.
+    /// current name (via `identity_id`) and falls back to this snapshot. Empty
+    /// (and ignored) for an [`unassigned`](Self::unassigned) boundary.
     pub display_name: String,
-    /// When the annotation was made. Overlapping annotations on the same
-    /// range are resolved last-write-wins by this timestamp.
+    /// A "无" boundary: from here on there is **no** manual speaker until the
+    /// next boundary. When set, `identity_id`/`display_name` are ignored and
+    /// segments in this range keep their original diarization/voiceprint
+    /// speaker (schema v15).
+    #[serde(default)]
+    pub unassigned: bool,
+    /// When the annotation was made. Two boundaries at the same `start_seconds`
+    /// are resolved last-write-wins by this timestamp.
     pub created_at: DateTime<Utc>,
 }
 
@@ -325,6 +341,23 @@ impl LiveAnnotation {
             channel,
             identity_id,
             display_name: display_name.into(),
+            unassigned: false,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// A "无" boundary at `start_seconds`: from here on, no manual speaker
+    /// until the next boundary on the same track. Carries no name or identity.
+    pub fn none_boundary(meeting_id: Uuid, start_seconds: f64, channel: SegmentChannel) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            meeting_id,
+            start_seconds,
+            end_seconds: None,
+            channel,
+            identity_id: None,
+            display_name: String::new(),
+            unassigned: true,
             created_at: Utc::now(),
         }
     }

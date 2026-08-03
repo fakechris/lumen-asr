@@ -456,8 +456,8 @@ impl Store {
             r#"
             INSERT INTO live_annotations (
               id, meeting_id, start_seconds, end_seconds, channel,
-              identity_id, display_name, created_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+              identity_id, display_name, unassigned, created_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
             "#,
             params![
                 annotation.id.to_string(),
@@ -467,6 +467,7 @@ impl Store {
                 annotation.channel.as_str(),
                 annotation.identity_id.map(|id| id.to_string()),
                 annotation.display_name,
+                annotation.unassigned as i64,
                 annotation.created_at.to_rfc3339(),
             ],
         )?;
@@ -480,7 +481,7 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, meeting_id, start_seconds, end_seconds, channel,
-                   identity_id, display_name, created_at
+                   identity_id, display_name, unassigned, created_at
             FROM live_annotations
             WHERE meeting_id=?1
             ORDER BY created_at ASC, id ASC
@@ -498,7 +499,7 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, meeting_id, start_seconds, end_seconds, channel,
-                   identity_id, display_name, created_at
+                   identity_id, display_name, unassigned, created_at
             FROM live_annotations
             WHERE id=?1
             "#,
@@ -731,7 +732,8 @@ fn map_live_annotation(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveAnnotati
         channel: SegmentChannel::from_str_or_mic(&row.get::<_, String>(4)?),
         identity_id,
         display_name: row.get(6)?,
-        created_at: parse_dt(&row.get::<_, String>(7)?),
+        unassigned: row.get::<_, i64>(7)? != 0,
+        created_at: parse_dt(&row.get::<_, String>(8)?),
     })
 }
 
@@ -1265,6 +1267,33 @@ mod tests {
         );
         // Deleting a missing annotation is a no-op.
         assert!(!store.delete_live_annotation(Uuid::new_v4()).unwrap());
+    }
+
+    #[test]
+    fn unassigned_none_boundary_round_trips() {
+        use lumen_core::{LiveAnnotation, SegmentChannel};
+
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+
+        // A "无" boundary: no name, no identity, unassigned set.
+        let mut none = LiveAnnotation::none_boundary(meeting.id, 42.0, SegmentChannel::Mic);
+        none.created_at = crate::parse_dt("2026-07-30T00:00:05Z");
+        // …and a normal named boundary alongside it.
+        let mut named =
+            LiveAnnotation::new(meeting.id, 10.0, None, SegmentChannel::Mic, None, "张三");
+        named.created_at = crate::parse_dt("2026-07-30T00:00:04Z");
+        store.add_live_annotation(&named).unwrap();
+        store.add_live_annotation(&none).unwrap();
+
+        let listed = store.list_live_annotations(meeting.id).unwrap();
+        assert_eq!(listed, vec![named, none.clone()]);
+        assert!(listed[1].unassigned);
+        assert_eq!(listed[1].display_name, "");
+        assert_eq!(listed[1].identity_id, None);
+        // Named boundaries default to not-unassigned.
+        assert!(!listed[0].unassigned);
     }
 
     #[test]
