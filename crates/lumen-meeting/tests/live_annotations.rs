@@ -22,7 +22,9 @@ fn segment(
     end: f64,
     speaker: &Speaker,
 ) -> TranscriptSegment {
-    let mut seg = TranscriptSegment::new(meeting_id, seq, start, end, "…");
+    // Enough transcript text (wordless, time-proportional splitting) that a
+    // sub-segment carved out by an interior boundary still carries content.
+    let mut seg = TranscriptSegment::new(meeting_id, seq, start, end, "话".repeat(40));
     seg.speaker_id = Some(speaker.id);
     seg.channel = Some(SegmentChannel::Mic);
     seg

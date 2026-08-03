@@ -3391,15 +3391,12 @@ button.meeting-seg-text.seekable:hover {
   font: inherit;
   font-size: 0.68rem;
   line-height: 1.5;
+  /* A muted-but-legible token (not a further-dimmed color): the resting
+   * affordance stays readable and firms to full strength on hover/focus. */
   color: var(--text-muted, #8a8a8a);
-  opacity: 0.55;
+  opacity: 0.75;
   cursor: pointer;
   vertical-align: 1px;
-}
-
-.meeting-live-chip:hover {
-  opacity: 1;
-  border-color: var(--border);
 }
 
 .meeting-live-chip.named {
@@ -3410,10 +3407,12 @@ button.meeting-seg-text.seekable:hover {
 }
 
 /* A "无" boundary governs this line: the user marked "no one from here on",
- * so the chip reads "未指定" and stays muted (no name, no voiceprint guess). */
+ * so the chip reads "未指定". Muted *token* at full opacity (legible contrast),
+ * with a border so the stateful label is distinguishable from the affordance. */
 .meeting-live-chip.unassigned {
-  opacity: 0.75;
+  opacity: 1;
   color: var(--muted);
+  border-color: var(--border);
 }
 
 /* Voiceprint attribution (L3): auto-verified reads like a confirmed name;
@@ -3425,8 +3424,18 @@ button.meeting-seg-text.seekable:hover {
 }
 
 .meeting-live-chip.voiceprint.provisional {
-  opacity: 0.6;
+  opacity: 0.8;
   color: var(--muted);
+}
+
+/* Hover and keyboard focus both firm the chip to full contrast so the label is
+ * legible and the DS :focus-visible ring reads clearly. Declared last so it
+ * wins over the equal-specificity variant rules above (e.g. `.unassigned`,
+ * `.provisional`) — otherwise a muted variant would never firm on interaction. */
+.meeting-live-chip:hover,
+.meeting-live-chip:focus-visible {
+  opacity: 1;
+  border-color: var(--border);
 }
 
 /* Positioned `fixed` from the chip's viewport rect at open time (inline

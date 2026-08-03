@@ -234,14 +234,43 @@ pub fn reconcile_annotations(
         }
 
         // Split at the interior sub-range starts (converted back to segment-local
-        // time), then attribute each piece by its sub-range outcome.
+        // time), attribute each piece by its sub-range outcome, and drop empty
+        // slivers so no zero-length or blank line ever reaches the transcript.
+        // Emptiness happens at the split extremes: `split_by_words` repeats the
+        // last word index once the words run out (zero-length tail pieces), and
+        // `split_by_ratio` can map a boundary to a character index that does not
+        // advance (a blank piece). A dropped sliver's time is absorbed into a
+        // neighbouring kept piece so the sub-segments stay contiguous with no gap
+        // (equivalent to not cutting at a boundary that lands on the very edge).
         let cut_local: Vec<f64> = coalesced[1..].iter().map(|(t, _)| t - offset).collect();
-        let pieces = split_segment(segment, &cut_local);
-        if pieces.len() > 1 {
-            outcome.split_segments += 1;
-            changed = true;
-        }
-        for (mut piece, (_, piece_outcome)) in pieces.into_iter().zip(coalesced.iter()) {
+        let raw = split_segment(segment, &cut_local);
+        let mut produced: Vec<TranscriptSegment> = Vec::with_capacity(raw.len());
+        let mut carry_start: Option<f64> = None;
+        for (mut piece, (_, piece_outcome)) in raw.into_iter().zip(coalesced.iter()) {
+            let is_empty = piece.end_seconds <= piece.start_seconds + EDGE_EPSILON
+                || piece.text.trim().is_empty();
+            if is_empty {
+                // Absorb this sliver's time into a neighbour: extend the previous
+                // kept piece, or (leading empties) carry the earliest start onto
+                // the next kept piece.
+                match produced.last_mut() {
+                    Some(last) if piece.end_seconds > last.end_seconds => {
+                        last.end_seconds = piece.end_seconds;
+                    }
+                    Some(_) => {}
+                    None => {
+                        carry_start = Some(
+                            carry_start.map_or(piece.start_seconds, |s| s.min(piece.start_seconds)),
+                        );
+                    }
+                }
+                continue;
+            }
+            if let Some(start) = carry_start.take() {
+                if start < piece.start_seconds {
+                    piece.start_seconds = start;
+                }
+            }
             if let Some((name, identity)) = piece_outcome {
                 let target = *speaker_for_name.entry(name.clone()).or_insert_with(|| {
                     let mut speaker = Speaker::new(
@@ -260,8 +289,19 @@ pub fn reconcile_annotations(
                     changed = true;
                 }
             }
-            new_segments.push(piece);
+            produced.push(piece);
         }
+        // Degenerate guard: an original segment with no non-blank content yields
+        // no pieces — keep it verbatim rather than dropping it.
+        if produced.is_empty() {
+            new_segments.push(segment.clone());
+            continue;
+        }
+        if produced.len() > 1 {
+            outcome.split_segments += 1;
+            changed = true;
+        }
+        new_segments.extend(produced);
     }
 
     // 3. Strict no-op when nothing actually changed (e.g. only "无" boundaries,
@@ -576,10 +616,16 @@ mod tests {
     #[test]
     fn long_segment_splits_at_interior_boundaries_reproducing_the_bug() {
         let meeting_id = Uuid::new_v4();
-        // One giant diarized turn [43.5, 230] on the mic track.
-        let (speaker, mut segments) = cluster(meeting_id, "S1", &[(43.5, 230.0)], 0);
+        // One giant diarized turn [43.5, 230] on the mic track, with enough
+        // transcript text to divide across the boundaries (no word timings — the
+        // wordless, time-proportional path, as the offline final may produce).
+        let speaker = Speaker::new(meeting_id, "S1");
         let original_cluster = speaker.id;
+        let mut seg = TranscriptSegment::new(meeting_id, 0, 43.5, 230.0, "话".repeat(200));
+        seg.speaker_id = Some(speaker.id);
+        seg.channel = Some(SegmentChannel::Mic);
         let mut speakers = vec![speaker];
+        let mut segments = vec![seg];
         // Mic boundaries: 张宏伟@0, 其他@86, 张宏伟@96.
         let annotations = vec![
             boundary(meeting_id, 0.0, SegmentChannel::Mic, "张宏伟", 0),
@@ -667,9 +713,14 @@ mod tests {
     #[test]
     fn none_boundary_ends_a_named_range_and_keeps_original_speaker() {
         let meeting_id = Uuid::new_v4();
-        let (speaker, mut segments) = cluster(meeting_id, "S1", &[(0.0, 30.0)], 0);
+        // Enough text to divide across the 15 s boundary (wordless path).
+        let speaker = Speaker::new(meeting_id, "S1");
         let original = speaker.id;
+        let mut seg = TranscriptSegment::new(meeting_id, 0, 0.0, 30.0, "话".repeat(30));
+        seg.speaker_id = Some(speaker.id);
+        seg.channel = Some(SegmentChannel::Mic);
         let mut speakers = vec![speaker];
+        let mut segments = vec![seg];
         let annotations = vec![
             boundary(meeting_id, 0.0, SegmentChannel::Mic, "张三", 0),
             none_boundary(meeting_id, 15.0, SegmentChannel::Mic, 1),
@@ -830,6 +881,119 @@ mod tests {
         assert!(segments[0].words.is_none());
         assert_eq!(name_of(&segments[0], &speakers).as_deref(), Some("张三"));
         assert_eq!(name_of(&segments[1], &speakers).as_deref(), Some("李四"));
+    }
+
+    /// A boundary exactly at a segment's start attributes the whole segment with
+    /// no split and no empty leading sliver.
+    #[test]
+    fn boundary_at_segment_start_attributes_whole_segment_without_empty_piece() {
+        let meeting_id = Uuid::new_v4();
+        let (speaker, mut segments) = cluster(meeting_id, "S1", &[(10.0, 20.0)], 0);
+        let mut speakers = vec![speaker];
+        let annotations = vec![boundary(meeting_id, 10.0, SegmentChannel::Mic, "张三", 0)];
+
+        let outcome = reconcile_annotations(
+            meeting_id,
+            &mut speakers,
+            &mut segments,
+            &annotations,
+            0.0,
+            0.0,
+        );
+
+        assert_eq!(outcome.split_segments, 0);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "…");
+        assert_eq!(segments[0].start_seconds, 10.0);
+        assert_eq!(segments[0].end_seconds, 20.0);
+        assert_eq!(name_of(&segments[0], &speakers).as_deref(), Some("张三"));
+    }
+
+    /// More boundaries than words: the word-run-out tail never emits a
+    /// zero-length or blank sub-segment, no word content is lost, and seq stays
+    /// dense and contiguous.
+    #[test]
+    fn more_boundaries_than_words_never_emit_empty_segments() {
+        let meeting_id = Uuid::new_v4();
+        let speaker = Speaker::new(meeting_id, "S1");
+        // Only two words, but four boundaries land inside the segment.
+        let mut segment = TranscriptSegment::new(meeting_id, 0, 0.0, 4.0, "甲乙");
+        segment.speaker_id = Some(speaker.id);
+        segment.channel = Some(SegmentChannel::Mic);
+        segment.words = Some(vec![Word::new("甲", 0.0, 1.0), Word::new("乙", 2.0, 3.0)]);
+        let mut speakers = vec![speaker];
+        let mut segments = vec![segment];
+        let annotations = vec![
+            boundary(meeting_id, 0.0, SegmentChannel::Mic, "A", 0),
+            boundary(meeting_id, 1.4, SegmentChannel::Mic, "B", 1),
+            boundary(meeting_id, 2.4, SegmentChannel::Mic, "C", 2),
+            boundary(meeting_id, 3.4, SegmentChannel::Mic, "D", 3),
+        ];
+
+        reconcile_annotations(
+            meeting_id,
+            &mut speakers,
+            &mut segments,
+            &annotations,
+            0.0,
+            0.0,
+        );
+
+        // No empty/zero-length sub-segment survived…
+        assert!(segments
+            .iter()
+            .all(|s| !s.text.trim().is_empty() && s.end_seconds > s.start_seconds));
+        // …no character content was lost…
+        let joined: String = segments.iter().map(|s| s.text.clone()).collect();
+        assert_eq!(joined, "甲乙");
+        // …the pieces stay contiguous and densely renumbered.
+        for pair in segments.windows(2) {
+            assert!((pair[0].end_seconds - pair[1].start_seconds).abs() < 1e-9);
+        }
+        assert_eq!(
+            segments.iter().map(|s| s.seq).collect::<Vec<_>>(),
+            (0..segments.len() as u32).collect::<Vec<_>>()
+        );
+    }
+
+    /// Wordless mode: a boundary whose proportional character index does not
+    /// advance yields a blank middle sliver — it is dropped, its time absorbed
+    /// into the previous piece, and no text is lost.
+    #[test]
+    fn wordless_blank_sliver_is_dropped_and_its_time_absorbed() {
+        let meeting_id = Uuid::new_v4();
+        let speaker = Speaker::new(meeting_id, "S1");
+        // 10 chars over [0,30]; two boundaries straddle the same char index.
+        let mut segment = TranscriptSegment::new(meeting_id, 0, 0.0, 30.0, "零一二三四五六七八九");
+        segment.speaker_id = Some(speaker.id);
+        segment.channel = Some(SegmentChannel::Mic);
+        let mut speakers = vec![speaker];
+        let mut segments = vec![segment];
+        // A[0,14.9] → 5 chars, B[14.9,15.1] → 0 chars (blank), C[15.1,30] → 5.
+        let annotations = vec![
+            boundary(meeting_id, 0.0, SegmentChannel::Mic, "A", 0),
+            boundary(meeting_id, 14.9, SegmentChannel::Mic, "B", 1),
+            boundary(meeting_id, 15.1, SegmentChannel::Mic, "C", 2),
+        ];
+
+        reconcile_annotations(
+            meeting_id,
+            &mut speakers,
+            &mut segments,
+            &annotations,
+            0.0,
+            0.0,
+        );
+
+        // The blank B sliver is gone; only the two non-blank pieces remain.
+        assert_eq!(segments.len(), 2);
+        assert!(segments.iter().all(|s| !s.text.trim().is_empty()));
+        assert_eq!(segments[0].text, "零一二三四");
+        assert_eq!(segments[1].text, "五六七八九");
+        // Contiguous with no gap: B's time was absorbed into A.
+        assert!((segments[0].end_seconds - segments[1].start_seconds).abs() < 1e-9);
+        assert_eq!(name_of(&segments[0], &speakers).as_deref(), Some("A"));
+        assert_eq!(name_of(&segments[1], &speakers).as_deref(), Some("C"));
     }
 
     /// The boundary's own precise time — lifted onto the unified timeline by the
