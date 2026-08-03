@@ -29,6 +29,7 @@ mod identify;
 mod merge;
 pub mod minutes;
 mod pipeline;
+mod preflight;
 mod process;
 mod unify;
 

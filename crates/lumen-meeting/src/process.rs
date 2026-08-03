@@ -213,6 +213,9 @@ async fn run(
     // bonus on top of a working mic recording, so a diarize/ASR failure here
     // degrades to the mic-only transcript with a warning instead of failing
     // the whole meeting.
+    // The system track's real (non-silence) failure, when it had one — kept so
+    // layer 3 below can surface it if the mic track also has nothing to say.
+    let mut system_track_error: Option<String> = None;
     let system_take = match system_wav {
         Some(sys) => match transcribe_track(sys, diar_models, asr_engine, opts).await {
             Ok((take, sys_embeddings, _sys_rate, sys_duration)) => {
@@ -220,7 +223,20 @@ async fn run(
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (a, b) => a.or(b),
                 };
-                Some((take, sys_embeddings))
+                if take.turns.is_empty() {
+                    // The silence preflight skipped the track (remote audio was
+                    // never played / stayed muted): fall back to the mic-only
+                    // merge instead of dragging an empty take through echo
+                    // suppression and cross-track unification.
+                    tracing::info!(
+                        meeting_id = %meeting_id,
+                        system_wav = %sys.display(),
+                        "system track produced no speech segments; continuing mic-only"
+                    );
+                    None
+                } else {
+                    Some((take, sys_embeddings))
+                }
             }
             Err(err) => {
                 tracing::warn!(
@@ -229,11 +245,34 @@ async fn run(
                     error = %err,
                     "system audio track failed to transcribe; continuing mic-only"
                 );
+                // Remember the *real* error (unwrapped from the ProcessError
+                // shell) for layer 3 below: if the mic track turns out to be
+                // silent, this — not a generic "no speech" — is the actionable
+                // failure reason.
+                system_track_error = Some(match &err {
+                    ProcessError::Transcribe(inner) => inner.to_string(),
+                    other => other.to_string(),
+                });
                 None
             }
         },
         None => None,
     };
+
+    // Layer 3 — only when *no* track carried any speech is the meeting failed.
+    // Plain reason: "no speech detected on any track". But when the system
+    // track failed for a *real* reason (not silence) and the mic track was
+    // silent, that swallowed error is the actionable one — surface it instead
+    // of hiding it behind the generic no-speech reason. (A mic-track real
+    // error already fails the meeting directly above, so it is never
+    // swallowed.) A silent track alone (either side) merely degrades to the
+    // other track's content.
+    if mic_take.turns.is_empty() && system_take.is_none() {
+        return Err(ProcessError::Transcribe(match system_track_error {
+            Some(reason) => MeetingError::SystemTrackFailed(reason),
+            None => MeetingError::NoSpeech,
+        }));
+    }
 
     // Cross-track echo duplicate suppression (config `meeting.echo_suppression`):
     // without headphones the remote voice plays through the loudspeaker and is

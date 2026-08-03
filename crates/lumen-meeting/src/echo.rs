@@ -617,6 +617,15 @@ pub(crate) fn write_diagnostics_sidecar(
 // (RIFF / PCM16 mono), decimated to 16 kHz. Every failure returns `None`.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Read a whole PCM16 **mono** WAV resampled to 16 kHz — the format both
+/// meeting recorders write. `None` on any parse/IO problem. Used by the
+/// non-diarizing `diarize_wav` stub's silence preflight (the macOS diarize
+/// path decodes through diar-rs instead, which also handles float/stereo).
+#[cfg_attr(all(target_os = "macos", feature = "diarize"), allow(dead_code))]
+pub(crate) fn read_full_wav_mono_16k(path: &Path) -> Option<Vec<f32>> {
+    read_wav_window_mono_16k(path, 0.0, f64::INFINITY)
+}
+
 /// Read `[start_s, start_s + duration_s)` from a PCM16 **mono** WAV and
 /// resample it to 16 kHz. `start_s` is clamped at 0 and the read is truncated
 /// at end-of-data; `None` on any parse/IO problem or an empty result — callers
