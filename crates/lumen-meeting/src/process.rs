@@ -123,7 +123,7 @@ pub fn reconcile_stored_annotations(
     mic_wav: &Path,
     identity_dir: Option<&Path>,
     speakers: &mut Vec<lumen_core::Speaker>,
-    segments: &mut [lumen_core::TranscriptSegment],
+    segments: &mut Vec<lumen_core::TranscriptSegment>,
 ) -> Result<crate::annotate::AnnotationReconciliation, anyhow::Error> {
     let annotations = store.list_live_annotations(meeting_id)?;
     if annotations.is_empty() {
@@ -143,10 +143,10 @@ pub fn reconcile_stored_annotations(
     tracing::info!(
         meeting_id = %meeting_id,
         annotations = annotations.len(),
-        renamed_clusters = outcome.renamed_speakers.len(),
         new_speakers = outcome.new_speakers.len(),
         reassigned_segments = outcome.reassigned_segments.len(),
-        "live speaker annotations reconciled (manual-first)"
+        split_segments = outcome.split_segments,
+        "live speaker annotations reconciled (timeline boundaries, manual-first)"
     );
     Ok(outcome)
 }

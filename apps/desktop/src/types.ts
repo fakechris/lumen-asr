@@ -489,20 +489,27 @@ export type EnrolledSpeaker = {
   sourceMeetingId?: string | null;
 };
 
-/** A recording-time "who is speaking" mark on a live caption line (serde
- * snake_case domain struct). Anchored to a time range on the meeting's unified
- * timeline + capture track; reconciled into speaker attribution after stop. */
+/** A recording-time speaker **boundary** on a live caption line (serde
+ * snake_case domain struct). Anchored to a precise time on the meeting's
+ * unified timeline + capture track; opens a range that runs until the next
+ * boundary on the same track. Reconciled into speaker attribution after stop
+ * (segments are split at the boundary times). */
 export type LiveAnnotation = {
   id: string;
   meeting_id: string;
+  /** Boundary time on the unified timeline; the range runs until the next
+   * boundary on this track. */
   start_seconds: number;
-  /** Absent when the live line had not finalized yet at annotate time. */
+  /** Retained for provenance only; not a range end in the timeline model. */
   end_seconds?: number | null;
   channel: "mic" | "system";
-  /** Enrolled identity id when picked from the library; null for typed names. */
+  /** Enrolled identity id when picked from the library; null for typed names
+   * and "无" boundaries. */
   identity_id?: string | null;
-  /** Name snapshot at annotate time. */
+  /** Name snapshot at annotate time; empty for a "无" boundary. */
   display_name: string;
+  /** A "无" boundary: from here on no manual speaker until the next boundary. */
+  unassigned?: boolean;
   created_at: string;
 };
 

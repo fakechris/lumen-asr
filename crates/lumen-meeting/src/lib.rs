@@ -33,10 +33,7 @@ mod preflight;
 mod process;
 mod unify;
 
-pub use annotate::{
-    reconcile_annotations, resolve_annotation_names, AnnotationReconciliation,
-    ANNOTATION_MIN_OVERLAP_RATIO,
-};
+pub use annotate::{reconcile_annotations, resolve_annotation_names, AnnotationReconciliation};
 pub use assemble::{
     assemble_meeting, assemble_meeting_with_channels, new_meeting, speaker_label,
     turn_sample_range, AssembledMeeting, DiarTurn,

@@ -766,83 +766,50 @@ const LIVE_TRACK_LABEL: Record<LiveEvent["track"], string> = {
   system: "远端",
 };
 
-// Front-end mirror of the reconciliation matching rules (annotate.rs). Used
-// only to label chips locally — the authoritative application happens offline
-// after stop.
+// Front-end mirror of the reconciliation model (annotate.rs, timeline
+// boundaries). Used only to label chips locally — the authoritative split +
+// attribution happens offline after stop.
 //
-// A closed annotation (仅此句) covers a line when their overlap reaches 50%
-// of the line's span OR of the annotation's own span (symmetric — matches the
-// backend rule that survives diarization merging lines into longer turns).
-function closedAnnotationCoversLine(
-  a: LiveAnnotation,
-  seg: LiveEvent,
-): boolean {
-  if (a.channel !== seg.track || a.end_seconds == null) return false;
-  const start = seg.startSeconds;
-  const end = seg.endSeconds ?? seg.startSeconds;
-  const length = end - start;
-  if (!(length > 0)) return false;
-  const overlap =
-    Math.min(a.end_seconds, end) - Math.max(a.start_seconds, start);
-  if (!(overlap > 0)) return false;
-  const aLength = a.end_seconds - a.start_seconds;
-  return overlap / length >= 0.5 || (aLength > 0 && overlap / aLength >= 0.5);
-}
-
-/** The annotation currently labeling a live line, if any. A closed annotation
- * covering the line wins (newest first); otherwise the line inherits the
- * open-ended (此句及之后) annotation with the greatest start at or before it
- * on the same track — i.e. "this person speaks from here until the next
- * open-ended mark". */
-function annotationForLine(
+// Every annotation is a boundary at its `start_seconds` opening a range that
+// runs until the next boundary on the same track. A line is governed by the
+// boundary with the greatest start at/before the line's start (newest wins on
+// ties) — mirrors the offline `governing_outcome`.
+function boundaryForLine(
   annotations: LiveAnnotation[],
   seg: LiveEvent,
 ): LiveAnnotation | null {
-  let closed: LiveAnnotation | null = null;
+  let best: LiveAnnotation | null = null;
   for (const a of annotations) {
-    if (!closedAnnotationCoversLine(a, seg)) continue;
-    if (!closed || a.created_at >= closed.created_at) closed = a;
-  }
-  if (closed) return closed;
-  const end = seg.endSeconds ?? seg.startSeconds;
-  let open: LiveAnnotation | null = null;
-  for (const a of annotations) {
-    if (a.channel !== seg.track || a.end_seconds != null) continue;
-    if (a.start_seconds > end) continue;
+    if (a.channel !== seg.track) continue;
+    if (a.start_seconds > seg.startSeconds + 1e-9) continue;
     if (
-      !open ||
-      a.start_seconds > open.start_seconds ||
-      (a.start_seconds === open.start_seconds &&
-        a.created_at >= open.created_at)
+      !best ||
+      a.start_seconds > best.start_seconds ||
+      (a.start_seconds === best.start_seconds &&
+        a.created_at >= best.created_at)
     ) {
-      open = a;
+      best = a;
     }
   }
-  return open;
+  return best;
 }
 
-/** The annotations anchored ON this line (for 清除): closed ones covering it
- * plus open-ended ones whose start falls inside it. Inherited open ranges
- * from earlier lines are excluded — clearing a line must not silently strip
- * a mark the user made elsewhere; clearing an open annotation's own line
- * removes its whole onward range, which is the intent there. */
-function annotationsAnchoredOnLine(
+/** Boundaries anchored ON this line (for 清除): same track, start within the
+ * line's span. Clearing removes the boundary marks the user made on this line
+ * (an inherited range from an earlier line is cleared on its own line). */
+function boundariesAnchoredOnLine(
   annotations: LiveAnnotation[],
   seg: LiveEvent,
 ): LiveAnnotation[] {
   const start = seg.startSeconds;
   const end = seg.endSeconds ?? seg.startSeconds;
-  return annotations.filter((a) => {
-    if (a.channel !== seg.track) return false;
-    if (a.end_seconds == null) {
-      return a.start_seconds >= start && a.start_seconds <= end;
-    }
-    return closedAnnotationCoversLine(a, seg);
-  });
+  return annotations.filter(
+    (a) =>
+      a.channel === seg.track &&
+      a.start_seconds >= start - 1e-9 &&
+      a.start_seconds <= end + 1e-9,
+  );
 }
-
-/** Scope of a new annotation: this line only, or from this line onward. */
-type AnnotateScope = "onward" | "line";
 
 function LiveTranscript({
   meetingId,
@@ -879,8 +846,6 @@ function LiveTranscript({
     top?: number;
     bottom?: number;
   } | null>(null);
-  // "此句及之后" (default: consecutive speech is the common case) vs 仅此句.
-  const [scope, setScope] = useState<AnnotateScope>("onward");
   const [customFor, setCustomFor] = useState<string | null>(null);
   const [customName, setCustomName] = useState("");
 
@@ -915,7 +880,6 @@ function LiveTranscript({
   const closeMenus = useCallback(() => {
     setMenuFor(null);
     setMenuPos(null);
-    setScope("onward");
     setCustomFor(null);
     setCustomName("");
   }, []);
@@ -924,7 +888,7 @@ function LiveTranscript({
    * rect: downward by default, upward only when the space below is tight. */
   const openMenu = useCallback((seg: LiveEvent, chip: HTMLElement) => {
     const rect = chip.getBoundingClientRect();
-    // Generous estimate of the tallest menu (scope row + names + input).
+    // Generous estimate of the tallest menu (names + input + 无 + clear).
     const estimatedHeight = 260;
     const spaceBelow = window.innerHeight - rect.bottom;
     const openDown = spaceBelow >= estimatedHeight || spaceBelow >= rect.top;
@@ -938,32 +902,50 @@ function LiveTranscript({
         ? { left, top: rect.bottom + 4 }
         : { left, bottom: window.innerHeight - rect.top + 4 },
     );
-    setScope("onward");
     setCustomFor(null);
     setCustomName("");
   }, []);
+
+  // Esc or a click outside the open menu closes it without submitting. (The
+  // custom-name input handles its own Esc to cancel just the input.)
+  useEffect(() => {
+    if (menuFor === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeMenus();
+    };
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && target.closest(".meeting-live-annotate")) return;
+      closeMenus();
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown, true);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown, true);
+    };
+  }, [menuFor, closeMenus]);
 
   const annotate = useCallback(
     async (
       seg: LiveEvent,
       displayName: string,
-      annotateScope: AnnotateScope,
-      identityId?: string,
+      opts?: { identityId?: string; unassigned?: boolean },
     ) => {
       closeMenus();
       try {
+        // Every mark is a boundary at the line's start: it holds from here
+        // until the next boundary on the track (see `boundaryForLine`). A "无"
+        // boundary carries no speaker (unassigned).
         const row = await api.annotateLiveSegment({
           meetingId,
           segmentId: seg.segmentId,
           startSeconds: seg.startSeconds,
-          // "此句及之后" stores an open-ended annotation (no end): it holds
-          // from this line's start until the next open-ended mark on the
-          // track — later lines inherit it (see `annotationForLine`).
-          endSeconds:
-            annotateScope === "line" ? (seg.endSeconds ?? null) : null,
+          endSeconds: null,
           channel: seg.track,
-          identityId: identityId ?? null,
+          identityId: opts?.identityId ?? null,
           displayName,
+          unassigned: opts?.unassigned ?? false,
         });
         // The chip shows the name immediately from local state — no backend
         // event round trip.
@@ -978,10 +960,10 @@ function LiveTranscript({
   const clearAnnotation = useCallback(
     async (seg: LiveEvent) => {
       closeMenus();
-      // Remove every annotation anchored on this line, so an older mark
-      // cannot resurface at reconciliation time. Open-ended ranges inherited
-      // from earlier lines are left alone (clear them on their own line).
-      const covering = annotationsAnchoredOnLine(annotations, seg);
+      // Remove every boundary anchored on this line, so an older mark cannot
+      // resurface at reconciliation time. Ranges inherited from earlier lines
+      // are left alone (clear them on their own line).
+      const covering = boundariesAnchoredOnLine(annotations, seg);
       const results = await Promise.allSettled(
         covering.map((a) => api.deleteLiveAnnotation(a.id)),
       );
@@ -1056,6 +1038,15 @@ function LiveTranscript({
     if (el) el.scrollTop = el.scrollHeight;
   }, [ordered, menuFor]);
 
+  // "我" is the self identity surfaced as its own menu entry; the remaining
+  // enrolled identities fill the list below it (self excluded to avoid a dup).
+  const selfSpeaker = selfIdentityId
+    ? identities.find((p) => p.id === selfIdentityId)
+    : undefined;
+  const otherIdentities = selfIdentityId
+    ? identities.filter((p) => p.id !== selfIdentityId)
+    : identities;
+
   return (
     <div className="meeting-live" aria-live="polite">
       <div className="meeting-live-head">
@@ -1075,22 +1066,33 @@ function LiveTranscript({
         {active ? (
           <div className="meeting-live-text">
             {ordered.map((seg) => {
-              const named = seg.isFinal
-                ? annotationForLine(annotations, seg)
+              // The boundary governing this line (timeline model): a named
+              // boundary labels the chip; a "无" boundary shows "未指定".
+              const boundary = seg.isFinal
+                ? boundaryForLine(annotations, seg)
                 : null;
-              // Chip display priority: manual annotation (L2, including an
-              // inherited open-ended range) > voiceprint attribution (L3,
-              // "我" when it is the self identity, "?" when provisional) >
-              // the bare 标注 affordance.
-              const voiceprint = named ? null : (seg.speaker ?? null);
+              const namedBoundary =
+                boundary && !boundary.unassigned ? boundary : null;
+              const unassignedBoundary =
+                boundary && boundary.unassigned ? boundary : null;
+              // Chip display priority: manual boundary (L2) > voiceprint
+              // attribution (L3, "我" when it is the self identity, "?" when
+              // provisional) > the bare 标注 affordance. A "无" boundary
+              // suppresses the voiceprint guess and shows "未指定".
+              const voiceprint = boundary ? null : (seg.speaker ?? null);
               const voiceprintName = voiceprint
                 ? (voiceprint.identityId === selfIdentityId
                     ? "我"
                     : voiceprint.displayName) +
                   (voiceprint.provisional ? "?" : "")
                 : null;
+              const chipLabel = namedBoundary
+                ? namedBoundary.display_name
+                : unassignedBoundary
+                  ? "未指定"
+                  : (voiceprintName ?? "标注");
               const anchored = seg.isFinal
-                ? annotationsAnchoredOnLine(annotations, seg)
+                ? boundariesAnchoredOnLine(annotations, seg)
                 : [];
               return (
                 <p
@@ -1110,19 +1112,21 @@ function LiveTranscript({
                       <button
                         type="button"
                         className={`meeting-live-chip${
-                          named
+                          namedBoundary
                             ? " named"
-                            : voiceprint
-                              ? ` voiceprint${voiceprint.provisional ? " provisional" : ""}`
-                              : ""
+                            : unassignedBoundary
+                              ? " unassigned"
+                              : voiceprint
+                                ? ` voiceprint${voiceprint.provisional ? " provisional" : ""}`
+                                : ""
                         }`}
-                        title="标注这句话是谁在说"
+                        title="标注这句话是谁在说（此句及之后）"
                         onClick={(e) => {
                           if (menuFor === seg.segmentId) closeMenus();
                           else openMenu(seg, e.currentTarget);
                         }}
                       >
-                        {named ? named.display_name : (voiceprintName ?? "标注")}
+                        {chipLabel}
                       </button>
                       {menuFor === seg.segmentId && menuPos && (
                         <span
@@ -1134,36 +1138,24 @@ function LiveTranscript({
                             bottom: menuPos.bottom,
                           }}
                         >
-                          <span
-                            className="meeting-live-annotate-scope"
-                            role="radiogroup"
-                            aria-label="标注范围"
-                          >
+                          {selfSpeaker && (
                             <button
                               type="button"
-                              role="radio"
-                              aria-checked={scope === "onward"}
-                              className={scope === "onward" ? "active" : ""}
-                              onClick={() => setScope("onward")}
+                              onClick={() =>
+                                void annotate(seg, selfSpeaker.name, {
+                                  identityId: selfSpeaker.id,
+                                })
+                              }
                             >
-                              此句及之后
+                              我
                             </button>
-                            <button
-                              type="button"
-                              role="radio"
-                              aria-checked={scope === "line"}
-                              className={scope === "line" ? "active" : ""}
-                              onClick={() => setScope("line")}
-                            >
-                              仅此句
-                            </button>
-                          </span>
-                          {identities.map((p) => (
+                          )}
+                          {otherIdentities.map((p) => (
                             <button
                               key={p.id}
                               type="button"
                               onClick={() =>
-                                void annotate(seg, p.name, scope, p.id)
+                                void annotate(seg, p.name, { identityId: p.id })
                               }
                             >
                               {p.name}
@@ -1178,8 +1170,10 @@ function LiveTranscript({
                               onChange={(e) => setCustomName(e.target.value)}
                               onKeyDown={(e) => {
                                 if (e.key === "Enter" && customName.trim()) {
-                                  void annotate(seg, customName.trim(), scope);
+                                  void annotate(seg, customName.trim());
                                 } else if (e.key === "Escape") {
+                                  // Cancel just the input, not the whole menu.
+                                  e.stopPropagation();
                                   setCustomFor(null);
                                   setCustomName("");
                                 }
@@ -1193,6 +1187,14 @@ function LiveTranscript({
                               自定义名字…
                             </button>
                           )}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void annotate(seg, "", { unassigned: true })
+                            }
+                          >
+                            无（之后无人）
+                          </button>
                           {anchored.length > 0 && (
                             <button
                               type="button"

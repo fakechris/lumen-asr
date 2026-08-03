@@ -3391,15 +3391,12 @@ button.meeting-seg-text.seekable:hover {
   font: inherit;
   font-size: 0.68rem;
   line-height: 1.5;
+  /* A muted-but-legible token (not a further-dimmed color): the resting
+   * affordance stays readable and firms to full strength on hover/focus. */
   color: var(--text-muted, #8a8a8a);
-  opacity: 0.55;
+  opacity: 0.75;
   cursor: pointer;
   vertical-align: 1px;
-}
-
-.meeting-live-chip:hover {
-  opacity: 1;
-  border-color: var(--border);
 }
 
 .meeting-live-chip.named {
@@ -3407,6 +3404,15 @@ button.meeting-seg-text.seekable:hover {
   border-color: var(--border);
   color: var(--accent, #4a7dbd);
   background: var(--accent-dim, transparent);
+}
+
+/* A "无" boundary governs this line: the user marked "no one from here on",
+ * so the chip reads "未指定". Muted *token* at full opacity (legible contrast),
+ * with a border so the stateful label is distinguishable from the affordance. */
+.meeting-live-chip.unassigned {
+  opacity: 1;
+  color: var(--muted);
+  border-color: var(--border);
 }
 
 /* Voiceprint attribution (L3): auto-verified reads like a confirmed name;
@@ -3418,8 +3424,18 @@ button.meeting-seg-text.seekable:hover {
 }
 
 .meeting-live-chip.voiceprint.provisional {
-  opacity: 0.6;
+  opacity: 0.8;
   color: var(--muted);
+}
+
+/* Hover and keyboard focus both firm the chip to full contrast so the label is
+ * legible and the DS :focus-visible ring reads clearly. Declared last so it
+ * wins over the equal-specificity variant rules above (e.g. `.unassigned`,
+ * `.provisional`) — otherwise a muted variant would never firm on interaction. */
+.meeting-live-chip:hover,
+.meeting-live-chip:focus-visible {
+  opacity: 1;
+  border-color: var(--border);
 }
 
 /* Positioned `fixed` from the chip's viewport rect at open time (inline
@@ -3440,29 +3456,6 @@ button.meeting-seg-text.seekable:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
-}
-
-/* Scope choice row (P3): 此句及之后 (default, consecutive-speech case) vs
- * 仅此句. Rendered as a compact segmented pair above the name list. */
-.meeting-live-annotate-scope {
-  display: flex;
-  gap: 3px;
-  padding: 2px;
-  margin-bottom: 3px;
-  border-bottom: 1px solid var(--border);
-}
-
-.meeting-live-annotate-scope button {
-  flex: 1;
-  text-align: center;
-  font-size: 0.74rem;
-  padding: 4px 6px;
-  color: var(--text-muted, #8a8a8a);
-}
-
-.meeting-live-annotate-scope button.active {
-  color: var(--accent, #4a7dbd);
-  background: color-mix(in srgb, var(--accent, #4a7dbd) 12%, transparent);
 }
 
 .meeting-live-annotate-menu button {
