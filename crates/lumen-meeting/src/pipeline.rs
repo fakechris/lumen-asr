@@ -118,6 +118,12 @@ pub enum MeetingError {
     /// internal pipeline error.
     #[error("no speech detected on any track")]
     NoSpeech,
+    /// The mic track carried no speech and the system track failed outright
+    /// (a real error, not silence). The system track's original error is
+    /// surfaced — a bare "no speech" would hide the actionable cause of the
+    /// only track that might have had content.
+    #[error("system track failed: {0}; mic track: no speech")]
+    SystemTrackFailed(String),
     /// A per-turn ASR call failed.
     #[error("asr failed: {0}")]
     Asr(#[source] AsrError),

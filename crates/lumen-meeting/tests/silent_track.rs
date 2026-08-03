@@ -146,6 +146,53 @@ async fn mic_only_silent_fails_with_explicit_reason() {
         .contains("no speech detected on any track"));
 }
 
+/// Silent mic + a system track that fails for a REAL reason (unreadable file,
+/// not silence): the meeting fails with the system track's actual error in the
+/// reason — not the generic "no speech detected on any track", which would
+/// hide the actionable cause of the only track that might have had content.
+/// Runs on every build: an unreadable wav is a real diarize/unsupported error
+/// under either `diarize_wav` flavor.
+#[tokio::test]
+async fn silent_mic_with_failing_system_track_surfaces_the_real_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mic = dir.path().join("mic.wav");
+    write_wav(&mic, &silent(15.0, 44_100), 44_100);
+    // Not a WAV at all → the system track errors before any silence check.
+    let sys = dir.path().join("system.wav");
+    std::fs::write(&sys, b"this is not a riff wave file").unwrap();
+    let (store, meeting_id) = open_meeting(dir.path());
+    let engine = StubAsr::new("unused");
+
+    let result = process_meeting(
+        &store,
+        meeting_id,
+        &mic,
+        Some(&sys),
+        &DiarModels::under_root(dir.path().join("no-models")),
+        &engine,
+        None,
+        &MeetingOptions::default(),
+    )
+    .await;
+
+    assert!(result.is_err());
+    let after = store.get_meeting(meeting_id).unwrap().unwrap();
+    assert_eq!(after.status, MeetingStatus::Failed);
+    let reason = after.failure_reason.unwrap_or_default();
+    assert!(
+        reason.contains("system track failed:"),
+        "reason must carry the system track's real error, got: {reason}"
+    );
+    assert!(
+        reason.contains("mic track: no speech"),
+        "reason should note the silent mic too, got: {reason}"
+    );
+    assert!(
+        !reason.contains("no speech detected on any track"),
+        "generic no-speech reason must not mask the real error, got: {reason}"
+    );
+}
+
 /// A track with clear speech but faint background hiss elsewhere must NOT be
 /// mistaken for silent by the preflight — on a non-diarizing build the voiced
 /// mic track still reaches (and is rejected by) the diarization gate, proving
