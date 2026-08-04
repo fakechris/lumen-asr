@@ -79,6 +79,11 @@ downloads. **Free code signing provided by
 [SignPath Foundation](https://signpath.org/).** Until acceptance and workflow
 integration, Windows assets are clearly identified as unsigned.
 
+Windows developers can create a free self-signed MSIX for local testing. This
+requires explicitly trusting the local development certificate and does not
+replace Store or SignPath signing. See
+[docs/WINDOWS_LOCAL_SIGNING.md](./docs/WINDOWS_LOCAL_SIGNING.md).
+
 To build locally instead:
 
 ```bash
@@ -288,6 +293,10 @@ x86 安装包。macOS 首次启动需要前往
 [SignPath.io](https://signpath.io/) 提供，证书由
 [SignPath Foundation](https://signpath.org/) 提供。获批并接入流水线前，
 Windows 下载会明确标记为未签名。
+
+Windows 开发者可以为本机测试免费创建自签名 MSIX；该流程需要显式信任
+本地开发证书，不能替代 Store 或 SignPath 的正式签名。详见
+[docs/WINDOWS_LOCAL_SIGNING.md](./docs/WINDOWS_LOCAL_SIGNING.md)。
 
 如需从源码构建：
 
