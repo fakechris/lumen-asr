@@ -767,6 +767,52 @@ const LIVE_TRACK_LABEL: Record<LiveEvent["track"], string> = {
   system: "远端",
 };
 
+/** Payload of `meeting-processing-progress`: which offline-pipeline stage a
+ * recorded meeting is on, its per-stage sub-progress (for the loop-heavy
+ * transcribe/cleanup stages), and an overall percent. Emitted by the backend
+ * ([`process_meeting`]) at each stage boundary and, throttled, inside the loops. */
+type ProcessingProgress = {
+  meetingId: string;
+  stage: string;
+  track: "mic" | "system" | null;
+  stageIndex: number;
+  stageTotal: number;
+  done: number;
+  total: number;
+  stagePercent: number | null;
+  overallPercent: number;
+};
+
+/** Friendly Chinese label per pipeline stage. */
+const PROCESSING_STAGE_LABEL: Record<string, string> = {
+  diarize: "正在分离说话人",
+  voiceprint: "正在提取声纹",
+  transcribe: "正在识别语音",
+  correct: "正在校正词典",
+  cleanup: "正在用 AI 清洗逐字稿",
+  identify: "正在识别说话人身份",
+  unify: "正在合并跨轨说话人",
+  minutes: "正在生成会议纪要",
+};
+
+const PROCESSING_TRACK_LABEL: Record<string, string> = {
+  mic: "本机音轨",
+  system: "系统音轨",
+};
+
+/** Compose the one-line progress headline, e.g. "正在识别语音 3/12 段（系统音轨）". */
+function processingStageText(p: ProcessingProgress): string {
+  let text = PROCESSING_STAGE_LABEL[p.stage] ?? "正在处理";
+  // The loop-heavy stages carry an item count worth surfacing.
+  if (p.total > 0 && (p.stage === "transcribe" || p.stage === "cleanup")) {
+    text += ` ${p.done}/${p.total} 段`;
+  }
+  if (p.track && PROCESSING_TRACK_LABEL[p.track]) {
+    text += `（${PROCESSING_TRACK_LABEL[p.track]}）`;
+  }
+  return text;
+}
+
 /** One quick-pick entry in the annotate menu: a name the user can apply with a
  * single click. Merged + deduped from the enrolled identity library and every
  * name already used this meeting (see the `candidates` builder). */
@@ -1801,6 +1847,35 @@ function MeetingDetailView({
     return () => window.clearInterval(id);
   }, [status, load]);
 
+  // Granular offline-processing progress (stage + per-stage percent + overall).
+  // The backend streams `meeting-processing-progress` while a recorded meeting
+  // runs through the pipeline; we keep the latest one for this meeting.
+  const [progress, setProgress] = useState<ProcessingProgress | null>(null);
+  // Reset on meeting switch (this component instance is reused across meetings).
+  useEffect(() => {
+    setProgress(null);
+  }, [meetingId]);
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void listen<ProcessingProgress>("meeting-processing-progress", (e) => {
+      if (e.payload.meetingId !== meetingId) return;
+      setProgress(e.payload);
+    }).then((fn) => {
+      if (active) unlisten = fn;
+      else fn();
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [meetingId]);
+  // Once the meeting reaches a terminal state, drop the progress so the detail
+  // page shows the final content (or an empty/failed note) instead of a bar.
+  useEffect(() => {
+    if (status && !isInProgress(status)) setProgress(null);
+  }, [status]);
+
   const minutes = useMemo(
     () => (detail ? parseMinutes(detail) : null),
     [detail],
@@ -2084,6 +2159,7 @@ function MeetingDetailView({
               jump={jump}
               currentTime={currentTime}
               playable={audioSrc != null}
+              progress={progress}
               onSeek={seekTo}
               onSegmentEdited={applySegmentText}
               onError={onError}
@@ -2160,9 +2236,12 @@ function FailureNote({
 function StatusNote({
   detail,
   kind,
+  progress,
 }: {
   detail: MeetingDetail;
   kind: "summary" | "transcript";
+  /** Live offline-processing progress; drives the granular stage view when set. */
+  progress?: ProcessingProgress | null;
 }) {
   const status = detail.meeting.status;
   if (status === "failed") {
@@ -2178,6 +2257,35 @@ function StatusNote({
           <p className="muted-text">
             这场会议没有可用的{kind === "summary" ? "结构化纪要" : "逐字稿内容"}。
           </p>
+        </div>
+      </div>
+    );
+  }
+  // Granular processing view: when the backend has told us which stage we are
+  // on, show the friendly stage name + this stage's percent + an overall bar,
+  // instead of the bare "离线转录进行中".
+  if (progress) {
+    const stagePct =
+      progress.stagePercent != null ? Math.round(progress.stagePercent) : null;
+    const overallPct = Math.min(100, Math.max(0, Math.round(progress.overallPercent)));
+    return (
+      <div className="meeting-statusnote">
+        <span className="mtg-spinner big" aria-hidden />
+        <div className="meeting-progress">
+          <strong>{processingStageText(progress)}</strong>
+          <div className="meeting-model-progress">
+            <div className="meeting-model-bar" aria-hidden>
+              <div
+                className="meeting-model-bar-fill"
+                style={{ width: `${overallPct}%` }}
+              />
+            </div>
+            <span className="muted-text meeting-model-progress-text">
+              {`第 ${progress.stageIndex}/${progress.stageTotal} 步`}
+              {stagePct != null ? ` · 本步 ${stagePct}%` : ""}
+              {` · 总进度 ${overallPct}%`}
+            </span>
+          </div>
         </div>
       </div>
     );
@@ -3086,6 +3194,7 @@ function TranscriptView({
   jump,
   currentTime,
   playable,
+  progress,
   onSeek,
   onSegmentEdited,
   onError,
@@ -3096,6 +3205,8 @@ function TranscriptView({
   currentTime: number;
   /** Whether an audio player is available (ready meeting with a recording). */
   playable: boolean;
+  /** Latest offline-processing progress for this meeting, when in progress. */
+  progress: ProcessingProgress | null;
   onSeek: (seconds: number) => void;
   onSegmentEdited: (segmentId: string, text: string) => void;
   onError: (e: string | null) => void;
@@ -3163,7 +3274,7 @@ function TranscriptView({
   if (turns.length === 0) {
     return (
       <div className="card meeting-empty">
-        <StatusNote detail={detail} kind="transcript" />
+        <StatusNote detail={detail} kind="transcript" progress={progress} />
       </div>
     );
   }

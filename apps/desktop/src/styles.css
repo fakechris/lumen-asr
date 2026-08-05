@@ -3093,6 +3093,16 @@ button.meeting-index-item:hover {
   color: var(--error);
 }
 
+/* granular offline-processing progress inside the status note */
+.meeting-statusnote .meeting-progress {
+  flex: 1;
+  min-width: 0;
+}
+
+.meeting-statusnote .meeting-progress .meeting-model-progress {
+  margin-top: 6px;
+}
+
 .meeting-statusnote p {
   margin: 4px 0 0;
 }

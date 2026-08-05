@@ -34,6 +34,9 @@ use crate::minutes::{
     generate_minutes, minutes_summaries, render_transcript_for_minutes, MinutesError,
 };
 use crate::pipeline::{diarize_wav, transcribe_turn, DiarModels, MeetingError, MeetingOptions};
+use crate::progress::{
+    ProcessingPlan, ProcessingProgress, ProcessingStage, ProcessingTrack, ProgressReporter,
+};
 
 /// Failure of [`process_meeting`]. Whichever step fails, the meeting is left in
 /// [`MeetingStatus::Failed`].
@@ -74,6 +77,12 @@ pub struct MinutesConfig<'a> {
 /// per-segment channel ("mic"/"system"). A failure on the **system** track is
 /// downgraded to a warning — the meeting still completes from the mic track
 /// alone. Passing `None` is byte-for-byte the legacy single-track pipeline.
+///
+/// `progress`, when supplied, is called at every pipeline stage boundary and,
+/// within the loop-heavy `transcribe`/`cleanup` stages, at a throttled cadence
+/// (see [`ProgressReporter`]) — the desktop app turns each
+/// [`ProcessingProgress`] into a `meeting-processing-progress` Tauri event.
+/// `None` runs the pipeline exactly as before (no observability overhead).
 #[allow(clippy::too_many_arguments)]
 pub async fn process_meeting(
     store: &Store,
@@ -84,6 +93,7 @@ pub async fn process_meeting(
     asr_engine: &dyn AsrEngine,
     minutes: Option<&MinutesConfig<'_>>,
     opts: &MeetingOptions,
+    progress: Option<&dyn Fn(ProcessingProgress)>,
 ) -> Result<(), ProcessError> {
     let result = run(
         store,
@@ -94,6 +104,7 @@ pub async fn process_meeting(
         asr_engine,
         minutes,
         opts,
+        progress,
     )
     .await;
     if let Err(err) = &result {
@@ -160,8 +171,20 @@ async fn transcribe_track(
     diar_models: &DiarModels,
     asr_engine: &dyn AsrEngine,
     opts: &MeetingOptions,
+    reporter: Option<&ProgressReporter<'_>>,
+    track: ProcessingTrack,
 ) -> Result<(TrackTake, BTreeMap<u32, Vec<f32>>, u32, Option<f64>), ProcessError> {
+    // Diarization (segmentation + per-speaker centroid voiceprints, both inside
+    // `diarize_wav`): a single slow stage with no natural sub-progress. Report
+    // it entering, then report `voiceprint` once its embeddings are ready — the
+    // two ticks give the bar some movement before the per-turn ASR loop begins.
+    if let Some(reporter) = reporter {
+        reporter.stage_start(ProcessingStage::Diarize, Some(track));
+    }
     let diar = diarize_wav(wav, diar_models, opts)?;
+    if let Some(reporter) = reporter {
+        reporter.stage_start(ProcessingStage::Voiceprint, Some(track));
+    }
     let sample_rate = diar.sample_rate;
     let duration = (sample_rate > 0).then(|| diar.samples.len() as f64 / sample_rate as f64);
 
@@ -170,11 +193,20 @@ async fn transcribe_track(
         texts: Vec::with_capacity(diar.turns.len()),
         words: Vec::with_capacity(diar.turns.len()),
     };
-    for turn in &diar.turns {
+    // Per-turn ASR — the loop-heavy stage. Report entering it, then tick once
+    // per finished turn (throttled) so a long meeting shows "识别 i/N".
+    let total_turns = diar.turns.len();
+    if let Some(reporter) = reporter {
+        reporter.stage_start(ProcessingStage::Transcribe, Some(track));
+    }
+    for (i, turn) in diar.turns.iter().enumerate() {
         let (text, turn_words) =
             transcribe_turn(asr_engine, &diar.samples, sample_rate, turn, opts).await?;
         take.texts.push(text);
         take.words.push(turn_words);
+        if let Some(reporter) = reporter {
+            reporter.tick(ProcessingStage::Transcribe, Some(track), i + 1, total_turns);
+        }
     }
     Ok((take, diar.speaker_embeddings, sample_rate, duration))
 }
@@ -189,7 +221,23 @@ async fn run(
     asr_engine: &dyn AsrEngine,
     minutes: Option<&MinutesConfig<'_>>,
     opts: &MeetingOptions,
+    progress: Option<&dyn Fn(ProcessingProgress)>,
 ) -> Result<(), ProcessError> {
+    // Fix the progress plan up front so the overall percent has a stable
+    // denominator: which optional stages run is known here (dual track from the
+    // presence of a system wav; cleanup from the same gate the stage uses below;
+    // minutes from an LLM being configured). The reporter is absent when no sink
+    // was supplied — the pipeline then runs with zero observability overhead.
+    let reporter = progress.map(|sink| {
+        let plan = ProcessingPlan {
+            dual_track: system_wav.is_some(),
+            cleanup: crate::cleanup::should_cleanup(opts.cleanup_transcript, minutes.is_some()),
+            minutes: minutes.is_some(),
+        };
+        ProgressReporter::new(plan, sink)
+    });
+    let reporter = reporter.as_ref();
+
     // ── transcribing ────────────────────────────────────────────────
     store
         .update_meeting_status(meeting_id, MeetingStatus::Transcribing)
@@ -197,8 +245,15 @@ async fn run(
 
     // Mic track: authoritative — any failure here fails the meeting, exactly
     // as before dual-track existed.
-    let (mic_take, mic_embeddings, sample_rate, mut duration) =
-        transcribe_track(wav, diar_models, asr_engine, opts).await?;
+    let (mic_take, mic_embeddings, sample_rate, mut duration) = transcribe_track(
+        wav,
+        diar_models,
+        asr_engine,
+        opts,
+        reporter,
+        ProcessingTrack::Mic,
+    )
+    .await?;
 
     // Per-speaker centroid voiceprints across both tracks, keyed by the
     // *merged* engine speaker id space: mic ids stay as-is; system ids are
@@ -217,7 +272,16 @@ async fn run(
     // layer 3 below can surface it if the mic track also has nothing to say.
     let mut system_track_error: Option<String> = None;
     let system_take = match system_wav {
-        Some(sys) => match transcribe_track(sys, diar_models, asr_engine, opts).await {
+        Some(sys) => match transcribe_track(
+            sys,
+            diar_models,
+            asr_engine,
+            opts,
+            reporter,
+            ProcessingTrack::System,
+        )
+        .await
+        {
             Ok((take, sys_embeddings, _sys_rate, sys_duration)) => {
                 duration = match (duration, sys_duration) {
                     (Some(a), Some(b)) => Some(a.max(b)),
@@ -385,6 +449,9 @@ async fn run(
     // corrected text. Engine-agnostic (runs for Paraformer and SenseVoice) and
     // cross-platform; a no-op when the dictionary is empty. Word-level timings are
     // preserved (see `correct_words`).
+    if let Some(reporter) = reporter {
+        reporter.stage_start(ProcessingStage::Correct, None);
+    }
     if !opts.correction.is_empty() {
         for text in &mut texts {
             *text = correct_segment(text, &opts.correction);
@@ -406,7 +473,25 @@ async fn run(
     // (beta trade-off, see `cleanup`), so click-to-seek is unaffected.
     if crate::cleanup::should_cleanup(opts.cleanup_transcript, minutes.is_some()) {
         if let Some(cfg) = minutes {
-            let stats = crate::cleanup::cleanup_transcript(cfg.corrector, &mut texts, None).await;
+            if let Some(reporter) = reporter {
+                reporter.stage_start(ProcessingStage::Cleanup, None);
+            }
+            // Per-chunk progress: the cleanup loop calls this back with
+            // `(chunk_done, chunk_total)`, which the reporter throttles like the
+            // per-turn ASR ticks.
+            let chunk_progress = reporter.map(|reporter| {
+                move |done: usize, total: usize| {
+                    reporter.tick(ProcessingStage::Cleanup, None, done, total);
+                }
+            });
+            let chunk_progress_ref = chunk_progress.as_ref().map(|f| f as &dyn Fn(usize, usize));
+            let stats = crate::cleanup::cleanup_transcript(
+                cfg.corrector,
+                &mut texts,
+                None,
+                chunk_progress_ref,
+            )
+            .await;
             tracing::info!(
                 meeting_id = %meeting_id,
                 chunks = stats.chunks,
@@ -434,6 +519,9 @@ async fn run(
     // speakers with too little voiced audio (`IDENTIFY_MIN_VOICED_MS`; the
     // merged turns share the merged engine-id space with `speaker_embeddings`).
     // No-op when `opts.identity_dir` is unset or no embeddings were produced.
+    if let Some(reporter) = reporter {
+        reporter.stage_start(ProcessingStage::Identify, None);
+    }
     let voiced_ms = crate::identify::speaker_voiced_ms(&turns);
     crate::identify::apply_auto_identification(
         &mut assembled.speakers,
@@ -478,6 +566,9 @@ async fn run(
         _ => Vec::new(),
     };
     if system_speaker_id_offset.is_some() {
+        if let Some(reporter) = reporter {
+            reporter.stage_start(ProcessingStage::Unify, None);
+        }
         let unified = crate::unify::unify_cross_track_speakers(
             &mut assembled.speakers,
             &mut assembled.segments,
@@ -507,6 +598,9 @@ async fn run(
         store
             .update_meeting_status(meeting_id, MeetingStatus::Summarizing)
             .map_err(ProcessError::Store)?;
+        if let Some(reporter) = reporter {
+            reporter.stage_start(ProcessingStage::Minutes, None);
+        }
         let transcript = render_transcript_for_minutes(&assembled.segments, &assembled.speakers);
         // Fuse in the notes the user took during the meeting (Granola-style): the
         // minutes LLM sees both the transcript and the user's own highlights, so
@@ -582,6 +676,7 @@ mod tests {
             &engine,
             Some(&cfg),
             &MeetingOptions::default(),
+            None,
         )
         .await;
 

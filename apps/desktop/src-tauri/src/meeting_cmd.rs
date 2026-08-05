@@ -24,14 +24,14 @@ use lumen_core::{
 use lumen_dictionary::split_for_injection;
 use lumen_meeting::{
     export_meeting as render_export, process_meeting, CorrectionDict, DiarModels, ExportOutput,
-    ExportPreset, MeetingOptions, MinutesConfig, DEFAULT_MAX_SPEAKERS,
+    ExportPreset, MeetingOptions, MinutesConfig, ProcessingProgress, DEFAULT_MAX_SPEAKERS,
 };
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 /// Unified-timeline sidecar written next to a meeting's WAVs as
@@ -838,6 +838,25 @@ fn meeting_correction_dict(store: &Store) -> CorrectionDict {
     CorrectionDict::new(terms, replacements)
 }
 
+/// The `meeting-processing-progress` event payload: which stage the offline
+/// pipeline is on, its per-stage sub-progress (for the loop-heavy stages), and
+/// an overall percent. The detail page filters by `meetingId` and renders a
+/// friendly stage label + progress bar. Field names are camelCase for the JS
+/// listener.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MeetingProcessingProgress {
+    meeting_id: String,
+    stage: &'static str,
+    track: Option<&'static str>,
+    stage_index: u32,
+    stage_total: u32,
+    done: u32,
+    total: u32,
+    stage_percent: Option<f32>,
+    overall_percent: f32,
+}
+
 /// Build the pipeline's dependencies from app config and run
 /// [`process_meeting`]. Errors are surfaced to [`spawn_meeting_processing`] which
 /// logs them and ensures the meeting ends `failed`.
@@ -931,6 +950,28 @@ async fn process_meeting_pipeline(
     // user to configure an LLM, instead of silently showing an empty 纪要 page.
     let no_llm = minutes_cfg.is_none();
 
+    // Stream granular progress to the detail page: each stage boundary (and, for
+    // the loop-heavy transcribe/cleanup stages, a throttled per-item tick) is
+    // relayed as a `meeting-processing-progress` event, filtered client-side by
+    // `meetingId`. Best-effort — a failed emit never affects the pipeline.
+    let progress_app = app.clone();
+    let emit_progress = move |p: ProcessingProgress| {
+        let _ = progress_app.emit(
+            "meeting-processing-progress",
+            MeetingProcessingProgress {
+                meeting_id: meeting_id.to_string(),
+                stage: p.stage.as_str(),
+                track: p.track.map(|t| t.as_str()),
+                stage_index: p.stage_index,
+                stage_total: p.stage_total,
+                done: p.done,
+                total: p.total,
+                stage_percent: p.stage_percent,
+                overall_percent: p.overall_percent,
+            },
+        );
+    };
+
     process_meeting(
         &store,
         meeting_id,
@@ -940,6 +981,7 @@ async fn process_meeting_pipeline(
         asr_engine.as_ref(),
         minutes_cfg.as_ref(),
         &opts,
+        Some(&emit_progress),
     )
     .await
     .map_err(|e| e.to_string())?;
