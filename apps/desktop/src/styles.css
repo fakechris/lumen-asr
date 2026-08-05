@@ -78,6 +78,21 @@
   --border-strong: #cdc4b6;
   --code-bg: #f4f1ea;
 
+  /* Per-speaker categorical palette (meeting transcript). Text/accent colors
+   * tuned to read on the near-white card; the same slots are re-tuned brighter
+   * for dark below. Color is a secondary cue — the name text always shows too. */
+  --spk-self: var(--accent);
+  --spk-1: #c05621;   /* orange   */
+  --spk-2: #2f8a4e;   /* green    */
+  --spk-3: #2570bd;   /* blue     */
+  --spk-4: #8a45c9;   /* purple   */
+  --spk-5: #147d7d;   /* teal     */
+  --spk-6: #b83c8f;   /* magenta  */
+  --spk-7: #9a6b12;   /* amber    */
+  --spk-8: #4453cc;   /* indigo   */
+  --spk-9: #c22e50;   /* red      */
+  --spk-10: #566f80;  /* slate    */
+
   /* Elevation — only two, used only on the outer shell + popovers */
   --shadow: 0 12px 36px rgba(31, 26, 23, 0.06);
   --shadow-lift: 0 16px 48px rgba(31, 26, 23, 0.12);
@@ -162,6 +177,19 @@
   --border: #1f2937;
   --border-strong: #2c3a4f;
   --code-bg: #0e1420;
+
+  /* Per-speaker palette — brighter so it reads on the near-black card. */
+  --spk-self: var(--accent);
+  --spk-1: #f0894d;   /* orange   */
+  --spk-2: #5fc27e;   /* green    */
+  --spk-3: #5aa8f0;   /* blue     */
+  --spk-4: #b483f0;   /* purple   */
+  --spk-5: #45c9bf;   /* teal     */
+  --spk-6: #ef7fc4;   /* magenta  */
+  --spk-7: #e0b93a;   /* amber    */
+  --spk-8: #8b9bf7;   /* indigo   */
+  --spk-9: #f26d80;   /* red      */
+  --spk-10: #93b4c8;  /* slate    */
 
   --shadow: 0 12px 36px rgba(0, 0, 0, 0.55);
   --shadow-lift: 0 18px 52px rgba(0, 0, 0, 0.7);
@@ -3479,6 +3507,19 @@ button.meeting-seg-text.seekable:hover {
 .meeting-live-chip:focus-visible {
   opacity: 1;
   border-color: var(--border);
+}
+
+/* Small per-speaker color dot. Inherits the chip's (speaker) text color via
+ * currentColor, so it always matches without a per-dot inline color. A dot +
+ * colored name is the whole color cue for a live line (no avatar there). */
+.meeting-spk-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: baseline;
 }
 
 /* Positioned `fixed` from the chip's viewport rect at open time (inline

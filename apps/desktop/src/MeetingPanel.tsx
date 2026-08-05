@@ -11,6 +11,7 @@ import {
 } from "./meetingModels";
 import { Icon } from "./Icons";
 import { diarGuidance, isNoLlmMarker } from "./meetingGuidance";
+import { buildSpeakerColorMap, colorForSpeaker } from "./speakerColors";
 import type {
   ActionItem,
   EnrolledSpeaker,
@@ -825,6 +826,34 @@ function boundariesAnchoredOnLine(
   );
 }
 
+/** The speaker identity a live line is colored by: the manual boundary name
+ * (L2), else the voiceprint guess (L3), else none (bare 标注 / 未指定). Mirrors
+ * the chip's display priority so the color and the chip label always agree. */
+function liveSpeakerIdentity(
+  annotations: LiveAnnotation[],
+  seg: LiveEvent,
+  selfIdentityId: string | null,
+): { key: string | null; self: boolean } {
+  const boundary = seg.isFinal ? boundaryForLine(annotations, seg) : null;
+  if (boundary) {
+    if (boundary.unassigned) return { key: null, self: false };
+    return {
+      key: boundary.display_name,
+      self:
+        boundary.identity_id != null &&
+        boundary.identity_id === selfIdentityId,
+    };
+  }
+  const vp = seg.speaker ?? null;
+  if (vp) {
+    return {
+      key: vp.displayName,
+      self: vp.identityId != null && vp.identityId === selfIdentityId,
+    };
+  }
+  return { key: null, self: false };
+}
+
 function LiveTranscript({
   meetingId,
   models,
@@ -1046,6 +1075,18 @@ function LiveTranscript({
     [segments],
   );
 
+  // Stable per-speaker colors across the lines currently shown. Keyed by the
+  // same identity the chip displays, so the dot/name color matches the label.
+  const speakerColors = useMemo(
+    () =>
+      buildSpeakerColorMap(
+        ordered.map(
+          (seg) => liveSpeakerIdentity(annotations, seg, selfIdentityId).key,
+        ),
+      ),
+    [ordered, annotations, selfIdentityId],
+  );
+
   // Keep the newest text in view — but never yank the viewport (and the
   // fixed-positioned menu with it) while the user has a menu open.
   useEffect(() => {
@@ -1154,6 +1195,18 @@ function LiveTranscript({
               const anchored = seg.isFinal
                 ? boundariesAnchoredOnLine(annotations, seg)
                 : [];
+              // Color follows the identity the chip shows (manual > voiceprint);
+              // a bare 标注 / 未指定 line stays neutral (no color).
+              const ident = liveSpeakerIdentity(
+                annotations,
+                seg,
+                selfIdentityId,
+              );
+              const spkColor = colorForSpeaker(speakerColors, ident.key, {
+                self: ident.self,
+              });
+              const colored =
+                spkColor != null && (namedBoundary != null || voiceprint != null);
               return (
                 <p
                   key={seg.segmentId}
@@ -1181,11 +1234,23 @@ function LiveTranscript({
                                 : ""
                         }`}
                         title="标注这句话是谁在说（此句及之后）"
+                        style={
+                          colored && spkColor
+                            ? {
+                                color: spkColor,
+                                borderColor: `color-mix(in srgb, ${spkColor} 45%, var(--border))`,
+                                background: `color-mix(in srgb, ${spkColor} 12%, transparent)`,
+                              }
+                            : undefined
+                        }
                         onClick={(e) => {
                           if (menuFor === seg.segmentId) closeMenus();
                           else openMenu(seg, e.currentTarget);
                         }}
                       >
+                        {colored && (
+                          <span className="meeting-spk-dot" aria-hidden />
+                        )}
                         {chipLabel}
                       </button>
                       {menuFor === seg.segmentId &&
@@ -2401,6 +2466,13 @@ function MeetingSideInfo({
 
   const meetingId = detail.meeting.id;
 
+  // Same per-speaker colors as the transcript (built from the same speaker list
+  // in the same order), so a participant's avatar/name matches their turns.
+  const speakerColors = useMemo(
+    () => buildSpeakerColorMap(detail.speakers.map((s) => speakerDisplay(s).name)),
+    [detail.speakers],
+  );
+
   const [selfIdentityId, setSelfIdentityId] = useState<string | null>(null);
 
   const refreshEnrollment = useCallback(async () => {
@@ -2527,9 +2599,18 @@ function MeetingSideInfo({
             {detail.speakers.map((s) => {
               const { name, confirmed } = speakerDisplay(s);
               const editing = editingId === s.id;
+              const swatch =
+                colorForSpeaker(speakerColors, name) ?? "var(--muted)";
               return (
                 <li key={s.id} className="meeting-participant">
-                  <span className="meeting-avatar sm" aria-hidden>
+                  <span
+                    className="meeting-avatar sm"
+                    aria-hidden
+                    style={{
+                      color: swatch,
+                      background: `color-mix(in srgb, ${swatch} 15%, transparent)`,
+                    }}
+                  >
                     {name.slice(0, 1)}
                   </span>
                   {editing ? (
@@ -3017,6 +3098,13 @@ function TranscriptView({
     for (const s of detail.speakers) map.set(s.id, s);
     return map;
   }, [detail.speakers]);
+  // Per-speaker colors, keyed by the same display the turn head shows (real name
+  // when confirmed, else the engine cluster label). Built from the canonical
+  // speaker list so the transcript and the participant list agree exactly.
+  const speakerColors = useMemo(
+    () => buildSpeakerColorMap(detail.speakers.map((s) => speakerDisplay(s).name)),
+    [detail.speakers],
+  );
 
   // Per-segment DOM refs, so a minutes-index jump can scroll to the right line.
   const segRefs = useRef<Map<string, HTMLElement>>(new Map());
@@ -3086,13 +3174,34 @@ function TranscriptView({
             : null;
           const { name, confirmed } = speakerDisplay(speaker);
           const head = turn.segments[0];
+          // Color the head by the speaker; an unattributed turn (no speaker)
+          // stays neutral gray. Name text still carries the identity, so color
+          // is only a secondary, at-a-glance cue.
+          const spkColor = colorForSpeaker(
+            speakerColors,
+            speaker ? name : null,
+          );
+          const swatch = spkColor ?? "var(--muted)";
           return (
-            <li key={head.id} className="meeting-turn">
+            <li
+              key={head.id}
+              className="meeting-turn"
+              style={{ borderLeftColor: swatch }}
+            >
               <div className="meeting-turn-head">
-                <span className="meeting-avatar sm" aria-hidden>
+                <span
+                  className="meeting-avatar sm"
+                  aria-hidden
+                  style={{
+                    color: swatch,
+                    background: `color-mix(in srgb, ${swatch} 15%, transparent)`,
+                  }}
+                >
                   {name.slice(0, 1)}
                 </span>
-                <span className="meeting-turn-name">{name}</span>
+                <span className="meeting-turn-name" style={{ color: swatch }}>
+                  {name}
+                </span>
                 {head.channel === "system" && (
                   <span
                     className="meeting-channel-system"
