@@ -161,7 +161,17 @@ struct WindowsTextInjectorBackend;
 #[async_trait::async_trait]
 impl TextInjectorBackend for WindowsTextInjectorBackend {
     async fn paste_with_restore(&self, text: &str, preserve: bool) -> Result<(), InjectError> {
-        windows_clipboard::paste_with_restore(text, preserve).map_err(InjectError::Other)
+        if preserve {
+            // Windows cannot losslessly snapshot every clipboard format. Keep
+            // the clipboard untouched and use Unicode input instead.
+            return windows_clipboard::type_unicode(text).map_err(InjectError::Other);
+        }
+        windows_clipboard::paste(text).map_err(|error| match error {
+            windows_clipboard::PasteError::NoInput(message) => InjectError::Other(message),
+            windows_clipboard::PasteError::PartialInput(message) => {
+                InjectError::PartialInput(message)
+            }
+        })
     }
 
     async fn ax_insert(&self, _text: &str) -> Result<(), InjectError> {
@@ -218,8 +228,6 @@ mod windows_clipboard {
         fn OpenClipboard(new_owner: *mut c_void) -> i32;
         fn CloseClipboard() -> i32;
         fn EmptyClipboard() -> i32;
-        fn GetClipboardData(format: u32) -> *mut c_void;
-        fn IsClipboardFormatAvailable(format: u32) -> i32;
         fn SetClipboardData(format: u32, memory: *mut c_void) -> *mut c_void;
         fn GetAsyncKeyState(v_key: i32) -> i16;
     }
@@ -229,7 +237,6 @@ mod windows_clipboard {
         fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
         fn GlobalFree(memory: *mut c_void) -> *mut c_void;
         fn GlobalLock(memory: *mut c_void) -> *mut c_void;
-        fn GlobalSize(memory: *mut c_void) -> usize;
         fn GlobalUnlock(memory: *mut c_void) -> i32;
     }
 
@@ -254,33 +261,6 @@ mod windows_clipboard {
                 }
             })
             .ok_or_else(|| "Windows clipboard is busy".to_string())
-    }
-
-    fn get_unicode_text() -> Result<Option<String>, String> {
-        let _guard = open_clipboard()?;
-        if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } == 0 {
-            return Ok(None);
-        }
-        let memory = unsafe { GetClipboardData(CF_UNICODETEXT) };
-        if memory.is_null() {
-            return Err("could not read Windows clipboard text".into());
-        }
-        let target = unsafe { GlobalLock(memory) } as *const u16;
-        if target.is_null() {
-            return Err("could not lock Windows clipboard text".into());
-        }
-        let units = unsafe { GlobalSize(memory) } / std::mem::size_of::<u16>();
-        let text = if units == 0 {
-            String::new()
-        } else {
-            let slice = unsafe { std::slice::from_raw_parts(target, units) };
-            let len = slice.iter().position(|unit| *unit == 0).unwrap_or(units);
-            String::from_utf16_lossy(&slice[..len])
-        };
-        unsafe {
-            GlobalUnlock(memory);
-        }
-        Ok(Some(text))
     }
 
     pub fn set_unicode_text(text: &str) -> Result<(), String> {
@@ -319,31 +299,29 @@ mod windows_clipboard {
         Ok(())
     }
 
-    pub fn paste_with_restore(text: &str, preserve: bool) -> Result<(), String> {
+    pub(super) enum PasteError {
+        NoInput(String),
+        PartialInput(String),
+    }
+
+    pub fn paste(text: &str) -> Result<(), PasteError> {
         if text.is_empty() {
             return Ok(());
         }
-        wait_hotkey_modifiers_clear(Duration::from_millis(800))?;
-        let previous = if preserve {
-            Some(get_unicode_text()?.unwrap_or_default())
-        } else {
-            None
-        };
+        wait_hotkey_modifiers_clear(Duration::from_millis(800)).map_err(PasteError::NoInput)?;
 
-        set_unicode_text(text)?;
+        set_unicode_text(text).map_err(PasteError::NoInput)?;
         thread::sleep(Duration::from_millis(40));
-        send_ctrl_v()?;
-        thread::sleep(Duration::from_millis(350));
-
-        if let Some(previous) = previous {
-            if let Err(error) = set_unicode_text(&previous) {
-                // The paste already reached the target. A clipboard-restore
-                // failure must not trigger the Unicode fallback and duplicate
-                // the inserted text.
-                tracing::warn!(%error, "Windows paste succeeded but clipboard restore failed");
-            }
+        match send_ctrl_v() {
+            InputDelivery::Complete => Ok(()),
+            InputDelivery::None => Err(PasteError::NoInput(
+                "Windows blocked simulated keyboard input; elevated apps cannot receive input from a non-elevated Lumen process"
+                    .into(),
+            )),
+            InputDelivery::Partial(sent) => Err(PasteError::PartialInput(format!(
+                "Windows accepted only {sent} of 4 simulated paste events"
+            ))),
         }
-        Ok(())
     }
 
     pub fn type_unicode(text: &str) -> Result<(), String> {
@@ -390,14 +368,30 @@ mod windows_clipboard {
         }
     }
 
-    fn send_ctrl_v() -> Result<(), String> {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InputDelivery {
+        None,
+        Partial(u32),
+        Complete,
+    }
+
+    fn send_ctrl_v() -> InputDelivery {
         let inputs = [
             keyboard_input(VK_CONTROL, 0, KEYBD_EVENT_FLAGS(0)),
             keyboard_input(VK_V, 0, KEYBD_EVENT_FLAGS(0)),
             keyboard_input(VK_V, 0, KEYEVENTF_KEYUP),
             keyboard_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
         ];
-        send_inputs(&inputs)
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent == inputs.len() as u32 {
+            return InputDelivery::Complete;
+        }
+        if sent > 0 {
+            release_paste_keys();
+            InputDelivery::Partial(sent)
+        } else {
+            InputDelivery::None
+        }
     }
 
     fn keyboard_input(key: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -420,18 +414,22 @@ mod windows_clipboard {
         if sent == inputs.len() as u32 {
             Ok(())
         } else {
-            // Best effort: if Windows accepted only part of a key sequence,
-            // ensure the synthetic Ctrl/V keys do not remain logically down.
-            let releases = [
-                keyboard_input(VK_V, 0, KEYEVENTF_KEYUP),
-                keyboard_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
-            ];
-            let _ = unsafe { SendInput(&releases, std::mem::size_of::<INPUT>() as i32) };
+            release_paste_keys();
             Err(
                 "Windows blocked simulated keyboard input; elevated apps cannot receive input from a non-elevated Lumen process"
                     .into(),
             )
         }
+    }
+
+    fn release_paste_keys() {
+        // Best effort: if Windows accepted only part of a key sequence, ensure
+        // the synthetic Ctrl/V keys do not remain logically down.
+        let releases = [
+            keyboard_input(VK_V, 0, KEYEVENTF_KEYUP),
+            keyboard_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+        ];
+        let _ = unsafe { SendInput(&releases, std::mem::size_of::<INPUT>() as i32) };
     }
 
     #[cfg(test)]

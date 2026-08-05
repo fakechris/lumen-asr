@@ -16,6 +16,8 @@ pub enum InjectError {
     NotSupported(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    #[error("partial input delivered: {0}")]
+    PartialInput(String),
     #[error("{0}")]
     Other(String),
 }
@@ -131,6 +133,7 @@ impl<B: TextInjectorBackend> TextInjector<B> {
             };
             match result {
                 Ok(o) => return Ok(o),
+                Err(error @ InjectError::PartialInput(_)) => return Err(error),
                 Err(e) => {
                     tracing::warn!(?strategy, error = %e, "inject strategy failed");
                     errors.push(format!("{strategy:?}: {e}"));
@@ -211,6 +214,31 @@ impl TextInjectorBackend for StubInjectorBackend {
 mod tests {
     use super::*;
 
+    struct PartialPasteBackend;
+
+    #[async_trait]
+    impl TextInjectorBackend for PartialPasteBackend {
+        async fn paste_with_restore(
+            &self,
+            _text: &str,
+            _preserve: bool,
+        ) -> Result<(), InjectError> {
+            Err(InjectError::PartialInput("two events accepted".into()))
+        }
+
+        async fn ax_insert(&self, _text: &str) -> Result<(), InjectError> {
+            panic!("partial input must stop fallback")
+        }
+
+        async fn type_unicode(&self, _text: &str) -> Result<(), InjectError> {
+            panic!("partial input must stop fallback")
+        }
+
+        async fn copy_only(&self, _text: &str) -> Result<(), InjectError> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn auto_paste_first_succeeds_by_default() {
         let inj = TextInjector::new(StubInjectorBackend::default(), InsertPolicy::default());
@@ -257,6 +285,13 @@ mod tests {
         );
         let o = inj.insert("hi").await.unwrap();
         assert_eq!(o.strategy, InsertStrategy::Ax);
+    }
+
+    #[tokio::test]
+    async fn auto_does_not_fallback_after_partial_input() {
+        let inj = TextInjector::new(PartialPasteBackend, InsertPolicy::default());
+        let error = inj.insert("hi").await.unwrap_err();
+        assert!(matches!(error, InjectError::PartialInput(_)));
     }
 
     #[tokio::test]

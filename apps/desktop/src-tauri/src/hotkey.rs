@@ -172,6 +172,19 @@ pub fn save_hotkey_config(
         }
         // Never rewrite user chords on save — only fill empty defaults.
         ensure_default_intents(&mut guard.hotkey);
+        #[cfg(target_os = "windows")]
+        if crate::hotkey_validate::contains_fn_key(&guard.hotkey.toggle)
+            || guard
+                .hotkey
+                .intents
+                .iter()
+                .any(|intent| crate::hotkey_validate::contains_fn_key(&intent.chord))
+        {
+            return Err(
+                "Windows 不会把键盘 Fn 键暴露为可注册的全局按键，请改用 Ctrl+Shift+Space 或 F 键"
+                    .into(),
+            );
+        }
         guard.save()?;
     }
     reregister(&app)?;
