@@ -947,6 +947,7 @@ function MicrophoneConsentDialog({
   onOpenSettings: () => void;
 }) {
   const cancelRef = useRef<HTMLButtonElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     cancelRef.current?.focus();
@@ -955,6 +956,7 @@ function MicrophoneConsentDialog({
   return (
     <div className="meeting-modal-overlay microphone-consent-overlay">
       <div
+        ref={dialogRef}
         className="card meeting-confirm microphone-consent"
         role="dialog"
         aria-modal="true"
@@ -964,6 +966,27 @@ function MicrophoneConsentDialog({
           if (event.key === "Escape") {
             event.stopPropagation();
             onCancel();
+            return;
+          }
+          if (event.key === "Tab") {
+            const controls = Array.from(
+              dialogRef.current?.querySelectorAll<HTMLElement>(
+                'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+              ) ?? [],
+            );
+            if (controls.length === 0) {
+              event.preventDefault();
+              return;
+            }
+            const first = controls[0];
+            const last = controls[controls.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+              event.preventDefault();
+              last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+              event.preventDefault();
+              first.focus();
+            }
           }
         }}
       >
@@ -1041,6 +1064,7 @@ function RecordPanel({
     },
   );
   const [showMicrophoneConsent, setShowMicrophoneConsent] = useState(false);
+  const microphoneConsentTriggerRef = useRef<HTMLElement | null>(null);
   const onSavedRef = useRef(onSaved);
   onSavedRef.current = onSaved;
 
@@ -1188,10 +1212,17 @@ function RecordPanel({
 
   async function start() {
     if (IS_WINDOWS && !microphoneNoticeAcknowledged) {
+      microphoneConsentTriggerRef.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setShowMicrophoneConsent(true);
       return;
     }
     await startRecording();
+  }
+
+  function cancelMicrophoneConsent() {
+    setShowMicrophoneConsent(false);
+    window.requestAnimationFrame(() => microphoneConsentTriggerRef.current?.focus());
   }
 
   function allowMicrophoneAndStart() {
@@ -1333,7 +1364,7 @@ function RecordPanel({
           onlineRecognition={!isLocal}
           providerLabel={status?.providerLabel || provider}
           onAllow={allowMicrophoneAndStart}
-          onCancel={() => setShowMicrophoneConsent(false)}
+          onCancel={cancelMicrophoneConsent}
           onOpenSettings={() => void api.openMicrophoneSettings()}
         />
       )}
