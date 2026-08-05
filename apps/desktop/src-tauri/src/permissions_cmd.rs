@@ -17,13 +17,17 @@ use crate::AppState;
 static WINDOWS_MICROPHONE_STATE: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(target_os = "windows")]
-fn windows_microphone_state() -> lumen_platform::PermissionState {
+fn windows_microphone_state_from_code(code: u8) -> lumen_platform::PermissionState {
     use lumen_platform::PermissionState;
-    match WINDOWS_MICROPHONE_STATE.load(Ordering::SeqCst) {
+    match code {
         1 => PermissionState::Granted,
-        2 => PermissionState::Denied,
         _ => PermissionState::NotDetermined,
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_microphone_state() -> lumen_platform::PermissionState {
+    windows_microphone_state_from_code(WINDOWS_MICROPHONE_STATE.load(Ordering::SeqCst))
 }
 
 #[derive(Debug, Serialize)]
@@ -347,7 +351,11 @@ pub async fn request_microphone_access(
             }
             Err(e) => {
                 #[cfg(target_os = "windows")]
-                WINDOWS_MICROPHONE_STATE.store(2, Ordering::SeqCst);
+                // AudioCapture reports device, stream, and worker failures in
+                // addition to permission failures. Until those are classified
+                // separately, a failed probe must remain unknown rather than
+                // falsely claiming the user denied microphone access.
+                WINDOWS_MICROPHONE_STATE.store(0, Ordering::SeqCst);
                 tracing::warn!(error = %e, "mic probe start failed");
             }
         }
@@ -412,5 +420,17 @@ mod tests {
         let dto = map_status(status(PermissionState::Granted));
         assert_eq!(dto.microphone, "granted");
         assert!(dto.can_record);
+    }
+
+    #[test]
+    fn windows_probe_failure_is_not_reported_as_permission_denied() {
+        assert!(matches!(
+            windows_microphone_state_from_code(0),
+            PermissionState::NotDetermined
+        ));
+        assert!(matches!(
+            windows_microphone_state_from_code(2),
+            PermissionState::NotDetermined
+        ));
     }
 }

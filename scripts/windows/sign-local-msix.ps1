@@ -79,6 +79,7 @@ New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 
 $makeAppx = Resolve-WindowsSdkTool -Name "makeappx.exe"
 $signTool = Resolve-WindowsSdkTool -Name "signtool.exe"
+$now = Get-Date
 $certificate = Get-ChildItem -Path "Cert:\CurrentUser\My" |
     Where-Object {
         $enhancedKeyUsages = @(
@@ -88,7 +89,8 @@ $certificate = Get-ChildItem -Path "Cert:\CurrentUser\My" |
         $_.FriendlyName -eq $CertificateFriendlyName -and
         $_.Subject -eq $Publisher -and
         $_.HasPrivateKey -and
-        $_.NotAfter -gt (Get-Date).AddDays(30) -and
+        $_.NotBefore -le $now -and
+        $_.NotAfter -gt $now.AddDays(30) -and
         ($enhancedKeyUsages -contains "1.3.6.1.5.5.7.3.3")
     } |
     Sort-Object NotAfter -Descending |
