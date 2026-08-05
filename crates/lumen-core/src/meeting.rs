@@ -223,10 +223,19 @@ impl TranscriptSegment {
 
 /// How a speaker's `display_name` was attributed (persisted as
 /// `speakers.attribution_origin`, schema v13). Stable tokens; the priority
-/// order for conflicts is manual > verification > offline_diarization.
+/// order for conflicts is
+/// manual > manual_spread > verification > offline_diarization.
 pub mod attribution_origin {
-    /// A human named this speaker (rename command, live annotation chip).
+    /// A human named this speaker (rename command, live annotation chip) —
+    /// a precise, time-bounded manual mark. The strongest evidence.
     pub const MANUAL: &str = "manual";
+    /// A manual name **spread** by voiceprint: a diar cluster the user never
+    /// marked, matched (in-meeting) to the centroid of a cluster the user *did*
+    /// mark, so the same person's unlabelled speech joins their name. Weaker
+    /// than a precise `manual` mark but stronger than a cross-meeting library
+    /// `verification` — the seed is the user's own high-signal annotation from
+    /// this very meeting.
+    pub const MANUAL_SPREAD: &str = "manual_spread";
     /// Voiceprint verification against the enrolled identity library.
     pub const VERIFICATION: &str = "verification";
     /// Plain diarization clustering with no name evidence (reserved).

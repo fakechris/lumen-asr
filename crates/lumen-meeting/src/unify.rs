@@ -422,10 +422,12 @@ fn trimmed_name(speaker: &Speaker) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Provenance strength for choosing the surviving row.
+/// Provenance strength for choosing the surviving row
+/// (manual > manual_spread > verification > everything else).
 fn provenance_rank(speaker: &Speaker) -> u8 {
     match speaker.attribution_origin.as_deref() {
-        Some(attribution_origin::MANUAL) => 2,
+        Some(attribution_origin::MANUAL) => 3,
+        Some(attribution_origin::MANUAL_SPREAD) => 2,
         Some(attribution_origin::VERIFICATION) => 1,
         _ => 0,
     }
