@@ -30,6 +30,13 @@ fn windows_microphone_state() -> lumen_platform::PermissionState {
     windows_microphone_state_from_code(WINDOWS_MICROPHONE_STATE.load(Ordering::SeqCst))
 }
 
+/// A successful real capture is the most reliable Windows permission probe.
+/// Keep Settings in sync when recording starts outside the permission page.
+pub(crate) fn mark_microphone_capture_started() {
+    #[cfg(target_os = "windows")]
+    WINDOWS_MICROPHONE_STATE.store(1, Ordering::SeqCst);
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionDto {
@@ -339,13 +346,11 @@ pub async fn request_microphone_access(
     state: State<'_, AppState>,
 ) -> Result<PermissionDto, String> {
     if state.audio.is_recording() {
-        #[cfg(target_os = "windows")]
-        WINDOWS_MICROPHONE_STATE.store(1, Ordering::SeqCst);
+        mark_microphone_capture_started();
     } else {
         match state.audio.start() {
             Ok(()) => {
-                #[cfg(target_os = "windows")]
-                WINDOWS_MICROPHONE_STATE.store(1, Ordering::SeqCst);
+                mark_microphone_capture_started();
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
                 let _ = state.audio.stop();
             }

@@ -642,6 +642,44 @@ code {
   margin-top: 8px;
 }
 
+.recording-retry {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--error) 35%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--error) 10%, transparent);
+  color: var(--error);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+}
+
+.microphone-consent-overlay {
+  z-index: 10000;
+  align-items: center;
+}
+
+.microphone-consent {
+  width: min(520px, 100%);
+}
+
+.microphone-consent-copy {
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.6;
+}
+
+.microphone-consent-copy p {
+  margin: 8px 0;
+}
+
+.microphone-consent-actions {
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+
 .btn {
   border: 1px solid transparent;
   background: var(--accent);
