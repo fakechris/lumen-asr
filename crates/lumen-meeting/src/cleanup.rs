@@ -219,13 +219,19 @@ pub async fn cleanup_transcript(
     corrector: &dyn Corrector,
     texts: &mut [String],
     max_tokens: Option<u32>,
+    progress: Option<&dyn Fn(usize, usize)>,
 ) -> CleanupStats {
     let mut stats = CleanupStats::default();
-    for (start, end) in chunk_ranges(texts) {
+    let ranges = chunk_ranges(texts);
+    let chunk_total = ranges.len();
+    for (chunk_idx, (start, end)) in ranges.into_iter().enumerate() {
         let expected = end - start;
         // An all-blank chunk has nothing to clean — skip the call entirely.
         if texts[start..end].iter().all(|t| t.trim().is_empty()) {
             stats.skipped_empty += 1;
+            if let Some(report) = progress {
+                report(chunk_idx + 1, chunk_total);
+            }
             continue;
         }
         stats.chunks += 1;
@@ -270,6 +276,9 @@ pub async fn cleanup_transcript(
                 );
                 stats.kept_original += 1;
             }
+        }
+        if let Some(report) = progress {
+            report(chunk_idx + 1, chunk_total);
         }
     }
     stats
@@ -455,7 +464,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let mut texts = v(&["嗯 a", "呃 b", "c", "d", "e"]);
-        let stats = cleanup_transcript(&corrector, &mut texts, None).await;
+        let stats = cleanup_transcript(&corrector, &mut texts, None, None).await;
 
         // One chunk → one call carrying all five segment markers (batched, not
         // one call per sentence).
@@ -479,7 +488,7 @@ mod tests {
         };
         // 25 short segments → two chunks (20 + 5).
         let mut texts: Vec<String> = (0..25).map(|i| format!("s{i}")).collect();
-        cleanup_transcript(&corrector, &mut texts, None).await;
+        cleanup_transcript(&corrector, &mut texts, None, None).await;
         let seen = corrector.seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(extract_markers(&seen[0]).1, 20);
@@ -519,7 +528,7 @@ mod tests {
             bodies: v(&["clean0", "clean1"]),
         };
         let mut texts = v(&["嗯 一", "呃 二"]);
-        let stats = cleanup_transcript(&corrector, &mut texts, None).await;
+        let stats = cleanup_transcript(&corrector, &mut texts, None, None).await;
         assert_eq!(texts, v(&["clean0", "clean1"]));
         assert_eq!(stats.cleaned, 1);
     }
@@ -534,7 +543,7 @@ mod tests {
         };
         let original = v(&["嗯 一", "SEGMENTS_END 二"]);
         let mut texts = original.clone();
-        let stats = cleanup_transcript(&corrector, &mut texts, None).await;
+        let stats = cleanup_transcript(&corrector, &mut texts, None, None).await;
         assert_eq!(texts, original, "original preserved on injected reply body");
         assert_eq!(stats.cleaned, 0);
         assert_eq!(stats.kept_original, 1);
@@ -550,7 +559,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let mut texts = v(&["请在 SEGMENTS_END 之后继续", "好的"]);
-        cleanup_transcript(&corrector, &mut texts, None).await;
+        cleanup_transcript(&corrector, &mut texts, None, None).await;
         let sent = corrector.seen.lock().unwrap()[0].clone();
         // No standalone bare-token fence line exists; only nonce-tagged fences do.
         assert!(!sent.lines().any(|l| l.trim() == "SEGMENTS_END"));
@@ -582,7 +591,7 @@ mod tests {
     async fn misaligned_reply_keeps_original_text() {
         let original = v(&["嗯 一", "呃 二"]);
         let mut texts = original.clone();
-        let stats = cleanup_transcript(&MisalignedCorrector, &mut texts, None).await;
+        let stats = cleanup_transcript(&MisalignedCorrector, &mut texts, None, None).await;
         assert_eq!(texts, original, "original text preserved on mismatch");
         assert_eq!(stats.cleaned, 0);
         assert_eq!(stats.kept_original, 1);
@@ -605,7 +614,7 @@ mod tests {
     async fn llm_failure_keeps_original_text() {
         let original = v(&["嗯 一", "呃 二"]);
         let mut texts = original.clone();
-        let stats = cleanup_transcript(&FailingCorrector, &mut texts, None).await;
+        let stats = cleanup_transcript(&FailingCorrector, &mut texts, None, None).await;
         assert_eq!(texts, original);
         assert_eq!(stats.kept_original, 1);
         assert_eq!(stats.cleaned, 0);
@@ -617,7 +626,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let mut texts = v(&["", "   ", ""]);
-        let stats = cleanup_transcript(&corrector, &mut texts, None).await;
+        let stats = cleanup_transcript(&corrector, &mut texts, None, None).await;
         assert!(
             corrector.seen.lock().unwrap().is_empty(),
             "no call for blank chunk"
@@ -632,7 +641,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let mut texts: Vec<String> = Vec::new();
-        let stats = cleanup_transcript(&corrector, &mut texts, None).await;
+        let stats = cleanup_transcript(&corrector, &mut texts, None, None).await;
         assert!(corrector.seen.lock().unwrap().is_empty());
         assert_eq!(stats, CleanupStats::default());
     }

@@ -102,6 +102,7 @@ async fn dual_track_all_silent_fails_with_explicit_reason() {
         &engine,
         None,
         &MeetingOptions::default(),
+        None,
     )
     .await;
 
@@ -134,6 +135,7 @@ async fn mic_only_silent_fails_with_explicit_reason() {
         &engine,
         None,
         &MeetingOptions::default(),
+        None,
     )
     .await;
 
@@ -172,6 +174,7 @@ async fn silent_mic_with_failing_system_track_surfaces_the_real_error() {
         &engine,
         None,
         &MeetingOptions::default(),
+        None,
     )
     .await;
 
@@ -215,6 +218,7 @@ async fn voiced_mic_track_passes_preflight_to_the_diarize_gate() {
         &engine,
         None,
         &MeetingOptions::default(),
+        None,
     )
     .await;
 
@@ -268,6 +272,7 @@ async fn voiced_mic_with_all_zero_system_track_succeeds_mic_only() {
         &engine,
         None,
         &MeetingOptions::default(),
+        None,
     )
     .await
     .expect("silent system track must not fail the meeting");
