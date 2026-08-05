@@ -31,6 +31,7 @@ pub mod minutes;
 mod pipeline;
 mod preflight;
 mod process;
+mod progress;
 mod spread;
 mod unify;
 
@@ -50,6 +51,10 @@ pub use merge::{merge_tracks, system_speaker_offset, MergedTake, TrackTake};
 pub use pipeline::LiveVoiceprintEmbedder;
 pub use pipeline::{transcribe_meeting, DiarModels, MeetingError, MeetingOptions};
 pub use process::{process_meeting, reconcile_stored_annotations, MinutesConfig, ProcessError};
+pub use progress::{
+    overall_percent, ProcessingPlan, ProcessingProgress, ProcessingStage, ProcessingTrack,
+    ProgressReporter,
+};
 pub use spread::{
     match_clusters_to_seeds, spread_annotations, Candidate, Seed, SpreadAssignment, SpreadOutcome,
     SPREAD_MIN_MARGIN, SPREAD_MIN_SCORE,
