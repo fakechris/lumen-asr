@@ -17,6 +17,7 @@ tauri-plugin-shell = "2"
 tauri-plugin-global-shortcut = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lumen-platform = { workspace = true }
@@ -52,7 +53,10 @@ lumen-context = { workspace = true }
 lumen-meeting = { workspace = true, features = ["diarize"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = ["Security_Authorization_AppCapabilityAccess"] }
+windows = { version = "0.61", features = [
+  "Security_Authorization_AppCapabilityAccess",
+  "Win32_UI_Input_KeyboardAndMouse",
+] }
 
 [features]
 default = ["custom-protocol"]

@@ -145,10 +145,21 @@ impl AppConfig {
             if self.asr.migrate_windows_shared_model_dirs() {
                 changed = true;
             }
-            // Alt+Space is commonly reserved by Windows shell/utilities.
-            if self.hotkey.toggle.eq_ignore_ascii_case("Alt+Space") && !self.onboarding.completed {
+            // Alt+Space is commonly reserved by Windows shell/utilities. Fn is
+            // handled by keyboard firmware and is not exposed as a registrable
+            // Windows global key, so migrate configurations that could never fire.
+            if (self.hotkey.toggle.eq_ignore_ascii_case("Alt+Space") && !self.onboarding.completed)
+                || crate::hotkey_validate::contains_fn_key(&self.hotkey.toggle)
+            {
                 self.hotkey.toggle = "Ctrl+Shift+Space".into();
                 changed = true;
+            }
+            for intent in &mut self.hotkey.intents {
+                if crate::hotkey_validate::contains_fn_key(&intent.chord) {
+                    intent.chord = "Alt+Shift+T".into();
+                    intent.enabled = false;
+                    changed = true;
+                }
             }
             return changed;
         }
@@ -1295,5 +1306,18 @@ provider = "minimax"
         assert_eq!(config.asr.provider, "local_sensevoice");
         assert!(!config.asr.qwen_shadow_enabled);
         assert_eq!(config.hotkey.toggle, "Ctrl+Shift+Space");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_migrates_unobservable_fn_hotkeys() {
+        let mut config = AppConfig::default();
+        config.hotkey.toggle = "Fn".into();
+        config.hotkey.intents[0].chord = "Fn+T".into();
+
+        assert!(config.apply_platform_fallbacks());
+        assert_eq!(config.hotkey.toggle, "Ctrl+Shift+Space");
+        assert_eq!(config.hotkey.intents[0].chord, "Alt+Shift+T");
+        assert!(!config.hotkey.intents[0].enabled);
     }
 }

@@ -1066,11 +1066,13 @@ pub async fn stop_and_transcribe_inner(
     let mut frontmost_before_insert = None;
     let insert_started = Instant::now();
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
+        #[cfg(target_os = "windows")]
+        let insert_available = true;
         #[cfg(target_os = "macos")]
-        let ax_ok = lumen_platform_macos::is_accessibility_trusted();
-        #[cfg(not(target_os = "macos"))]
-        let ax_ok = false;
-        if !ax_ok {
+        let insert_available = lumen_platform_macos::is_accessibility_trusted();
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let insert_available = false;
+        if !insert_available {
             #[cfg(target_os = "macos")]
             tracing::error!(
                 "Accessibility not granted; cannot inject into other apps. Open System Settings → Privacy & Security → Accessibility and enable this process"

@@ -114,6 +114,27 @@ pub fn save_hotkey_config(
     state: State<'_, AppState>,
     input: HotkeyInput,
 ) -> Result<HotkeyDto, String> {
+    #[cfg(target_os = "windows")]
+    {
+        if input
+            .toggle
+            .as_deref()
+            .is_some_and(crate::hotkey_validate::contains_fn_key)
+            || input.intents.as_ref().is_some_and(|intents| {
+                intents.iter().any(|intent| {
+                    intent
+                        .chord
+                        .as_deref()
+                        .is_some_and(crate::hotkey_validate::contains_fn_key)
+                })
+            })
+        {
+            return Err(
+                "Windows 不会把键盘 Fn 键暴露为可注册的全局按键，请改用 Ctrl+Shift+Space 或 F 键"
+                    .into(),
+            );
+        }
+    }
     {
         let mut guard = state
             .config

@@ -11,6 +11,15 @@ pub struct HotkeyValidation {
     pub errors: Vec<String>,
 }
 
+pub fn contains_fn_key(shortcut: &str) -> bool {
+    shortcut.split('+').any(|part| {
+        matches!(
+            part.trim().to_ascii_uppercase().as_str(),
+            "FN" | "FUNCTION" | "GLOBE"
+        )
+    })
+}
+
 #[tauri::command]
 pub fn validate_hotkey(shortcut: String) -> HotkeyValidation {
     let s = shortcut.trim().to_string();
@@ -53,6 +62,14 @@ pub fn validate_hotkey(shortcut: String) -> HotkeyValidation {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    if has_fn {
+        errors.push(
+            "Windows 不会把键盘 Fn 键暴露为可注册的全局按键，请改用 Ctrl+Shift+Space 或 F 键"
+                .into(),
+        );
+    }
+
     if mc == 0 {
         errors.push("至少需要一个修饰键（如 Fn / Alt / Shift / Control）".into());
     }
@@ -70,6 +87,7 @@ pub fn validate_hotkey(shortcut: String) -> HotkeyValidation {
     if upper.contains("COMMAND") && upper.contains("TAB") {
         warnings.push("可能与应用切换冲突".into());
     }
+    #[cfg(target_os = "macos")]
     if has_fn {
         warnings.push(
             "若 macOS 已将 Fn/🌐 设为听写或切换输入法，建议在系统设置中关闭该动作以免冲突".into(),
@@ -100,6 +118,7 @@ pub fn validate_hotkey(shortcut: String) -> HotkeyValidation {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn accepts_single_fn_with_system_conflict_hint() {
         let result = validate_hotkey("Fn".into());
@@ -109,5 +128,21 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("macOS")));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rejects_fn_that_windows_cannot_register() {
+        let result = validate_hotkey("Fn".into());
+        assert!(!result.ok);
+        assert!(result.errors.iter().any(|error| error.contains("Windows")));
+    }
+
+    #[test]
+    fn detects_only_complete_fn_tokens() {
+        assert!(contains_fn_key("Control+Fn"));
+        assert!(contains_fn_key("Globe"));
+        assert!(!contains_fn_key("F12"));
+        assert!(!contains_fn_key("FunctionKey"));
     }
 }

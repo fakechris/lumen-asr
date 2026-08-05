@@ -12,6 +12,8 @@ import {
   type ChordState,
 } from "./hotkeyFormat";
 
+const IS_WINDOWS = navigator.userAgent.includes("Windows");
+
 type Props = {
   enabled: boolean;
   toggle: string;
@@ -398,7 +400,7 @@ export function HotkeyRecorder({
         <span className="muted-text" style={{ fontSize: 12 }}>
           常用
         </span>
-        {HOTKEY_PRESETS.map((p) => (
+        {HOTKEY_PRESETS.filter((p) => !IS_WINDOWS || p.value !== "Fn").map((p) => (
           <button
             key={p.value}
             type="button"
@@ -415,9 +417,19 @@ export function HotkeyRecorder({
       </div>
 
       <p className="muted-text" style={{ marginTop: 12, fontSize: "0.85rem" }}>
-        录制时可直接按 <code>fn</code>/🌐 键，松开即生效；也可点下方
-        <code>fn</code> 预设按钮。若 macOS 已将 Fn/🌐 设置为听写或切换输入法，
-        请先关闭该系统动作以免冲突。
+        {IS_WINDOWS ? (
+          <>
+            Windows 通常由键盘固件直接处理 <code>Fn</code>，不会把它提供给
+            App 作为全局按键。请使用 <code>Ctrl+Shift+Space</code>，或直接设置
+            <code>F8</code> 等系统可识别的 F 键。
+          </>
+        ) : (
+          <>
+            录制时可直接按 <code>fn</code>/🌐 键，松开即生效；也可点下方
+            <code>fn</code> 预设按钮。若 macOS 已将 Fn/🌐 设置为听写或切换输入法，
+            请先关闭该系统动作以免冲突。
+          </>
+        )}
       </p>
     </section>
   );
