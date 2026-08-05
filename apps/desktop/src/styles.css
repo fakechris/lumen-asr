@@ -78,20 +78,22 @@
   --border-strong: #cdc4b6;
   --code-bg: #f4f1ea;
 
-  /* Per-speaker categorical palette (meeting transcript). Text/accent colors
-   * tuned to read on the near-white card; the same slots are re-tuned brighter
-   * for dark below. Color is a secondary cue — the name text always shows too. */
+  /* Per-speaker categorical palette (meeting transcript). Text-grade colors,
+   * each ≥6:1 on the near-white card so a speaker name/label stays readable as
+   * plain colored text (no reliance on a tinted background); the same slots are
+   * re-tuned brighter for dark below. Color is a secondary cue — the name text
+   * always shows too. */
   --spk-self: var(--accent);
-  --spk-1: #c05621;   /* orange   */
-  --spk-2: #2f8a4e;   /* green    */
-  --spk-3: #2570bd;   /* blue     */
-  --spk-4: #8a45c9;   /* purple   */
-  --spk-5: #147d7d;   /* teal     */
-  --spk-6: #b83c8f;   /* magenta  */
-  --spk-7: #9a6b12;   /* amber    */
-  --spk-8: #4453cc;   /* indigo   */
-  --spk-9: #c22e50;   /* red      */
-  --spk-10: #566f80;  /* slate    */
+  --spk-1: #a0451a;   /* orange   */
+  --spk-2: #1f6e3c;   /* green    */
+  --spk-3: #1d5c9e;   /* blue     */
+  --spk-4: #6f34a8;   /* purple   */
+  --spk-5: #0e6363;   /* teal     */
+  --spk-6: #98276f;   /* magenta  */
+  --spk-7: #7a5810;   /* amber    */
+  --spk-8: #333dad;   /* indigo   */
+  --spk-9: #a82539;   /* red      */
+  --spk-10: #445c6b;  /* slate    */
 
   /* Elevation — only two, used only on the outer shell + popovers */
   --shadow: 0 12px 36px rgba(31, 26, 23, 0.06);
@@ -3510,7 +3512,7 @@ button.meeting-seg-text.seekable:hover {
 }
 
 /* Small per-speaker color dot. Inherits the chip's (speaker) text color via
- * currentColor, so it always matches without a per-dot inline color. A dot +
+ * currentcolor, so it always matches without a per-dot inline color. A dot +
  * colored name is the whole color cue for a live line (no avatar there). */
 .meeting-spk-dot {
   display: inline-block;
@@ -3518,7 +3520,7 @@ button.meeting-seg-text.seekable:hover {
   height: 7px;
   margin-right: 5px;
   border-radius: 50%;
-  background: currentColor;
+  background: currentcolor;
   vertical-align: baseline;
 }
 

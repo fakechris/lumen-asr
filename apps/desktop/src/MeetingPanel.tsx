@@ -1237,9 +1237,13 @@ function LiveTranscript({
                         style={
                           colored && spkColor
                             ? {
+                                // Color the label text + border only; no
+                                // same-hue fill behind the text, so the label
+                                // keeps its full foreground/card contrast
+                                // (≥4.5:1) in both themes.
                                 color: spkColor,
                                 borderColor: `color-mix(in srgb, ${spkColor} 45%, var(--border))`,
-                                background: `color-mix(in srgb, ${spkColor} 12%, transparent)`,
+                                background: "transparent",
                               }
                             : undefined
                         }
@@ -2607,8 +2611,12 @@ function MeetingSideInfo({
                     className="meeting-avatar sm"
                     aria-hidden
                     style={{
+                      // Neutral fill + colored ring/initial (see transcript
+                      // turn head) so the initial keeps full contrast.
                       color: swatch,
-                      background: `color-mix(in srgb, ${swatch} 15%, transparent)`,
+                      background: "var(--card-soft)",
+                      border: "1.5px solid",
+                      borderColor: swatch,
                     }}
                   >
                     {name.slice(0, 1)}
@@ -3193,8 +3201,13 @@ function TranscriptView({
                   className="meeting-avatar sm"
                   aria-hidden
                   style={{
+                    // Neutral fill + colored ring/initial: the initial keeps
+                    // full contrast against a near-card background instead of
+                    // sitting on a same-hue tint.
                     color: swatch,
-                    background: `color-mix(in srgb, ${swatch} 15%, transparent)`,
+                    background: "var(--card-soft)",
+                    border: "1.5px solid",
+                    borderColor: swatch,
                   }}
                 >
                   {name.slice(0, 1)}
