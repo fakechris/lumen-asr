@@ -856,9 +856,16 @@ async fn process_meeting_pipeline(
     // Build the ASR engine and (optional) minutes corrector from the user's
     // settings under brief locks, then drop the app-state handle before the long
     // async run below.
-    let (asr_engine, corrector, minutes_model, cleanup_transcript, echo_suppression) = {
+    let (
+        asr_engine,
+        corrector,
+        minutes_model,
+        cleanup_transcript,
+        echo_suppression,
+        annotation_voiceprint_spread,
+    ) = {
         let state = app.state::<AppState>();
-        let (corrector_cfg, cleanup_transcript, echo_suppression) = {
+        let (corrector_cfg, cleanup_transcript, echo_suppression, annotation_voiceprint_spread) = {
             let cfg = state
                 .config
                 .lock()
@@ -867,6 +874,7 @@ async fn process_meeting_pipeline(
                 cfg.corrector.clone(),
                 cfg.meeting.transcript_cleanup,
                 cfg.meeting.echo_suppression,
+                cfg.meeting.annotation_voiceprint_spread,
             )
         };
         let asr_engine = crate::dictation::build_meeting_asr_engine(state.inner())?;
@@ -888,6 +896,7 @@ async fn process_meeting_pipeline(
             minutes_model,
             cleanup_transcript,
             echo_suppression,
+            annotation_voiceprint_spread,
         )
     };
 
@@ -923,6 +932,10 @@ async fn process_meeting_pipeline(
         // library lives entirely on this machine (never uploaded); on builds
         // without diarization no embeddings exist, so this is naturally inert.
         identity_dir: Some(lumen_identity::default_identity_dir()),
+        // Spread manual speaker marks to unlabelled clusters by voiceprint so
+        // one person's unmarked speech joins their name. Needs diarization
+        // embeddings; inert without them. Config: `meeting.annotation_voiceprint_spread`.
+        annotation_voiceprint_spread,
         ..MeetingOptions::default()
     };
 
