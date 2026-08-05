@@ -447,6 +447,12 @@ async fn run(
     // guess (manual > verified > offline_diarization), and *before* the
     // persists/minutes below so every downstream consumer sees the manual
     // attribution. No annotations → byte-for-byte no-op.
+    //
+    // Snapshot the assembled segments *before* reconciliation: each still
+    // carries its diar cluster's `speaker_id`, which the spread pass below uses
+    // to map a manual mark's time back to the cluster (and its centroid) it fell
+    // in. Cheap and only kept for this pass.
+    let pre_reconcile_segments = assembled.segments.clone();
     reconcile_stored_annotations(
         store,
         meeting_id,
@@ -456,6 +462,45 @@ async fn run(
         &mut assembled.segments,
     )
     .map_err(ProcessError::Store)?;
+
+    // Annotation voiceprint spread (config `meeting.annotation_voiceprint_spread`):
+    // the user's manual marks are high-signal seeds — spread each name's
+    // voiceprint (its marked cluster's centroid) onto the *unlabelled* diar
+    // clusters that sound like the same person, so one voice's unmarked speech
+    // joins their name instead of a stray "说话人N". Runs *after* reconciliation
+    // (precise marks already placed; those clusters are excluded as candidates)
+    // and *before* cross-track unification, giving the final priority order
+    // manual > manual_spread > verification > raw diarization. A no-op without
+    // embeddings (non-diarizing builds) or without manual seeds.
+    if opts.annotation_voiceprint_spread {
+        // Map each cluster's centroid/voiced-duration from the engine-id keyed
+        // maps onto the assembled `S{n}` speaker row ids the spread pass works
+        // with (the `S`-cluster rows survive reconciliation untouched).
+        let mut cluster_centroids: BTreeMap<Uuid, Vec<f32>> = BTreeMap::new();
+        let mut cluster_voiced: BTreeMap<Uuid, u64> = BTreeMap::new();
+        for (engine_id, embedding) in &speaker_embeddings {
+            let label = crate::assemble::speaker_label(*engine_id);
+            if let Some(row) = assembled.speakers.iter().find(|s| s.label == label) {
+                cluster_centroids.insert(row.id, embedding.clone());
+                cluster_voiced.insert(row.id, voiced_ms.get(engine_id).copied().unwrap_or(0));
+            }
+        }
+        let spread = crate::spread::spread_annotations(
+            &mut assembled.speakers,
+            &pre_reconcile_segments,
+            &assembled.segments,
+            &cluster_centroids,
+            &cluster_voiced,
+        );
+        if !spread.spread_speakers.is_empty() {
+            // Counts only — the manual names are PII.
+            tracing::info!(
+                meeting_id = %meeting_id,
+                spread_speakers = spread.spread_speakers.len(),
+                "manual speaker annotations spread to unlabelled clusters via voiceprint"
+            );
+        }
+    }
     // Cross-track speaker unification (L4b): the very last attribution step —
     // after auto-identification and annotation reconciliation, before any
     // persistence — merges a mic-track and a system-track speaker row when

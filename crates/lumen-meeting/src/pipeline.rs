@@ -101,6 +101,16 @@ pub struct MeetingOptions {
     /// (see [`auto_identify_speakers`](crate::auto_identify_speakers)). `None`
     /// disables auto-identification.
     pub identity_dir: Option<PathBuf>,
+    /// Spread manual speaker annotations to *unlabelled* segments by voiceprint:
+    /// after the timeline reconciliation, a diar cluster the user never marked
+    /// whose centroid matches (in-meeting) a cluster the user *did* mark inherits
+    /// that name (`attribution_origin = manual_spread`), so one person's
+    /// unlabelled speech joins their name instead of becoming a stray "说话人N"
+    /// (see [`spread_annotations`](crate::spread_annotations)). Needs
+    /// diarization embeddings; a no-op without them or without manual marks.
+    /// `Default` is `false` — the app layer sets it from config
+    /// (`meeting.annotation_voiceprint_spread`), where it defaults **on**.
+    pub annotation_voiceprint_spread: bool,
 }
 
 /// Failure modes of [`transcribe_meeting`].
