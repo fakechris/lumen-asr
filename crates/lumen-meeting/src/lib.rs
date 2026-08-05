@@ -32,6 +32,7 @@ mod pipeline;
 mod preflight;
 mod process;
 mod progress;
+mod spread;
 mod unify;
 
 pub use annotate::{reconcile_annotations, resolve_annotation_names, AnnotationReconciliation};
@@ -53,6 +54,10 @@ pub use process::{process_meeting, reconcile_stored_annotations, MinutesConfig, 
 pub use progress::{
     overall_percent, ProcessingPlan, ProcessingProgress, ProcessingStage, ProcessingTrack,
     ProgressReporter,
+};
+pub use spread::{
+    match_clusters_to_seeds, spread_annotations, Candidate, Seed, SpreadAssignment, SpreadOutcome,
+    SPREAD_MIN_MARGIN, SPREAD_MIN_SCORE,
 };
 pub use unify::{
     unify_cross_track_speakers, EchoSpeakerEvidence, SpeakerUnification, UnifyEvidence,

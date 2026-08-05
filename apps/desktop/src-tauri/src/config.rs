@@ -84,6 +84,14 @@ pub struct MeetingConfig {
     /// headphone meetings and uncertain pairs are untouched. Defaults to
     /// `true`; only meaningful when a system track was recorded.
     pub echo_suppression: bool,
+    /// Spread the user's manual speaker marks to unlabelled segments by
+    /// voiceprint: after offline reconciliation, a diar cluster the user never
+    /// marked whose voice matches (in this meeting) a cluster they *did* mark
+    /// inherits that name, so one person's unmarked speech joins their name
+    /// instead of becoming a stray "说话人N". Conservative (confident,
+    /// clearly-winning match only) and gated on diarization embeddings; a no-op
+    /// on builds without them or when the user made no marks. Defaults to `true`.
+    pub annotation_voiceprint_spread: bool,
     /// Capture the meeting microphone through the macOS system voice
     /// processor (VoiceProcessingIO — the FaceTime chain) so the OS cancels
     /// acoustic echo at the source: on speakerphone meetings the far-end
@@ -111,6 +119,7 @@ impl Default for MeetingConfig {
             system_audio: true,
             system_live_preview: true,
             echo_suppression: true,
+            annotation_voiceprint_spread: true,
             mic_aec: true,
             self_identity_id: None,
         }
