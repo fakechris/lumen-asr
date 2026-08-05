@@ -26,8 +26,43 @@ fn windows_microphone_state_from_code(code: u8) -> lumen_platform::PermissionSta
 }
 
 #[cfg(target_os = "windows")]
+fn windows_microphone_state_from_capability_code(
+    code: i32,
+) -> Option<lumen_platform::PermissionState> {
+    use lumen_platform::PermissionState;
+    use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
+
+    match AppCapabilityAccessStatus(code) {
+        AppCapabilityAccessStatus::Allowed => Some(PermissionState::Granted),
+        AppCapabilityAccessStatus::DeniedByUser => Some(PermissionState::Denied),
+        AppCapabilityAccessStatus::DeniedBySystem => Some(PermissionState::Restricted),
+        AppCapabilityAccessStatus::UserPromptRequired => Some(PermissionState::NotDetermined),
+        // An unpackaged build cannot declare an MSIX capability. Keep that
+        // state neutral and let the real CPAL/WASAPI probe decide on use.
+        AppCapabilityAccessStatus::NotDeclaredByApp => None,
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_microphone_app_capability_state() -> Option<lumen_platform::PermissionState> {
+    use windows::{core::HSTRING, Security::Authorization::AppCapabilityAccess::AppCapability};
+
+    let capability = AppCapability::Create(&HSTRING::from("Microphone")).ok()?;
+    let status = capability.CheckAccess().ok()?;
+    windows_microphone_state_from_capability_code(status.0)
+}
+
+#[cfg(target_os = "windows")]
 fn windows_microphone_state() -> lumen_platform::PermissionState {
-    windows_microphone_state_from_code(WINDOWS_MICROPHONE_STATE.load(Ordering::SeqCst))
+    // AppCapability is a non-prompting query for packaged MSIX/Store apps and
+    // survives process restarts because Windows owns the permission state. It
+    // stays authoritative so a Settings change is reflected by the UI poll.
+    // Unpackaged NSIS builds fall back to NotDetermined and the real capture
+    // probe above remains authoritative for the current process.
+    windows_microphone_app_capability_state().unwrap_or_else(|| {
+        windows_microphone_state_from_code(WINDOWS_MICROPHONE_STATE.load(Ordering::SeqCst))
+    })
 }
 
 /// A successful real capture is the most reliable Windows permission probe.
@@ -252,9 +287,9 @@ pub async fn get_permission_status() -> Result<PermissionDto, String> {
     {
         use lumen_platform::PermissionState;
         Ok(map_status(PermissionStatus {
-            // Windows has no macOS-style TCC query here. Cache the result of
-            // the last user-initiated CPAL/WASAPI capture probe instead of
-            // resetting the UI to "not determined" on every poll.
+            // MSIX/Store builds can query the declared microphone capability
+            // without opening the device. A successful real capture remains
+            // the fallback for unpackaged builds.
             microphone: windows_microphone_state(),
             accessibility: PermissionState::Restricted,
         }))
@@ -393,10 +428,14 @@ pub fn bootstrap_permissions() {
         }
     }
     #[cfg(target_os = "windows")]
-    tracing::info!(
-        path = %process_path(),
-        "Windows permission bootstrap: microphone is probed on capture; text output is copy-only"
-    );
+    {
+        let microphone = windows_microphone_state();
+        tracing::info!(
+            path = %process_path(),
+            ?microphone,
+            "Windows permission bootstrap: package capability checked; capture probe remains available; text output is copy-only"
+        );
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     tracing::info!("permission bootstrap unavailable on this platform");
 }
@@ -437,5 +476,39 @@ mod tests {
             windows_microphone_state_from_code(2),
             PermissionState::NotDetermined
         ));
+    }
+
+    #[test]
+    fn windows_app_capability_status_maps_to_permission_state() {
+        use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
+
+        assert!(matches!(
+            windows_microphone_state_from_capability_code(AppCapabilityAccessStatus::Allowed.0),
+            Some(PermissionState::Granted)
+        ));
+        assert!(matches!(
+            windows_microphone_state_from_capability_code(
+                AppCapabilityAccessStatus::DeniedByUser.0
+            ),
+            Some(PermissionState::Denied)
+        ));
+        assert!(matches!(
+            windows_microphone_state_from_capability_code(
+                AppCapabilityAccessStatus::DeniedBySystem.0
+            ),
+            Some(PermissionState::Restricted)
+        ));
+        assert!(matches!(
+            windows_microphone_state_from_capability_code(
+                AppCapabilityAccessStatus::UserPromptRequired.0
+            ),
+            Some(PermissionState::NotDetermined)
+        ));
+        assert_eq!(
+            windows_microphone_state_from_capability_code(
+                AppCapabilityAccessStatus::NotDeclaredByApp.0
+            ),
+            None
+        );
     }
 }

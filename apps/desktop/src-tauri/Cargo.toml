@@ -51,6 +51,9 @@ lumen-context = { workspace = true }
 # builds compile the meeting pipeline's Unsupported stub instead.
 lumen-meeting = { workspace = true, features = ["diarize"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Security_Authorization_AppCapabilityAccess"] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

@@ -1880,17 +1880,39 @@ function SettingsPanel({
         {perm ? (
           <>
             <div className="perm-list">
-              <div className={`perm-row ${perm.microphone === "granted" ? "ok" : "bad"}`}>
+              <div
+                className={`perm-row ${
+                  perm.microphone === "granted"
+                    ? "ok"
+                    : IS_WINDOWS && perm.microphone === "not_determined"
+                      ? ""
+                      : "bad"
+                }`}
+              >
                 <span className="perm-status">
                   <span
-                    className={`perm-dot ${perm.microphone === "granted" ? "ok" : "bad"}`}
+                    className={`perm-dot ${
+                      perm.microphone === "granted"
+                        ? "ok"
+                        : IS_WINDOWS && perm.microphone === "not_determined"
+                          ? ""
+                          : "bad"
+                    }`}
                     aria-hidden
                   />
                   <span className="perm-status-text">
                     <span className="perm-name">
                       麦克风
                       <span className="perm-badge">
-                        {perm.microphone === "granted" ? "已授权" : "未授权"}
+                        {perm.microphone === "granted"
+                          ? "已授权"
+                          : perm.microphone === "denied"
+                            ? "未授权"
+                            : perm.microphone === "restricted"
+                              ? "受限制"
+                              : IS_WINDOWS
+                                ? "未检查"
+                                : "未授权"}
                       </span>
                     </span>
                     <span className="perm-state">
@@ -1900,7 +1922,9 @@ function SettingsPanel({
                           ? "已被拒绝 — 到系统设置里打开"
                           : perm.microphone === "restricted"
                             ? "被系统策略限制"
-                            : "尚未授权 — 点右侧请求，会弹系统授权窗"}
+                            : IS_WINDOWS
+                              ? "尚未确认 — 点右侧检查，必要时 Windows 会显示授权提示"
+                              : "尚未授权 — 点右侧请求，会弹系统授权窗"}
                     </span>
                   </span>
                 </span>
@@ -1923,7 +1947,13 @@ function SettingsPanel({
                     })()
                   }
                 >
-                  {perm.microphone === "granted" ? "重新检查" : "请求麦克风"}
+                  {IS_WINDOWS
+                    ? perm.microphone === "granted"
+                      ? "测试麦克风"
+                      : "检查麦克风"
+                    : perm.microphone === "granted"
+                      ? "重新检查"
+                      : "请求麦克风"}
                 </button>
               </div>
 
