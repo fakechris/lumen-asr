@@ -1433,6 +1433,11 @@ code {
   background: color-mix(in srgb, var(--danger) 16%, transparent);
 }
 
+.perm-row:not(.ok):not(.bad) .perm-badge {
+  color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+}
+
 .perm-state {
   font-size: 12px;
   color: var(--muted);
