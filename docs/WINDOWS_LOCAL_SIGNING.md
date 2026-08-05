@@ -56,10 +56,12 @@ The script:
 3. increments the newest source, installed, or previously generated local
    four-part version so Windows can update an already installed test package
    without deleting its data;
-4. repacks the MSIX;
-5. creates or reuses a non-exportable RSA development certificate in
+4. creates or reuses a non-exportable RSA development certificate in
    `Cert:\CurrentUser\My`;
-6. signs the package with SHA-256; and
+5. signs every executable payload with SHA-256 before repacking (Smart App
+   Control can reject an unsigned inner `.exe` even when the MSIX envelope is
+   signed);
+6. repacks and signs the MSIX with SHA-256; and
 7. prints the package version, hash, certificate thumbprint, and expiration
    date.
 

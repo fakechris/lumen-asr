@@ -8,7 +8,27 @@ use lumen_platform_macos::{is_accessibility_trusted, prompt_accessibility, MacPe
 use serde::Serialize;
 use tauri::State;
 
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use crate::AppState;
+
+#[cfg(target_os = "windows")]
+static WINDOWS_MICROPHONE_STATE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(target_os = "windows")]
+fn windows_microphone_state_from_code(code: u8) -> lumen_platform::PermissionState {
+    use lumen_platform::PermissionState;
+    match code {
+        1 => PermissionState::Granted,
+        _ => PermissionState::NotDetermined,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_microphone_state() -> lumen_platform::PermissionState {
+    windows_microphone_state_from_code(WINDOWS_MICROPHONE_STATE.load(Ordering::SeqCst))
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +78,9 @@ fn map_status(s: PermissionStatus) -> PermissionDto {
             PermissionState::NotDetermined => "needs_enable",
         }
     };
+    #[cfg(target_os = "windows")]
+    let can_record = matches!(s.microphone, PermissionState::Granted);
+    #[cfg(not(target_os = "windows"))]
     let can_record = matches!(
         s.microphone,
         PermissionState::Granted | PermissionState::NotDetermined
@@ -222,9 +245,10 @@ pub async fn get_permission_status() -> Result<PermissionDto, String> {
     {
         use lumen_platform::PermissionState;
         Ok(map_status(PermissionStatus {
-            // CPAL/WASAPI will trigger the actual privacy prompt when capture
-            // starts; Windows does not expose the macOS-style TCC query here.
-            microphone: PermissionState::NotDetermined,
+            // Windows has no macOS-style TCC query here. Cache the result of
+            // the last user-initiated CPAL/WASAPI capture probe instead of
+            // resetting the UI to "not determined" on every poll.
+            microphone: windows_microphone_state(),
             accessibility: PermissionState::Restricted,
         }))
     }
@@ -314,13 +338,24 @@ pub async fn request_accessibility_access() -> Result<PermissionDto, String> {
 pub async fn request_microphone_access(
     state: State<'_, AppState>,
 ) -> Result<PermissionDto, String> {
-    if !state.audio.is_recording() {
+    if state.audio.is_recording() {
+        #[cfg(target_os = "windows")]
+        WINDOWS_MICROPHONE_STATE.store(1, Ordering::SeqCst);
+    } else {
         match state.audio.start() {
             Ok(()) => {
+                #[cfg(target_os = "windows")]
+                WINDOWS_MICROPHONE_STATE.store(1, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
                 let _ = state.audio.stop();
             }
             Err(e) => {
+                #[cfg(target_os = "windows")]
+                // AudioCapture reports device, stream, and worker failures in
+                // addition to permission failures. Until those are classified
+                // separately, a failed probe must remain unknown rather than
+                // falsely claiming the user denied microphone access.
+                WINDOWS_MICROPHONE_STATE.store(0, Ordering::SeqCst);
                 tracing::warn!(error = %e, "mic probe start failed");
             }
         }
@@ -359,4 +394,43 @@ pub fn bootstrap_permissions() {
     );
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     tracing::info!("permission bootstrap unavailable on this platform");
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use lumen_platform::PermissionState;
+
+    fn status(microphone: PermissionState) -> PermissionStatus {
+        PermissionStatus {
+            microphone,
+            accessibility: PermissionState::Restricted,
+        }
+    }
+
+    #[test]
+    fn windows_unknown_microphone_is_not_recordable() {
+        let dto = map_status(status(PermissionState::NotDetermined));
+        assert_eq!(dto.microphone, "not_determined");
+        assert!(!dto.can_record);
+    }
+
+    #[test]
+    fn windows_granted_microphone_is_recordable() {
+        let dto = map_status(status(PermissionState::Granted));
+        assert_eq!(dto.microphone, "granted");
+        assert!(dto.can_record);
+    }
+
+    #[test]
+    fn windows_probe_failure_is_not_reported_as_permission_denied() {
+        assert!(matches!(
+            windows_microphone_state_from_code(0),
+            PermissionState::NotDetermined
+        ));
+        assert!(matches!(
+            windows_microphone_state_from_code(2),
+            PermissionState::NotDetermined
+        ));
+    }
 }

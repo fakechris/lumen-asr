@@ -70,7 +70,7 @@ fn scan_candidates() -> Vec<AsrModelCandidate> {
         .into_iter()
         .map(|candidate| AsrModelCandidate {
             engine: candidate.engine,
-            path: candidate.path.display().to_string(),
+            path: crate::display_path(&candidate.path),
             label: candidate.label,
             ready: candidate.ready,
             source: candidate.source,
@@ -111,9 +111,9 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
         .unwrap_or_else(|| qw.clone());
 
     let active_model_dir = match engine.as_str() {
-        "qwen" => qw_live.display().to_string(),
-        "whisper" => wh_live.display().to_string(),
-        _ => sv_live.display().to_string(),
+        "qwen" => crate::display_path(&qw_live),
+        "whisper" => crate::display_path(&wh_live),
+        _ => crate::display_path(&sv_live),
     };
     let qwen_runtime_supported = cfg!(target_os = "macos");
     let total_memory_mb = total_memory_mb();
@@ -138,31 +138,31 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
     Ok(AsrModelStatus {
         sensevoice_ready: sensevoice_ready(&sv_live) || sensevoice_ready(&sv),
         sensevoice_dir: if sensevoice_ready(&sv_live) {
-            sv_live.display().to_string()
+            crate::display_path(&sv_live)
         } else {
-            sv.display().to_string()
+            crate::display_path(&sv)
         },
         whisper_ready: whisper_ready(&wh_live) || whisper_ready(&wh),
         whisper_dir: if whisper_ready(&wh_live) {
-            wh_live.display().to_string()
+            crate::display_path(&wh_live)
         } else {
-            wh.display().to_string()
+            crate::display_path(&wh)
         },
         qwen_ready: qwen_ready(&qw_live) || qwen_ready(&qw),
         qwen_dir: if qwen_ready(&qw_live) {
-            qw_live.display().to_string()
+            crate::display_path(&qw_live)
         } else {
-            qw.display().to_string()
+            crate::display_path(&qw)
         },
         paraformer_offline_ready: paraformer_offline_ready(&pf_offline),
-        paraformer_offline_dir: pf_offline.display().to_string(),
+        paraformer_offline_dir: crate::display_path(&pf_offline),
         paraformer_streaming_ready: paraformer_streaming_ready(&pf_streaming),
-        paraformer_streaming_dir: pf_streaming.display().to_string(),
+        paraformer_streaming_dir: crate::display_path(&pf_streaming),
         qwen_runtime_supported,
         qwen_fallback_reason,
         recommended_engine: recommended_engine.into(),
         total_memory_mb,
-        models_root: lumen_models_dir().display().to_string(),
+        models_root: crate::display_path(&lumen_models_dir()),
         active_engine: engine,
         active_model_dir,
         candidates: scan_candidates(),

@@ -5,6 +5,11 @@ use crate::AppState;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+// Version 2 is the first Windows onboarding that verifies the real microphone
+// capture result and explains the copy-only output mode. Keep macOS on its
+// existing version so this Windows migration never re-prompts Mac users.
+const CURRENT_ONBOARDING_VERSION: u32 = if cfg!(target_os = "windows") { 2 } else { 1 };
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OnboardingStateDto {
@@ -24,12 +29,17 @@ pub struct OnboardingStepInput {
 }
 
 fn dto_from(cfg: &OnboardingConfig) -> OnboardingStateDto {
-    let show_wizard = !cfg.completed && !cfg.skipped;
+    let current = cfg.version >= CURRENT_ONBOARDING_VERSION;
+    let completed = current && cfg.completed;
+    let skipped = current && cfg.skipped;
+    let show_wizard = !completed && !skipped;
     OnboardingStateDto {
-        completed: cfg.completed,
-        skipped: cfg.skipped,
-        version: cfg.version,
-        step: cfg.step,
+        completed,
+        skipped,
+        version: CURRENT_ONBOARDING_VERSION,
+        // An older completed wizard must restart at Welcome, not reopen on its
+        // old final step.
+        step: if current { cfg.step } else { 0 },
         show_wizard,
         max_step_stage_b: 6, // full wizard: 0…6
     }
@@ -53,6 +63,9 @@ pub fn set_onboarding_step(
         .config
         .lock()
         .map_err(|_| "config lock poisoned".to_string())?;
+    guard.onboarding.version = CURRENT_ONBOARDING_VERSION;
+    guard.onboarding.completed = false;
+    guard.onboarding.skipped = false;
     guard.onboarding.step = input.step.min(6);
     guard.save()?;
     Ok(dto_from(&guard.onboarding))
@@ -66,6 +79,7 @@ pub fn skip_onboarding(state: State<'_, AppState>) -> Result<OnboardingStateDto,
         .map_err(|_| "config lock poisoned".to_string())?;
     guard.onboarding.skipped = true;
     guard.onboarding.completed = false;
+    guard.onboarding.version = CURRENT_ONBOARDING_VERSION;
     guard.save()?;
     tracing::info!("onboarding skipped");
     Ok(dto_from(&guard.onboarding))
@@ -84,6 +98,7 @@ pub fn complete_onboarding(
     let _ = complete_all;
     guard.onboarding.completed = true;
     guard.onboarding.skipped = false;
+    guard.onboarding.version = CURRENT_ONBOARDING_VERSION;
     guard.onboarding.step = 6;
     guard.onboarding.completed_at = Some(chrono::Utc::now().to_rfc3339());
     guard.save()?;
@@ -99,8 +114,44 @@ pub fn reopen_onboarding(state: State<'_, AppState>) -> Result<OnboardingStateDt
         .map_err(|_| "config lock poisoned".to_string())?;
     guard.onboarding.completed = false;
     guard.onboarding.skipped = false;
+    guard.onboarding.version = CURRENT_ONBOARDING_VERSION;
     guard.onboarding.step = 0;
     guard.onboarding.completed_at = None;
     guard.save()?;
     Ok(dto_from(&guard.onboarding))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_current_onboarding_stays_closed() {
+        let cfg = OnboardingConfig {
+            completed: true,
+            version: CURRENT_ONBOARDING_VERSION,
+            step: 6,
+            ..OnboardingConfig::default()
+        };
+
+        let dto = dto_from(&cfg);
+        assert!(dto.completed);
+        assert!(!dto.show_wizard);
+        assert_eq!(dto.step, 6);
+    }
+
+    #[test]
+    fn older_onboarding_restarts_at_welcome() {
+        let cfg = OnboardingConfig {
+            completed: true,
+            version: CURRENT_ONBOARDING_VERSION - 1,
+            step: 6,
+            ..OnboardingConfig::default()
+        };
+
+        let dto = dto_from(&cfg);
+        assert!(!dto.completed);
+        assert!(dto.show_wizard);
+        assert_eq!(dto.step, 0);
+    }
 }

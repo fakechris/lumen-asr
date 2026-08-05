@@ -34,6 +34,8 @@ import type {
   TabId,
 } from "./types";
 
+const IS_WINDOWS = navigator.userAgent.includes("Windows");
+
 function previewText(s?: string | null, n = 72): string {
   if (!s) return "—";
   const t = s.replace(/\s+/g, " ").trim();
@@ -1743,8 +1745,10 @@ function SettingsPanel({
                   onClick={() =>
                     void (async () => {
                       onBusy(true);
+                      onError(null);
                       try {
                         setPerm(await api.requestMicrophoneAccess());
+                        onSaved();
                       } catch (e) {
                         onError(String(e));
                       } finally {
@@ -1757,6 +1761,22 @@ function SettingsPanel({
                 </button>
               </div>
 
+              {IS_WINDOWS ? (
+                <div className="perm-row ok">
+                  <span className="perm-status">
+                    <span className="perm-dot ok" aria-hidden />
+                    <span className="perm-status-text">
+                      <span className="perm-name">
+                        Windows 输出模式
+                        <span className="perm-badge">复制到剪贴板</span>
+                      </span>
+                      <span className="perm-state">
+                        Windows 版当前不需要 macOS“辅助功能”权限；转写结果会安全地复制到剪贴板。
+                      </span>
+                    </span>
+                  </span>
+                </div>
+              ) : (
               <div className={`perm-row ${perm.accessibilityTrusted ? "ok" : "bad"}`}>
                 <span className="perm-status">
                   <span
@@ -1798,9 +1818,10 @@ function SettingsPanel({
                   {perm.accessibilityTrusted ? "重新检查" : "打开辅助功能设置"}
                 </button>
               </div>
+              )}
             </div>
 
-            <details className="settings-help perm-details">
+            {!IS_WINDOWS && <details className="settings-help perm-details">
               <summary>权限如何检测 · 技术细节</summary>
               <p className="muted-text" style={{ margin: "10px 0" }}>
                 麦克风走系统弹窗授权。辅助功能系统<strong>不会</strong>弹窗，必须在「系统设置 →
@@ -1830,8 +1851,8 @@ function SettingsPanel({
                   ) : null}
                 </dd>
               </dl>
-            </details>
-            {!perm.accessibilityTrusted && (
+            </details>}
+            {!IS_WINDOWS && !perm.accessibilityTrusted && (
               <div className="ax-recovery" style={{ marginTop: 12 }}>
                 <p className="muted-text" style={{ marginBottom: 8 }}>
                   <strong>为什么开关开了仍显示「需要开启」？</strong>
