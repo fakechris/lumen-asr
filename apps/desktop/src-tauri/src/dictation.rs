@@ -307,6 +307,29 @@ fn insertion_outcome_for_strategy(strategy: InsertStrategy) -> InsertionOutcome 
     }
 }
 
+fn copy_only_error_message(clipboard_copied: bool) -> Option<&'static str> {
+    #[cfg(target_os = "windows")]
+    {
+        if clipboard_copied {
+            None
+        } else {
+            Some("Windows 复制模式未能把文字写入剪贴板，请先从历史记录手动复制结果。")
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if clipboard_copied {
+            Some(
+                "需要「辅助功能」权限才能插入到其他 App。请到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop），然后重试。文字已复制到剪贴板。",
+            )
+        } else {
+            Some(
+                "需要「辅助功能」权限才能插入到其他 App，并且复制到剪贴板也失败了。请先手动复制结果，并到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop）后重试。",
+            )
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AsrStatus {
@@ -1042,20 +1065,28 @@ pub async fn stop_and_transcribe_inner(
     let mut frontmost_before_insert = None;
     let insert_started = Instant::now();
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
+        #[cfg(target_os = "macos")]
         let ax_ok = lumen_platform_macos::is_accessibility_trusted();
+        #[cfg(not(target_os = "macos"))]
+        let ax_ok = false;
         if !ax_ok {
-            // Without Accessibility, synthetic keys only hit *this* process — copy instead.
+            #[cfg(target_os = "macos")]
             tracing::error!(
                 "Accessibility not granted; cannot inject into other apps. Open System Settings → Privacy & Security → Accessibility and enable this process"
             );
+            #[cfg(not(target_os = "macos"))]
+            tracing::info!("platform uses copy-only output; skipping cross-app injection");
             let clipboard_copied = match crate::inject_cmd::copy_only(&corrected_text).await {
                 Ok(()) => {
                     insert_strategy = InsertStrategy::CopyOnly;
                     insertion_outcome = InsertionOutcome::Copied;
+                    #[cfg(target_os = "macos")]
                     notes.push(
                         "accessibility denied — text copied to clipboard; enable Accessibility for insert"
                             .into(),
                     );
+                    #[cfg(not(target_os = "macos"))]
+                    notes.push("platform copy-only mode — text copied to clipboard".into());
                     tracing::info!("copied result to clipboard (no AX)");
                     true
                 }
@@ -1073,12 +1104,7 @@ pub async fn stop_and_transcribe_inner(
                     false
                 }
             };
-            if let Some(app) = app {
-                let message = if clipboard_copied {
-                    "需要「辅助功能」权限才能插入到其他 App。请到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop），然后重试。文字已复制到剪贴板。"
-                } else {
-                    "需要「辅助功能」权限才能插入到其他 App，并且复制到剪贴板也失败了。请先手动复制结果，并到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop）后重试。"
-                };
+            if let (Some(app), Some(message)) = (app, copy_only_error_message(clipboard_copied)) {
                 emit_dictation(
                     app,
                     DictationUiEvent::Error {
@@ -2149,6 +2175,21 @@ mod attempt_metric_tests {
             insertion_outcome_for_strategy(InsertStrategy::None),
             InsertionOutcome::Failed
         );
+    }
+
+    #[test]
+    fn copy_only_feedback_matches_platform_contract() {
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(copy_only_error_message(true), None);
+            let failure = copy_only_error_message(false).unwrap();
+            assert!(failure.contains("剪贴板"));
+            assert!(!failure.contains("辅助功能"));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(copy_only_error_message(true).unwrap().contains("辅助功能"));
+        }
     }
 
     #[test]
