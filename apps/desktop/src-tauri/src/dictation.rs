@@ -654,6 +654,7 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
         state.context.clear_active();
         error.to_string()
     })?;
+    crate::permissions_cmd::mark_microphone_capture_started();
     // Notify the capture arbiter that a dictation is now live (CaptureMode::
     // Dictation). Recording is already running here, so this is a state-only
     // signal — it never touches the audio/hotkey path. A meeting suspends the

@@ -14,6 +14,10 @@ import { ChordCaptureChip } from "./ChordCaptureChip";
 import { MeetingPanel } from "./MeetingPanel";
 import { MeetingModelsProvider } from "./meetingModels";
 import {
+  acknowledgeWindowsMicrophoneNotice,
+  hasAcknowledgedWindowsMicrophoneNotice,
+} from "./microphoneConsent";
+import {
   correctorFallbackNotice,
   correctorFallbackReasonLabel,
 } from "./fallbackPresentation";
@@ -929,6 +933,93 @@ function StopSuggestPrompt({
   );
 }
 
+function MicrophoneConsentDialog({
+  onlineRecognition,
+  providerLabel,
+  onAllow,
+  onCancel,
+  onOpenSettings,
+}: {
+  onlineRecognition: boolean;
+  providerLabel: string;
+  onAllow: () => void;
+  onCancel: () => void;
+  onOpenSettings: () => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    cancelRef.current?.focus();
+  }, []);
+
+  return (
+    <div className="meeting-modal-overlay microphone-consent-overlay">
+      <div
+        ref={dialogRef}
+        className="card meeting-confirm microphone-consent"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="microphone-consent-title"
+        aria-describedby="microphone-consent-description"
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.stopPropagation();
+            onCancel();
+            return;
+          }
+          if (event.key === "Tab") {
+            const controls = Array.from(
+              dialogRef.current?.querySelectorAll<HTMLElement>(
+                'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+              ) ?? [],
+            );
+            if (controls.length === 0) {
+              event.preventDefault();
+              return;
+            }
+            const first = controls[0];
+            const last = controls[controls.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+              event.preventDefault();
+              last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+              event.preventDefault();
+              first.focus();
+            }
+          }
+        }}
+      >
+        <h2 id="microphone-consent-title" className="meeting-confirm-title">
+          允许 Lumen 使用麦克风？
+        </h2>
+        <div id="microphone-consent-description" className="microphone-consent-copy">
+          <p>Lumen 只会在你点击录音或主动使用录音热键时开启麦克风。</p>
+          <p>
+            {onlineRecognition
+              ? `当前选择“${providerLabel}”，录音将发送给你配置的在线服务进行语音识别。`
+              : `当前选择“${providerLabel}”，语音识别在本机完成；如果另行启用在线文本修正，转写文字可能发送给所配置的服务。`}
+          </p>
+          <p>
+            Windows 桌面应用不一定显示单独的系统授权弹窗。你可以随时到系统麦克风设置中关闭访问。
+          </p>
+        </div>
+        <div className="meeting-confirm-actions microphone-consent-actions">
+          <button type="button" className="btn" onClick={onAllow}>
+            允许并开始录音
+          </button>
+          <button type="button" className="btn ghost" onClick={onOpenSettings}>
+            打开 Windows 设置
+          </button>
+          <button type="button" className="btn ghost" ref={cancelRef} onClick={onCancel}>
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function RecordPanel({
   busy,
   onError,
@@ -961,6 +1052,19 @@ function RecordPanel({
   const [baseline, setBaseline] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [liveCandidates, setLiveCandidates] = useState<LearnCandidate[]>([]);
+  const [startError, setStartError] = useState<string | null>(null);
+  const [microphoneNoticeAcknowledged, setMicrophoneNoticeAcknowledged] = useState(
+    () => {
+      if (!IS_WINDOWS) return true;
+      try {
+        return hasAcknowledgedWindowsMicrophoneNotice(window.localStorage);
+      } catch {
+        return false;
+      }
+    },
+  );
+  const [showMicrophoneConsent, setShowMicrophoneConsent] = useState(false);
+  const microphoneConsentTriggerRef = useRef<HTMLElement | null>(null);
   const onSavedRef = useRef(onSaved);
   onSavedRef.current = onSaved;
 
@@ -1075,21 +1179,61 @@ function RecordPanel({
     }
   }
 
-  async function start() {
+  async function startRecording() {
     onBusy(true);
     onError(null);
+    setStartError(null);
     setText("");
     setAsrText("");
     setMeta("");
     try {
+      if (IS_WINDOWS) {
+        const currentPermission = await api.getPermissionStatus();
+        if (!currentPermission.canRecord) {
+          const requestedPermission = await api.requestMicrophoneAccess();
+          if (!requestedPermission.canRecord) {
+            throw new Error(
+              "麦克风尚未就绪。请允许 Windows 麦克风访问后点击“重试录音”，或到「设置 → 权限」再次请求。",
+            );
+          }
+        }
+      }
       await api.startRecording();
       setRecording(true);
       await refreshStatus();
     } catch (e) {
-      onError(String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setStartError(message);
+      onError(message);
     } finally {
       onBusy(false);
     }
+  }
+
+  async function start() {
+    if (IS_WINDOWS && !microphoneNoticeAcknowledged) {
+      microphoneConsentTriggerRef.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      setShowMicrophoneConsent(true);
+      return;
+    }
+    await startRecording();
+  }
+
+  function cancelMicrophoneConsent() {
+    setShowMicrophoneConsent(false);
+    window.requestAnimationFrame(() => microphoneConsentTriggerRef.current?.focus());
+  }
+
+  function allowMicrophoneAndStart() {
+    try {
+      acknowledgeWindowsMicrophoneNotice(window.localStorage);
+    } catch {
+      // Keep the acknowledgement for this app session when storage is blocked.
+    }
+    setMicrophoneNoticeAcknowledged(true);
+    setShowMicrophoneConsent(false);
+    void startRecording();
   }
 
   async function stop() {
@@ -1215,6 +1359,15 @@ function RecordPanel({
 
   return (
     <>
+      {showMicrophoneConsent && (
+        <MicrophoneConsentDialog
+          onlineRecognition={!isLocal}
+          providerLabel={status?.providerLabel || provider}
+          onAllow={allowMicrophoneAndStart}
+          onCancel={cancelMicrophoneConsent}
+          onOpenSettings={() => void api.openMicrophoneSettings()}
+        />
+      )}
       <section className="card">
         <h2>录音转写</h2>
         <p className="muted-text">
@@ -1331,6 +1484,19 @@ function RecordPanel({
             </>
           )}
         </div>
+        {!recording && startError && (
+          <div className="recording-retry" role="alert">
+            <span>{startError}</span>
+            <button
+              type="button"
+              className="btn small"
+              disabled={busy || !ready}
+              onClick={() => void start()}
+            >
+              重试录音
+            </button>
+          </div>
+        )}
         {!ready && isLocal && (
           <p className="muted-text" style={{ marginTop: 12 }}>
             当前本地引擎未就绪。
