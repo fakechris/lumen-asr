@@ -52,6 +52,41 @@ use tauri::Manager;
 
 const QWEN_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Render filesystem paths with native separators in user-facing DTOs.
+/// `PathBuf` accepts `/` on Windows, but exposing mixed separators in Settings
+/// made a valid model directory look broken.
+pub(crate) fn display_path(path: &Path) -> String {
+    let value = path.display().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        value.replace('/', "\\")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        value
+    }
+}
+
+/// Keep Windows installs on the documented shared model root even while the
+/// pinned lumen-models revision still treats every non-macOS platform as Unix.
+/// An explicit user/environment override always wins.
+#[cfg(target_os = "windows")]
+fn configure_windows_models_root() {
+    let configured = std::env::var_os("LUMEN_MODELS_DIR")
+        .filter(|value| !value.to_string_lossy().trim().is_empty());
+    if configured.is_some() {
+        return;
+    }
+    if let Some(local_app_data) =
+        std::env::var_os("LOCALAPPDATA").filter(|value| !value.to_string_lossy().trim().is_empty())
+    {
+        std::env::set_var(
+            "LUMEN_MODELS_DIR",
+            PathBuf::from(local_app_data).join("Lumen").join("models"),
+        );
+    }
+}
+
 fn remove_session_artifacts(
     data_dir: &Path,
     artifacts: &SessionArtifactPaths,
@@ -361,6 +396,9 @@ pub(crate) fn schedule_qwen_runtime_refresh(app: tauri::AppHandle) -> Result<(),
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    configure_windows_models_root();
+
     let data_dir = default_data_dir();
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::fs::create_dir_all(data_dir.join("models"));

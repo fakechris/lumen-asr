@@ -503,17 +503,17 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
     } else {
         canonical_asr_provider(&asr_cfg.provider)
     };
-    let sv = state
+    let mut sv = state
         .sensevoice
         .lock()
         .map(|engine| probe_status(EngineKind::SenseVoice, Some(&engine.model_dir())))
         .unwrap_or_else(|_| lumen_asr::sensevoice_status());
-    let wh = state
+    let mut wh = state
         .whisper
         .lock()
         .map(|engine| probe_status(EngineKind::Whisper, Some(&engine.model_dir())))
         .unwrap_or_else(|_| lumen_asr::whisper_status());
-    let (qwen, qwen_runtime_path) = state
+    let (mut qwen, qwen_runtime_path) = state
         .qwen
         .lock()
         .map(|engine| {
@@ -529,6 +529,10 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
                 asr_cfg.qwen_python_executable().display().to_string(),
             )
         });
+    sv.model_dir = crate::display_path(std::path::Path::new(&sv.model_dir));
+    wh.model_dir = crate::display_path(std::path::Path::new(&wh.model_dir));
+    qwen.model_dir = crate::display_path(std::path::Path::new(&qwen.model_dir));
+    let qwen_runtime_path = crate::display_path(std::path::Path::new(&qwen_runtime_path));
     let (qwen_runtime_ready, qwen_runtime_checking) = if qwen.ready {
         state
             .qwen_runtime

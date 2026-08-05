@@ -133,6 +133,9 @@ impl AppConfig {
                 self.asr.qwen_shadow_enabled = false;
                 changed = true;
             }
+            if self.asr.migrate_windows_shared_model_dirs() {
+                changed = true;
+            }
             // Alt+Space is commonly reserved by Windows shell/utilities.
             if self.hotkey.toggle.eq_ignore_ascii_case("Alt+Space") && !self.onboarding.completed {
                 self.hotkey.toggle = "Ctrl+Shift+Space".into();
@@ -248,6 +251,57 @@ impl AsrServiceConfig {
             }
             _ => {}
         }
+    }
+
+    /// Older Windows builds persisted the Unix-style `~/.lumen/models` path.
+    /// Move that *selection* to the canonical LocalAppData root only when the
+    /// same engine is already ready there; model files are never moved or
+    /// deleted, and custom user paths are never rewritten.
+    #[cfg(target_os = "windows")]
+    fn migrate_windows_shared_model_dirs(&mut self) -> bool {
+        let Some(home) = std::env::var_os("USERPROFILE")
+            .filter(|value| !value.to_string_lossy().trim().is_empty())
+            .map(PathBuf::from)
+        else {
+            return false;
+        };
+        let legacy_root = home.join(".lumen").join("models");
+        let shared_root = lumen_asr::lumen_models_dir();
+        if legacy_root == shared_root {
+            return false;
+        }
+
+        let mut changed = false;
+        let legacy_sensevoice = legacy_root.join("sensevoice");
+        let shared_sensevoice = shared_root.join("sensevoice");
+        if PathBuf::from(self.sensevoice_model_dir.trim()) == legacy_sensevoice
+            && lumen_asr::sensevoice_ready(&shared_sensevoice)
+        {
+            self.sensevoice_model_dir = shared_sensevoice.display().to_string();
+            changed = true;
+        }
+
+        let legacy_whisper = legacy_root.join("whisper");
+        let shared_whisper = shared_root.join("whisper");
+        if PathBuf::from(self.whisper_model_dir.trim()) == legacy_whisper
+            && lumen_asr::whisper_ready(&shared_whisper)
+        {
+            self.whisper_model_dir = shared_whisper.display().to_string();
+            changed = true;
+        }
+
+        if PathBuf::from(self.model_dir.trim()) == legacy_sensevoice
+            && lumen_asr::sensevoice_ready(&shared_sensevoice)
+        {
+            self.model_dir = shared_sensevoice.display().to_string();
+            changed = true;
+        } else if PathBuf::from(self.model_dir.trim()) == legacy_whisper
+            && lumen_asr::whisper_ready(&shared_whisper)
+        {
+            self.model_dir = shared_whisper.display().to_string();
+            changed = true;
+        }
+        changed
     }
 
     pub fn model_dir_for(&self, engine: lumen_asr::EngineKind) -> PathBuf {

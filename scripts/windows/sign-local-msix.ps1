@@ -79,6 +79,44 @@ New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 
 $makeAppx = Resolve-WindowsSdkTool -Name "makeappx.exe"
 $signTool = Resolve-WindowsSdkTool -Name "signtool.exe"
+$certificate = Get-ChildItem -Path "Cert:\CurrentUser\My" |
+    Where-Object {
+        $enhancedKeyUsages = @(
+            $_.EnhancedKeyUsageList |
+                ForEach-Object { [string]$_.ObjectId }
+        )
+        $_.FriendlyName -eq $CertificateFriendlyName -and
+        $_.Subject -eq $Publisher -and
+        $_.HasPrivateKey -and
+        $_.NotAfter -gt (Get-Date).AddDays(30) -and
+        ($enhancedKeyUsages -contains "1.3.6.1.5.5.7.3.3")
+    } |
+    Sort-Object NotAfter -Descending |
+    Select-Object -First 1
+
+if ($null -eq $certificate) {
+    $certificate = New-SelfSignedCertificate `
+        -Type Custom `
+        -Subject $Publisher `
+        -KeyAlgorithm RSA `
+        -KeyLength 3072 `
+        -HashAlgorithm SHA256 `
+        -KeyUsage DigitalSignature `
+        -KeyExportPolicy NonExportable `
+        -FriendlyName $CertificateFriendlyName `
+        -CertStoreLocation "Cert:\CurrentUser\My" `
+        -TextExtension @(
+            "2.5.29.37={text}1.3.6.1.5.5.7.3.3",
+            "2.5.29.19={text}"
+        ) `
+        -NotAfter (Get-Date).AddYears($CertificateValidityYears)
+}
+
+$certificateDirectory = Join-Path $developmentRoot "Certificates"
+New-Item -ItemType Directory -Path $certificateDirectory -Force | Out-Null
+$certificatePath = Join-Path $certificateDirectory "lumen-asr-local-dev-$($certificate.Thumbprint).cer"
+Export-Certificate -Cert $certificate -FilePath $certificatePath -Force | Out-Null
+
 $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) "lumen-asr-local-sign-$([guid]::NewGuid().ToString('N'))"
 
 try {
@@ -168,48 +206,29 @@ try {
         Remove-Item -LiteralPath $codeIntegrityCatalog -Force
     }
 
+    # Smart App Control evaluates the packaged executable as well as the MSIX
+    # envelope. Sign every executable payload before MakeAppx hashes it into
+    # the package; signing only the final MSIX can still yield error 4551.
+    $payloadExecutables = @(Get-ChildItem -LiteralPath $stagingRoot -Recurse -Filter "*.exe" -File)
+    if ($payloadExecutables.Count -eq 0) {
+        throw "The package does not contain an executable payload."
+    }
+    foreach ($payload in $payloadExecutables) {
+        & $signTool sign /fd SHA256 /sha1 $certificate.Thumbprint $payload.FullName | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "SignTool failed for executable payload '$($payload.FullName)' with exit code $LASTEXITCODE."
+        }
+        $payloadSignature = Get-AuthenticodeSignature -LiteralPath $payload.FullName
+        if ($null -eq $payloadSignature.SignerCertificate -or
+            $payloadSignature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
+            throw "Executable payload '$($payload.FullName)' does not contain the expected signature."
+        }
+    }
+
     & $makeAppx pack /o /d $stagingRoot /p $resolvedOutput | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "MakeAppx pack failed with exit code $LASTEXITCODE."
     }
-
-    $certificate = Get-ChildItem -Path "Cert:\CurrentUser\My" |
-        Where-Object {
-            $enhancedKeyUsages = @(
-                $_.EnhancedKeyUsageList |
-                    ForEach-Object { [string]$_.ObjectId }
-            )
-            $_.FriendlyName -eq $CertificateFriendlyName -and
-            $_.Subject -eq $Publisher -and
-            $_.HasPrivateKey -and
-            $_.NotAfter -gt (Get-Date).AddDays(30) -and
-            ($enhancedKeyUsages -contains "1.3.6.1.5.5.7.3.3")
-        } |
-        Sort-Object NotAfter -Descending |
-        Select-Object -First 1
-
-    if ($null -eq $certificate) {
-        $certificate = New-SelfSignedCertificate `
-            -Type Custom `
-            -Subject $Publisher `
-            -KeyAlgorithm RSA `
-            -KeyLength 3072 `
-            -HashAlgorithm SHA256 `
-            -KeyUsage DigitalSignature `
-            -KeyExportPolicy NonExportable `
-            -FriendlyName $CertificateFriendlyName `
-            -CertStoreLocation "Cert:\CurrentUser\My" `
-            -TextExtension @(
-                "2.5.29.37={text}1.3.6.1.5.5.7.3.3",
-                "2.5.29.19={text}"
-            ) `
-            -NotAfter (Get-Date).AddYears($CertificateValidityYears)
-    }
-
-    $certificateDirectory = Join-Path $developmentRoot "Certificates"
-    New-Item -ItemType Directory -Path $certificateDirectory -Force | Out-Null
-    $certificatePath = Join-Path $certificateDirectory "lumen-asr-local-dev-$($certificate.Thumbprint).cer"
-    Export-Certificate -Cert $certificate -FilePath $certificatePath -Force | Out-Null
 
     & $signTool sign /fd SHA256 /sha1 $certificate.Thumbprint $resolvedOutput | Out-Host
     if ($LASTEXITCODE -ne 0) {
