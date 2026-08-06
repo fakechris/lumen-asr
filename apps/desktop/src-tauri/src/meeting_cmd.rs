@@ -472,6 +472,27 @@ pub fn stop_meeting_recording(
     // the meeting is mic-only.
     let system_summary = state.meeting_system_audio.stop();
 
+    // Surface any capture stalls (system sleep / App Nap suspended the audio
+    // callback): the recorder padded them with silence to keep the timeline
+    // honest, but the audio for those stretches was genuinely not captured, so
+    // warn with the total across both tracks.
+    let gap_seconds: f64 = stop_result
+        .as_ref()
+        .map(|s| s.gaps.iter().map(|g| g.duration_seconds).sum())
+        .unwrap_or(0.0)
+        + system_summary
+            .as_ref()
+            .map(|s| s.gaps.iter().map(|g| g.duration_seconds).sum::<f64>())
+            .unwrap_or(0.0);
+    if gap_seconds >= 1.0 {
+        tracing::warn!(
+            meeting_id = %id,
+            gap_seconds,
+            "meeting had capture stalls padded with silence (likely the Mac slept); \
+             that audio was not recorded"
+        );
+    }
+
     // Stop the real-time worker (no-op if none was running). The recorder stop
     // above already dropped the audio fan-out sender, which ends the worker's
     // loop; this joins it (flushing the last live segment) so it never outlives
