@@ -23,6 +23,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 APP_DIR="$ROOT/target/release/bundle/macos/Lumen ASR.app"
 BIN_SRC="$ROOT/target/release/lumen-asr-desktop"
 BIN_DST="$APP_DIR/Contents/MacOS/lumen-asr-desktop"
+SRC_PLIST="$ROOT/apps/desktop/src-tauri/Info.plist"
 # Final install location. Building into target/ but launching from /Applications
 # (Spotlight/Dock) is how you end up running a stale copy — so after signing we
 # sync the fresh bundle here and open THIS one. Override with LUMEN_INSTALL_DEST=
@@ -31,6 +32,15 @@ INSTALL_DEST="${LUMEN_INSTALL_DEST-/Applications/Lumen ASR.app}"
 OPEN_APP=0
 SKIP_BUILD=0
 SKIP_FRONTEND=0
+
+if [[ ! -f "$SRC_PLIST" ]]; then
+  echo "ERROR: canonical Info.plist not found: $SRC_PLIST" >&2
+  exit 1
+fi
+if ! /usr/bin/plutil -lint "$SRC_PLIST" >/dev/null; then
+  echo "ERROR: canonical Info.plist is invalid: $SRC_PLIST" >&2
+  exit 1
+fi
 
 for arg in "$@"; do
   case "$arg" in
@@ -74,10 +84,9 @@ fi
 if [[ ! -d "$APP_DIR" ]]; then
   echo "==> no .app skeleton; creating minimal bundle at $APP_DIR"
   mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
-  # Try to pull Info.plist / icon from a prior tauri build or src-tauri
-  if [[ -f "$ROOT/apps/desktop/src-tauri/Info.plist" ]]; then
-    # Minimal Info.plist for local runs
-    cat >"$APP_DIR/Contents/Info.plist" <<'PLIST'
+  # Minimal bundle metadata for local runs. Privacy consent strings are merged
+  # from the canonical src-tauri/Info.plist below.
+  cat >"$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -93,14 +102,9 @@ if [[ ! -d "$APP_DIR" ]]; then
   <key>CFBundleVersion</key><string>0.1.0</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSMicrophoneUsageDescription</key>
-  <string>Lumen ASR needs the microphone to record your voice for local speech-to-text.</string>
-  <key>NSAccessibilityUsageDescription</key>
-  <string>Lumen ASR needs Accessibility permission to paste transcribed text into other apps.</string>
 </dict>
 </plist>
 PLIST
-  fi
   echo -n "APPL????" >"$APP_DIR/Contents/PkgInfo"
 fi
 
@@ -149,21 +153,65 @@ if [[ -f "$ICON_DST" && -f "$PLIST" ]]; then
 fi
 
 # Sync every privacy consent string from the canonical src-tauri/Info.plist into
-# the bundle plist. This is a plain `cargo build` (not `tauri build`), so the
-# scaffolded minimal plist above only carries Mic + Accessibility; without this,
-# system-audio (NSAudioCaptureUsageDescription) and Calendar consent strings are
-# absent, and after any TCC reset the first request is denied — meetings then
-# silently degrade to mic-only (system_audio.rs treats denial as a degrade, not
-# a crash). Keeping one source of truth avoids that latent trap.
-SRC_PLIST="$ROOT/apps/desktop/src-tauri/Info.plist"
-if [[ -f "$SRC_PLIST" && -f "$PLIST" ]]; then
-  while IFS= read -r key; do
-    [[ -n "$key" ]] || continue
-    val="$(/usr/libexec/PlistBuddy -c "Print :$key" "$SRC_PLIST" 2>/dev/null)" || continue
-    /usr/libexec/PlistBuddy -c "Set :$key $val" "$PLIST" 2>/dev/null \
-      || /usr/libexec/PlistBuddy -c "Add :$key string $val" "$PLIST"
-  done < <(grep -oE 'NS[A-Za-z]+UsageDescription' "$SRC_PLIST" | sort -u)
+# the bundle plist. This is a plain `cargo build` (not `tauri build`), so Tauri
+# does not merge these keys for us. Missing consent strings after a TCC reset can
+# make system audio or Calendar access silently degrade.
+if [[ ! -f "$PLIST" ]]; then
+  echo "ERROR: bundle Info.plist not found: $PLIST" >&2
+  exit 1
 fi
+
+usage_key_count=0
+while IFS= read -r key; do
+  [[ -n "$key" ]] || continue
+  usage_key_count=$((usage_key_count + 1))
+  if ! val="$(/usr/bin/plutil -extract "$key" raw -o - "$SRC_PLIST" 2>/dev/null)"; then
+    echo "ERROR: could not read $key from canonical Info.plist" >&2
+    exit 1
+  fi
+  /usr/bin/plutil -replace "$key" -string "$val" "$PLIST" 2>/dev/null \
+    || /usr/bin/plutil -insert "$key" -string "$val" "$PLIST"
+  actual="$(/usr/bin/plutil -extract "$key" raw -o - "$PLIST" 2>/dev/null)" || {
+    echo "ERROR: $key was not written to bundle Info.plist" >&2
+    exit 1
+  }
+  if [[ "$actual" != "$val" ]]; then
+    echo "ERROR: $key differs between canonical and bundle Info.plist" >&2
+    exit 1
+  fi
+done < <(
+  /usr/bin/plutil -p "$SRC_PLIST" \
+    | /usr/bin/sed -n 's/^  "\([^"]*UsageDescription\)" =>.*$/\1/p' \
+    | /usr/bin/sort -u
+)
+
+if [[ "$usage_key_count" -eq 0 ]]; then
+  echo "ERROR: canonical Info.plist has no UsageDescription keys" >&2
+  exit 1
+fi
+
+required_privacy_keys=(
+  NSMicrophoneUsageDescription
+  NSAudioCaptureUsageDescription
+  NSCalendarsUsageDescription
+  NSCalendarsFullAccessUsageDescription
+  NSAccessibilityUsageDescription
+)
+for key in "${required_privacy_keys[@]}"; do
+  if ! /usr/bin/plutil -extract "$key" raw -o - "$SRC_PLIST" >/dev/null 2>&1; then
+    echo "ERROR: canonical Info.plist is missing required key: $key" >&2
+    exit 1
+  fi
+  if ! /usr/bin/plutil -extract "$key" raw -o - "$PLIST" >/dev/null 2>&1; then
+    echo "ERROR: bundle Info.plist is missing required key: $key" >&2
+    exit 1
+  fi
+done
+if ! /usr/bin/plutil -lint "$PLIST" >/dev/null; then
+  echo "ERROR: bundle Info.plist is invalid after privacy-key sync: $PLIST" >&2
+  exit 1
+fi
+echo "==> privacy consent strings synced and verified ($usage_key_count keys)"
 
 echo "==> sign"
 "$ROOT/scripts/macos/sign-app.sh" "$APP_DIR"
