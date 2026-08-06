@@ -344,6 +344,7 @@ export default function App() {
   // that auto-clears after a while.
   useEffect(() => {
     let un: (() => void) | undefined;
+    let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     listen<{ kind: string; percent?: number }>("meeting-power-warning", (e) => {
       const msg =
@@ -356,9 +357,13 @@ export default function App() {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => setPowerWarning(null), 15000);
     }).then((fn) => {
-      un = fn;
+      // If the effect was already cleaned up before the listener resolved
+      // (e.g. StrictMode remount), unlisten immediately instead of leaking it.
+      if (cancelled) fn();
+      else un = fn;
     });
     return () => {
+      cancelled = true;
       un?.();
       if (timer) clearTimeout(timer);
     };

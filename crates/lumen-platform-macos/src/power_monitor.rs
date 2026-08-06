@@ -81,9 +81,11 @@ mod imp {
     // IOKit power-source description keys and values (IOKit/ps/IOPSKeys.h). These
     // are plain string constants in the SDK headers, so we build the CFStrings
     // from the same literals rather than link the extern key symbols.
+    const KEY_TYPE: &str = "Type";
     const KEY_CURRENT_CAPACITY: &str = "Current Capacity";
     const KEY_MAX_CAPACITY: &str = "Max Capacity";
     const KEY_POWER_SOURCE_STATE: &str = "Power Source State";
+    const VALUE_INTERNAL_BATTERY: &str = "InternalBattery";
     const VALUE_AC_POWER: &str = "AC Power";
 
     // SAFETY: standard IOKit power-sources entry points.
@@ -112,8 +114,15 @@ mod imp {
     }
 
     /// Turn one power-source description into a [`BatteryStatus`]. `None` when the
-    /// source is not a battery (missing the capacity keys, e.g. a UPS entry).
+    /// source is not the internal battery — e.g. an external UPS, which also
+    /// carries capacity keys but must not be reported as the machine's battery.
     fn status_from_description(dict: &CFDictionary) -> Option<BatteryStatus> {
+        let source_type = dict_value(dict, KEY_TYPE)?
+            .downcast::<CFString>()?
+            .to_string();
+        if source_type != VALUE_INTERNAL_BATTERY {
+            return None;
+        }
         let current = dict_value(dict, KEY_CURRENT_CAPACITY)?
             .downcast::<CFNumber>()?
             .to_i32()?;
