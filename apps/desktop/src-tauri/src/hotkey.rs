@@ -19,6 +19,8 @@ pub struct HotkeyIntentDto {
     pub mode: String,
     pub intent: String,
     pub target_language: String,
+    /// Optional translation style / register (preset key or custom text).
+    pub translate_style: Option<String>,
     pub enabled: bool,
 }
 
@@ -44,6 +46,7 @@ pub struct HotkeyIntentInput {
     pub mode: Option<String>,
     pub intent: Option<String>,
     pub target_language: Option<String>,
+    pub translate_style: Option<String>,
     pub enabled: Option<bool>,
 }
 
@@ -64,6 +67,7 @@ fn intent_dto(i: &HotkeyIntentConfig) -> HotkeyIntentDto {
         mode: i.mode.clone(),
         intent: i.intent.clone(),
         target_language: i.target_language.clone(),
+        translate_style: i.translate_style.clone(),
         enabled: i.enabled,
     }
 }
@@ -166,6 +170,10 @@ pub fn save_hotkey_config(
                     mode: i.mode.unwrap_or_else(|| "hold".into()),
                     intent: i.intent.unwrap_or_else(|| "translate".into()),
                     target_language: i.target_language.unwrap_or_else(|| "en".into()),
+                    translate_style: i
+                        .translate_style
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
                     enabled: i.enabled.unwrap_or(false),
                 })
                 .collect();

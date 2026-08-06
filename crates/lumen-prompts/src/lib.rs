@@ -193,6 +193,15 @@ pub enum IntentSpec {
     Default,
     Translate {
         target_language: String,
+        /// Optional translation *style / register* for this take.
+        ///
+        /// A separate axis from the whole-output [`Style`] enum: it only shapes
+        /// how the translated text reads (faithful / formal / casual / social /
+        /// or a verbatim custom instruction). `None` (the default for configs
+        /// written before this field existed) means faithful translation with
+        /// no added style — byte-for-byte the pre-style behaviour.
+        #[serde(default)]
+        style: Option<String>,
     },
     /// Force cleanup=none for this take.
     Raw,
@@ -328,11 +337,54 @@ fn custom_clause(custom: &Option<String>) -> String {
     )
 }
 
+/// One optional bullet line describing the *translation style / register*.
+///
+/// A separate axis from cleanup strength and the whole-output [`Style`] enum —
+/// it only shapes how the translated text reads. Known preset keywords map to a
+/// curated Chinese clause; any other non-empty value is treated as a verbatim
+/// custom style instruction (capped to bound the prompt-injection surface). An
+/// empty / whitespace / `faithful` value (and `None`) yields no line at all, so
+/// the prompt is byte-for-byte the pre-style faithful translation.
+///
+/// Returns either an empty string or a single `"- …\n"` bullet line.
+fn translate_style_clause(style: &Option<String>) -> String {
+    let Some(raw) = style.as_ref() else {
+        return String::new();
+    };
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let body = match s.to_ascii_lowercase().as_str() {
+        // Faithful is the default (no added style).
+        "faithful" | "none" | "忠实" => return String::new(),
+        "formal" | "正式" => "译文用正式、专业、得体的书面语，适合工作/商务场合".to_string(),
+        "casual" | "口语" => "译文用轻松口语、自然的日常表达".to_string(),
+        "social" | "twitter" | "x" | "社媒" | "社交" => {
+            "译文符合社交媒体（如社交平台/微博）风格：简洁有网感、口语化，可适度用话题标签和 emoji，但不添加原文没有的信息".to_string()
+        }
+        // Any other value: a verbatim custom style instruction. Cap the length
+        // to bound the prompt-injection surface (mirrors `custom_clause`).
+        _ => {
+            let capped = if s.chars().count() > 200 {
+                s.chars().take(200).collect::<String>()
+            } else {
+                s.to_string()
+            };
+            format!("译文风格要求：{capped}")
+        }
+    };
+    format!("- {body}\n")
+}
+
 fn intent_clause(intent: &IntentSpec, cleanup: CleanupLevel) -> String {
     match intent {
         IntentSpec::Default | IntentSpec::PolishOverride => String::new(),
         IntentSpec::Raw => String::new(),
-        IntentSpec::Translate { target_language } => {
+        IntentSpec::Translate {
+            target_language,
+            style,
+        } => {
             let lang = target_language.trim();
             let lang = if lang.is_empty() { "en" } else { lang };
             // Product: light cleanup first, then translate.
@@ -341,8 +393,9 @@ fn intent_clause(intent: &IntentSpec, cleanup: CleanupLevel) -> String {
             } else {
                 "在完成上文整理后，"
             };
+            let style_line = translate_style_clause(style);
             format!(
-                "\n# 本轮意图：翻译\n- {pre}将结果翻译为「{lang}」\n- 专有名词、代码标识符可保留原文\n- 仍禁止回答问题或添加原文没有的内容\n- 只输出目标语言最终文本\n"
+                "\n# 本轮意图：翻译\n- {pre}将结果翻译为「{lang}」\n- 专有名词、代码标识符可保留原文\n{style_line}- 仍禁止回答问题或添加原文没有的内容\n- 只输出目标语言最终文本\n"
             )
         }
     }
@@ -659,6 +712,7 @@ mod tests {
             custom: Some("写成列表".into()),
             intent: IntentSpec::Translate {
                 target_language: "en".into(),
+                style: None,
             },
             ..Default::default()
         });
@@ -677,11 +731,102 @@ mod tests {
             cleanup: CleanupLevel::None,
             intent: IntentSpec::Translate {
                 target_language: "ja".into(),
+                style: None,
             },
             ..Default::default()
         });
         assert!(!p.is_empty());
         assert!(p.contains("整理强度：轻") || p.contains("翻译"));
+    }
+
+    /// Build a translate prompt for the given (target, style) with medium cleanup.
+    fn translate_prompt(target: &str, style: Option<&str>) -> String {
+        build_system_prompt_from(&PromptBuildInput {
+            cleanup: CleanupLevel::Medium,
+            intent: IntentSpec::Translate {
+                target_language: target.into(),
+                style: style.map(str::to_string),
+            },
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn translate_style_none_is_faithful_no_extra_clause() {
+        // None / faithful / empty all produce the same (pre-style) translate
+        // block — no style bullet is injected.
+        let baseline = translate_prompt("en", None);
+        assert!(baseline.contains("本轮意图：翻译"));
+        assert!(!baseline.contains("译文"));
+        for faithful in ["", "  ", "faithful", "none", "忠实"] {
+            assert_eq!(
+                translate_prompt("en", Some(faithful)),
+                baseline,
+                "style={faithful:?} should equal faithful baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn translate_style_presets_inject_their_clause() {
+        let formal = translate_prompt("en", Some("formal"));
+        assert!(formal.contains("正式、专业、得体的书面语"));
+        assert!(formal.contains("只输出目标语言最终文本"));
+
+        assert!(translate_prompt("en", Some("casual")).contains("轻松口语、自然的日常表达"));
+
+        for social in ["social", "twitter", "X", "社媒"] {
+            let p = translate_prompt("en", Some(social));
+            assert!(
+                p.contains("社交媒体"),
+                "social alias {social:?} missing clause"
+            );
+            assert!(p.contains("话题标签"));
+        }
+
+        // Preset lookup is case-insensitive.
+        assert!(translate_prompt("en", Some("FORMAL")).contains("正式、专业、得体"));
+    }
+
+    #[test]
+    fn translate_style_custom_free_text_is_injected_verbatim() {
+        let p = translate_prompt("ja", Some("像写诗一样，多用比喻"));
+        assert!(p.contains("译文风格要求：像写诗一样，多用比喻"));
+        assert!(p.contains("将结果翻译为「ja」"));
+        // Red lines still present with a custom style.
+        assert!(p.contains("绝对禁止"));
+        assert!(p.contains("仍禁止回答问题或添加原文没有的内容"));
+        assert!(p.contains("只输出目标语言最终文本"));
+    }
+
+    #[test]
+    fn translate_style_custom_is_length_capped() {
+        let long = "字".repeat(500);
+        let p = translate_prompt("en", Some(&long));
+        assert!(p.contains("译文风格要求："));
+        // Capped to 200 chars of the custom instruction.
+        assert!(!p.contains(&"字".repeat(201)));
+    }
+
+    #[test]
+    fn translate_style_survives_serde_roundtrip_and_missing_field() {
+        // New field roundtrips.
+        let spec = IntentSpec::Translate {
+            target_language: "en".into(),
+            style: Some("formal".into()),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert_eq!(serde_json::from_str::<IntentSpec>(&json).unwrap(), spec);
+
+        // Old configs (no `style` field) deserialize to `None` = faithful.
+        let legacy = r#"{"kind":"translate","target_language":"ja"}"#;
+        assert_eq!(
+            serde_json::from_str::<IntentSpec>(legacy).unwrap(),
+            IntentSpec::Translate {
+                target_language: "ja".into(),
+                style: None,
+            }
+        );
     }
 
     #[test]

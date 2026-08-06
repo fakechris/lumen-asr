@@ -1825,7 +1825,9 @@ pub enum DictationUiEvent {
 
 fn intent_ui_label(intent: &IntentSpec) -> (String, Option<String>, String) {
     match intent {
-        IntentSpec::Translate { target_language } => (
+        IntentSpec::Translate {
+            target_language, ..
+        } => (
             "translate".into(),
             Some(target_language.clone()),
             format!("翻译→{target_language}"),

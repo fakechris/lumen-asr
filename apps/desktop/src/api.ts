@@ -108,6 +108,10 @@ export type HotkeyIntent = {
   mode: string;
   intent: string;
   targetLanguage: string;
+  /** For intent="translate": optional translation style/register — a preset
+   * key ("faithful" | "formal" | "casual" | "social") or free-form custom text.
+   * Omitted/empty means faithful translation. */
+  translateStyle?: string;
   enabled: boolean;
 };
 

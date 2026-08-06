@@ -679,6 +679,12 @@ pub struct HotkeyIntentConfig {
     pub intent: String,
     /// For intent=translate
     pub target_language: String,
+    /// For intent=translate: optional translation style / register.
+    /// A preset key (`faithful` | `formal` | `casual` | `social`) or free-form
+    /// custom text. `#[serde(default)]` → old configs without it load as `None`
+    /// (= faithful translation), so this is backward-compatible.
+    #[serde(default)]
+    pub translate_style: Option<String>,
     pub enabled: bool,
 }
 
@@ -690,6 +696,7 @@ impl Default for HotkeyIntentConfig {
             mode: "hold".into(),
             intent: "translate".into(),
             target_language: "en".into(),
+            translate_style: None,
             // Ship enabled: secondary translate chord is a core product path.
             enabled: true,
         }
@@ -773,6 +780,11 @@ impl HotkeyIntentConfig {
                 } else {
                     self.target_language.clone()
                 },
+                style: self
+                    .translate_style
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
             },
             "raw" => lumen_prompts::IntentSpec::Raw,
             _ => lumen_prompts::IntentSpec::Default,
