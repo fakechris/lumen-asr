@@ -259,6 +259,15 @@ pub struct AppState {
     /// Nap so the audio capture callbacks are not suspended. `None` when no
     /// recording is active. Best-effort — acquiring never blocks recording.
     pub meeting_power_guard: std::sync::Mutex<Option<lumen_platform_macos::MeetingPowerGuard>>,
+    /// Low-battery poll thread for the active recording: its stop flag and join
+    /// handle, so `stop_meeting_recording` can signal + join it. `None` when no
+    /// recording is active. All `Send`/`Sync` — never holds an objc2 object.
+    pub meeting_battery_poll: std::sync::Mutex<
+        Option<(
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+            std::thread::JoinHandle<()>,
+        )>,
+    >,
     /// Real-time (P3) streaming-Paraformer live-transcript worker for the
     /// active recording. Idle (no worker) unless a recording is streaming.
     pub meeting_live: meeting_live::MeetingLive,
@@ -502,6 +511,7 @@ pub fn run() {
             audio,
             meeting_recorder: MeetingRecorder::new(),
             meeting_power_guard: Mutex::new(None),
+            meeting_battery_poll: Mutex::new(None),
             meeting_live: meeting_live::MeetingLive::default(),
             meeting_system_audio: meeting_system_audio::MeetingSystemAudio::default(),
             meeting_mic_aec: meeting_mic_aec::MeetingMicAec::default(),
@@ -645,6 +655,24 @@ pub fn run() {
             // mark it failed — off the launch path so the UI never blocks.
             meeting_cmd::recover_interrupted_meetings(app.handle().clone());
             schedule_legacy_short_silent_session_purge(app.handle().clone());
+
+            // Register the imminent-sleep observer once, on the main thread
+            // (Tauri setup runs on the main thread). It fires whenever the system
+            // is about to sleep (lid close / forced sleep). Only warn when a
+            // meeting is actually recording, so a routine sleep with no meeting
+            // stays silent. The observer lives for the app's lifetime (its token
+            // is leaked inside the platform layer).
+            {
+                let handle = app.handle().clone();
+                lumen_platform_macos::install_will_sleep_observer(move || {
+                    if handle
+                        .try_state::<AppState>()
+                        .is_some_and(|state| state.capture.is_meeting_recording())
+                    {
+                        meeting_cmd::emit_power_warning(&handle, "will-sleep", None);
+                    }
+                });
+            }
 
             // Opt-in meeting detection: only start when the user enabled it AND
             // the OS capability is present. Off by default; failure to start

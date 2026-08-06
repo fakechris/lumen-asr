@@ -30,7 +30,10 @@ use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
@@ -126,6 +129,86 @@ pub struct MeetingRecordingDto {
     pub duration_seconds: f64,
     pub sample_rate: u32,
     pub status: String,
+}
+
+/// Battery percent at or below which a meeting recording on battery power is
+/// warned about (the machine may sleep / power off and cut the recording).
+const LOW_BATTERY_PERCENT: u8 = 20;
+
+/// How often the low-battery poll thread re-checks the battery while a meeting
+/// records.
+const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Payload of the `meeting-power-warning` event the front-end listens for to
+/// warn that a recording may be interrupted by power loss or system sleep.
+/// `kind` is `"low-battery"` or `"will-sleep"`; `percent` is the battery level
+/// for a low-battery warning and absent for a will-sleep warning.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingPowerWarning {
+    pub kind: &'static str,
+    pub percent: Option<u8>,
+}
+
+/// Emit a `meeting-power-warning` to the front-end. Best-effort: a failed emit
+/// only costs the warning, never the recording.
+pub fn emit_power_warning(app: &AppHandle, kind: &'static str, percent: Option<u8>) {
+    let _ = app.emit(
+        "meeting-power-warning",
+        MeetingPowerWarning { kind, percent },
+    );
+}
+
+/// A meeting is on battery power at or below the low threshold.
+fn is_low_on_battery(status: Option<lumen_platform_macos::BatteryStatus>) -> bool {
+    matches!(status, Some(s) if !s.on_ac && s.percent <= LOW_BATTERY_PERCENT)
+}
+
+/// Spawn a background thread that re-checks the battery every
+/// [`BATTERY_POLL_INTERVAL`] while a meeting records and emits a low-battery
+/// warning when the level newly crosses at/under the threshold on battery
+/// power. Warns at most once per crossing: the `warned` latch is cleared once
+/// the machine is back on AC or above the threshold, so a later dip warns
+/// again. `initially_warned` seeds the latch from the start-of-recording check
+/// so an already-low start does not warn twice.
+///
+/// Returns the stop flag + join handle so the stop command can signal and join
+/// it. On non-macOS `battery_status()` is always `None`, so the thread simply
+/// idles until stopped.
+fn spawn_battery_poll(app: AppHandle, initially_warned: bool) -> (Arc<AtomicBool>, JoinHandle<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let mut warned = initially_warned;
+        // Sleep in small slices so a stop request is honored promptly.
+        let step = Duration::from_millis(500);
+        while !stop_thread.load(Ordering::SeqCst) {
+            let mut slept = Duration::ZERO;
+            while slept < BATTERY_POLL_INTERVAL && !stop_thread.load(Ordering::SeqCst) {
+                std::thread::sleep(step);
+                slept += step;
+            }
+            if stop_thread.load(Ordering::SeqCst) {
+                break;
+            }
+            let status = lumen_platform_macos::battery_status();
+            if is_low_on_battery(status) {
+                if !warned {
+                    warned = true;
+                    let percent = status.map(|s| s.percent);
+                    tracing::warn!(
+                        percent,
+                        "meeting on low battery; recording may be interrupted by power loss"
+                    );
+                    emit_power_warning(&app, "low-battery", percent);
+                }
+            } else {
+                // Back on AC or above the threshold → re-arm for the next dip.
+                warned = false;
+            }
+        }
+    });
+    (stop, handle)
 }
 
 /// Start a new meeting recording. Creates the meeting row (`Recording`), begins
@@ -344,6 +427,31 @@ pub fn start_meeting_recording(
         tracing::warn!("meeting power guard lock poisoned; skipping idle-sleep hold");
     }
 
+    // Proactive power warnings: the idle-sleep hold above cannot stop a drained
+    // battery or a lid close, so warn the user while there is still time to plug
+    // in. Check the battery once now, then poll it for the duration of the
+    // recording. `battery_status()` is `None` on desktops / off-macOS, so this
+    // is naturally inert there.
+    let battery = lumen_platform_macos::battery_status();
+    let low_at_start = is_low_on_battery(battery);
+    if low_at_start {
+        let percent = battery.map(|s| s.percent);
+        tracing::warn!(
+            percent,
+            "meeting starting on low battery; recording may be interrupted by power loss"
+        );
+        emit_power_warning(&app, "low-battery", percent);
+    }
+    let poll = spawn_battery_poll(app.clone(), low_at_start);
+    if let Ok(mut guard) = state.meeting_battery_poll.lock() {
+        *guard = Some(poll);
+    } else {
+        // Poisoned lock: we cannot store the handle, so signal the thread to
+        // stop rather than leak it (it exits at its next slice check).
+        poll.0.store(true, Ordering::SeqCst);
+        tracing::warn!("meeting battery poll lock poisoned; skipping low-battery monitoring");
+    }
+
     tracing::info!(meeting_id = %meeting_id, "meeting recording started");
     Ok(meeting_id.to_string())
 }
@@ -513,6 +621,16 @@ pub fn stop_meeting_recording(
     // path regardless of stop success or failure. Dropping the guard ends the
     // activity; a poisoned lock just means it is already gone.
     let _ = state.meeting_power_guard.lock().map(|mut g| g.take());
+
+    // Stop the low-battery poll thread started with the recording, on every
+    // path. Signal it to exit and join (returns within a poll slice). A poisoned
+    // lock just means it is already gone.
+    if let Ok(mut guard) = state.meeting_battery_poll.lock() {
+        if let Some((stop, handle)) = guard.take() {
+            stop.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+        }
+    }
 
     // Same finally semantics for meeting detection: whether the recorder stop
     // below succeeded or failed, the recording is over, so the policy must
