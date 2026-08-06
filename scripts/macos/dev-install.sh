@@ -148,6 +148,23 @@ if [[ -f "$ICON_DST" && -f "$PLIST" ]]; then
     || /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string icon" "$PLIST"
 fi
 
+# Sync every privacy consent string from the canonical src-tauri/Info.plist into
+# the bundle plist. This is a plain `cargo build` (not `tauri build`), so the
+# scaffolded minimal plist above only carries Mic + Accessibility; without this,
+# system-audio (NSAudioCaptureUsageDescription) and Calendar consent strings are
+# absent, and after any TCC reset the first request is denied — meetings then
+# silently degrade to mic-only (system_audio.rs treats denial as a degrade, not
+# a crash). Keeping one source of truth avoids that latent trap.
+SRC_PLIST="$ROOT/apps/desktop/src-tauri/Info.plist"
+if [[ -f "$SRC_PLIST" && -f "$PLIST" ]]; then
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    val="$(/usr/libexec/PlistBuddy -c "Print :$key" "$SRC_PLIST" 2>/dev/null)" || continue
+    /usr/libexec/PlistBuddy -c "Set :$key $val" "$PLIST" 2>/dev/null \
+      || /usr/libexec/PlistBuddy -c "Add :$key string $val" "$PLIST"
+  done < <(grep -oE 'NS[A-Za-z]+UsageDescription' "$SRC_PLIST" | sort -u)
+fi
+
 echo "==> sign"
 "$ROOT/scripts/macos/sign-app.sh" "$APP_DIR"
 
