@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -55,6 +55,82 @@ pub struct RecordingSummary {
     pub duration_seconds: f64,
     /// Native capture sample rate written to the file.
     pub sample_rate: u32,
+    /// Capture stalls that were padded with silence (system sleep / App Nap
+    /// suspended the audio callback). Empty for a normal recording.
+    pub gaps: Vec<MeetingGap>,
+}
+
+/// A stretch of wall-clock time during which the audio callback delivered
+/// nothing — the OS suspended capture (idle system sleep or App Nap). The
+/// recorder pads the WAV with this much silence so media time stays aligned to
+/// real time instead of silently collapsing, and records the marker so the app
+/// can tell the user roughly this much audio was not captured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeetingGap {
+    /// Media-time offset (seconds into the WAV) where the silence pad begins.
+    pub start_seconds: f64,
+    /// Length of the un-captured stretch, in seconds.
+    pub duration_seconds: f64,
+}
+
+/// Minimum capture stall (seconds) that counts as a gap worth padding. Normal
+/// scheduling jitter and buffer cadence stay well under this; only a real
+/// suspension trips it.
+const GAP_MIN_SECONDS: f64 = 1.5;
+
+/// Detects capture stalls by comparing the wall-clock spacing of consecutive
+/// chunks against the audio each one represents. The **wall clock**
+/// (`SystemTime`) is deliberate: it advances across system sleep, whereas a
+/// monotonic timer may pause, and a suspended process is exactly what we must
+/// catch. Pure and clock-injectable so the logic is unit-testable.
+struct GapDetector {
+    sample_rate: u32,
+    last: Option<SystemTime>,
+}
+
+impl GapDetector {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            sample_rate,
+            last: None,
+        }
+    }
+
+    /// Feed one captured chunk of `chunk_len` mono samples arriving at wall
+    /// clock `now`. Returns the number of silence samples to pad when the stall
+    /// since the previous chunk exceeds [`GAP_MIN_SECONDS`].
+    fn observe(&mut self, chunk_len: usize, now: SystemTime) -> Option<u64> {
+        let sr = self.sample_rate.max(1) as f64;
+        let pad = self.last.and_then(|last| {
+            // A backwards clock step (`duration_since` err) is treated as no gap.
+            let wall = now.duration_since(last).ok()?.as_secs_f64();
+            let audio = chunk_len as f64 / sr;
+            let deficit = wall - audio;
+            (deficit > GAP_MIN_SECONDS).then_some((deficit * sr) as u64)
+        });
+        self.last = Some(now);
+        pad.filter(|n| *n > 0)
+    }
+
+    /// Forget the last arrival so the next chunk cannot form a gap. Called when
+    /// pausing/resuming: a paused interval drops chunks on purpose and must not
+    /// be mistaken for a capture stall.
+    fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
+/// Append `n` samples of silence to `sink` in bounded blocks, so a long stall
+/// never allocates one huge buffer. Block size is not correctness-critical.
+fn write_silence(sink: &mut WavSink, mut n: u64) -> io::Result<()> {
+    const BLOCK: usize = 16_000;
+    let zeros = [0.0f32; BLOCK];
+    while n > 0 {
+        let take = n.min(BLOCK as u64) as usize;
+        sink.write_samples(&zeros[..take])?;
+        n -= take as u64;
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,7 +330,10 @@ pub fn repair_wav_header(path: impl AsRef<Path>) -> io::Result<RepairedWav> {
 
 enum WriterMsg {
     Chunk(Vec<f32>),
-    Finalize(Sender<io::Result<u64>>),
+    /// Forget the gap detector's last-arrival timestamp (sent on pause/resume so
+    /// an intentional paused interval is not padded as a capture stall).
+    ResetGapClock,
+    Finalize(Sender<io::Result<(u64, Vec<MeetingGap>)>>),
 }
 
 fn spawn_writer(mut sink: WavSink) -> (Sender<WriterMsg>, JoinHandle<()>) {
@@ -262,15 +341,41 @@ fn spawn_writer(mut sink: WavSink) -> (Sender<WriterMsg>, JoinHandle<()>) {
     let handle = thread::Builder::new()
         .name("lumen-meeting-wav".into())
         .spawn(move || {
+            let mut detector = GapDetector::new(sink.sample_rate());
+            let mut gaps: Vec<MeetingGap> = Vec::new();
             while let Ok(msg) = rx.recv() {
                 match msg {
                     WriterMsg::Chunk(chunk) => {
+                        // Before writing this chunk, pad any capture stall that
+                        // preceded it so media time stays aligned to real time.
+                        if let Some(pad) = detector.observe(chunk.len(), SystemTime::now()) {
+                            let sr = sink.sample_rate().max(1) as f64;
+                            let start_seconds = sink.samples_written() as f64 / sr;
+                            match write_silence(&mut sink, pad) {
+                                Ok(()) => {
+                                    let duration_seconds = pad as f64 / sr;
+                                    tracing::warn!(
+                                        start_seconds,
+                                        duration_seconds,
+                                        "meeting capture stalled (likely system sleep); padded with silence"
+                                    );
+                                    gaps.push(MeetingGap {
+                                        start_seconds,
+                                        duration_seconds,
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "meeting silence pad write failed")
+                                }
+                            }
+                        }
                         if let Err(e) = sink.write_samples(&chunk) {
                             tracing::warn!(error = %e, "meeting wav chunk write failed");
                         }
                     }
+                    WriterMsg::ResetGapClock => detector.reset(),
                     WriterMsg::Finalize(reply) => {
-                        let _ = reply.send(sink.finalize());
+                        let _ = reply.send(sink.finalize().map(|n| (n, std::mem::take(&mut gaps))));
                         return;
                     }
                 }
@@ -360,6 +465,9 @@ impl SystemTrackRecorder {
     /// same wall-clock interval.
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
+        // Reset the gap clock across the transition so the paused interval
+        // (chunks dropped on purpose) is not padded as a capture stall.
+        let _ = self.writer_tx.send(WriterMsg::ResetGapClock);
     }
 
     /// Path of the WAV being written.
@@ -376,7 +484,7 @@ impl SystemTrackRecorder {
             .recv()
             .unwrap_or_else(|_| Err(io::Error::other("system track writer thread gone")));
         let _ = self.writer_handle.join();
-        let samples = result?;
+        let (samples, gaps) = result?;
         let duration_seconds = if self.sample_rate > 0 {
             samples as f64 / self.sample_rate as f64
         } else {
@@ -386,6 +494,7 @@ impl SystemTrackRecorder {
             wav_path: self.out_path,
             duration_seconds,
             sample_rate: self.sample_rate,
+            gaps,
         })
     }
 }
@@ -576,9 +685,15 @@ impl MeetingRecorder {
                         }
                         RecCmd::Pause => {
                             paused_flag.store(true, Ordering::SeqCst);
+                            if let Some(s) = &session {
+                                let _ = s.writer_tx.send(WriterMsg::ResetGapClock);
+                            }
                         }
                         RecCmd::Resume => {
                             paused_flag.store(false, Ordering::SeqCst);
+                            if let Some(s) = &session {
+                                let _ = s.writer_tx.send(WriterMsg::ResetGapClock);
+                            }
                         }
                         RecCmd::Stop { reply } => {
                             let res = stop_on_thread(&rec_flag, &paused_flag, &epoch, &mut session);
@@ -886,8 +1001,8 @@ fn stop_on_thread(
     let (fin_tx, fin_rx) = mpsc::channel();
     let _ = session.writer_tx.send(WriterMsg::Finalize(fin_tx));
     drop(session.writer_tx);
-    let samples = match fin_rx.recv() {
-        Ok(Ok(n)) => n,
+    let (samples, gaps) = match fin_rx.recv() {
+        Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             let _ = session.writer_handle.join();
             recording.store(false, Ordering::SeqCst);
@@ -916,6 +1031,7 @@ fn stop_on_thread(
         samples,
         sample_rate,
         duration_seconds,
+        gaps = gaps.len(),
         path = %session.out_path.display(),
         "meeting recording stopped"
     );
@@ -923,6 +1039,7 @@ fn stop_on_thread(
         wav_path: session.out_path,
         duration_seconds,
         sample_rate,
+        gaps,
     })
 }
 
@@ -1042,6 +1159,81 @@ fn teardown_session(session: &mut Option<Session>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn at(secs: f64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs)
+    }
+
+    #[test]
+    fn gap_detector_ignores_normal_cadence() {
+        // 16 kHz, ~100 ms chunks arriving ~100 ms apart: no stall, no pad.
+        let mut d = GapDetector::new(16_000);
+        assert_eq!(d.observe(1_600, at(0.0)), None); // first chunk: no baseline
+        assert_eq!(d.observe(1_600, at(0.1)), None);
+        assert_eq!(d.observe(1_600, at(0.2)), None);
+        // A little jitter (chunk late by <1.5 s) still isn't a gap.
+        assert_eq!(d.observe(1_600, at(1.0)), None);
+    }
+
+    #[test]
+    fn gap_detector_pads_a_long_stall() {
+        // Previous chunk at t=1 s, next arrives ~17 min later (process was
+        // suspended): the ~17 min minus this chunk's 0.1 s is padded.
+        let mut d = GapDetector::new(16_000);
+        assert_eq!(d.observe(1_600, at(1.0)), None);
+        let stall = 17.0 * 60.0;
+        let pad = d.observe(1_600, at(1.0 + stall)).expect("gap detected");
+        let expected = ((stall - 0.1) * 16_000.0) as u64;
+        assert_eq!(pad, expected);
+    }
+
+    #[test]
+    fn gap_detector_reset_prevents_a_gap_across_a_pause() {
+        // A paused interval drops chunks; reset() on pause/resume means the first
+        // chunk after resume has no baseline and cannot be seen as a stall.
+        let mut d = GapDetector::new(16_000);
+        assert_eq!(d.observe(1_600, at(1.0)), None);
+        d.reset();
+        assert_eq!(d.observe(1_600, at(600.0)), None);
+    }
+
+    #[test]
+    fn gap_detector_treats_backwards_clock_as_no_gap() {
+        let mut d = GapDetector::new(16_000);
+        assert_eq!(d.observe(1_600, at(10.0)), None);
+        assert_eq!(d.observe(1_600, at(5.0)), None); // clock stepped back
+    }
+
+    #[test]
+    fn write_silence_appends_exactly_n_zero_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silence.wav");
+        let mut sink = WavSink::create(&path, 16_000).unwrap();
+        // Cross a block boundary to exercise the loop (BLOCK = 16_000).
+        write_silence(&mut sink, 40_000).unwrap();
+        assert_eq!(sink.samples_written(), 40_000);
+        assert_eq!(sink.finalize().unwrap(), 40_000);
+    }
+
+    #[test]
+    fn normal_system_track_run_reports_no_gaps() {
+        // Regression: chunks pushed back-to-back (no real-time stall) must not
+        // produce false gap markers.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sys.wav");
+        let track = SystemTrackRecorder::create(&path, 16_000).unwrap();
+        let sender = track.sender();
+        for _ in 0..10 {
+            sender.push(&[0.2f32; 1_600]);
+        }
+        let summary = track.finalize().unwrap();
+        assert!(
+            summary.gaps.is_empty(),
+            "unexpected gaps: {:?}",
+            summary.gaps
+        );
+    }
 
     fn read_u32_le(bytes: &[u8], off: usize) -> u32 {
         u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
