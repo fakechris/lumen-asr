@@ -78,6 +78,12 @@ pub struct MeetingGap {
 /// suspension trips it.
 const GAP_MIN_SECONDS: f64 = 1.5;
 
+/// Max mono i16 samples one WAV can hold before the 32-bit RIFF/`data` size
+/// fields ([`WavSink::finalize`] writes them as `u32`) overflow. Silence padding
+/// is clamped to the file's remaining room against this so a very long stall
+/// cannot produce a malformed, multi-GB file (~12.4 h at 48 kHz mono PCM16).
+const WAV_MAX_SAMPLES: u64 = ((u32::MAX as u64) - WAV_HEADER_LEN) / 2;
+
 /// Detects capture stalls by comparing the wall-clock spacing of consecutive
 /// chunks against the audio each one represents. The **wall clock**
 /// (`SystemTime`) is deliberate: it advances across system sleep, whereas a
@@ -329,7 +335,13 @@ pub fn repair_wav_header(path: impl AsRef<Path>) -> io::Result<RepairedWav> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum WriterMsg {
-    Chunk(Vec<f32>),
+    Chunk {
+        samples: Vec<f32>,
+        /// Wall clock at which the capture callback produced this chunk — stamped
+        /// on the callback side, *not* when the writer dequeues it, so gap
+        /// detection is immune to writer backlog (disk I/O, silence padding).
+        arrived_at: SystemTime,
+    },
     /// Forget the gap detector's last-arrival timestamp (sent on pause/resume so
     /// an intentional paused interval is not padded as a capture stall).
     ResetGapClock,
@@ -345,31 +357,38 @@ fn spawn_writer(mut sink: WavSink) -> (Sender<WriterMsg>, JoinHandle<()>) {
             let mut gaps: Vec<MeetingGap> = Vec::new();
             while let Ok(msg) = rx.recv() {
                 match msg {
-                    WriterMsg::Chunk(chunk) => {
+                    WriterMsg::Chunk { samples, arrived_at } => {
                         // Before writing this chunk, pad any capture stall that
                         // preceded it so media time stays aligned to real time.
-                        if let Some(pad) = detector.observe(chunk.len(), SystemTime::now()) {
+                        // Clamp the pad to the WAV's remaining capacity so a very
+                        // long stall can never overflow the 32-bit RIFF sizes into
+                        // a malformed, multi-GB file.
+                        if let Some(pad) = detector.observe(samples.len(), arrived_at) {
+                            let remaining = WAV_MAX_SAMPLES.saturating_sub(sink.samples_written());
+                            let pad = pad.min(remaining);
                             let sr = sink.sample_rate().max(1) as f64;
                             let start_seconds = sink.samples_written() as f64 / sr;
-                            match write_silence(&mut sink, pad) {
-                                Ok(()) => {
-                                    let duration_seconds = pad as f64 / sr;
-                                    tracing::warn!(
-                                        start_seconds,
-                                        duration_seconds,
-                                        "meeting capture stalled (likely system sleep); padded with silence"
-                                    );
-                                    gaps.push(MeetingGap {
-                                        start_seconds,
-                                        duration_seconds,
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "meeting silence pad write failed")
+                            if pad > 0 {
+                                match write_silence(&mut sink, pad) {
+                                    Ok(()) => {
+                                        let duration_seconds = pad as f64 / sr;
+                                        tracing::warn!(
+                                            start_seconds,
+                                            duration_seconds,
+                                            "meeting capture stalled (likely system sleep); padded with silence"
+                                        );
+                                        gaps.push(MeetingGap {
+                                            start_seconds,
+                                            duration_seconds,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "meeting silence pad write failed")
+                                    }
                                 }
                             }
                         }
-                        if let Err(e) = sink.write_samples(&chunk) {
+                        if let Err(e) = sink.write_samples(&samples) {
                             tracing::warn!(error = %e, "meeting wav chunk write failed");
                         }
                     }
@@ -431,7 +450,10 @@ impl SystemTrackSender {
         }
         self.tx
             .lock()
-            .send(WriterMsg::Chunk(samples.to_vec()))
+            .send(WriterMsg::Chunk {
+                samples: samples.to_vec(),
+                arrived_at: SystemTime::now(),
+            })
             .is_ok()
     }
 }
@@ -464,10 +486,12 @@ impl SystemTrackRecorder {
     /// matching the mic recorder so pausing compresses both timelines by the
     /// same wall-clock interval.
     pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::SeqCst);
-        // Reset the gap clock across the transition so the paused interval
-        // (chunks dropped on purpose) is not padded as a capture stall.
+        // Queue the reset *before* clearing the paused flag: on resume this
+        // guarantees the reset is enqueued ahead of any chunk the callback
+        // delivers once unpaused, so the paused interval (chunks dropped on
+        // purpose) is never converted into a padded capture stall.
         let _ = self.writer_tx.send(WriterMsg::ResetGapClock);
+        self.paused.store(paused, Ordering::SeqCst);
     }
 
     /// Path of the WAV being written.
@@ -684,16 +708,20 @@ impl MeetingRecorder {
                             let _ = reply.send(res);
                         }
                         RecCmd::Pause => {
-                            paused_flag.store(true, Ordering::SeqCst);
+                            // Reset the gap clock before flipping the flag (see
+                            // SystemTrackRecorder::set_paused for the ordering).
                             if let Some(s) = &session {
                                 let _ = s.writer_tx.send(WriterMsg::ResetGapClock);
                             }
+                            paused_flag.store(true, Ordering::SeqCst);
                         }
                         RecCmd::Resume => {
-                            paused_flag.store(false, Ordering::SeqCst);
+                            // Reset before clearing paused so the reset is queued
+                            // ahead of the first post-resume chunk (no false gap).
                             if let Some(s) = &session {
                                 let _ = s.writer_tx.send(WriterMsg::ResetGapClock);
                             }
+                            paused_flag.store(false, Ordering::SeqCst);
                         }
                         RecCmd::Stop { reply } => {
                             let res = stop_on_thread(&rec_flag, &paused_flag, &epoch, &mut session);
@@ -1097,7 +1125,10 @@ where
                 fanout_chunk(&sample_sink, &mono);
                 // Writer thread does the file I/O; if it has gone away the
                 // recording is being torn down and dropping the chunk is fine.
-                let _ = writer_tx.send(WriterMsg::Chunk(mono));
+                let _ = writer_tx.send(WriterMsg::Chunk {
+                    samples: mono,
+                    arrived_at: SystemTime::now(),
+                });
             },
             err_fn,
             None,
