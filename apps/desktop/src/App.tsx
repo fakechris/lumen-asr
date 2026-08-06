@@ -2163,8 +2163,7 @@ function SettingsPanel({
         </p>
         {(() => {
           const tr =
-            intents.find((i) => i.intent === "translate") ||
-            intents[0] || {
+            intents.find((i) => i.intent.toLowerCase() === "translate") || {
               id: "translate",
               chord: "Alt+Shift+T",
               mode: hotkeyMode === "toggle" ? "toggle" : "hold",
@@ -2196,17 +2195,25 @@ function SettingsPanel({
             onError(null);
             try {
               const style = (next.translateStyle ?? "").trim();
-              const list = [
-                {
-                  id: "translate",
-                  chord: next.chord || "Alt+Shift+T",
-                  mode: hotkeyMode === "toggle" ? "toggle" : "hold",
-                  intent: "translate",
-                  targetLanguage: next.targetLanguage || "en",
-                  translateStyle: style || undefined,
-                  enabled: next.enabled,
-                },
-              ];
+              const existing = intents.find(
+                (i) => i.intent.toLowerCase() === "translate",
+              );
+              const nextTranslate = {
+                id: existing?.id || "translate",
+                chord: next.chord || "Alt+Shift+T",
+                mode: hotkeyMode === "toggle" ? "toggle" : "hold",
+                intent: "translate",
+                targetLanguage: next.targetLanguage || "en",
+                translateStyle: style || undefined,
+                enabled: next.enabled,
+              };
+              // Replace only the translation intent; never drop other configured
+              // intents (save_hotkey_config overwrites the whole list).
+              const list = existing
+                ? intents.map((i) =>
+                    i.intent.toLowerCase() === "translate" ? nextTranslate : i,
+                  )
+                : [...intents, nextTranslate];
               const h = await api.saveHotkeyConfig({
                 enabled: hotkeyEnabled,
                 toggle: hotkeyToggle,
