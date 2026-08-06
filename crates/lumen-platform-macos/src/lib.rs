@@ -7,6 +7,7 @@ mod inject;
 mod meeting_activity;
 mod permissions;
 pub mod power_assertion;
+pub mod power_monitor;
 mod system_audio;
 mod voice_processing;
 
@@ -29,6 +30,7 @@ pub use permissions::{
     ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,
 };
 pub use power_assertion::MeetingPowerGuard;
+pub use power_monitor::{battery_status, install_will_sleep_observer, BatteryStatus};
 pub use system_audio::{
     capability_available as system_audio_capability_available, SystemAudioCapture,
     SystemAudioError, SystemAudioSink,

@@ -157,6 +157,7 @@ export default function App() {
   const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [powerWarning, setPowerWarning] = useState<string | null>(null);
   const [editFeedbackRevision, setEditFeedbackRevision] = useState(0);
   const [busy, setBusy] = useState(false);
   const [hotkeyLabel, setHotkeyLabel] = useState("⌥Space");
@@ -334,6 +335,37 @@ export default function App() {
     return () => {
       unDetected?.();
       unCancelled?.();
+    };
+  }, []);
+
+  // Power warnings during a meeting recording: the backend emits
+  // `meeting-power-warning` when the machine is on a low battery or is about to
+  // sleep, either of which can cut a recording short. Show a dismissible banner
+  // that auto-clears after a while.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    listen<{ kind: string; percent?: number }>("meeting-power-warning", (e) => {
+      const msg =
+        e.payload.kind === "low-battery"
+          ? `电量偏低${
+              typeof e.payload.percent === "number" ? `（${e.payload.percent}%）` : ""
+            }，会议录音可能因断电中断，建议接上电源。`
+          : "系统即将睡眠，会议录音会中断。";
+      setPowerWarning(msg);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => setPowerWarning(null), 15000);
+    }).then((fn) => {
+      // If the effect was already cleaned up before the listener resolved
+      // (e.g. StrictMode remount), unlisten immediately instead of leaking it.
+      if (cancelled) fn();
+      else un = fn;
+    });
+    return () => {
+      cancelled = true;
+      un?.();
+      if (timer) clearTimeout(timer);
     };
   }, []);
 
@@ -567,6 +599,18 @@ export default function App() {
             <div className="banner success" role="status">
               {notice}
               <button type="button" className="linkish" onClick={() => setNotice(null)}>
+                关闭
+              </button>
+            </div>
+          )}
+          {powerWarning && (
+            <div className="banner error" role="alert">
+              {powerWarning}
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => setPowerWarning(null)}
+              >
                 关闭
               </button>
             </div>
