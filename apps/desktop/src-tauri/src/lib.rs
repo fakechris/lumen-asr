@@ -255,6 +255,10 @@ pub struct AppState {
     pub audio: AudioCapture,
     /// Independent continuous recorder for meetings (never touches `audio`).
     pub meeting_recorder: MeetingRecorder,
+    /// Held while a meeting is recording to prevent idle system sleep and App
+    /// Nap so the audio capture callbacks are not suspended. `None` when no
+    /// recording is active. Best-effort — acquiring never blocks recording.
+    pub meeting_power_guard: std::sync::Mutex<Option<lumen_platform_macos::MeetingPowerGuard>>,
     /// Real-time (P3) streaming-Paraformer live-transcript worker for the
     /// active recording. Idle (no worker) unless a recording is streaming.
     pub meeting_live: meeting_live::MeetingLive,
@@ -497,6 +501,7 @@ pub fn run() {
             store: Mutex::new(store),
             audio,
             meeting_recorder: MeetingRecorder::new(),
+            meeting_power_guard: Mutex::new(None),
             meeting_live: meeting_live::MeetingLive::default(),
             meeting_system_audio: meeting_system_audio::MeetingSystemAudio::default(),
             meeting_mic_aec: meeting_mic_aec::MeetingMicAec::default(),

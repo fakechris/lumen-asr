@@ -333,6 +333,17 @@ pub fn start_meeting_recording(
         spawn_calendar_link(meeting_id);
     }
 
+    // Hold an activity that prevents idle system sleep and App Nap for the
+    // duration of the recording, so the OS never suspends the audio capture
+    // callbacks and drops meeting audio. Acquisition is infallible; guard the
+    // lock defensively so a poisoned mutex can never fail the start command.
+    if let Ok(mut guard) = state.meeting_power_guard.lock() {
+        *guard = Some(lumen_platform_macos::MeetingPowerGuard::acquire());
+        tracing::info!("holding off idle system sleep for the duration of the meeting");
+    } else {
+        tracing::warn!("meeting power guard lock poisoned; skipping idle-sleep hold");
+    }
+
     tracing::info!(meeting_id = %meeting_id, "meeting recording started");
     Ok(meeting_id.to_string())
 }
@@ -476,6 +487,11 @@ pub fn stop_meeting_recording(
         Ok(action) => apply_hotkey_action(&app, action),
         Err(e) => tracing::warn!(error = %e, "arbiter end_meeting on stop"),
     }
+
+    // Release the idle-system-sleep / App-Nap hold acquired at start, on every
+    // path regardless of stop success or failure. Dropping the guard ends the
+    // activity; a poisoned lock just means it is already gone.
+    let _ = state.meeting_power_guard.lock().map(|mut g| g.take());
 
     // Same finally semantics for meeting detection: whether the recorder stop
     // below succeeded or failed, the recording is over, so the policy must

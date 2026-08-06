@@ -6,6 +6,7 @@ mod hotkey_tap;
 mod inject;
 mod meeting_activity;
 mod permissions;
+pub mod power_assertion;
 mod system_audio;
 mod voice_processing;
 
@@ -27,6 +28,7 @@ pub use meeting_activity::{
 pub use permissions::{
     ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,
 };
+pub use power_assertion::MeetingPowerGuard;
 pub use system_audio::{
     capability_available as system_audio_capability_available, SystemAudioCapture,
     SystemAudioError, SystemAudioSink,
