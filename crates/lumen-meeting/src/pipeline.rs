@@ -275,23 +275,106 @@ pub(crate) async fn transcribe_turn(
     else {
         return Ok((String::new(), Vec::new()));
     };
-    // Absolute-time offset of this slice's first sample.
-    let offset = start as f64 / sample_rate as f64;
-    let mut request = AsrRequest::new(samples[start..end].to_vec(), sample_rate);
-    request.hotwords = opts.hotwords.clone();
-    request.language_hint = opts.language_hint.clone();
-    match engine.transcribe(request).await {
-        Ok(result) => {
-            let words = result
-                .words
-                .into_iter()
-                .map(|w| Word::new(w.word, w.start + offset, w.end + offset))
-                .collect();
-            Ok((result.text, words))
+    let slice = &samples[start..end];
+    // Absolute-time offset of this turn slice's first sample.
+    let turn_offset = start as f64 / sample_rate as f64;
+
+    // A long single-speaker turn is split into bounded windows (see
+    // `chunk_ranges`) to cap the audio handed to the engine per request:
+    // an offline decode of a multi-minute buffer uses far more memory than
+    // several short ones. Cuts land in pauses, so no overlap or dedup is
+    // needed — texts concatenate and each chunk's word timings are lifted to
+    // absolute media time by the chunk's own offset.
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut words: Vec<Word> = Vec::new();
+    for (c_start, c_end) in chunk_ranges(slice, sample_rate) {
+        if c_start >= c_end {
+            continue;
         }
-        Err(AsrError::EmptyAudio) => Ok((String::new(), Vec::new())),
-        Err(error) => Err(MeetingError::Asr(error)),
+        let chunk_offset = turn_offset + c_start as f64 / sample_rate as f64;
+        let mut request = AsrRequest::new(slice[c_start..c_end].to_vec(), sample_rate);
+        request.hotwords = opts.hotwords.clone();
+        request.language_hint = opts.language_hint.clone();
+        match engine.transcribe(request).await {
+            Ok(result) => {
+                for w in result.words {
+                    words.push(Word::new(
+                        w.word,
+                        w.start + chunk_offset,
+                        w.end + chunk_offset,
+                    ));
+                }
+                let trimmed = result.text.trim();
+                if !trimmed.is_empty() {
+                    text_parts.push(trimmed.to_string());
+                }
+            }
+            // A chunk the engine rejects as empty contributes nothing, but the
+            // rest of the turn still transcribes.
+            Err(AsrError::EmptyAudio) => {}
+            Err(error) => return Err(MeetingError::Asr(error)),
+        }
     }
+    Ok((text_parts.join(" "), words))
+}
+
+/// Upper bound on how much audio is fed to the ASR engine in a single decode.
+/// See [`transcribe_turn`] for why a single request must stay bounded.
+const MAX_CHUNK_SECS: f64 = 20.0;
+/// Once a chunk reaches this length we start scanning for the quietest spot to
+/// cut, up to [`MAX_CHUNK_SECS`]; a cut lands in a pause instead of mid-word.
+const CHUNK_SEARCH_START_SECS: f64 = 14.0;
+/// Width of the frame whose energy scores a candidate cut point (~100 ms).
+const QUIET_FRAME_SECS: f64 = 0.1;
+
+/// Split `[0, samples.len())` into consecutive sub-ranges, each at most
+/// [`MAX_CHUNK_SECS`] long. When a cut is needed it lands on the quietest
+/// ~100 ms frame in the `[CHUNK_SEARCH_START_SECS, MAX_CHUNK_SECS]` window, so
+/// cuts fall in the gaps between words and chunks need no overlap. A slice that
+/// already fits (or a zero sample rate) yields a single range.
+fn chunk_ranges(samples: &[f32], sample_rate: u32) -> Vec<(usize, usize)> {
+    let len = samples.len();
+    if sample_rate == 0 || len == 0 {
+        return vec![(0, len)];
+    }
+    let max_len = (MAX_CHUNK_SECS * sample_rate as f64) as usize;
+    if len <= max_len {
+        return vec![(0, len)];
+    }
+    let search_start = ((CHUNK_SEARCH_START_SECS * sample_rate as f64) as usize).max(1);
+    let frame = ((QUIET_FRAME_SECS * sample_rate as f64) as usize).max(1);
+
+    let mut ranges = Vec::new();
+    let mut pos = 0usize;
+    while pos < len {
+        if len - pos <= max_len {
+            ranges.push((pos, len));
+            break;
+        }
+        // Scan non-overlapping frames in [pos+search_start, pos+max_len] for the
+        // lowest-energy one and cut at its center. The window is fully in bounds
+        // because we only get here when `len - pos > max_len`.
+        let win_lo = pos + search_start;
+        let win_hi = pos + max_len;
+        let mut cut = win_hi;
+        let mut best_energy = f64::INFINITY;
+        let mut f = win_lo;
+        while f + frame <= win_hi {
+            let energy: f64 = samples[f..f + frame]
+                .iter()
+                .map(|s| (*s as f64) * (*s as f64))
+                .sum();
+            if energy < best_energy {
+                best_energy = energy;
+                cut = f + frame / 2;
+            }
+            f += frame;
+        }
+        // `cut` is in (pos, win_hi] so the loop always advances.
+        ranges.push((pos, cut));
+        pos = cut;
+    }
+    ranges
 }
 
 /// Real diarization via `diar-rs`. macOS + `diarize` feature only.
@@ -677,6 +760,58 @@ mod tests {
         assert!(approx(words[0].end, 1.3));
         assert!(approx(words[1].start, 1.3));
         assert!(approx(words[1].end, 1.6));
+    }
+
+    #[test]
+    fn chunk_ranges_short_slice_is_one_range() {
+        // 10 s < MAX_CHUNK_SECS -> untouched, single decode.
+        let samples = vec![0.1f32; 10 * 16_000];
+        assert_eq!(chunk_ranges(&samples, 16_000), vec![(0, 10 * 16_000)]);
+    }
+
+    #[test]
+    fn chunk_ranges_cuts_a_long_slice_at_the_quiet_gap() {
+        // 25 s of tone with a 200 ms silent gap at 16.0 s. The cut must land in
+        // that gap (inside the [14 s, 20 s] search window), split into two
+        // contiguous ranges that cover the whole slice, each within the cap.
+        let sr = 16_000usize;
+        let len = 25 * sr;
+        let mut samples = vec![0.1f32; len];
+        let gap = 16 * sr..16 * sr + sr / 5; // [16.0, 16.2) s
+        for s in &mut samples[gap.clone()] {
+            *s = 0.0;
+        }
+        let ranges = chunk_ranges(&samples, sr as u32);
+        assert_eq!(ranges.len(), 2, "{ranges:?}");
+        assert_eq!(ranges[0].0, 0);
+        assert!(gap.contains(&ranges[0].1), "cut {} not in gap", ranges[0].1);
+        assert!(ranges[0].1 - ranges[0].0 <= MAX_CHUNK_SECS as usize * sr);
+        assert_eq!(ranges[1], (ranges[0].1, len)); // contiguous, covers the rest
+    }
+
+    #[tokio::test]
+    async fn transcribe_turn_splits_long_turn_and_offsets_each_chunk() {
+        let engine = WordEchoAsr; // echoes "你好" + 2 words per chunk
+                                  // 25 s single turn -> two chunks; texts concatenate, the second chunk's
+                                  // words carry its own (later) absolute offset, not the turn start.
+        let sr = 16_000usize;
+        let samples = vec![0.1f32; 25 * sr];
+        let turn = DiarTurn::new(0.0, 25.0, 0);
+        let (text, words) = transcribe_turn(
+            &engine,
+            &samples,
+            sr as u32,
+            &turn,
+            &MeetingOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(text, "你好 你好");
+        assert_eq!(words.len(), 4);
+        // First chunk starts at t=0; second chunk starts well past 14 s.
+        assert!(approx(words[0].start, 0.0), "{words:?}");
+        assert!(words[2].start > 14.0 && words[2].start < 20.0, "{words:?}");
     }
 
     #[test]
