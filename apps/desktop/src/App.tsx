@@ -1609,6 +1609,22 @@ function RecordPanel({
   );
 }
 
+/** Short human label for the current translation style, used in the hint line. */
+function styleLabel(preset: string, custom: string): string {
+  switch (preset) {
+    case "formal":
+      return "正式风格";
+    case "casual":
+      return "口语风格";
+    case "social":
+      return "社媒风格";
+    case "custom":
+      return custom.trim() ? `自定义风格：${custom.trim()}` : "自定义风格";
+    default:
+      return "忠实翻译";
+  }
+}
+
 function SettingsPanel({
   busy,
   onBusy,
@@ -2139,6 +2155,288 @@ function SettingsPanel({
       />
 
       <section className="card settings-section">
+        <h2>翻译快捷键</h2>
+        <p className="muted-text">
+          另一组键，专门「说话 → 整理 → <strong>译成目标语言（按所选风格）</strong>」。
+          和上面的全局热键一样：{hotkeyMode === "toggle" ? "再按一次结束" : "按住说话，松手结束"}
+          ；可在下方单独重绑这组快捷键、设定目标语言与译文风格。
+        </p>
+        {(() => {
+          const tr =
+            intents.find((i) => i.intent.toLowerCase() === "translate") || {
+              id: "translate",
+              chord: "Alt+Shift+T",
+              mode: hotkeyMode === "toggle" ? "toggle" : "hold",
+              intent: "translate",
+              targetLanguage: "en",
+              enabled: false,
+            };
+          const lang = (tr.targetLanguage || "en").toLowerCase();
+          const preset = ["en", "zh", "ja", "ko", "fr", "de", "es"].includes(lang)
+            ? lang
+            : "custom";
+          // Translation style / register is a separate axis from target language.
+          // Known preset keys map to a curated tone; anything else is custom text.
+          const styleRaw = (tr.translateStyle || "").trim();
+          const stylePreset =
+            styleRaw === "" || styleRaw.toLowerCase() === "faithful"
+              ? "faithful"
+              : ["formal", "casual", "social"].includes(styleRaw.toLowerCase())
+                ? styleRaw.toLowerCase()
+                : "custom";
+
+          async function saveTranslate(next: {
+            enabled: boolean;
+            chord: string;
+            targetLanguage: string;
+            translateStyle?: string;
+          }) {
+            onBusy(true);
+            onError(null);
+            try {
+              const style = (next.translateStyle ?? "").trim();
+              const existing = intents.find(
+                (i) => i.intent.toLowerCase() === "translate",
+              );
+              const nextTranslate = {
+                id: existing?.id || "translate",
+                chord: next.chord || "Alt+Shift+T",
+                mode: hotkeyMode === "toggle" ? "toggle" : "hold",
+                intent: "translate",
+                targetLanguage: next.targetLanguage || "en",
+                translateStyle: style || undefined,
+                enabled: next.enabled,
+              };
+              // Replace only the translation intent; never drop other configured
+              // intents (save_hotkey_config overwrites the whole list).
+              const list = existing
+                ? intents.map((i) =>
+                    i.intent.toLowerCase() === "translate" ? nextTranslate : i,
+                  )
+                : [...intents, nextTranslate];
+              const h = await api.saveHotkeyConfig({
+                enabled: hotkeyEnabled,
+                toggle: hotkeyToggle,
+                showCapsule,
+                mode: hotkeyMode,
+                intents: list,
+              });
+              setIntents(h.intents || list);
+              setHotkeyRegisterNote(h.registerNote || "");
+              onSaved();
+            } catch (e) {
+              onError(String(e));
+            } finally {
+              onBusy(false);
+            }
+          }
+
+          return (
+            <div className="intent-card">
+              <label className="muted-text intent-enable">
+                <input
+                  type="checkbox"
+                  checked={!!tr.enabled}
+                  disabled={busy}
+                  onChange={(e) =>
+                    void saveTranslate({
+                      enabled: e.target.checked,
+                      chord: tr.chord || "Control+Alt",
+                      targetLanguage: tr.targetLanguage || "en",
+                      translateStyle: tr.translateStyle,
+                    })
+                  }
+                />{" "}
+                启用翻译热键
+              </label>
+
+              <div className="intent-card-row">
+                <span className="muted-text intent-label">快捷键</span>
+                <ChordCaptureChip
+                  value={tr.chord || "Control+Alt"}
+                  disabled={busy || !tr.enabled}
+                  busy={busy}
+                  onBusy={onBusy}
+                  onError={onError}
+                  onChange={(chord) =>
+                    void saveTranslate({
+                      enabled: true,
+                      chord,
+                      targetLanguage: tr.targetLanguage || "en",
+                      translateStyle: tr.translateStyle,
+                    })
+                  }
+                />
+                <button
+                  type="button"
+                  className="btn small ghost"
+                  disabled={busy}
+                  onClick={() =>
+                    void saveTranslate({
+                      enabled: true,
+                      chord: "Alt+Shift+T",
+                      targetLanguage: tr.targetLanguage || "en",
+                      translateStyle: tr.translateStyle,
+                    })
+                  }
+                  title="推荐：与纯修饰键主热键不易冲突"
+                >
+                  推荐 ⌥⇧T
+                </button>
+              </div>
+              {hotkeyRegisterNote && (
+                <p className="muted-text intent-hint" style={{ fontSize: "0.8rem" }}>
+                  注册状态：{hotkeyRegisterNote}
+                </p>
+              )}
+
+              <div className="intent-card-row">
+                <span className="muted-text intent-label">译成</span>
+                <select
+                  className="input"
+                  style={{ maxWidth: 180 }}
+                  value={preset}
+                  disabled={busy || !tr.enabled}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    void saveTranslate({
+                      enabled: tr.enabled,
+                      chord: tr.chord || "Alt+Shift+T",
+                      targetLanguage: v === "custom" ? "pt" : v,
+                      translateStyle: tr.translateStyle,
+                    });
+                  }}
+                >
+                  <option value="en">英语</option>
+                  <option value="zh">中文</option>
+                  <option value="ja">日语</option>
+                  <option value="ko">韩语</option>
+                  <option value="fr">法语</option>
+                  <option value="de">德语</option>
+                  <option value="es">西班牙语</option>
+                  <option value="custom">其他…</option>
+                </select>
+                {preset === "custom" && (
+                  <input
+                    className="input"
+                    style={{ maxWidth: 100 }}
+                    value={tr.targetLanguage}
+                    disabled={busy || !tr.enabled}
+                    onChange={(e) =>
+                      setIntents([
+                        {
+                          id: "translate",
+                          chord: tr.chord || "Alt+Shift+T",
+                          mode: hotkeyMode === "toggle" ? "toggle" : "hold",
+                          intent: "translate",
+                          targetLanguage: e.target.value,
+                          translateStyle: tr.translateStyle,
+                          enabled: !!tr.enabled,
+                        },
+                      ])
+                    }
+                    onBlur={() =>
+                      void saveTranslate({
+                        enabled: !!tr.enabled,
+                        chord: tr.chord || "Alt+Shift+T",
+                        targetLanguage: tr.targetLanguage || "en",
+                        translateStyle: tr.translateStyle,
+                      })
+                    }
+                    placeholder="语言代码"
+                  />
+                )}
+              </div>
+
+              <div className="intent-card-row">
+                <span className="muted-text intent-label">风格</span>
+                <select
+                  className="input"
+                  style={{ maxWidth: 180 }}
+                  value={stylePreset}
+                  disabled={busy || !tr.enabled}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    // faithful → clear; a preset → its key; custom → seed an
+                    // editable example (mirrors the target-language "其他…" flow).
+                    const nextStyle =
+                      v === "faithful"
+                        ? ""
+                        : v === "custom"
+                          ? stylePreset === "custom"
+                            ? styleRaw
+                            : "更简洁"
+                          : v;
+                    void saveTranslate({
+                      enabled: tr.enabled,
+                      chord: tr.chord || "Alt+Shift+T",
+                      targetLanguage: tr.targetLanguage || "en",
+                      translateStyle: nextStyle,
+                    });
+                  }}
+                >
+                  <option value="faithful">忠实（默认）</option>
+                  <option value="formal">正式</option>
+                  <option value="casual">口语</option>
+                  <option value="social">社媒（Twitter/X）</option>
+                  <option value="custom">自定义…</option>
+                </select>
+                {stylePreset === "custom" && (
+                  <input
+                    className="input"
+                    style={{ maxWidth: 240 }}
+                    value={styleRaw}
+                    disabled={busy || !tr.enabled}
+                    onChange={(e) =>
+                      setIntents([
+                        {
+                          id: "translate",
+                          chord: tr.chord || "Alt+Shift+T",
+                          mode: hotkeyMode === "toggle" ? "toggle" : "hold",
+                          intent: "translate",
+                          targetLanguage: tr.targetLanguage || "en",
+                          translateStyle: e.target.value,
+                          enabled: !!tr.enabled,
+                        },
+                      ])
+                    }
+                    onBlur={() =>
+                      void saveTranslate({
+                        enabled: !!tr.enabled,
+                        chord: tr.chord || "Alt+Shift+T",
+                        targetLanguage: tr.targetLanguage || "en",
+                        translateStyle: tr.translateStyle,
+                      })
+                    }
+                    placeholder="像李白写诗 / 更简洁 / 商务邮件语气"
+                  />
+                )}
+              </div>
+
+              <p className="muted-text intent-hint">
+                {tr.enabled
+                  ? hotkeyMode === "toggle"
+                    ? `按一下开始录音，再按结束 → 整理后译成「${tr.targetLanguage || "en"}」（${styleLabel(stylePreset, styleRaw)}）。应弹出录音胶囊。`
+                    : `按住 ${tr.chord || "⌥⇧T"} 说话，松手 → 整理后译成「${tr.targetLanguage || "en"}」（${styleLabel(stylePreset, styleRaw)}）。应弹出录音胶囊。`
+                  : "勾选启用后立即生效。建议用带字母的组合（如 ⌥⇧T），避免与纯修饰键主热键冲突。"}
+              </p>
+              {hotkeyToggle &&
+                tr.chord &&
+                tr.chord.replace(/\+/g, "").toLowerCase().startsWith(
+                  hotkeyToggle.replace(/\+/g, "").toLowerCase()
+                ) &&
+                tr.chord.split("+").length <= hotkeyToggle.split("+").length && (
+                  <p className="muted-text intent-hint" style={{ color: "var(--error)" }}>
+                    注意：当前主热键是「{hotkeyToggle}」。若翻译键与它完全相同会冲突；翻译键应多一个字母键（如主热键
+                    ⌥⇧ 时用 ⌥⇧T）。
+                  </p>
+                )}
+            </div>
+          );
+        })()}
+      </section>
+
+      <section className="card settings-section">
         <h2>会议自动检测</h2>
         <p className="muted-text">
           开启后，Lumen 会留意 Zoom、Teams、Slack、FaceTime
@@ -2426,198 +2724,6 @@ function SettingsPanel({
             保存 ASR 设置
           </button>
         </div>
-      </section>
-
-      <section className="card settings-section">
-        <h2>翻译快捷键</h2>
-        <p className="muted-text">
-          另一组键，专门「说话 → 整理 → <strong>译成目标语言</strong>」。
-          和上面的录音热键一样：{hotkeyMode === "toggle" ? "再按一次结束" : "按住说话，松手结束"}
-          （触发方式只在上面「全局热键」里改，这里不重复设）。
-        </p>
-        {(() => {
-          const tr =
-            intents.find((i) => i.intent === "translate") ||
-            intents[0] || {
-              id: "translate",
-              chord: "Alt+Shift+T",
-              mode: hotkeyMode === "toggle" ? "toggle" : "hold",
-              intent: "translate",
-              targetLanguage: "en",
-              enabled: false,
-            };
-          const lang = (tr.targetLanguage || "en").toLowerCase();
-          const preset = ["en", "zh", "ja", "ko", "fr", "de", "es"].includes(lang)
-            ? lang
-            : "custom";
-
-          async function saveTranslate(next: {
-            enabled: boolean;
-            chord: string;
-            targetLanguage: string;
-          }) {
-            onBusy(true);
-            onError(null);
-            try {
-              const list = [
-                {
-                  id: "translate",
-                  chord: next.chord || "Alt+Shift+T",
-                  mode: hotkeyMode === "toggle" ? "toggle" : "hold",
-                  intent: "translate",
-                  targetLanguage: next.targetLanguage || "en",
-                  enabled: next.enabled,
-                },
-              ];
-              const h = await api.saveHotkeyConfig({
-                enabled: hotkeyEnabled,
-                toggle: hotkeyToggle,
-                showCapsule,
-                mode: hotkeyMode,
-                intents: list,
-              });
-              setIntents(h.intents || list);
-              setHotkeyRegisterNote(h.registerNote || "");
-              onSaved();
-            } catch (e) {
-              onError(String(e));
-            } finally {
-              onBusy(false);
-            }
-          }
-
-          return (
-            <div className="intent-card">
-              <label className="muted-text intent-enable">
-                <input
-                  type="checkbox"
-                  checked={!!tr.enabled}
-                  disabled={busy}
-                  onChange={(e) =>
-                    void saveTranslate({
-                      enabled: e.target.checked,
-                      chord: tr.chord || "Control+Alt",
-                      targetLanguage: tr.targetLanguage || "en",
-                    })
-                  }
-                />{" "}
-                启用翻译热键
-              </label>
-
-              <div className="intent-card-row">
-                <span className="muted-text intent-label">快捷键</span>
-                <ChordCaptureChip
-                  value={tr.chord || "Control+Alt"}
-                  disabled={busy || !tr.enabled}
-                  busy={busy}
-                  onBusy={onBusy}
-                  onError={onError}
-                  onChange={(chord) =>
-                    void saveTranslate({
-                      enabled: true,
-                      chord,
-                      targetLanguage: tr.targetLanguage || "en",
-                    })
-                  }
-                />
-                <button
-                  type="button"
-                  className="btn small ghost"
-                  disabled={busy}
-                  onClick={() =>
-                    void saveTranslate({
-                      enabled: true,
-                      chord: "Alt+Shift+T",
-                      targetLanguage: tr.targetLanguage || "en",
-                    })
-                  }
-                  title="推荐：与纯修饰键主热键不易冲突"
-                >
-                  推荐 ⌥⇧T
-                </button>
-              </div>
-              {hotkeyRegisterNote && (
-                <p className="muted-text intent-hint" style={{ fontSize: "0.8rem" }}>
-                  注册状态：{hotkeyRegisterNote}
-                </p>
-              )}
-
-              <div className="intent-card-row">
-                <span className="muted-text intent-label">译成</span>
-                <select
-                  className="input"
-                  style={{ maxWidth: 180 }}
-                  value={preset}
-                  disabled={busy || !tr.enabled}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    void saveTranslate({
-                      enabled: tr.enabled,
-                      chord: tr.chord || "Alt+Shift+T",
-                      targetLanguage: v === "custom" ? "pt" : v,
-                    });
-                  }}
-                >
-                  <option value="en">英语</option>
-                  <option value="zh">中文</option>
-                  <option value="ja">日语</option>
-                  <option value="ko">韩语</option>
-                  <option value="fr">法语</option>
-                  <option value="de">德语</option>
-                  <option value="es">西班牙语</option>
-                  <option value="custom">其他…</option>
-                </select>
-                {preset === "custom" && (
-                  <input
-                    className="input"
-                    style={{ maxWidth: 100 }}
-                    value={tr.targetLanguage}
-                    disabled={busy || !tr.enabled}
-                    onChange={(e) =>
-                      setIntents([
-                        {
-                          id: "translate",
-                          chord: tr.chord || "Alt+Shift+T",
-                          mode: hotkeyMode === "toggle" ? "toggle" : "hold",
-                          intent: "translate",
-                          targetLanguage: e.target.value,
-                          enabled: !!tr.enabled,
-                        },
-                      ])
-                    }
-                    onBlur={() =>
-                      void saveTranslate({
-                        enabled: !!tr.enabled,
-                        chord: tr.chord || "Alt+Shift+T",
-                        targetLanguage: tr.targetLanguage || "en",
-                      })
-                    }
-                    placeholder="语言代码"
-                  />
-                )}
-              </div>
-
-              <p className="muted-text intent-hint">
-                {tr.enabled
-                  ? hotkeyMode === "toggle"
-                    ? `按一下开始录音，再按结束 → 整理后译成「${tr.targetLanguage || "en"}」。应弹出录音胶囊。`
-                    : `按住 ${tr.chord || "⌥⇧T"} 说话，松手 → 整理后译成「${tr.targetLanguage || "en"}」。应弹出录音胶囊。`
-                  : "勾选启用后立即生效。建议用带字母的组合（如 ⌥⇧T），避免与纯修饰键主热键冲突。"}
-              </p>
-              {hotkeyToggle &&
-                tr.chord &&
-                tr.chord.replace(/\+/g, "").toLowerCase().startsWith(
-                  hotkeyToggle.replace(/\+/g, "").toLowerCase()
-                ) &&
-                tr.chord.split("+").length <= hotkeyToggle.split("+").length && (
-                  <p className="muted-text intent-hint" style={{ color: "var(--error)" }}>
-                    注意：当前主热键是「{hotkeyToggle}」。若翻译键与它完全相同会冲突；翻译键应多一个字母键（如主热键
-                    ⌥⇧ 时用 ⌥⇧T）。
-                  </p>
-                )}
-            </div>
-          );
-        })()}
       </section>
 
       <section className="card settings-section">

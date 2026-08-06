@@ -7,3 +7,6 @@ description = "System prompts for Lumen corrector and related LLM tasks"
 
 [dependencies]
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
