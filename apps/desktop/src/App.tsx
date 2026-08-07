@@ -158,6 +158,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [powerWarning, setPowerWarning] = useState<string | null>(null);
+  const [recoveryNotices, setRecoveryNotices] = useState<
+    { meetingId: string; text: string; ok: boolean }[]
+  >([]);
   const [editFeedbackRevision, setEditFeedbackRevision] = useState(0);
   const [busy, setBusy] = useState(false);
   const [hotkeyLabel, setHotkeyLabel] = useState("⌥Space");
@@ -366,6 +369,68 @@ export default function App() {
       cancelled = true;
       un?.();
       if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  // Interrupted-recording recovery: on launch the backend scans for recordings
+  // left unfinished by a previous run (crash / kill / power loss). Recovery can
+  // run before this listener is ready, so we both DRAIN the buffered outcomes on
+  // mount and LISTEN for live ones; both feed the same keyed list (dedup by
+  // meetingId) so nothing is lost or shown twice, and multiple recoveries each
+  // get their own banner.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let cancelled = false;
+    type Recovery = {
+      meetingId: string;
+      title?: string;
+      outcome: string;
+      durationSeconds?: number;
+      reason?: string;
+    };
+    const toNotice = (p: Recovery) => {
+      const name = p.title?.trim() || "上次录音";
+      if (p.outcome === "recovered") {
+        const mins =
+          typeof p.durationSeconds === "number"
+            ? Math.round(p.durationSeconds / 60)
+            : null;
+        return {
+          meetingId: p.meetingId,
+          ok: true,
+          text: `「${name}」上次被中断，已抢救${
+            mins != null ? ` ${mins} 分钟` : ""
+          }并重新处理。`,
+        };
+      }
+      return {
+        meetingId: p.meetingId,
+        ok: false,
+        text: `「${name}」上次被中断且无法恢复${
+          p.reason ? `：${p.reason}` : ""
+        }。`,
+      };
+    };
+    const add = (p: Recovery) =>
+      setRecoveryNotices((prev) =>
+        prev.some((n) => n.meetingId === p.meetingId)
+          ? prev
+          : [...prev, toNotice(p)],
+      );
+    // Drain what recovery buffered before this listener existed.
+    void api
+      .takeRecoveryNotices()
+      .then((list) => {
+        if (!cancelled) list.forEach(add);
+      })
+      .catch(() => {});
+    listen<Recovery>("meeting-recovery", (e) => add(e.payload)).then((fn) => {
+      if (cancelled) fn();
+      else un = fn;
+    });
+    return () => {
+      cancelled = true;
+      un?.();
     };
   }, []);
 
@@ -615,6 +680,26 @@ export default function App() {
               </button>
             </div>
           )}
+          {recoveryNotices.map((n) => (
+            <div
+              key={n.meetingId}
+              className={`banner ${n.ok ? "success" : "error"}`}
+              role="status"
+            >
+              {n.text}
+              <button
+                type="button"
+                className="linkish"
+                onClick={() =>
+                  setRecoveryNotices((prev) =>
+                    prev.filter((x) => x.meetingId !== n.meetingId),
+                  )
+                }
+              >
+                关闭
+              </button>
+            </div>
+          ))}
 
           <div className="content-scroll">
             <div className="content-header">
