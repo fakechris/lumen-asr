@@ -1286,7 +1286,7 @@ fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
         .map(|m| m.len() > 0)
         .unwrap_or(false);
     if !has_bytes {
-        fail_interrupted(store, id);
+        fail_interrupted(app, store, meeting);
         return;
     }
 
@@ -1309,10 +1309,17 @@ fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
                 dual_track = system_wav.is_some(),
                 "crash recovery: salvaged recording, header repaired → processing"
             );
+            emit_recovery(
+                app,
+                meeting,
+                "recovered",
+                Some(repaired.duration_seconds),
+                None,
+            );
             spawn_meeting_processing(app.clone(), id, wav, system_wav);
         }
         // Header-only WAV: repaired to a valid 0-length take — no audio to keep.
-        Ok(_) => fail_interrupted(store, id),
+        Ok(_) => fail_interrupted(app, store, meeting),
         Err(e) => {
             // File exists but is not a repairable WAV (truncated / corrupt).
             let reason = format!("recording interrupted, audio unrecoverable: {e}");
@@ -1320,6 +1327,7 @@ fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
             if let Err(e) = store.fail_meeting(id, Some(&reason)) {
                 tracing::warn!(meeting_id = %id, error = %e, "crash recovery: could not mark failed");
             }
+            emit_recovery(app, meeting, "failed", None, Some(reason));
         }
     }
 }
@@ -1358,11 +1366,52 @@ fn recover_system_track(store: &Store, meeting: &Meeting) -> Option<PathBuf> {
 }
 
 /// Mark an interrupted meeting `failed` with the standard "no audio" reason.
-fn fail_interrupted(store: &Store, id: Uuid) {
+fn fail_interrupted(app: &AppHandle, store: &Store, meeting: &Meeting) {
+    let id = meeting.id;
     tracing::info!(meeting_id = %id, "crash recovery: no salvageable audio → failed");
     if let Err(e) = store.fail_meeting(id, Some(INTERRUPTED_NO_AUDIO)) {
         tracing::warn!(meeting_id = %id, error = %e, "crash recovery: could not mark failed");
     }
+    emit_recovery(
+        app,
+        meeting,
+        "failed",
+        None,
+        Some(INTERRUPTED_NO_AUDIO.to_string()),
+    );
+}
+
+/// Payload of the `meeting-recovery` event: the app found a recording that was
+/// interrupted on a previous run (crash / kill / power loss) and either salvaged
+/// it (`"recovered"`, now reprocessing) or could not (`"failed"`). The front-end
+/// surfaces this so an interruption is never silent.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MeetingRecoveryEvent {
+    meeting_id: String,
+    title: Option<String>,
+    outcome: &'static str,
+    duration_seconds: Option<f64>,
+    reason: Option<String>,
+}
+
+fn emit_recovery(
+    app: &AppHandle,
+    meeting: &Meeting,
+    outcome: &'static str,
+    duration_seconds: Option<f64>,
+    reason: Option<String>,
+) {
+    let _ = app.emit(
+        "meeting-recovery",
+        MeetingRecoveryEvent {
+            meeting_id: meeting.id.to_string(),
+            title: meeting.title.clone(),
+            outcome,
+            duration_seconds,
+            reason,
+        },
+    );
 }
 
 /// Mark a meeting `failed` (with an optional reason) from the background

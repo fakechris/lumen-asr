@@ -158,6 +158,10 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [powerWarning, setPowerWarning] = useState<string | null>(null);
+  const [recoveryNotice, setRecoveryNotice] = useState<{
+    text: string;
+    ok: boolean;
+  } | null>(null);
   const [editFeedbackRevision, setEditFeedbackRevision] = useState(0);
   const [busy, setBusy] = useState(false);
   const [hotkeyLabel, setHotkeyLabel] = useState("⌥Space");
@@ -366,6 +370,50 @@ export default function App() {
       cancelled = true;
       un?.();
       if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  // Interrupted-recording recovery: on launch the backend scans for recordings
+  // left unfinished by a previous run (crash / kill / power loss) and emits
+  // `meeting-recovery` — salvaged (now reprocessing) or unrecoverable — so an
+  // interruption is never silent. Show a banner (no auto-dismiss: the user
+  // should see it).
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let cancelled = false;
+    listen<{
+      title?: string;
+      outcome: string;
+      durationSeconds?: number;
+      reason?: string;
+    }>("meeting-recovery", (e) => {
+      const name = e.payload.title?.trim() || "上次录音";
+      if (e.payload.outcome === "recovered") {
+        const mins =
+          typeof e.payload.durationSeconds === "number"
+            ? Math.round(e.payload.durationSeconds / 60)
+            : null;
+        setRecoveryNotice({
+          ok: true,
+          text: `「${name}」上次被中断，已抢救${
+            mins != null ? ` ${mins} 分钟` : ""
+          }并重新处理。`,
+        });
+      } else {
+        setRecoveryNotice({
+          ok: false,
+          text: `「${name}」上次被中断且无法恢复${
+            e.payload.reason ? `：${e.payload.reason}` : ""
+          }。`,
+        });
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else un = fn;
+    });
+    return () => {
+      cancelled = true;
+      un?.();
     };
   }, []);
 
@@ -610,6 +658,21 @@ export default function App() {
                 type="button"
                 className="linkish"
                 onClick={() => setPowerWarning(null)}
+              >
+                关闭
+              </button>
+            </div>
+          )}
+          {recoveryNotice && (
+            <div
+              className={`banner ${recoveryNotice.ok ? "success" : "error"}`}
+              role="status"
+            >
+              {recoveryNotice.text}
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => setRecoveryNotice(null)}
               >
                 关闭
               </button>
