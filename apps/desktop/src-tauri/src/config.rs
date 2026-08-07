@@ -63,6 +63,19 @@ pub struct MeetingConfig {
     /// matching event) the recording proceeds exactly as before. Defaults to
     /// `true`; macOS-only (a no-op elsewhere).
     pub calendar_link: bool,
+    /// Minutes of continuous microphone silence after which an unattended
+    /// recording auto-stops (a meeting nobody stopped). `0` disables the
+    /// auto-stop entirely. Defaults to `15`. The recorder measures silence from
+    /// the mic track only; when it cannot tell (e.g. the system-AEC mic path is
+    /// active) nothing is auto-stopped.
+    #[serde(default = "default_silence_auto_stop_minutes")]
+    pub silence_auto_stop_minutes: u32,
+    /// When a calendar-linked meeting's end time passes, prompt the user to stop
+    /// recording (a reminder with a Stop button — never an auto-stop, since a
+    /// calendar end is not necessarily the real end). Defaults to `true`; only
+    /// meaningful when the meeting was linked to a calendar event.
+    #[serde(default = "default_calendar_end_reminder")]
+    pub calendar_end_reminder: bool,
     /// Record the system audio output (remote participants) as a second,
     /// synchronized meeting track via a Core Audio process tap. Defaults to
     /// `true` but only takes effect when the OS capability (macOS 14.2+) and
@@ -116,6 +129,8 @@ impl Default for MeetingConfig {
             transcript_cleanup: true,
             detection_enabled: false,
             calendar_link: true,
+            silence_auto_stop_minutes: default_silence_auto_stop_minutes(),
+            calendar_end_reminder: default_calendar_end_reminder(),
             system_audio: true,
             system_live_preview: true,
             echo_suppression: true,
@@ -124,6 +139,17 @@ impl Default for MeetingConfig {
             self_identity_id: None,
         }
     }
+}
+
+/// Default minutes of continuous mic silence before an unattended recording
+/// auto-stops. `0` would disable the feature.
+fn default_silence_auto_stop_minutes() -> u32 {
+    15
+}
+
+/// Default for the calendar-end stop reminder (a prompt, never an auto-stop).
+fn default_calendar_end_reminder() -> bool {
+    true
 }
 
 impl AppConfig {
@@ -1192,6 +1218,56 @@ calendar_link = false
         )
         .unwrap();
         assert!(!off.meeting.calendar_link);
+    }
+
+    #[test]
+    fn meeting_silence_auto_stop_defaults_to_fifteen_minutes_and_can_opt_out() {
+        // Ships at 15 minutes…
+        assert_eq!(MeetingConfig::default().silence_auto_stop_minutes, 15);
+        assert_eq!(AppConfig::default().meeting.silence_auto_stop_minutes, 15);
+        // …absent from an existing config → still 15…
+        let existing: AppConfig = toml::from_str(
+            r#"
+[meeting]
+transcript_cleanup = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(existing.meeting.silence_auto_stop_minutes, 15);
+        // …and an explicit value (including 0 = disabled) is honored.
+        let off: AppConfig = toml::from_str(
+            r#"
+[meeting]
+silence_auto_stop_minutes = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(off.meeting.silence_auto_stop_minutes, 0);
+    }
+
+    #[test]
+    fn meeting_calendar_end_reminder_defaults_on_and_can_opt_out() {
+        // Defaults on…
+        assert!(MeetingConfig::default().calendar_end_reminder);
+        assert!(AppConfig::default().meeting.calendar_end_reminder);
+        // …absent from an existing config → still on…
+        let existing: AppConfig = toml::from_str(
+            r#"
+[meeting]
+transcript_cleanup = true
+"#,
+        )
+        .unwrap();
+        assert!(existing.meeting.calendar_end_reminder);
+        // …and an explicit opt-out is honored.
+        let off: AppConfig = toml::from_str(
+            r#"
+[meeting]
+calendar_end_reminder = false
+"#,
+        )
+        .unwrap();
+        assert!(!off.meeting.calendar_end_reminder);
     }
 
     #[test]

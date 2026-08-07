@@ -211,6 +211,87 @@ fn spawn_battery_poll(app: AppHandle, initially_warned: bool) -> (Arc<AtomicBool
     (stop, handle)
 }
 
+/// How often the silence watchdog re-checks the microphone while a meeting
+/// records. Small enough that a stop request is honored promptly.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Payload of the `meeting-auto-stop` event: the front-end owns the real stop
+/// path, so the watchdog only *asks* it to stop (it never calls the stop
+/// command from the background thread). `reason` is `"silence"`.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingAutoStop {
+    pub meeting_id: String,
+    pub reason: &'static str,
+}
+
+/// Payload of the `meeting-calendar-ended` event: a linked calendar meeting's
+/// end time has passed while it is still recording. The front-end shows a
+/// *reminder* with a Stop button — never an auto-stop, since a calendar end is
+/// not necessarily the real end.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingCalendarEnded {
+    pub meeting_id: String,
+    pub title: String,
+}
+
+/// Spawn a background thread that watches the active recording's microphone
+/// silence and, once it has been continuously silent for `minutes`, emits
+/// `meeting-auto-stop` so the front-end stops the recording (catching a meeting
+/// nobody ended). `MeetingRecorder::silence_seconds` returns `None` when it
+/// cannot tell — not recording, or the system-AEC mic path is active — which is
+/// treated as "can't tell, don't auto-stop". The thread only *emits*; it never
+/// calls the stop command itself.
+///
+/// Returns the stop flag + join handle so the stop command can signal and join
+/// it. Reads the recorder through the shared [`AppState`] each tick (like the
+/// offline pipeline), so it holds no `!Send` handles.
+fn spawn_meeting_watchdog(
+    app: AppHandle,
+    meeting_id: String,
+    minutes: u32,
+) -> (Arc<AtomicBool>, JoinHandle<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let threshold_seconds = f64::from(minutes) * 60.0;
+    let handle = std::thread::spawn(move || {
+        // Sleep in small slices so a stop request is honored promptly.
+        let step = Duration::from_millis(500);
+        while !stop_thread.load(Ordering::SeqCst) {
+            let mut slept = Duration::ZERO;
+            while slept < WATCHDOG_POLL_INTERVAL && !stop_thread.load(Ordering::SeqCst) {
+                std::thread::sleep(step);
+                slept += step;
+            }
+            if stop_thread.load(Ordering::SeqCst) {
+                break;
+            }
+            let silence = app.state::<AppState>().meeting_recorder.silence_seconds();
+            if let Some(seconds) = silence {
+                if seconds >= threshold_seconds {
+                    tracing::info!(
+                        meeting_id = %meeting_id,
+                        silence_seconds = seconds,
+                        "meeting silent past the auto-stop threshold; asking the UI to stop"
+                    );
+                    let _ = app.emit(
+                        "meeting-auto-stop",
+                        MeetingAutoStop {
+                            meeting_id: meeting_id.clone(),
+                            reason: "silence",
+                        },
+                    );
+                    // The front-end will stop the recording (and join this
+                    // thread); our job is done.
+                    break;
+                }
+            }
+        }
+    });
+    (stop, handle)
+}
+
 /// Start a new meeting recording. Creates the meeting row (`Recording`), begins
 /// the continuous recorder writing to `<data_dir>/meetings/<id>.wav`, and
 /// suspends the dictation hotkey. Returns the new meeting id.
@@ -421,13 +502,13 @@ pub fn start_meeting_recording(
     //    auto-title an untitled meeting and note the attendee names. Spawned
     //    *after* the recorder is live so the start path is never delayed —
     //    a denied permission or no matching event changes nothing.
-    let calendar_link_enabled = state
+    let (calendar_link_enabled, calendar_end_reminder) = state
         .config
         .lock()
-        .map(|cfg| cfg.meeting.calendar_link)
-        .unwrap_or(true);
+        .map(|cfg| (cfg.meeting.calendar_link, cfg.meeting.calendar_end_reminder))
+        .unwrap_or((true, true));
     if calendar_link_enabled {
-        spawn_calendar_link(meeting_id);
+        spawn_calendar_link(app.clone(), meeting_id, calendar_end_reminder);
     }
 
     // Hold an activity that prevents idle system sleep and App Nap for the
@@ -466,6 +547,33 @@ pub fn start_meeting_recording(
         tracing::warn!("meeting battery poll lock poisoned; skipping low-battery monitoring");
     }
 
+    // Silence watchdog: auto-stop an unattended recording after N minutes of
+    // continuous mic silence (a meeting nobody stopped). Disabled when
+    // `silence_auto_stop_minutes` is 0. The thread only emits an event — the
+    // front-end owns the real stop path. Same store-or-stop-on-poison handling
+    // as the battery poll above.
+    let silence_minutes = state
+        .config
+        .lock()
+        .map(|cfg| cfg.meeting.silence_auto_stop_minutes)
+        .unwrap_or(0);
+    // The silence watchdog reads `MeetingRecorder::silence_seconds`, which only
+    // the plain cpal recorder feeds. When the AEC mic backend engaged
+    // (`aec_rate.is_some()`) it returns `None`, so the watchdog could never fire
+    // — don't start a thread that can only spin. (AEC-path silence detection is a
+    // follow-up.)
+    if silence_minutes > 0 && aec_rate.is_none() {
+        let watchdog = spawn_meeting_watchdog(app.clone(), meeting_id.to_string(), silence_minutes);
+        if let Ok(mut guard) = state.meeting_watchdog.lock() {
+            *guard = Some(watchdog);
+        } else {
+            watchdog.0.store(true, Ordering::SeqCst);
+            tracing::warn!("meeting watchdog lock poisoned; skipping silence auto-stop monitoring");
+        }
+    } else if silence_minutes > 0 {
+        tracing::info!("silence auto-stop unavailable on the AEC mic path this recording");
+    }
+
     tracing::info!(meeting_id = %meeting_id, "meeting recording started");
     Ok(meeting_id.to_string())
 }
@@ -499,7 +607,7 @@ fn merge_attendees_into_notes(existing: &str, attendees: &[String]) -> Option<St
 /// lock), exactly like the processing pipeline: the start path has already
 /// returned, and every failure here is log-and-drop — the recording itself
 /// is untouched. On non-macOS there is no calendar bridge, so this is a no-op.
-fn spawn_calendar_link(meeting_id: Uuid) {
+fn spawn_calendar_link(app: AppHandle, meeting_id: Uuid, end_reminder: bool) {
     #[cfg(target_os = "macos")]
     std::thread::spawn(move || {
         // May block on the (first-use) permission prompt and the EventKit
@@ -520,9 +628,88 @@ fn spawn_calendar_link(meeting_id: Uuid) {
         if let Err(e) = apply_calendar_event(&store, meeting_id, &event) {
             tracing::warn!(meeting_id = %meeting_id, error = %e, "calendar link: could not apply event");
         }
+        // Calendar-end reminder (opt-out): when the matched event has a future
+        // end time, wait until it passes and — if the meeting is still
+        // recording — prompt the user to stop. A reminder, never an auto-stop.
+        if end_reminder && event.end_epoch_seconds > now_epoch_seconds() {
+            spawn_calendar_end_reminder(
+                app,
+                meeting_id,
+                event.title.trim().to_string(),
+                event.end_epoch_seconds,
+            );
+        }
     });
     #[cfg(not(target_os = "macos"))]
-    let _ = meeting_id;
+    {
+        let _ = (app, meeting_id, end_reminder);
+    }
+}
+
+/// Current wall-clock time as seconds since the Unix epoch (a backwards clock
+/// clamps to 0). Used to schedule the calendar-end reminder relative to now.
+#[cfg(target_os = "macos")]
+fn now_epoch_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Spawn a one-shot timer that fires when a linked calendar event's end time
+/// passes: it sleeps until `end_epoch_seconds` (relative to now; a past end
+/// fires ~immediately), re-opens the store, and — only if the meeting is STILL
+/// `Recording` — emits `meeting-calendar-ended` so the front-end shows a Stop
+/// reminder. Best-effort: any failure just drops the reminder.
+#[cfg(target_os = "macos")]
+fn spawn_calendar_end_reminder(
+    app: AppHandle,
+    meeting_id: Uuid,
+    title: String,
+    end_epoch_seconds: f64,
+) {
+    std::thread::spawn(move || {
+        let store = match Store::open(default_db_path()) {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::warn!(meeting_id = %meeting_id, error = %e, "calendar-end reminder: could not open store");
+                return;
+            }
+        };
+        let still_recording = |store: &Store| {
+            matches!(
+                store.get_meeting(meeting_id),
+                Ok(Some(m)) if m.status == MeetingStatus::Recording
+            )
+        };
+        // Sleep toward the event end in short slices, re-checking status each one,
+        // so a meeting stopped before its scheduled end frees this thread within a
+        // slice instead of parking it (possibly for hours).
+        loop {
+            let remaining = end_epoch_seconds - now_epoch_seconds();
+            if remaining <= 0.0 {
+                break;
+            }
+            if !still_recording(&store) {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs_f64(remaining.min(15.0)));
+        }
+        match store.get_meeting(meeting_id) {
+            Ok(Some(meeting)) if meeting.status == MeetingStatus::Recording => {
+                tracing::info!(meeting_id = %meeting_id, "calendar meeting end reached while recording; reminding to stop");
+                let _ = app.emit(
+                    "meeting-calendar-ended",
+                    MeetingCalendarEnded {
+                        meeting_id: meeting_id.to_string(),
+                        title,
+                    },
+                );
+            }
+            // Already stopped / not found → the reminder is moot; drop it.
+            _ => {}
+        }
+    });
 }
 
 /// Fold a matched calendar event into the meeting row: title the meeting
@@ -645,6 +832,16 @@ pub fn stop_meeting_recording(
     // path. Signal it to exit and join (returns within a poll slice). A poisoned
     // lock just means it is already gone.
     if let Ok(mut guard) = state.meeting_battery_poll.lock() {
+        if let Some((stop, handle)) = guard.take() {
+            stop.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+        }
+    }
+
+    // Stop the silence watchdog started with the recording, on every path.
+    // Signal it to exit and join (returns within a poll slice). A poisoned lock
+    // just means it is already gone.
+    if let Ok(mut guard) = state.meeting_watchdog.lock() {
         if let Some((stop, handle)) = guard.take() {
             stop.store(true, Ordering::SeqCst);
             let _ = handle.join();
@@ -871,6 +1068,54 @@ pub fn get_meeting_detection_stats(
         stop_accepted: c.stop_accepted,
         stop_declined: c.stop_declined,
     })
+}
+
+/// Serialized watchdog settings for the meeting settings UI.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingWatchdogConfig {
+    /// Minutes of continuous mic silence before an unattended recording
+    /// auto-stops. `0` disables the auto-stop.
+    pub silence_auto_stop_minutes: u32,
+    /// Prompt to stop when a calendar-linked meeting's end time passes.
+    pub calendar_end_reminder: bool,
+}
+
+/// Read the meeting watchdog settings (silence auto-stop + calendar-end
+/// reminder) for the settings UI.
+#[tauri::command]
+pub fn get_meeting_watchdog_config(
+    state: State<'_, AppState>,
+) -> Result<MeetingWatchdogConfig, String> {
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    Ok(MeetingWatchdogConfig {
+        silence_auto_stop_minutes: cfg.meeting.silence_auto_stop_minutes,
+        calendar_end_reminder: cfg.meeting.calendar_end_reminder,
+    })
+}
+
+/// Persist the meeting watchdog settings and return the stored values. Takes
+/// effect for the next recording (a running watchdog captured its threshold at
+/// start).
+#[tauri::command]
+pub fn set_meeting_watchdog_config(
+    state: State<'_, AppState>,
+    silence_auto_stop_minutes: u32,
+    calendar_end_reminder: bool,
+) -> Result<MeetingWatchdogConfig, String> {
+    {
+        let mut cfg = state
+            .config
+            .lock()
+            .map_err(|_| "config lock poisoned".to_string())?;
+        cfg.meeting.silence_auto_stop_minutes = silence_auto_stop_minutes;
+        cfg.meeting.calendar_end_reminder = calendar_end_reminder;
+        cfg.save()?;
+    }
+    get_meeting_watchdog_config(state)
 }
 
 fn meeting_detection_capability() -> bool {

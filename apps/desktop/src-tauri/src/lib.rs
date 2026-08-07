@@ -271,6 +271,16 @@ pub struct AppState {
             std::thread::JoinHandle<()>,
         )>,
     >,
+    /// Silence-watchdog poll thread for the active recording: its stop flag and
+    /// join handle, so `stop_meeting_recording` can signal + join it. `None`
+    /// when no recording is active (or the silence auto-stop is disabled). All
+    /// `Send`/`Sync` — never holds an objc2 object.
+    pub meeting_watchdog: std::sync::Mutex<
+        Option<(
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+            std::thread::JoinHandle<()>,
+        )>,
+    >,
     /// Interrupted-recording recovery outcomes buffered at startup until the
     /// front-end drains them (it can miss the live event if recovery runs before
     /// its listener is ready). See `meeting_cmd::take_recovery_notices`.
@@ -519,6 +529,7 @@ pub fn run() {
             meeting_recorder: MeetingRecorder::new(),
             meeting_power_guard: Mutex::new(None),
             meeting_battery_poll: Mutex::new(None),
+            meeting_watchdog: Mutex::new(None),
             meeting_recovery_notices: Mutex::new(Vec::new()),
             meeting_live: meeting_live::MeetingLive::default(),
             meeting_system_audio: meeting_system_audio::MeetingSystemAudio::default(),
@@ -598,6 +609,8 @@ pub fn run() {
             meeting_cmd::accept_meeting_detection_stop,
             meeting_cmd::decline_meeting_detection_stop,
             meeting_cmd::get_meeting_detection_stats,
+            meeting_cmd::get_meeting_watchdog_config,
+            meeting_cmd::set_meeting_watchdog_config,
             meeting_cmd::process_meeting_now,
             meeting_cmd::list_meetings,
             meeting_cmd::get_meeting_detail,
