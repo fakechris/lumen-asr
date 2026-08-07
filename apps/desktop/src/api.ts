@@ -642,6 +642,30 @@ export const api = {
   removeEnrolledSpeaker: (identityId: string) =>
     invoke<boolean>("remove_enrolled_speaker", { identityId }),
 
+  /** Rename an enrolled identity (samples kept). Rejects renaming onto another
+   * identity's name — use `mergeEnrolledSpeakers` for the same person. */
+  renameEnrolledSpeaker: (identityId: string, name: string) =>
+    invoke<import("./types").EnrolledSpeaker>("rename_enrolled_speaker", {
+      identityId,
+      name,
+    }),
+
+  /** Merge `fromId` into `intoId`: move all of `from`'s samples onto `into`,
+   * then delete `from`. Resolves the surviving (merged) identity. */
+  mergeEnrolledSpeakers: (fromId: string, intoId: string) =>
+    invoke<import("./types").EnrolledSpeaker>("merge_enrolled_speakers", {
+      fromId,
+      intoId,
+    }),
+
+  /** Delete one voiceprint sample by its (oldest-first) index; removing the
+   * last sample deletes the identity (then resolves null). */
+  removeSpeakerSample: (identityId: string, sampleIndex: number) =>
+    invoke<import("./types").EnrolledSpeaker | null>("remove_speaker_sample", {
+      identityId,
+      sampleIndex,
+    }),
+
   /** Read the enrolled identity marked as the user themself ("这是我"), or
    * null. Rendering hint: attribution matching it displays as "我". */
   getSelfIdentity: () => invoke<string | null>("get_self_identity"),

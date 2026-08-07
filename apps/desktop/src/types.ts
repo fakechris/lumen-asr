@@ -487,6 +487,10 @@ export type EnrolledSpeaker = {
   name: string;
   enrolledAt: string;
   sourceMeetingId?: string | null;
+  /** How many voiceprint samples back this identity (1 = enrolled once). */
+  sampleCount: number;
+  /** Distinct source meetings across all samples, newest first. */
+  sourceMeetingIds: string[];
 };
 
 /** A recording-time speaker **boundary** on a live caption line (serde

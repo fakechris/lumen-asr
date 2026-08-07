@@ -253,6 +253,10 @@ pub enum IdentityError {
     EmptyName,
     #[error("voiced audio too short to enroll: {voiced_ms} ms (need at least {MIN_VOICED_MS} ms)")]
     VoiceTooShort { voiced_ms: u64 },
+    #[error("no enrolled identity with id {0}")]
+    NotFound(Uuid),
+    #[error("an identity named {0:?} already exists")]
+    NameExists(String),
 }
 
 /// File-backed store of enrolled identities: one `<id>.json` per identity
@@ -491,6 +495,119 @@ impl IdentityStore {
             Err(error) => return Err(error.into()),
         }
         self.identities.retain(|i| i.id != id);
+        Ok(true)
+    }
+
+    /// Rename identity `id` to `new_name` (keeping its id and samples).
+    ///
+    /// The name is the identity's key for the user, but the file is named by
+    /// id, so a rename only rewrites the `name` field of the same file. Renaming
+    /// to the identity's current name is a no-op; renaming onto a *different*
+    /// existing identity's name is rejected ([`IdentityError::NameExists`]) —
+    /// the caller should [`merge`](Self::merge) those two instead, which is the
+    /// explicit "these are the same person" operation.
+    pub fn rename(&mut self, id: Uuid, new_name: &str) -> Result<EnrolledIdentity, IdentityError> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return Err(IdentityError::EmptyName);
+        }
+        if self
+            .identities
+            .iter()
+            .any(|i| i.id != id && i.name == new_name)
+        {
+            return Err(IdentityError::NameExists(new_name.to_string()));
+        }
+        let mut identity = self
+            .identities
+            .iter()
+            .find(|i| i.id == id)
+            .cloned()
+            .ok_or(IdentityError::NotFound(id))?;
+        if identity.name == new_name {
+            return Ok(identity); // no-op; nothing to rewrite
+        }
+        identity.name = new_name.to_string();
+        self.write_identity(&identity)?;
+        self.identities.retain(|i| i.id != id);
+        self.identities.push(identity.clone());
+        self.identities.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(identity)
+    }
+
+    /// Merge identity `from` into `into`: move every sample of `from` onto
+    /// `into` (keeping `into`'s id and name), then delete `from`. This is the
+    /// "same person enrolled twice under different names" fix — e.g. resolving a
+    /// cross-meeting label conflict.
+    ///
+    /// Samples are combined oldest-first and capped at
+    /// [`MAX_SAMPLES_PER_IDENTITY`], evicting the oldest — so the merged
+    /// identity keeps the most recent voiceprints from both. `into` is written
+    /// before `from` is deleted, so an interrupted merge never loses samples
+    /// (at worst `from` lingers and can be merged again). `from == into` is a
+    /// no-op.
+    pub fn merge(&mut self, from: Uuid, into: Uuid) -> Result<EnrolledIdentity, IdentityError> {
+        if from == into {
+            return self
+                .identities
+                .iter()
+                .find(|i| i.id == into)
+                .cloned()
+                .ok_or(IdentityError::NotFound(into));
+        }
+        let from_samples = self
+            .identities
+            .iter()
+            .find(|i| i.id == from)
+            .ok_or(IdentityError::NotFound(from))?
+            .samples
+            .clone();
+        let mut target = self
+            .identities
+            .iter()
+            .find(|i| i.id == into)
+            .cloned()
+            .ok_or(IdentityError::NotFound(into))?;
+        target.samples.extend(from_samples);
+        target
+            .samples
+            .sort_by(|a, b| a.enrolled_at.cmp(&b.enrolled_at));
+        if target.samples.len() > MAX_SAMPLES_PER_IDENTITY {
+            let excess = target.samples.len() - MAX_SAMPLES_PER_IDENTITY;
+            target.samples.drain(..excess);
+        }
+        self.write_identity(&target)?;
+        self.remove(from)?; // disk + memory; `into` already persisted above
+        self.identities.retain(|i| i.id != target.id);
+        self.identities.push(target.clone());
+        self.identities.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(target)
+    }
+
+    /// Delete a single voiceprint sample from identity `id` by its index into
+    /// the (oldest-first) [`samples`](EnrolledIdentity::samples) list — e.g. the
+    /// user pruning a bad recording. Removing the **last** sample removes the
+    /// whole identity, since an identity must never have zero samples (matching
+    /// and [`latest_sample`](EnrolledIdentity::latest_sample) assume non-empty).
+    /// Returns `true` if a sample (or the identity) was removed, `false` if `id`
+    /// is unknown or `index` is out of range.
+    pub fn remove_sample(&mut self, id: Uuid, index: usize) -> Result<bool, IdentityError> {
+        let Some(identity) = self.identities.iter().find(|i| i.id == id) else {
+            return Ok(false);
+        };
+        if index >= identity.samples.len() {
+            return Ok(false);
+        }
+        if identity.samples.len() == 1 {
+            // Last sample → drop the whole identity rather than leave it empty.
+            return self.remove(id);
+        }
+        let mut identity = identity.clone();
+        identity.samples.remove(index);
+        self.write_identity(&identity)?;
+        self.identities.retain(|i| i.id != id);
+        self.identities.push(identity);
+        self.identities.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(true)
     }
 
@@ -948,6 +1065,87 @@ mod tests {
         std::fs::remove_file(dir.path().join(format!("{}.json", identity.id))).unwrap();
         assert!(store.remove(identity.id).unwrap());
         assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn rename_rewrites_name_and_keeps_id_and_samples() {
+        let (dir, mut store) = store();
+        let id = store.enroll("旧名", &emb(0.1), VOICED_OK, None).unwrap().id;
+        let renamed = store.rename(id, " 新名 ").unwrap();
+        assert_eq!(renamed.id, id, "id preserved");
+        assert_eq!(renamed.name, "新名", "trimmed");
+        assert_eq!(renamed.samples.len(), 1, "samples preserved");
+        // Same id/new name across reopen (file named by id, not name).
+        let store = IdentityStore::open(dir.path()).unwrap();
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].name, "新名");
+        assert_eq!(store.list()[0].id, id);
+    }
+
+    #[test]
+    fn rename_onto_a_different_existing_name_is_rejected() {
+        let (_dir, mut store) = store();
+        let a = store.enroll("甲", &emb(0.1), VOICED_OK, None).unwrap().id;
+        store.enroll("乙", &emb(0.5), VOICED_OK, None).unwrap();
+        assert!(matches!(
+            store.rename(a, "乙"),
+            Err(IdentityError::NameExists(n)) if n == "乙"
+        ));
+        // Renaming to its own current name is a no-op success.
+        assert_eq!(store.rename(a, "甲").unwrap().name, "甲");
+        assert!(matches!(
+            store.rename(Uuid::new_v4(), "丙"),
+            Err(IdentityError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn merge_moves_samples_and_deletes_the_source() {
+        let (dir, mut store) = store();
+        let a = store.enroll("甲", &emb(0.1), VOICED_OK, None).unwrap().id;
+        let b = store.enroll("乙", &emb(0.5), VOICED_OK, None).unwrap().id;
+        let merged = store.merge(b, a).unwrap();
+        assert_eq!(merged.id, a, "target id kept");
+        assert_eq!(merged.name, "甲", "target name kept");
+        assert_eq!(merged.samples.len(), 2, "both samples present");
+        assert_eq!(store.list().len(), 1, "source gone");
+        // Source file deleted; survives reopen.
+        assert!(!dir.path().join(format!("{b}.json")).exists());
+        let store = IdentityStore::open(dir.path()).unwrap();
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].samples.len(), 2);
+    }
+
+    #[test]
+    fn merge_is_noop_on_self_and_errors_on_missing() {
+        let (_dir, mut store) = store();
+        let a = store.enroll("甲", &emb(0.1), VOICED_OK, None).unwrap().id;
+        assert_eq!(store.merge(a, a).unwrap().id, a, "self-merge is a no-op");
+        assert!(matches!(
+            store.merge(Uuid::new_v4(), a),
+            Err(IdentityError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.merge(a, Uuid::new_v4()),
+            Err(IdentityError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn remove_sample_prunes_one_and_drops_identity_on_last() {
+        let (_dir, mut store) = store();
+        store.enroll("甲", &emb(0.1), VOICED_OK, None).unwrap();
+        let id = store.enroll("甲", &emb(0.2), VOICED_OK, None).unwrap().id;
+        assert_eq!(store.list()[0].samples.len(), 2);
+        // Prune the oldest (index 0); one sample remains.
+        assert!(store.remove_sample(id, 0).unwrap());
+        assert_eq!(store.list()[0].samples.len(), 1);
+        // Out-of-range index is a no-op false.
+        assert!(!store.remove_sample(id, 5).unwrap());
+        // Removing the last sample drops the whole identity.
+        assert!(store.remove_sample(id, 0).unwrap());
+        assert!(store.list().is_empty());
+        assert!(!store.remove_sample(Uuid::new_v4(), 0).unwrap());
     }
 
     #[test]

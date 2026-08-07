@@ -2065,13 +2065,27 @@ pub struct EnrolledSpeakerDto {
     pub name: String,
     pub enrolled_at: String,
     pub source_meeting_id: Option<String>,
+    /// How many voiceprint samples back this identity (1 = enrolled once).
+    pub sample_count: usize,
+    /// Distinct source meetings across all samples, newest first — the manager
+    /// page resolves these ids to titles from the meeting list it already has.
+    pub source_meeting_ids: Vec<String>,
 }
 
 impl From<&lumen_identity::EnrolledIdentity> for EnrolledSpeakerDto {
     fn from(identity: &lumen_identity::EnrolledIdentity) -> Self {
         // Identities now hold multiple samples; the UI list shows the most
-        // recent enrollment's metadata.
+        // recent enrollment's metadata plus a roll-up of every source meeting.
         let latest = identity.latest_sample();
+        let mut source_meeting_ids = Vec::new();
+        for sample in identity.samples.iter().rev() {
+            if let Some(id) = sample.source_meeting_id {
+                let id = id.to_string();
+                if !source_meeting_ids.contains(&id) {
+                    source_meeting_ids.push(id);
+                }
+            }
+        }
         Self {
             id: identity.id.to_string(),
             name: identity.name.clone(),
@@ -2081,6 +2095,8 @@ impl From<&lumen_identity::EnrolledIdentity> for EnrolledSpeakerDto {
             source_meeting_id: latest
                 .and_then(|s| s.source_meeting_id)
                 .map(|id| id.to_string()),
+            sample_count: identity.samples.len(),
+            source_meeting_ids,
         }
     }
 }
@@ -2202,6 +2218,66 @@ pub fn remove_enrolled_speaker(identity_id: String) -> Result<bool, String> {
     let id = parse_id(&identity_id, "identity")?;
     let mut identities = open_identity_store()?;
     identities.remove(id).map_err(|e| format!("remove: {e}"))
+}
+
+/// Rename an enrolled identity (its samples and auto-identification history are
+/// kept). Renaming onto another identity's name is rejected — use
+/// [`merge_enrolled_speakers`] for "these two are the same person".
+#[tauri::command]
+pub fn rename_enrolled_speaker(
+    identity_id: String,
+    name: String,
+) -> Result<EnrolledSpeakerDto, String> {
+    let id = parse_id(&identity_id, "identity")?;
+    let mut identities = open_identity_store()?;
+    let renamed = identities.rename(id, &name).map_err(|e| match e {
+        lumen_identity::IdentityError::NameExists(n) => {
+            format!("已存在名为“{n}”的声纹，若是同一个人请改用“合并”")
+        }
+        lumen_identity::IdentityError::EmptyName => "名字不能为空".to_string(),
+        other => format!("rename: {other}"),
+    })?;
+    Ok(EnrolledSpeakerDto::from(&renamed))
+}
+
+/// Merge the `from` identity into `into` (all of `from`'s voiceprint samples
+/// move onto `into`, then `from` is deleted). Resolves "same voice enrolled
+/// under two names". The surviving identity keeps `into`'s name and id.
+#[tauri::command]
+pub fn merge_enrolled_speakers(
+    from_id: String,
+    into_id: String,
+) -> Result<EnrolledSpeakerDto, String> {
+    let from = parse_id(&from_id, "identity")?;
+    let into = parse_id(&into_id, "identity")?;
+    let mut identities = open_identity_store()?;
+    let merged = identities
+        .merge(from, into)
+        .map_err(|e| format!("merge: {e}"))?;
+    Ok(EnrolledSpeakerDto::from(&merged))
+}
+
+/// Delete a single voiceprint sample from an identity by its index in the
+/// (oldest-first) sample list. Removing the last sample deletes the whole
+/// identity. Returns the updated identity, or `None` when it no longer exists.
+#[tauri::command]
+pub fn remove_speaker_sample(
+    identity_id: String,
+    sample_index: usize,
+) -> Result<Option<EnrolledSpeakerDto>, String> {
+    let id = parse_id(&identity_id, "identity")?;
+    let mut identities = open_identity_store()?;
+    let removed = identities
+        .remove_sample(id, sample_index)
+        .map_err(|e| format!("remove sample: {e}"))?;
+    if !removed {
+        return Ok(None);
+    }
+    Ok(identities
+        .list()
+        .iter()
+        .find(|i| i.id.to_string() == identity_id)
+        .map(EnrolledSpeakerDto::from))
 }
 
 /// Read the enrolled identity marked as *the user themself* ("这是我"), if
