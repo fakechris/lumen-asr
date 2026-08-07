@@ -632,6 +632,12 @@ async fn run(
             );
         }
     }
+    // Clear any prior transcript for this meeting first, so a reprocess/retry
+    // replaces the result instead of appending a second set of speakers and
+    // segments (which doubled the data on the failed-meeting retry path).
+    store
+        .clear_meeting_transcript(meeting_id)
+        .map_err(ProcessError::Store)?;
     for speaker in &assembled.speakers {
         store.upsert_speaker(speaker).map_err(ProcessError::Store)?;
     }
@@ -703,15 +709,32 @@ async fn run(
             .map_err(ProcessError::Store)?
             .map(|m| m.notes)
             .unwrap_or_default();
-        let doc = generate_minutes(
+        // Minutes are a best-effort bonus on top of the (already-persisted)
+        // transcript: a flaky LLM — a malformed-JSON reply, a timeout — must not
+        // fail the whole meeting and throw away a complete transcript. On any
+        // minutes error, log and continue to Ready transcript-only; the user can
+        // regenerate minutes later.
+        let minutes_result = generate_minutes(
             cfg.corrector,
             &transcript,
             Some(notes.as_str()),
             cfg.max_tokens,
         )
-        .await?;
-        for row in minutes_summaries(meeting_id, &doc, cfg.model.as_deref())? {
-            store.save_summary(&row).map_err(ProcessError::Store)?;
+        .await
+        .and_then(|doc| minutes_summaries(meeting_id, &doc, cfg.model.as_deref()));
+        match minutes_result {
+            Ok(rows) => {
+                for row in rows {
+                    store.save_summary(&row).map_err(ProcessError::Store)?;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    meeting_id = %meeting_id,
+                    error = %error,
+                    "minutes generation failed; meeting is ready transcript-only"
+                );
+            }
         }
     }
 

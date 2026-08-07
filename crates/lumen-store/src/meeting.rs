@@ -273,6 +273,26 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a meeting's derived transcript data — its segments, speaker rows,
+    /// and summaries — so a reprocess/retry writes a fresh result instead of
+    /// appending a duplicate set on top of the old one. The meeting row itself
+    /// and its audio paths are kept.
+    pub fn clear_meeting_transcript(&self, meeting_id: Uuid) -> Result<()> {
+        let id = meeting_id.to_string();
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM transcript_segments WHERE meeting_id=?1",
+            params![id],
+        )?;
+        transaction.execute("DELETE FROM speakers WHERE meeting_id=?1", params![id])?;
+        transaction.execute(
+            "DELETE FROM meeting_summaries WHERE meeting_id=?1",
+            params![id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Overwrite only the `text` of one transcript segment. Its timing
     /// (`start_seconds`/`end_seconds`), ordering (`seq`), speaker attribution
     /// (`speaker_id`), and word timing (`words_json`) are all left untouched.
