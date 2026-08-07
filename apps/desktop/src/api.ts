@@ -671,21 +671,12 @@ export const api = {
   listEnrollConflicts: () =>
     invoke<import("./types").EnrollConflict[]>("list_enroll_conflicts"),
 
-  /** Resolve one conflict: `enrollAs` a name enrolls that speaker's voiceprint
-   * under it (the existing name = "same person", the meeting's label = "a
-   * different person who sounds alike"); `null` just dismisses it. */
-  resolveEnrollConflict: (
-    conflictId: string,
-    meetingId: string,
-    speakerId: string,
-    enrollAs: string | null,
-  ) =>
-    invoke<void>("resolve_enroll_conflict", {
-      conflictId,
-      meetingId,
-      speakerId,
-      enrollAs,
-    }),
+  /** Resolve one conflict (meeting/speaker come from the stored record):
+   * `enrollAs` a name enrolls that speaker's voiceprint under it (the existing
+   * name = "same person", the meeting's label = "a different person who sounds
+   * alike"); `null` just dismisses it. */
+  resolveEnrollConflict: (conflictId: string, enrollAs: string | null) =>
+    invoke<void>("resolve_enroll_conflict", { conflictId, enrollAs }),
 
   /** Read the enrolled identity marked as the user themself ("这是我"), or
    * null. Rendering hint: attribution matching it displays as "我". */

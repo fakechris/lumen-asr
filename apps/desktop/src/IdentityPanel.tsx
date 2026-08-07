@@ -152,12 +152,7 @@ export function IdentityPanel({
     async (conflict: EnrollConflict, enrollAs: string | null) => {
       onError(null);
       try {
-        await api.resolveEnrollConflict(
-          conflict.id,
-          conflict.meetingId,
-          conflict.speakerId,
-          enrollAs,
-        );
+        await api.resolveEnrollConflict(conflict.id, enrollAs);
         await refresh();
       } catch (e) {
         onError(String(e));

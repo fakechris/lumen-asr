@@ -2342,35 +2342,46 @@ pub fn list_enroll_conflicts(state: State<'_, AppState>) -> Result<Vec<EnrollCon
 /// Resolve one auto-enroll conflict. When `enroll_as` names a person, the
 /// conflicting speaker's centroid is enrolled under that name (either "同一个
 /// 人" → the existing name, or "确实是另一个人" → the meeting's label); when it
-/// is `None` the conflict is simply dismissed. Either way the row is marked
-/// resolved. `meeting_id`/`speaker_id` come from the conflict record.
+/// is `None` the conflict is simply dismissed.
+///
+/// The meeting/speaker to act on come from the **stored** conflict record, not
+/// the client, and the row is *claimed* (atomically flipped to resolved) before
+/// enrolling: an already-resolved or unknown id is a no-op, and only the caller
+/// that wins the claim enrolls — so a stale or concurrent request can never add
+/// a duplicate sample.
 #[tauri::command]
 pub fn resolve_enroll_conflict(
     state: State<'_, AppState>,
     conflict_id: String,
-    meeting_id: String,
-    speaker_id: String,
     enroll_as: Option<String>,
 ) -> Result<(), String> {
     let conflict = parse_id(&conflict_id, "conflict")?;
+    let Some(record) = with_store(&state, |s| {
+        s.get_enroll_conflict(conflict).map_err(|e| e.to_string())
+    })?
+    else {
+        return Ok(()); // already resolved or unknown — nothing to do
+    };
+    // Claim first, so at most one caller proceeds to enroll.
+    let claimed = with_store(&state, |s| {
+        s.resolve_enroll_conflict(conflict)
+            .map_err(|e| e.to_string())
+    })?;
+    if !claimed {
+        return Ok(());
+    }
     if let Some(name) = enroll_as
         .as_deref()
         .map(str::trim)
         .filter(|n| !n.is_empty())
     {
-        let meeting = parse_id(&meeting_id, "meeting")?;
-        let speaker_uuid = parse_id(&speaker_id, "speaker")?;
         let (_speaker, embedding, voiced_ms) =
-            fetch_speaker_centroid(&state, meeting, speaker_uuid)?;
+            fetch_speaker_centroid(&state, record.meeting_id, record.speaker_id)?;
         let mut identities = open_identity_store()?;
         identities
-            .enroll(name, &embedding, voiced_ms, Some(meeting))
+            .enroll(name, &embedding, voiced_ms, Some(record.meeting_id))
             .map_err(|e| format!("enroll: {e}"))?;
     }
-    with_store(&state, |s| {
-        s.resolve_enroll_conflict(conflict)
-            .map_err(|e| e.to_string())
-    })?;
     tracing::info!(conflict_id = %conflict, "auto-enroll conflict resolved");
     Ok(())
 }

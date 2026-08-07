@@ -3,7 +3,7 @@
 mod meeting;
 mod schema;
 
-pub use meeting::EnrollConflictRecord;
+pub use meeting::{EnrollConflictRecord, NewEnrollConflict};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};

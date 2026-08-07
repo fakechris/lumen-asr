@@ -682,22 +682,21 @@ async fn run(
                         );
                     }
                     // Persist the withheld conflicts for the user to resolve in
-                    // the voiceprint manager. Cleared first so a reprocess
-                    // replaces them instead of duplicating; best-effort — a
-                    // queue write never fails the meeting.
-                    if let Err(error) = store.clear_enroll_conflicts(meeting_id) {
-                        tracing::warn!(meeting_id = %meeting_id, error = %error, "clear enroll conflicts");
-                    }
-                    for conflict in &out.conflicts {
-                        if let Err(error) = store.insert_enroll_conflict(
-                            meeting_id,
-                            conflict.speaker_id,
-                            &conflict.name,
-                            &conflict.existing_name,
-                            conflict.score,
-                        ) {
-                            tracing::warn!(meeting_id = %meeting_id, error = %error, "record enroll conflict");
-                        }
+                    // the voiceprint manager. One transactional replace so a
+                    // reprocess swaps the whole set atomically (never a partial
+                    // mix); best-effort — a queue write never fails the meeting.
+                    let rows: Vec<lumen_store::NewEnrollConflict> = out
+                        .conflicts
+                        .iter()
+                        .map(|c| lumen_store::NewEnrollConflict {
+                            speaker_id: c.speaker_id,
+                            label_name: c.name.clone(),
+                            existing_name: c.existing_name.clone(),
+                            score: c.score,
+                        })
+                        .collect();
+                    if let Err(error) = store.replace_enroll_conflicts(meeting_id, &rows) {
+                        tracing::warn!(meeting_id = %meeting_id, error = %error, "record enroll conflicts");
                     }
                 }
                 Err(error) => tracing::warn!(
