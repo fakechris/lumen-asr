@@ -2329,9 +2329,7 @@ impl From<&lumen_store::EnrollConflictRecord> for EnrollConflictDto {
 /// Every unresolved same-voice/different-name auto-enroll conflict, newest
 /// first. Surfaced in the voiceprint manager for the user to resolve.
 #[tauri::command]
-pub fn list_enroll_conflicts(
-    state: State<'_, AppState>,
-) -> Result<Vec<EnrollConflictDto>, String> {
+pub fn list_enroll_conflicts(state: State<'_, AppState>) -> Result<Vec<EnrollConflictDto>, String> {
     with_store(&state, |s| {
         Ok(s.list_unresolved_enroll_conflicts()
             .map_err(|e| e.to_string())?
