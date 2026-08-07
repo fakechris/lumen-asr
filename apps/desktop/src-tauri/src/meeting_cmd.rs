@@ -324,6 +324,20 @@ pub fn start_meeting_recording(
     };
     let mic_offset_seconds = t0.elapsed().as_secs_f64();
 
+    // Record the mic WAV path up front (mirroring the system track below) so
+    // crash recovery can salvage it if the app is killed mid-recording — the
+    // stop path is the only other place this is set, so without this an
+    // interrupted meeting has no mic path and its audio, though on disk, is
+    // reported unrecoverable. Best-effort: a store failure only weakens
+    // recovery, never the recording.
+    let mic_path = out_path.to_string_lossy().to_string();
+    if let Err(e) = with_store(&state, |s| {
+        s.set_meeting_audio_path(meeting_id, &mic_path)
+            .map_err(|e| e.to_string())
+    }) {
+        tracing::warn!(meeting_id = %meeting_id, error = %e, "could not record mic audio path");
+    }
+
     // 5. Optional second track: system audio output (remote participants) via
     //    the macOS Core Audio process tap. Strictly best-effort and
     //    capability-gated — if the config opts out, the OS is too old
@@ -1255,11 +1269,17 @@ pub fn recover_interrupted_meetings(app: AppHandle) {
 /// Recover a single interrupted meeting. See [`recover_interrupted_meetings`].
 fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
     let id = meeting.id;
-    let Some(audio_path) = meeting.audio_path.clone() else {
-        // Crashed before the stop path ever recorded an audio path.
-        fail_interrupted(store, id);
-        return;
-    };
+    // Prefer the stored mic path; fall back to the conventional
+    // `<meetings>/<id>.wav` when it is missing (older meetings interrupted
+    // before the start path persisted it, or a lost store write) — the WAV is
+    // still on disk under that name, so it can be salvaged instead of lost.
+    let audio_path = meeting.audio_path.clone().unwrap_or_else(|| {
+        default_data_dir()
+            .join("meetings")
+            .join(format!("{id}.wav"))
+            .to_string_lossy()
+            .to_string()
+    });
     let wav = PathBuf::from(&audio_path);
     // A missing or truly empty (0-byte) file has nothing to salvage.
     let has_bytes = std::fs::metadata(&wav)
