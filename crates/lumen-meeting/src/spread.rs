@@ -322,16 +322,29 @@ pub fn spread_annotations(
         match_clusters_to_seeds(&seeds, &candidates)
     };
 
-    // Within-cluster spread: each seed's dominant cluster is the SAME speaker as
-    // the annotation (the marks overlap it most), so its still-unlabelled
-    // segments should carry the manual name too — otherwise a person whose diar
-    // cluster the reconciliation only partly relabelled stays split between the
-    // manual row and a stray "说话人N". The dominant cluster is excluded from the
+    // Within-cluster spread: a seed's dominant cluster is the SAME speaker as the
+    // annotation (the marks overlap it most), so its still-unlabelled segments
+    // should carry the manual name too — otherwise a person whose diar cluster
+    // the reconciliation only partly relabelled stays split between the manual
+    // row and a stray "说话人N". The dominant cluster is excluded from the
     // voiceprint candidates above (it is a marked cluster), so add it directly.
-    // Only when the cluster row still owns a segment and no voiceprint match
-    // already claimed it.
+    //
+    // Only when EXACTLY ONE manual name claims a cluster: if two different
+    // annotations both fall mostly in one cluster it is contested (diarization
+    // merged two voices, or the marks disagree) — leave it on its diar label
+    // rather than pick a name by iteration order. Skip too when a voiceprint
+    // match already claimed the cluster or it no longer owns a segment.
+    let mut dominant_claimants: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
     for seed in &seeds {
-        let dominant = seed.dominant_cluster_id;
+        dominant_claimants
+            .entry(seed.dominant_cluster_id)
+            .or_default()
+            .push(seed.manual_speaker_id);
+    }
+    for (dominant, claimants) in dominant_claimants {
+        if claimants.len() != 1 {
+            continue;
+        }
         if assignments.iter().any(|a| a.cluster_speaker_id == dominant) {
             continue;
         }
@@ -340,7 +353,7 @@ pub fn spread_annotations(
         }
         assignments.push(SpreadAssignment {
             cluster_speaker_id: dominant,
-            manual_speaker_id: seed.manual_speaker_id,
+            manual_speaker_id: claimants[0],
             // Same cluster as the annotation → certain, not a voiceprint guess.
             score: 1.0,
         });
@@ -576,6 +589,44 @@ mod tests {
                 .attribution_origin
                 .as_deref(),
             Some(attribution_origin::MANUAL)
+        );
+    }
+
+    /// A cluster two *different* names both fall in most is contested — the
+    /// within-cluster back-fill must not pick one by iteration order; the tail
+    /// keeps its diarization label.
+    #[test]
+    fn contested_dominant_cluster_is_left_on_its_label() {
+        let meeting = Uuid::new_v4();
+        let s1 = Speaker::new(meeting, "S1");
+        let ma = manual_speaker(meeting, "M1", "A");
+        let mb = manual_speaker(meeting, "M2", "B");
+        let mut speakers = vec![s1.clone(), ma.clone(), mb.clone()];
+
+        // One cluster S1 [0,30]; the user marked [0,10] as A and [20,30] as B
+        // (both fall in S1), leaving [10,20] an unmarked S1 tail.
+        let pre = vec![seg(meeting, 0, 0.0, 30.0, s1.id)];
+        let post = vec![
+            seg(meeting, 0, 0.0, 10.0, ma.id),
+            seg(meeting, 1, 10.0, 20.0, s1.id),
+            seg(meeting, 2, 20.0, 30.0, mb.id),
+        ];
+        let centroids = BTreeMap::from([(s1.id, emb(0.10))]);
+        let voiced = BTreeMap::from([(s1.id, IDENTIFY_MIN_VOICED_MS + 1)]);
+
+        let out = spread_annotations(&mut speakers, &pre, &post, &centroids, &voiced);
+
+        assert!(
+            out.spread_speakers.is_empty(),
+            "contested cluster untouched"
+        );
+        assert_eq!(
+            speakers
+                .iter()
+                .find(|s| s.id == s1.id)
+                .unwrap()
+                .display_name,
+            None
         );
     }
 
