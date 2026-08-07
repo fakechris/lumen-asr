@@ -583,6 +583,19 @@ export const api = {
   renameLiveAnnotations: (meetingId: string, oldName: string, newName: string) =>
     invoke<number>("rename_live_annotations", { meetingId, oldName, newName }),
 
+  /** Drain interrupted-recording recovery outcomes buffered at startup (the
+   * live `meeting-recovery` event can fire before the listener is ready). */
+  takeRecoveryNotices: () =>
+    invoke<
+      {
+        meetingId: string;
+        title?: string;
+        outcome: string;
+        durationSeconds?: number;
+        reason?: string;
+      }[]
+    >("take_recovery_notices"),
+
   // ---- Speaker voiceprint enrollment (M5) -------------------------------
   // The identity library is local-only (JSON under the Lumen identity dir);
   // embeddings never leave the machine and never cross IPC.

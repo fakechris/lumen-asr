@@ -271,6 +271,10 @@ pub struct AppState {
             std::thread::JoinHandle<()>,
         )>,
     >,
+    /// Interrupted-recording recovery outcomes buffered at startup until the
+    /// front-end drains them (it can miss the live event if recovery runs before
+    /// its listener is ready). See `meeting_cmd::take_recovery_notices`.
+    pub meeting_recovery_notices: std::sync::Mutex<Vec<meeting_cmd::MeetingRecoveryEvent>>,
     /// Real-time (P3) streaming-Paraformer live-transcript worker for the
     /// active recording. Idle (no worker) unless a recording is streaming.
     pub meeting_live: meeting_live::MeetingLive,
@@ -515,6 +519,7 @@ pub fn run() {
             meeting_recorder: MeetingRecorder::new(),
             meeting_power_guard: Mutex::new(None),
             meeting_battery_poll: Mutex::new(None),
+            meeting_recovery_notices: Mutex::new(Vec::new()),
             meeting_live: meeting_live::MeetingLive::default(),
             meeting_system_audio: meeting_system_audio::MeetingSystemAudio::default(),
             meeting_mic_aec: meeting_mic_aec::MeetingMicAec::default(),
@@ -604,6 +609,7 @@ pub fn run() {
             meeting_cmd::list_live_annotations,
             meeting_cmd::delete_live_annotation,
             meeting_cmd::rename_live_annotations,
+            meeting_cmd::take_recovery_notices,
             meeting_cmd::rename_speaker,
             meeting_cmd::reassign_segment_speaker,
             meeting_cmd::merge_speakers,

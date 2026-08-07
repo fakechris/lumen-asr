@@ -1387,12 +1387,12 @@ fn fail_interrupted(app: &AppHandle, store: &Store, meeting: &Meeting) {
 /// surfaces this so an interruption is never silent.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MeetingRecoveryEvent {
-    meeting_id: String,
-    title: Option<String>,
-    outcome: &'static str,
-    duration_seconds: Option<f64>,
-    reason: Option<String>,
+pub struct MeetingRecoveryEvent {
+    pub meeting_id: String,
+    pub title: Option<String>,
+    pub outcome: &'static str,
+    pub duration_seconds: Option<f64>,
+    pub reason: Option<String>,
 }
 
 fn emit_recovery(
@@ -1402,16 +1402,35 @@ fn emit_recovery(
     duration_seconds: Option<f64>,
     reason: Option<String>,
 ) {
-    let _ = app.emit(
-        "meeting-recovery",
-        MeetingRecoveryEvent {
-            meeting_id: meeting.id.to_string(),
-            title: meeting.title.clone(),
-            outcome,
-            duration_seconds,
-            reason,
-        },
-    );
+    let event = MeetingRecoveryEvent {
+        meeting_id: meeting.id.to_string(),
+        title: meeting.title.clone(),
+        outcome,
+        duration_seconds,
+        reason,
+    };
+    // Recovery runs on a startup background thread that can outrun the webview's
+    // `listen()` registration, so buffer every outcome too: the front-end drains
+    // the buffer on mount (see `take_recovery_notices`) and also listens live, so
+    // a notice is never lost to that race. Keyed dedup happens client-side.
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut buf) = state.meeting_recovery_notices.lock() {
+            buf.push(event.clone());
+        }
+    }
+    let _ = app.emit("meeting-recovery", event);
+}
+
+/// Drain the buffered interrupted-recording recovery outcomes (see
+/// [`emit_recovery`]). The front-end calls this once on mount to pick up any
+/// notices emitted before its live listener was ready.
+#[tauri::command]
+pub fn take_recovery_notices(state: State<'_, AppState>) -> Vec<MeetingRecoveryEvent> {
+    state
+        .meeting_recovery_notices
+        .lock()
+        .map(|mut buf| std::mem::take(&mut *buf))
+        .unwrap_or_default()
 }
 
 /// Mark a meeting `failed` (with an optional reason) from the background
