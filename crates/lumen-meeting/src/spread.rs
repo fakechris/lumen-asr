@@ -24,6 +24,11 @@
 //!    winning match ([`SPREAD_MIN_SCORE`] / [`SPREAD_MIN_MARGIN`]) renames that
 //!    whole cluster to the seed's name, provenance
 //!    [`attribution_origin::MANUAL_SPREAD`] carrying the score.
+//! 4. **Own cluster** — the seed's *own* dominant cluster (the one the marks fall
+//!    in) is the same speaker by definition, so its remaining unmarked segments
+//!    inherit the name directly (no voiceprint gate). Otherwise a person whose
+//!    cluster the reconciliation only partly relabelled would stay split between
+//!    the manual name and a stray "说话人N" — the reported "标注没传导到其他段落".
 //!
 //! ## Why rename the cluster, not move its segments
 //! This mirrors [`auto_identify_speakers`](crate::auto_identify_speakers): a
@@ -31,10 +36,10 @@
 //! its segments already point at it — nothing is split or moved. Two rows can
 //! then share one name (the precise `manual` M-row and the spread `S`-row),
 //! exactly as two clusters auto-identified to one enrolled person already do;
-//! the UI/minutes group by name. Precise `manual` segments are never touched —
-//! their cluster is, by construction, in the *annotated* set and thus never a
-//! candidate. The whole pass is a no-op without embeddings, without manual
-//! seeds, or when nothing matches.
+//! the UI/minutes group by name. The precise `manual` M-row is never touched;
+//! its dominant `S`-cluster, however, is back-filled to the same name (step 4)
+//! so the speaker is whole. The pass is a no-op without embeddings, without
+//! manual seeds, or when nothing matches and no dominant cluster owns a segment.
 //!
 //! ## Priority
 //! Runs **after** [`reconcile_annotations`] (precise manual marks already
@@ -79,6 +84,11 @@ pub const SPREAD_MIN_MARGIN: f32 = 0.08;
 pub struct Seed {
     /// The manual (`M`) speaker row this seed represents.
     pub manual_speaker_id: Uuid,
+    /// The diar cluster the manual marks overlap most — the same speaker as the
+    /// annotation. Its remaining (unlabelled) segments inherit the manual name
+    /// directly (within-cluster spread), separate from the voiceprint match to
+    /// *other* clusters.
+    pub dominant_cluster_id: Uuid,
     /// The seed's representative embedding (its dominant cluster's centroid).
     pub embedding: Vec<f32>,
 }
@@ -278,6 +288,7 @@ pub fn spread_annotations(
                 .map(|(cluster_id, _)| cluster_id)?;
             Some(Seed {
                 manual_speaker_id: manual_id,
+                dominant_cluster_id: dominant,
                 embedding: cluster_centroids.get(&dominant)?.clone(),
             })
         })
@@ -305,11 +316,51 @@ pub fn spread_annotations(
             embedding: embedding.clone(),
         })
         .collect();
-    if candidates.is_empty() {
+    let mut assignments = if candidates.is_empty() {
+        Vec::new()
+    } else {
+        match_clusters_to_seeds(&seeds, &candidates)
+    };
+
+    // Within-cluster spread: a seed's dominant cluster is the SAME speaker as the
+    // annotation (the marks overlap it most), so its still-unlabelled segments
+    // should carry the manual name too — otherwise a person whose diar cluster
+    // the reconciliation only partly relabelled stays split between the manual
+    // row and a stray "说话人N". The dominant cluster is excluded from the
+    // voiceprint candidates above (it is a marked cluster), so add it directly.
+    //
+    // Only when EXACTLY ONE manual name claims a cluster: if two different
+    // annotations both fall mostly in one cluster it is contested (diarization
+    // merged two voices, or the marks disagree) — leave it on its diar label
+    // rather than pick a name by iteration order. Skip too when a voiceprint
+    // match already claimed the cluster or it no longer owns a segment.
+    let mut dominant_claimants: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
+    for seed in &seeds {
+        dominant_claimants
+            .entry(seed.dominant_cluster_id)
+            .or_default()
+            .push(seed.manual_speaker_id);
+    }
+    for (dominant, claimants) in dominant_claimants {
+        if claimants.len() != 1 {
+            continue;
+        }
+        if assignments.iter().any(|a| a.cluster_speaker_id == dominant) {
+            continue;
+        }
+        if !owns_segment(dominant) {
+            continue;
+        }
+        assignments.push(SpreadAssignment {
+            cluster_speaker_id: dominant,
+            manual_speaker_id: claimants[0],
+            // Same cluster as the annotation → certain, not a voiceprint guess.
+            score: 1.0,
+        });
+    }
+    if assignments.is_empty() {
         return outcome;
     }
-
-    let assignments = match_clusters_to_seeds(&seeds, &candidates);
     apply_spread(speakers, &assignments)
 }
 
@@ -369,6 +420,8 @@ mod tests {
     fn seed(id: Uuid, e: Vec<f32>) -> Seed {
         Seed {
             manual_speaker_id: id,
+            // Not used by `match_clusters_to_seeds` (voiceprint matcher tests).
+            dominant_cluster_id: Uuid::nil(),
             embedding: e,
         }
     }
@@ -481,6 +534,102 @@ mod tests {
         s
     }
 
+    /// The reported complaint: a manual annotation covers only PART of a
+    /// person's diar cluster (reconciliation relabelled one turn), leaving the
+    /// rest of that same cluster a stray "说话人N". Within-cluster spread must
+    /// relabel the annotation's own dominant cluster to the manual name — even
+    /// when no *other* cluster voiceprint-matches.
+    #[test]
+    fn spreads_the_annotations_own_dominant_cluster_to_its_remaining_segments() {
+        let meeting = Uuid::new_v4();
+        let s1 = Speaker::new(meeting, "S1"); // 海燕's cluster
+        let s2 = Speaker::new(meeting, "S2"); // a different person
+        let ma = manual_speaker(meeting, "M1", "海燕");
+        let mut speakers = vec![s1.clone(), s2.clone(), ma.clone()];
+
+        // Pre-reconcile: S1 owns two turns (0–10, 20–30), S2 owns one (10–20).
+        let pre = vec![
+            seg(meeting, 0, 0.0, 10.0, s1.id),
+            seg(meeting, 1, 10.0, 20.0, s2.id),
+            seg(meeting, 2, 20.0, 30.0, s1.id),
+        ];
+        // Post-reconcile: the mark relabelled S1's first turn to 海燕; S1's second
+        // turn (and S2) stay on their clusters.
+        let post = vec![
+            seg(meeting, 0, 0.0, 10.0, ma.id),
+            seg(meeting, 1, 10.0, 20.0, s2.id),
+            seg(meeting, 2, 20.0, 30.0, s1.id),
+        ];
+        let centroids = BTreeMap::from([(s1.id, emb(0.10)), (s2.id, emb(5.00))]);
+        let voiced = BTreeMap::from([(s1.id, 10_000u64), (s2.id, 10_000u64)]);
+
+        let out = spread_annotations(&mut speakers, &pre, &post, &centroids, &voiced);
+
+        assert_eq!(out.spread_speakers.len(), 1, "only S1 relabelled");
+        let s1_row = speakers.iter().find(|s| s.id == s1.id).unwrap();
+        assert_eq!(s1_row.display_name.as_deref(), Some("海燕"));
+        assert_eq!(
+            s1_row.attribution_origin.as_deref(),
+            Some(attribution_origin::MANUAL_SPREAD)
+        );
+        // A different person is never touched; the manual row is unchanged.
+        assert_eq!(
+            speakers
+                .iter()
+                .find(|s| s.id == s2.id)
+                .unwrap()
+                .display_name,
+            None
+        );
+        assert_eq!(
+            speakers
+                .iter()
+                .find(|s| s.id == ma.id)
+                .unwrap()
+                .attribution_origin
+                .as_deref(),
+            Some(attribution_origin::MANUAL)
+        );
+    }
+
+    /// A cluster two *different* names both fall in most is contested — the
+    /// within-cluster back-fill must not pick one by iteration order; the tail
+    /// keeps its diarization label.
+    #[test]
+    fn contested_dominant_cluster_is_left_on_its_label() {
+        let meeting = Uuid::new_v4();
+        let s1 = Speaker::new(meeting, "S1");
+        let ma = manual_speaker(meeting, "M1", "A");
+        let mb = manual_speaker(meeting, "M2", "B");
+        let mut speakers = vec![s1.clone(), ma.clone(), mb.clone()];
+
+        // One cluster S1 [0,30]; the user marked [0,10] as A and [20,30] as B
+        // (both fall in S1), leaving [10,20] an unmarked S1 tail.
+        let pre = vec![seg(meeting, 0, 0.0, 30.0, s1.id)];
+        let post = vec![
+            seg(meeting, 0, 0.0, 10.0, ma.id),
+            seg(meeting, 1, 10.0, 20.0, s1.id),
+            seg(meeting, 2, 20.0, 30.0, mb.id),
+        ];
+        let centroids = BTreeMap::from([(s1.id, emb(0.10))]);
+        let voiced = BTreeMap::from([(s1.id, IDENTIFY_MIN_VOICED_MS + 1)]);
+
+        let out = spread_annotations(&mut speakers, &pre, &post, &centroids, &voiced);
+
+        assert!(
+            out.spread_speakers.is_empty(),
+            "contested cluster untouched"
+        );
+        assert_eq!(
+            speakers
+                .iter()
+                .find(|s| s.id == s1.id)
+                .unwrap()
+                .display_name,
+            None
+        );
+    }
+
     /// Segment 1 marked A, segment 2 marked B; a later *unlabelled* cluster that
     /// sounds like A is spread to A (not left a new speaker), a dissimilar
     /// cluster is untouched, and the precise manual rows are never altered.
@@ -555,12 +704,14 @@ mod tests {
         assert_eq!(speakers.iter().find(|s| s.id == mb.id).unwrap(), &mb);
     }
 
-    /// A cluster the user *did* mark (even partially) is never a spread
-    /// candidate — the annotated cluster is excluded, so its remaining
-    /// unlabelled tail keeps its diarization label (the timeline model's "无"
-    /// gaps are respected, not silently back-filled).
+    /// The annotation's own dominant cluster is back-filled: after the user marks
+    /// part of a cluster as A, the cluster's remaining unmarked tail inherits A
+    /// too (within-cluster spread), so one person is not left split between the
+    /// manual name and a stray "说话人N". (This reverses the earlier
+    /// "don't back-fill the tail" behavior, which surfaced as annotations that
+    /// only labelled part of a speaker.)
     #[test]
-    fn annotated_cluster_is_excluded_from_candidates() {
+    fn annotated_clusters_unmarked_tail_inherits_the_manual_name() {
         let meeting = Uuid::new_v4();
         let s1 = Speaker::new(meeting, "S1");
         let ma = manual_speaker(meeting, "M1", "A");
@@ -577,9 +728,17 @@ mod tests {
 
         let out = spread_annotations(&mut speakers, &pre, &post, &centroids, &voiced);
 
-        assert!(out.spread_speakers.is_empty());
+        assert_eq!(out.spread_speakers.len(), 1);
         let s1_row = speakers.iter().find(|s| s.id == s1.id).unwrap();
-        assert_eq!(s1_row.display_name, None, "unmarked tail keeps its label");
+        assert_eq!(
+            s1_row.display_name.as_deref(),
+            Some("A"),
+            "unmarked tail inherits the manual name"
+        );
+        assert_eq!(
+            s1_row.attribution_origin.as_deref(),
+            Some(attribution_origin::MANUAL_SPREAD)
+        );
     }
 
     /// A "无"/unassigned-only meeting produces no manual rows, hence no seeds and
