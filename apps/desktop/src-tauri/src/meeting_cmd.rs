@@ -2065,27 +2065,26 @@ pub struct EnrolledSpeakerDto {
     pub name: String,
     pub enrolled_at: String,
     pub source_meeting_id: Option<String>,
-    /// How many voiceprint samples back this identity (1 = enrolled once).
-    pub sample_count: usize,
-    /// Distinct source meetings across all samples, newest first — the manager
-    /// page resolves these ids to titles from the meeting list it already has.
-    pub source_meeting_ids: Vec<String>,
+    /// Every voiceprint sample, **oldest-first** — the same order
+    /// `remove_speaker_sample` indexes into, so the manager can prune a
+    /// specific recording by its position here.
+    pub samples: Vec<EnrolledSampleDto>,
+}
+
+/// One voiceprint sample for the manager UI (the embedding never crosses IPC).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrolledSampleDto {
+    pub enrolled_at: String,
+    pub voiced_ms: u64,
+    pub source_meeting_id: Option<String>,
 }
 
 impl From<&lumen_identity::EnrolledIdentity> for EnrolledSpeakerDto {
     fn from(identity: &lumen_identity::EnrolledIdentity) -> Self {
-        // Identities now hold multiple samples; the UI list shows the most
-        // recent enrollment's metadata plus a roll-up of every source meeting.
+        // Identities hold multiple samples; the list header shows the most
+        // recent one's metadata, the samples array drives per-sample pruning.
         let latest = identity.latest_sample();
-        let mut source_meeting_ids = Vec::new();
-        for sample in identity.samples.iter().rev() {
-            if let Some(id) = sample.source_meeting_id {
-                let id = id.to_string();
-                if !source_meeting_ids.contains(&id) {
-                    source_meeting_ids.push(id);
-                }
-            }
-        }
         Self {
             id: identity.id.to_string(),
             name: identity.name.clone(),
@@ -2095,8 +2094,15 @@ impl From<&lumen_identity::EnrolledIdentity> for EnrolledSpeakerDto {
             source_meeting_id: latest
                 .and_then(|s| s.source_meeting_id)
                 .map(|id| id.to_string()),
-            sample_count: identity.samples.len(),
-            source_meeting_ids,
+            samples: identity
+                .samples
+                .iter()
+                .map(|s| EnrolledSampleDto {
+                    enrolled_at: s.enrolled_at.to_rfc3339(),
+                    voiced_ms: s.voiced_ms,
+                    source_meeting_id: s.source_meeting_id.map(|id| id.to_string()),
+                })
+                .collect(),
         }
     }
 }

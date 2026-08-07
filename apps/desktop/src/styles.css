@@ -3903,3 +3903,112 @@ button.meeting-seg-text.seekable:hover {
   gap: 8px;
   flex-shrink: 0;
 }
+
+/* ---- Voiceprint / identity manager (声纹管理) ------------------------- */
+.identity-panel .identity-head h2 {
+  margin: 0 0 4px;
+}
+.identity-panel .identity-head p {
+  margin: 0 0 12px;
+  max-width: 60ch;
+}
+.identity-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.identity-item {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--surface, transparent);
+}
+.identity-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.identity-name {
+  font-weight: 600;
+  font-size: 15px;
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  cursor: pointer;
+  color: inherit;
+  border-radius: 6px;
+}
+.identity-name:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.identity-name-input {
+  font-weight: 600;
+  font-size: 15px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface, #fff);
+  color: inherit;
+}
+.identity-self {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.identity-meta {
+  font-size: 13px;
+}
+.identity-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+.identity-sources {
+  margin-top: 6px;
+  font-size: 13px;
+}
+.identity-merge {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+.identity-merge select {
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface, #fff);
+  color: inherit;
+}
+.identity-samples {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 8px 0 0;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.identity-sample {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+}
+.btn.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+.btn.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
