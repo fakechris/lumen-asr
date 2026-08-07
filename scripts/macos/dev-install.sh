@@ -108,12 +108,37 @@ PLIST
   echo -n "APPL????" >"$APP_DIR/Contents/PkgInfo"
 fi
 
+# Stop any running instance so the new binary actually loads. `osascript quit`
+# can silently fail when the app is busy/unresponsive, and `open` on a
+# still-running app only re-focuses it (the old process keeps executing its
+# in-memory image) — that is how you "install" a new build but keep running the
+# old one. So ask nicely, then escalate to SIGTERM and SIGKILL, and confirm the
+# process is actually gone.
+quit_lumen() {
+  pgrep -x "lumen-asr-desktop" >/dev/null 2>&1 || return 0
+  osascript -e 'tell application "Lumen ASR" to quit' >/dev/null 2>&1 || true
+  for _ in $(seq 1 15); do  # up to ~3s for a graceful exit
+    pgrep -x "lumen-asr-desktop" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  echo "  graceful quit timed out → SIGTERM" >&2
+  pkill -x "lumen-asr-desktop" 2>/dev/null || true
+  for _ in $(seq 1 10); do
+    pgrep -x "lumen-asr-desktop" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  echo "  still running → SIGKILL" >&2
+  pkill -9 -x "lumen-asr-desktop" 2>/dev/null || true
+  sleep 0.3
+  if pgrep -x "lumen-asr-desktop" >/dev/null 2>&1; then
+    echo "WARNING: could not stop the running Lumen ASR instance; the new build" >&2
+    echo "         may not launch (old process still holds the app)." >&2
+    return 1
+  fi
+}
+
 echo "==> install binary → $BIN_DST"
-# Quit previous instance if running (match path, not argv of this script)
-if pgrep -x "lumen-asr-desktop" >/dev/null 2>&1; then
-  osascript -e 'tell application "Lumen ASR" to quit' 2>/dev/null || true
-  sleep 0.4
-fi
+quit_lumen || true  # match path, not argv of this script; never abort the install
 
 mkdir -p "$(dirname "$BIN_DST")"
 cp -f "$BIN_SRC" "$BIN_DST"
@@ -239,10 +264,7 @@ if [[ -n "$INSTALL_DEST" ]]; then
   fi
 
   echo "==> install → $INSTALL_DEST"
-  if pgrep -x "lumen-asr-desktop" >/dev/null 2>&1; then
-    osascript -e 'tell application "Lumen ASR" to quit' 2>/dev/null || true
-    sleep 0.4
-  fi
+  quit_lumen || true
   # Stage to a sibling, verify the signature there, and only then swap it in — so
   # a failed copy/verify never leaves the destination half-removed, and a verify
   # failure falls through to the run-in-place warning instead of exiting (set -e).
