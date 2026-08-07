@@ -500,6 +500,19 @@ export type EnrolledSample = {
   sourceMeetingId?: string | null;
 };
 
+/** A queued auto-enroll conflict: a meeting labelled `speakerId` as `labelName`,
+ * but that voice matched the already-enrolled `existingName` (cosine `score`),
+ * so the enrollment was withheld for the user to resolve. */
+export type EnrollConflict = {
+  id: string;
+  meetingId: string;
+  speakerId: string;
+  labelName: string;
+  existingName: string;
+  score: number;
+  createdAt: string;
+};
+
 /** A recording-time speaker **boundary** on a live caption line (serde
  * snake_case domain struct). Anchored to a precise time on the meeting's
  * unified timeline + capture track; opens a range that runs until the next

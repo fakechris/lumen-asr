@@ -666,6 +666,27 @@ export const api = {
       sampleIndex,
     }),
 
+  /** Unresolved auto-enroll conflicts (same voice labelled under a different
+   * name than an already-enrolled person), newest first. */
+  listEnrollConflicts: () =>
+    invoke<import("./types").EnrollConflict[]>("list_enroll_conflicts"),
+
+  /** Resolve one conflict: `enrollAs` a name enrolls that speaker's voiceprint
+   * under it (the existing name = "same person", the meeting's label = "a
+   * different person who sounds alike"); `null` just dismisses it. */
+  resolveEnrollConflict: (
+    conflictId: string,
+    meetingId: string,
+    speakerId: string,
+    enrollAs: string | null,
+  ) =>
+    invoke<void>("resolve_enroll_conflict", {
+      conflictId,
+      meetingId,
+      speakerId,
+      enrollAs,
+    }),
+
   /** Read the enrolled identity marked as the user themself ("这是我"), or
    * null. Rendering hint: attribution matching it displays as "我". */
   getSelfIdentity: () => invoke<string | null>("get_self_identity"),

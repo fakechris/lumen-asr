@@ -2122,25 +2122,16 @@ fn open_identity_store() -> Result<lumen_identity::IdentityStore, String> {
         .map_err(|e| format!("open identity library: {e}"))
 }
 
-/// Enroll one confirmed meeting speaker into the local voiceprint library
-/// (repeat enrollments of the same person accumulate samples, making future
-/// auto-identification more robust). The name defaults to the speaker's
-/// `display_name`; passing `name` overrides it (and confirms the speaker with
-/// that name when it was still unnamed). Fails when the speaker has no stored
-/// embedding (meeting transcribed before voiceprints existed → re-run
-/// transcription first) or spoke for less than the minimum voiced duration
-/// (`lumen_identity::MIN_VOICED_MS`).
-#[tauri::command]
-pub fn enroll_speaker(
-    state: State<'_, AppState>,
-    meeting_id: String,
-    speaker_id: String,
-    name: Option<String>,
-) -> Result<EnrolledSpeakerDto, String> {
-    let meeting = parse_id(&meeting_id, "meeting")?;
-    let speaker_uuid = parse_id(&speaker_id, "speaker")?;
-
-    let (speaker, embedding, voiced_ms) = with_store(&state, |s| {
+/// Read one meeting speaker's stored centroid plus its total voiced duration,
+/// applying the same "no embedding" / "too short" gates `lumen_identity::enroll`
+/// enforces so callers get an actionable message *before* anything is written.
+/// Shared by direct enrollment and auto-enroll conflict resolution.
+fn fetch_speaker_centroid(
+    state: &State<'_, AppState>,
+    meeting: Uuid,
+    speaker_uuid: Uuid,
+) -> Result<(lumen_core::Speaker, Vec<f32>, u64), String> {
+    let (speaker, embedding, voiced_ms) = with_store(state, |s| {
         let speaker = s
             .list_speakers(meeting)
             .map_err(|e| e.to_string())?
@@ -2164,8 +2155,6 @@ pub fn enroll_speaker(
     let embedding = embedding.ok_or_else(|| {
         "该说话人没有声纹数据（此会议在声纹功能之前转录，重新转录后即可注册）".to_string()
     })?;
-    // Same gate `lumen_identity::enroll` enforces, checked up front so the
-    // user gets an actionable message before anything is renamed or written.
     if voiced_ms < lumen_identity::MIN_VOICED_MS {
         return Err(format!(
             "该说话人语音太短，无法注册声纹（有效语音约 {:.1} 秒，至少需要 {} 秒）",
@@ -2173,6 +2162,28 @@ pub fn enroll_speaker(
             lumen_identity::MIN_VOICED_MS / 1000
         ));
     }
+    Ok((speaker, embedding, voiced_ms))
+}
+
+/// Enroll one confirmed meeting speaker into the local voiceprint library
+/// (repeat enrollments of the same person accumulate samples, making future
+/// auto-identification more robust). The name defaults to the speaker's
+/// `display_name`; passing `name` overrides it (and confirms the speaker with
+/// that name when it was still unnamed). Fails when the speaker has no stored
+/// embedding (meeting transcribed before voiceprints existed → re-run
+/// transcription first) or spoke for less than the minimum voiced duration
+/// (`lumen_identity::MIN_VOICED_MS`).
+#[tauri::command]
+pub fn enroll_speaker(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    speaker_id: String,
+    name: Option<String>,
+) -> Result<EnrolledSpeakerDto, String> {
+    let meeting = parse_id(&meeting_id, "meeting")?;
+    let speaker_uuid = parse_id(&speaker_id, "speaker")?;
+
+    let (speaker, embedding, voiced_ms) = fetch_speaker_centroid(&state, meeting, speaker_uuid)?;
 
     let name = name
         .as_deref()
@@ -2284,6 +2295,86 @@ pub fn remove_speaker_sample(
         .iter()
         .find(|i| i.id.to_string() == identity_id)
         .map(EnrolledSpeakerDto::from))
+}
+
+/// One queued auto-enroll conflict for the manager UI: a meeting labelled a
+/// speaker `labelName`, but that voice matched the already-enrolled
+/// `existingName` (cosine `score`), so the enrollment was withheld.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrollConflictDto {
+    pub id: String,
+    pub meeting_id: String,
+    pub speaker_id: String,
+    pub label_name: String,
+    pub existing_name: String,
+    pub score: f32,
+    pub created_at: String,
+}
+
+impl From<&lumen_store::EnrollConflictRecord> for EnrollConflictDto {
+    fn from(record: &lumen_store::EnrollConflictRecord) -> Self {
+        Self {
+            id: record.id.to_string(),
+            meeting_id: record.meeting_id.to_string(),
+            speaker_id: record.speaker_id.to_string(),
+            label_name: record.label_name.clone(),
+            existing_name: record.existing_name.clone(),
+            score: record.score,
+            created_at: record.created_at.clone(),
+        }
+    }
+}
+
+/// Every unresolved same-voice/different-name auto-enroll conflict, newest
+/// first. Surfaced in the voiceprint manager for the user to resolve.
+#[tauri::command]
+pub fn list_enroll_conflicts(
+    state: State<'_, AppState>,
+) -> Result<Vec<EnrollConflictDto>, String> {
+    with_store(&state, |s| {
+        Ok(s.list_unresolved_enroll_conflicts()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(EnrollConflictDto::from)
+            .collect())
+    })
+}
+
+/// Resolve one auto-enroll conflict. When `enroll_as` names a person, the
+/// conflicting speaker's centroid is enrolled under that name (either "同一个
+/// 人" → the existing name, or "确实是另一个人" → the meeting's label); when it
+/// is `None` the conflict is simply dismissed. Either way the row is marked
+/// resolved. `meeting_id`/`speaker_id` come from the conflict record.
+#[tauri::command]
+pub fn resolve_enroll_conflict(
+    state: State<'_, AppState>,
+    conflict_id: String,
+    meeting_id: String,
+    speaker_id: String,
+    enroll_as: Option<String>,
+) -> Result<(), String> {
+    let conflict = parse_id(&conflict_id, "conflict")?;
+    if let Some(name) = enroll_as
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        let meeting = parse_id(&meeting_id, "meeting")?;
+        let speaker_uuid = parse_id(&speaker_id, "speaker")?;
+        let (_speaker, embedding, voiced_ms) =
+            fetch_speaker_centroid(&state, meeting, speaker_uuid)?;
+        let mut identities = open_identity_store()?;
+        identities
+            .enroll(name, &embedding, voiced_ms, Some(meeting))
+            .map_err(|e| format!("enroll: {e}"))?;
+    }
+    with_store(&state, |s| {
+        s.resolve_enroll_conflict(conflict)
+            .map_err(|e| e.to_string())
+    })?;
+    tracing::info!(conflict_id = %conflict, "auto-enroll conflict resolved");
+    Ok(())
 }
 
 /// Read the enrolled identity marked as *the user themself* ("这是我"), if

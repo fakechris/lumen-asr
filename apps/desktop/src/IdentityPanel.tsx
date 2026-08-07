@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "./api";
-import type { EnrolledSpeaker, Meeting } from "./types";
+import type { EnrolledSpeaker, EnrollConflict, Meeting } from "./types";
 
 /** Global voiceprint manager: the whole enrolled-identity library on one page.
  *
@@ -16,6 +16,7 @@ export function IdentityPanel({
   onError: (message: string | null) => void;
 }) {
   const [enrolled, setEnrolled] = useState<EnrolledSpeaker[]>([]);
+  const [conflicts, setConflicts] = useState<EnrollConflict[]>([]);
   const [selfIdentityId, setSelfIdentityId] = useState<string | null>(null);
   const [titles, setTitles] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
@@ -28,13 +29,17 @@ export function IdentityPanel({
   const refresh = useCallback(async () => {
     // Each read degrades independently: a failed meeting-list still lets the
     // identity list render (titles just fall back to the raw id).
-    const [identities, selfId, meetings] = await Promise.allSettled([
-      api.listEnrolledSpeakers(),
-      api.getSelfIdentity(),
-      api.listMeetings(),
-    ]);
+    const [identities, selfId, meetings, conflictList] = await Promise.allSettled(
+      [
+        api.listEnrolledSpeakers(),
+        api.getSelfIdentity(),
+        api.listMeetings(),
+        api.listEnrollConflicts(),
+      ],
+    );
     if (identities.status === "fulfilled") setEnrolled(identities.value);
     if (selfId.status === "fulfilled") setSelfIdentityId(selfId.value);
+    if (conflictList.status === "fulfilled") setConflicts(conflictList.value);
     if (meetings.status === "fulfilled") {
       setTitles(
         Object.fromEntries(
@@ -42,7 +47,7 @@ export function IdentityPanel({
         ),
       );
     }
-    const failed = [identities, selfId, meetings].find(
+    const failed = [identities, selfId, meetings, conflictList].find(
       (r): r is PromiseRejectedResult => r.status === "rejected",
     );
     if (failed) onError(String(failed.reason));
@@ -143,6 +148,24 @@ export function IdentityPanel({
     [mergeInto, enrolled, refresh, onError],
   );
 
+  const resolveConflict = useCallback(
+    async (conflict: EnrollConflict, enrollAs: string | null) => {
+      onError(null);
+      try {
+        await api.resolveEnrollConflict(
+          conflict.id,
+          conflict.meetingId,
+          conflict.speakerId,
+          enrollAs,
+        );
+        await refresh();
+      } catch (e) {
+        onError(String(e));
+      }
+    },
+    [refresh, onError],
+  );
+
   const removeSample = useCallback(
     async (identity: EnrolledSpeaker, index: number) => {
       const last = identity.samples.length === 1;
@@ -204,6 +227,53 @@ export function IdentityPanel({
           标记「这是我」。全部保存在本机，声纹数据不会离开设备。
         </p>
       </header>
+
+      {conflicts.length > 0 && (
+        <section className="identity-conflicts">
+          <h3>待处理冲突（{conflicts.length}）</h3>
+          <p className="muted">
+            这些会议里标注的名字，声纹却和库里另一个人高度相似，已暂缓自动注册，
+            请确认是不是同一个人。
+          </p>
+          <ul className="identity-conflict-list">
+            {conflicts.map((c) => (
+              <li key={c.id} className="identity-conflict">
+                <div className="identity-conflict-text">
+                  会议「{titles[c.meetingId] ?? "未命名会议"}」中标注为「
+                  <b>{c.labelName}</b>」，但声纹与已注册的「<b>{c.existingName}</b>
+                  」相似度约 {(c.score * 100).toFixed(0)}%。
+                </div>
+                <div className="identity-conflict-actions">
+                  <button
+                    type="button"
+                    className="btn small"
+                    title={`同一个人：把这段声纹并入「${c.existingName}」`}
+                    onClick={() => void resolveConflict(c, c.existingName)}
+                  >
+                    就是{c.existingName}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn small"
+                    title={`不同的人：单独注册为「${c.labelName}」`}
+                    onClick={() => void resolveConflict(c, c.labelName)}
+                  >
+                    确实是{c.labelName}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn small"
+                    title="先不处理，仅从列表移除"
+                    onClick={() => void resolveConflict(c, null)}
+                  >
+                    忽略
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {loading ? (
         <p className="muted">加载中…</p>

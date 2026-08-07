@@ -30,6 +30,9 @@ pub const ENROLL_CONFLICT_THRESHOLD: f32 = 0.80;
 /// name — recorded for the user to resolve later instead of enrolled.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnrollConflict {
+    /// The assembled speaker row this cluster belongs to, so a later resolution
+    /// can re-fetch its centroid and enroll it under whichever name wins.
+    pub speaker_id: Uuid,
     /// The name the user gave the cluster this meeting.
     pub name: String,
     /// The existing enrolled identity the voiceprint matched instead.
@@ -91,6 +94,7 @@ pub fn auto_enroll_named_speakers(
         if let Some((existing, score)) = matched {
             if existing != name {
                 outcome.conflicts.push(EnrollConflict {
+                    speaker_id: speaker.id,
                     name: name.to_string(),
                     existing_name: existing,
                     score,
@@ -171,10 +175,12 @@ mod tests {
         let b = named(m2, "S1", "B", attribution_origin::MANUAL);
         let cb = BTreeMap::from([(b.id, emb(0.10))]); // identical voice
         let vb = BTreeMap::from([(b.id, 8_000u64)]);
+        let b_id = b.id;
         let out = auto_enroll_named_speakers(&mut store, &[b], &cb, &vb, m2);
 
         assert!(out.enrolled.is_empty(), "not enrolled");
         assert_eq!(out.conflicts.len(), 1);
+        assert_eq!(out.conflicts[0].speaker_id, b_id);
         assert_eq!(out.conflicts[0].name, "B");
         assert_eq!(out.conflicts[0].existing_name, "A");
         // Library is unchanged (still just A).

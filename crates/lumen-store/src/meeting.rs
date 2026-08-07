@@ -16,6 +16,22 @@ use uuid::Uuid;
 
 use crate::{parse_dt, parse_u32_column, parse_uuid_column, Store};
 
+/// One queued auto-enroll conflict: a meeting labelled `speaker_id` as
+/// `label_name`, but that voice strongly matched the already-enrolled
+/// `existing_name` (cosine `score`), so the enrollment was withheld. Resolving
+/// it re-fetches the speaker's centroid and enrolls it under the chosen name.
+#[derive(Debug, Clone)]
+pub struct EnrollConflictRecord {
+    pub id: Uuid,
+    pub meeting_id: Uuid,
+    pub speaker_id: Uuid,
+    pub label_name: String,
+    pub existing_name: String,
+    pub score: f32,
+    /// RFC 3339 timestamp of when the conflict was recorded.
+    pub created_at: String,
+}
+
 impl Store {
     // ----- meetings ---------------------------------------------------------
 
@@ -291,6 +307,84 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    // ----- auto-enroll conflict queue (v16) ---------------------------------
+
+    /// Delete every conflict recorded for a meeting — called before re-recording
+    /// its conflicts so a reprocess replaces them instead of duplicating.
+    pub fn clear_enroll_conflicts(&self, meeting_id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM enroll_conflicts WHERE meeting_id=?1",
+            params![meeting_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Record one same-voice/different-name auto-enroll conflict for the user to
+    /// resolve later. `id` and `created_at` are generated here.
+    pub fn insert_enroll_conflict(
+        &self,
+        meeting_id: Uuid,
+        speaker_id: Uuid,
+        label_name: &str,
+        existing_name: &str,
+        score: f32,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO enroll_conflicts (
+              id, meeting_id, speaker_id, label_name, existing_name, score,
+              created_at, resolved
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,0)
+            "#,
+            params![
+                Uuid::new_v4().to_string(),
+                meeting_id.to_string(),
+                speaker_id.to_string(),
+                label_name,
+                existing_name,
+                score as f64,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every still-unresolved conflict, newest first.
+    pub fn list_unresolved_enroll_conflicts(&self) -> Result<Vec<EnrollConflictRecord>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, meeting_id, speaker_id, label_name, existing_name, score,
+                   created_at
+            FROM enroll_conflicts
+            WHERE resolved = 0
+            ORDER BY created_at DESC
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(EnrollConflictRecord {
+                id: parse_uuid_column(row, 0)?,
+                meeting_id: parse_uuid_column(row, 1)?,
+                speaker_id: parse_uuid_column(row, 2)?,
+                label_name: row.get(3)?,
+                existing_name: row.get(4)?,
+                score: row.get::<_, f64>(5)? as f32,
+                created_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Mark one conflict resolved (however the user decided). Returns `true` if
+    /// a row was updated.
+    pub fn resolve_enroll_conflict(&self, conflict_id: Uuid) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE enroll_conflicts SET resolved=1 WHERE id=?1",
+            params![conflict_id.to_string()],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Overwrite only the `text` of one transcript segment. Its timing
@@ -1716,5 +1810,38 @@ mod tests {
             .list_meetings_filtered(Some(MeetingStatus::Ready), Some("Broken"), 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn enroll_conflicts_queue_inserts_lists_clears_and_resolves() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        let speaker = Speaker::new(meeting.id, "S1");
+
+        store
+            .insert_enroll_conflict(meeting.id, speaker.id, "乙", "甲", 0.83)
+            .unwrap();
+        let listed = store.list_unresolved_enroll_conflicts().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].speaker_id, speaker.id);
+        assert_eq!(listed[0].label_name, "乙");
+        assert_eq!(listed[0].existing_name, "甲");
+        assert!((listed[0].score - 0.83).abs() < 1e-6);
+
+        // Resolving hides it from the unresolved list.
+        assert!(store.resolve_enroll_conflict(listed[0].id).unwrap());
+        assert!(store.list_unresolved_enroll_conflicts().unwrap().is_empty());
+        assert!(!store.resolve_enroll_conflict(Uuid::new_v4()).unwrap());
+
+        // Re-recording is idempotent: clear replaces, never duplicates.
+        store
+            .insert_enroll_conflict(meeting.id, speaker.id, "乙", "甲", 0.83)
+            .unwrap();
+        store.clear_enroll_conflicts(meeting.id).unwrap();
+        store
+            .insert_enroll_conflict(meeting.id, speaker.id, "乙", "甲", 0.83)
+            .unwrap();
+        assert_eq!(store.list_unresolved_enroll_conflicts().unwrap().len(), 1);
     }
 }

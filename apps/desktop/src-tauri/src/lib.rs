@@ -632,6 +632,8 @@ pub fn run() {
             meeting_cmd::rename_enrolled_speaker,
             meeting_cmd::merge_enrolled_speakers,
             meeting_cmd::remove_speaker_sample,
+            meeting_cmd::list_enroll_conflicts,
+            meeting_cmd::resolve_enroll_conflict,
             meeting_cmd::get_meeting_voiceprints,
             meeting_cmd::get_self_identity,
             meeting_cmd::set_self_identity,

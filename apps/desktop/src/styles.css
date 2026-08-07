@@ -4012,3 +4012,42 @@ button.meeting-seg-text.seekable:hover {
 .btn.danger:hover:not(:disabled) {
   background: var(--danger-soft);
 }
+
+/* ---- Auto-enroll conflict queue ------------------------------------- */
+.identity-conflicts {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-radius: 10px;
+  background: var(--danger-soft);
+}
+.identity-conflicts h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+.identity-conflicts > p {
+  margin: 0 0 10px;
+  max-width: 60ch;
+}
+.identity-conflict-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.identity-conflict {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.identity-conflict-text {
+  font-size: 14px;
+  line-height: 1.5;
+}
+.identity-conflict-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}

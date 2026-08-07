@@ -3,6 +3,8 @@
 mod meeting;
 mod schema;
 
+pub use meeting::EnrollConflictRecord;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use lumen_core::{

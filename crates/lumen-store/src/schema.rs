@@ -23,8 +23,9 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// for conflict handling between manual/verified/offline attribution; v14 adds
 /// indexed history visibility for short absolute-silence captures; v15 adds the
 /// additive `live_annotations.unassigned` column (a "无" boundary — from here on
-/// no manual speaker — for the timeline-based annotation model).
-pub(crate) const SCHEMA_VERSION: i64 = 15;
+/// no manual speaker — for the timeline-based annotation model); v16 adds the
+/// `enroll_conflicts` queue (same-voice/different-name auto-enroll conflicts).
+pub(crate) const SCHEMA_VERSION: i64 = 16;
 
 pub(crate) const HISTORY_TEXT_WHITESPACE: &str =
     "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
@@ -616,6 +617,36 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (15)",
+        [],
+    )?;
+
+    // v16: the auto-enroll conflict queue. When a meeting labels a speaker with
+    // a name whose voiceprint strongly matches a *different* already-enrolled
+    // person, the enrollment is withheld (see `lumen-meeting`'s label→enroll)
+    // and one row recorded here for the user to resolve in the voiceprint
+    // manager. `speaker_id` lets a resolution re-fetch that speaker's centroid
+    // and enroll it under whichever name wins; rows are cleared and rewritten
+    // when a meeting is reprocessed. FK-cascades away with its meeting.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS enroll_conflicts (
+          id TEXT PRIMARY KEY NOT NULL,
+          meeting_id TEXT NOT NULL,
+          speaker_id TEXT NOT NULL,
+          label_name TEXT NOT NULL,
+          existing_name TEXT NOT NULL,
+          score REAL NOT NULL,
+          created_at TEXT NOT NULL,
+          resolved INTEGER NOT NULL DEFAULT 0,
+          FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_enroll_conflicts_unresolved
+          ON enroll_conflicts(resolved, created_at);
+        "#,
+    )?;
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
         [SCHEMA_VERSION],
