@@ -101,58 +101,72 @@ fn run_meeting_process(args: &[String]) -> i32 {
     let diar_models =
         lumen_meeting::DiarModels::under_root(lumen_asr::lumen_models_dir().join("diar"));
 
-    // A throwaway store: this command transcribes and prints, it does not touch
-    // the app's real meeting library.
-    let store_path =
-        std::env::temp_dir().join(format!("lumen-headless-{}.sqlite", std::process::id()));
-    let store = match lumen_store::Store::open(&store_path) {
-        Ok(store) => store,
-        Err(error) => {
-            eprintln!("meeting process: open store: {error}");
-            return 1;
-        }
-    };
-
     let opts = lumen_meeting::MeetingOptions {
         max_speakers: Some(6),
         ..Default::default()
     };
 
-    let outcome = tauri::async_runtime::block_on(lumen_meeting::transcribe_meeting(
-        wav_path,
-        &diar_models,
-        &engine,
-        &store,
-        &opts,
-    ));
-    let code = match outcome {
-        Ok(meeting_id) => match store.list_segments(meeting_id) {
-            Ok(segments) => {
-                print_segments(&segments, json);
-                0
-            }
+    // A throwaway store in a private, exclusively-created dir: `create_dir` fails
+    // if the path already exists, so a pre-planted path can't be hijacked, and
+    // removing the whole dir at the end clears the SQLite `-wal`/`-shm` sidecars
+    // too. This command transcribes and prints; it never touches the real library.
+    let dir = std::env::temp_dir().join(format!("lumen-headless-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(error) = std::fs::create_dir(&dir) {
+        eprintln!("meeting process: create temp dir: {error}");
+        return 1;
+    }
+
+    let code = {
+        let store = match lumen_store::Store::open(dir.join("headless.sqlite")) {
+            Ok(store) => store,
             Err(error) => {
-                eprintln!("meeting process: read segments: {error}");
+                eprintln!("meeting process: open store: {error}");
+                let _ = std::fs::remove_dir_all(&dir);
+                return 1;
+            }
+        };
+        let outcome = tauri::async_runtime::block_on(lumen_meeting::transcribe_meeting(
+            wav_path,
+            &diar_models,
+            &engine,
+            &store,
+            &opts,
+        ));
+        match outcome {
+            Ok(meeting_id) => match store.list_segments(meeting_id) {
+                Ok(segments) => print_segments(&segments, json),
+                Err(error) => {
+                    eprintln!("meeting process: read segments: {error}");
+                    1
+                }
+            },
+            Err(error) => {
+                eprintln!("meeting process: {error}");
                 1
             }
-        },
-        Err(error) => {
-            eprintln!("meeting process: {error}");
-            1
         }
+        // `store` drops here, closing the SQLite handles before the dir is removed.
     };
 
-    let _ = std::fs::remove_file(&store_path);
+    let _ = std::fs::remove_dir_all(&dir);
     code
 }
 
-fn print_segments(segments: &[lumen_core::TranscriptSegment], json: bool) {
+/// Print the transcript and return an exit code (`1` if a `--json` transcript
+/// could not be serialized, so the caller never reports success with no output).
+fn print_segments(segments: &[lumen_core::TranscriptSegment], json: bool) -> i32 {
     if json {
-        match serde_json::to_string_pretty(segments) {
-            Ok(text) => println!("{text}"),
-            Err(error) => eprintln!("meeting process: serialize json: {error}"),
-        }
-        return;
+        return match serde_json::to_string_pretty(segments) {
+            Ok(text) => {
+                println!("{text}");
+                0
+            }
+            Err(error) => {
+                eprintln!("meeting process: serialize json: {error}");
+                1
+            }
+        };
     }
     // Label speakers S1, S2, … in first-seen order for a readable transcript.
     use std::collections::HashMap;
@@ -179,4 +193,5 @@ fn print_segments(segments: &[lumen_core::TranscriptSegment], json: bool) {
         labels.len(),
         if labels.len() == 1 { "" } else { "s" }
     );
+    0
 }
