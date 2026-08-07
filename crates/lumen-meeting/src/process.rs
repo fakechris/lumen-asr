@@ -649,6 +649,48 @@ async fn run(
         .add_segments(&assembled.segments)
         .map_err(ProcessError::Store)?;
 
+    // Label → enroll: add each manually named speaker's voiceprint to the global
+    // identity library so future meetings auto-identify the same person. Local,
+    // best-effort — a library failure never fails the meeting.
+    if opts.auto_enroll_speakers {
+        if let Some(identity_dir) = opts.identity_dir.as_deref() {
+            let mut centroids: BTreeMap<Uuid, Vec<f32>> = BTreeMap::new();
+            let mut voiced: BTreeMap<Uuid, u64> = BTreeMap::new();
+            for (engine_id, embedding) in &speaker_embeddings {
+                let label = crate::assemble::speaker_label(*engine_id);
+                if let Some(row) = assembled.speakers.iter().find(|s| s.label == label) {
+                    centroids.insert(row.id, embedding.clone());
+                    voiced.insert(row.id, voiced_ms.get(engine_id).copied().unwrap_or(0));
+                }
+            }
+            match lumen_identity::IdentityStore::open(identity_dir) {
+                Ok(mut identity_store) => {
+                    let out = crate::enroll::auto_enroll_named_speakers(
+                        &mut identity_store,
+                        &assembled.speakers,
+                        &centroids,
+                        &voiced,
+                        meeting_id,
+                    );
+                    if !out.enrolled.is_empty() || !out.conflicts.is_empty() {
+                        // Counts only — the names are personal data.
+                        tracing::info!(
+                            meeting_id = %meeting_id,
+                            enrolled = out.enrolled.len(),
+                            conflicts = out.conflicts.len(),
+                            "auto-enrolled manually named speakers into the identity library"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    meeting_id = %meeting_id,
+                    error = %error,
+                    "auto-enroll: could not open identity library"
+                ),
+            }
+        }
+    }
+
     // ── summarizing (optional) ──────────────────────────────────────
     if let Some(cfg) = minutes {
         store

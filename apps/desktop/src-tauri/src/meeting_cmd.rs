@@ -1301,9 +1301,16 @@ async fn process_meeting_pipeline(
         cleanup_transcript,
         echo_suppression,
         annotation_voiceprint_spread,
+        auto_enroll_speakers,
     ) = {
         let state = app.state::<AppState>();
-        let (corrector_cfg, cleanup_transcript, echo_suppression, annotation_voiceprint_spread) = {
+        let (
+            corrector_cfg,
+            cleanup_transcript,
+            echo_suppression,
+            annotation_voiceprint_spread,
+            auto_enroll_speakers,
+        ) = {
             let cfg = state
                 .config
                 .lock()
@@ -1313,6 +1320,7 @@ async fn process_meeting_pipeline(
                 cfg.meeting.transcript_cleanup,
                 cfg.meeting.echo_suppression,
                 cfg.meeting.annotation_voiceprint_spread,
+                cfg.meeting.auto_enroll_speakers,
             )
         };
         let asr_engine = crate::dictation::build_meeting_asr_engine(state.inner())?;
@@ -1335,6 +1343,7 @@ async fn process_meeting_pipeline(
             cleanup_transcript,
             echo_suppression,
             annotation_voiceprint_spread,
+            auto_enroll_speakers,
         )
     };
 
@@ -1374,6 +1383,9 @@ async fn process_meeting_pipeline(
         // one person's unmarked speech joins their name. Needs diarization
         // embeddings; inert without them. Config: `meeting.annotation_voiceprint_spread`.
         annotation_voiceprint_spread,
+        // Enroll manually named speakers into the local identity library so
+        // future meetings auto-identify them. Config: `meeting.auto_enroll_speakers`.
+        auto_enroll_speakers,
         ..MeetingOptions::default()
     };
 
