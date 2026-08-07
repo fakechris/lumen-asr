@@ -1365,6 +1365,10 @@ function LiveTranscript({
                                         menuQuery,
                                       );
                                     } else if (e.key === "Escape") {
+                                      // Return to the candidate menu, not close
+                                      // the whole menu (the document Esc handler
+                                      // would otherwise call closeMenus).
+                                      e.stopPropagation();
                                       setRenameFrom(null);
                                     }
                                   }}

@@ -130,6 +130,22 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Title a meeting only while it is still untitled, in one atomic statement.
+    /// The async calendar link uses this so a title the user sets concurrently
+    /// (e.g. renaming during recording) is never clobbered by a stale
+    /// "was untitled when I read it" check. Returns whether a row was titled.
+    pub fn set_meeting_title_if_untitled(&self, id: Uuid, title: &str) -> Result<bool> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        let changed = self.conn.execute(
+            "UPDATE meetings SET title=?2 WHERE id=?1 AND (title IS NULL OR title='')",
+            params![id.to_string(), trimmed],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Overwrite a meeting's free-form user notes. The caller (front-end)
     /// debounces; this is a plain last-write-wins update of just the `notes`
     /// column, leaving every other field untouched. Returns `true` if a row was

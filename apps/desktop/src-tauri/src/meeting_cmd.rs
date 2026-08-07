@@ -526,11 +526,16 @@ fn apply_calendar_event(
         .get_meeting(meeting_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "meeting not found".to_string())?;
-    if meeting.title.is_none() && !event.title.trim().is_empty() {
+    // Atomic conditional write: only title an *untitled* meeting, so a title the
+    // user sets between our read above and this write (e.g. renaming during
+    // recording) is never clobbered.
+    let auto_titled = if event.title.trim().is_empty() {
+        false
+    } else {
         store
-            .set_meeting_title(meeting_id, event.title.trim())
-            .map_err(|e| e.to_string())?;
-    }
+            .set_meeting_title_if_untitled(meeting_id, event.title.trim())
+            .map_err(|e| e.to_string())?
+    };
     if let Some(merged) = merge_attendees_into_notes(&meeting.notes, &event.attendee_names) {
         store
             .set_meeting_notes(meeting_id, &merged)
@@ -540,7 +545,7 @@ fn apply_calendar_event(
     // personal data.
     tracing::info!(
         meeting_id = %meeting_id,
-        auto_titled = meeting.title.is_none(),
+        auto_titled,
         attendees = event.attendee_names.len(),
         "calendar link applied to meeting"
     );
@@ -1620,10 +1625,24 @@ pub fn rename_live_annotations(
     new_name: String,
 ) -> Result<u64, String> {
     let id = parse_id(&meeting_id, "meeting")?;
-    with_store(&state, |s| {
-        s.rename_live_annotations(id, &old_name, &new_name)
+    let new_trimmed = new_name.trim().to_string();
+    let changed = with_store(&state, |s| {
+        s.rename_live_annotations(id, &old_name, &new_trimmed)
             .map_err(|e| e.to_string())
-    })
+    })?;
+    // Keep the live worker's session voiceprints in step (recording only): relabel
+    // the group so the corrected name keeps matching instead of the old one
+    // resurfacing in future live chips. No-op when no recording/worker is active.
+    if changed > 0 {
+        state.meeting_live.notify_annotation(
+            &meeting_id,
+            crate::meeting_live::AnnotationNotice::Renamed {
+                old_name,
+                new_name: new_trimmed,
+            },
+        );
+    }
+    Ok(changed)
 }
 
 /// Rename a speaker cluster (Speaker 3 → 李明). Returns `true` if updated.
