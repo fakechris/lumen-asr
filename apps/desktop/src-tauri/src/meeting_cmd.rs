@@ -1609,6 +1609,23 @@ pub fn delete_live_annotation(
     Ok(deleted)
 }
 
+/// Rename a mistyped live-annotation name across a whole meeting (the chip's
+/// "重命名" action): every caption line marked `old_name` becomes `new_name`.
+/// Returns the number of annotations updated.
+#[tauri::command]
+pub fn rename_live_annotations(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    old_name: String,
+    new_name: String,
+) -> Result<u64, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    with_store(&state, |s| {
+        s.rename_live_annotations(id, &old_name, &new_name)
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// Rename a speaker cluster (Speaker 3 → 李明). Returns `true` if updated.
 #[tauri::command]
 pub fn rename_speaker(

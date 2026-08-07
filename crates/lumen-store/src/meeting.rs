@@ -518,6 +518,30 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Rename every named live annotation in `meeting_id` whose `display_name`
+    /// equals `old_name` to `new_name` (the "重命名说话人" action: fix a
+    /// mistyped name across the whole meeting, not just one caption line).
+    /// Returns the number of rows changed. A no-op (`0`) when either name is
+    /// empty/whitespace or unchanged; `old_name` is non-empty so "无" boundaries
+    /// (empty name) are never touched.
+    pub fn rename_live_annotations(
+        &self,
+        meeting_id: Uuid,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<u64> {
+        let new_name = new_name.trim();
+        if old_name.is_empty() || new_name.is_empty() || new_name == old_name {
+            return Ok(0);
+        }
+        let changed = self.conn.execute(
+            "UPDATE live_annotations SET display_name=?3 \
+             WHERE meeting_id=?1 AND display_name=?2",
+            params![meeting_id.to_string(), old_name, new_name],
+        )?;
+        Ok(changed as u64)
+    }
+
     // ----- summaries --------------------------------------------------------
 
     /// Persist a generated summary.
