@@ -130,6 +130,18 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Record a meeting's mic WAV path without touching its status or duration.
+    /// Called at recording *start* (not just stop) so crash recovery can find
+    /// and salvage the audio if the app is killed mid-recording. Returns whether
+    /// a row was updated.
+    pub fn set_meeting_audio_path(&self, id: Uuid, path: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE meetings SET audio_path=?2 WHERE id=?1",
+            params![id.to_string(), path],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Title a meeting only while it is still untitled, in one atomic statement.
     /// The async calendar link uses this so a title the user sets concurrently
     /// (e.g. renaming during recording) is never clobbered by a stale
