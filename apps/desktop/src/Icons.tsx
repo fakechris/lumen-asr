@@ -7,6 +7,7 @@ export type IconName =
   | "meeting"
   | "history"
   | "dictionary"
+  | "identity"
   | "learn"
   | "settings"
   | "overview"
@@ -57,6 +58,13 @@ const PATHS: Record<IconName, ReactNode> = {
       <path d="M12 6.5C10.4 5.2 8.2 4.6 5.5 4.6 4.9 4.6 4.5 5 4.5 5.6V17c0 .6.4 1 1 1 2.6 0 4.6.5 6.5 1.8" />
       <path d="M12 6.5c1.6-1.3 3.8-1.9 6.5-1.9.6 0 1 .4 1 1V17c0 .6-.4 1-1 1-2.6 0-4.6.5-6.5 1.8" />
       <path d="M12 6.5v13" />
+    </>
+  ),
+  identity: (
+    <>
+      <circle cx="12" cy="8" r="3.2" />
+      <path d="M5.5 20c0-3.3 2.9-5.6 6.5-5.6s6.5 2.3 6.5 5.6" />
+      <path d="M3 8v4M6.5 6.5v7M17.5 6.5v7M21 8v4" />
     </>
   ),
   learn: (

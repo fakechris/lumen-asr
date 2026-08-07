@@ -12,6 +12,7 @@ import { Icon, type IconName } from "./Icons";
 import { ThemeToggle } from "./ThemeToggle";
 import { ChordCaptureChip } from "./ChordCaptureChip";
 import { MeetingPanel } from "./MeetingPanel";
+import { IdentityPanel } from "./IdentityPanel";
 import { MeetingModelsProvider } from "./meetingModels";
 import {
   acknowledgeWindowsMicrophoneNotice,
@@ -125,6 +126,13 @@ const NAV: { id: TabId; label: string; icon: IconName; title: string; blurb: str
     icon: "dictionary",
     title: "词典",
     blurb: "术语与替换规则",
+  },
+  {
+    id: "identity",
+    label: "声纹",
+    icon: "identity",
+    title: "声纹管理",
+    blurb: "跨会议声纹库 · 重命名 · 合并 · 这是我",
   },
   {
     id: "learn",
@@ -916,6 +924,8 @@ export default function App() {
                 }
               />
             )}
+
+            {tab === "identity" && <IdentityPanel onError={setError} />}
 
             {tab === "learn" && (
               <LearnPanel

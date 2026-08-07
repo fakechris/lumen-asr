@@ -419,6 +419,7 @@ export type TabId =
   | "overview"
   | "history"
   | "dictionary"
+  | "identity"
   | "learn"
   | "settings";
 
@@ -486,6 +487,16 @@ export type EnrolledSpeaker = {
   id: string;
   name: string;
   enrolledAt: string;
+  sourceMeetingId?: string | null;
+  /** Every voiceprint sample, oldest-first — the order `removeSpeakerSample`
+   * indexes into. */
+  samples: EnrolledSample[];
+};
+
+/** One voiceprint sample of an enrolled identity (embedding stays server-side). */
+export type EnrolledSample = {
+  enrolledAt: string;
+  voicedMs: number;
   sourceMeetingId?: string | null;
 };
 
