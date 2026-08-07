@@ -632,6 +632,12 @@ async fn run(
             );
         }
     }
+    // Clear any prior transcript for this meeting first, so a reprocess/retry
+    // replaces the result instead of appending a second set of speakers and
+    // segments (which doubled the data on the failed-meeting retry path).
+    store
+        .clear_meeting_transcript(meeting_id)
+        .map_err(ProcessError::Store)?;
     for speaker in &assembled.speakers {
         store.upsert_speaker(speaker).map_err(ProcessError::Store)?;
     }
