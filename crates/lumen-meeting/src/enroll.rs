@@ -2,24 +2,17 @@
 //! speaker's voiceprint to the global identity library so future meetings
 //! auto-identify the same person (cross-meeting propagation).
 //!
-//! ## Trust the label, veto on a voiceprint conflict
-//! The user's name is authoritative for *who* a cluster is, so a named cluster
-//! is enrolled under that name (accumulating a new sample when the name already
-//! exists, creating the identity otherwise — [`IdentityStore::enroll`] keys by
-//! name). The voiceprint is used only to **veto**: if the cluster's voice
-//! strongly matches a *different* already-named identity, that is a conflict
-//! (the reported "labelled A here, B there, same voice" case, or a mislabel) —
-//! it is recorded and **not** enrolled, rather than silently merging two names.
+//! The user's name is authoritative for who a cluster is, so a named cluster is
+//! enrolled under that name — accumulating a sample when the name already
+//! exists, creating the identity otherwise ([`IdentityStore::enroll`] keys by
+//! name). The voiceprint only **vetoes**: when the cluster's voice strongly
+//! matches a *different* already-named identity, the enrollment is withheld and
+//! the mismatch recorded, rather than merging two names under one voice.
 //!
-//! ## What is never enrolled
-//! - Auto-identified rows (`verification` / library hits): enrolling those would
-//!   feed the library its own guesses and reinforce mistakes. Only `manual` and
-//!   `manual_spread` (both rooted in the user's mark) are eligible.
-//! - Clusters with less than [`lumen_identity::MIN_VOICED_MS`] of voiced audio
-//!   (too noisy to trust — [`IdentityStore::enroll`] would reject them anyway).
-//!
-//! Pure logic over the assembled rows + their centroids; the only side effect is
-//! the (local-only) identity store write.
+//! Not eligible: auto-identified rows (`verification` / library hits — enrolling
+//! those would feed the library its own guesses), and clusters below
+//! [`lumen_identity::MIN_VOICED_MS`] of voiced audio. Pure over the assembled
+//! rows + centroids; the only side effect is the local identity-store write.
 
 use std::collections::BTreeMap;
 
@@ -45,8 +38,8 @@ pub struct EnrollConflict {
     pub score: f32,
 }
 
-/// What [`auto_enroll_named_speakers`] did, for logging (counts only — the
-/// names are personal data) and for the future conflict-resolution queue.
+/// What [`auto_enroll_named_speakers`] did (counts are logged; names are
+/// personal data). Conflicts are returned for the caller to surface.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AutoEnrollOutcome {
     /// Names enrolled (a new identity or an accumulated sample).
