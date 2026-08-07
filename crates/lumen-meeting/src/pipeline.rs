@@ -111,6 +111,14 @@ pub struct MeetingOptions {
     /// `Default` is `false` — the app layer sets it from config
     /// (`meeting.annotation_voiceprint_spread`), where it defaults **on**.
     pub annotation_voiceprint_spread: bool,
+    /// After attribution, enroll each **manually named** speaker's voiceprint
+    /// into the global identity library (`identity_dir`), so future meetings
+    /// auto-identify the same person. Trusts the user's name and only withholds
+    /// on a confident different-name voiceprint conflict (see
+    /// [`auto_enroll_named_speakers`](crate::auto_enroll_named_speakers)). Needs
+    /// `identity_dir`; a no-op without it. `Default` is `false` — the app layer
+    /// sets it from config (`meeting.auto_enroll_speakers`, default **on**).
+    pub auto_enroll_speakers: bool,
 }
 
 /// Failure modes of [`transcribe_meeting`].

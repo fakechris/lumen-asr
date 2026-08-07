@@ -24,6 +24,7 @@ mod assemble;
 mod cleanup;
 mod correct;
 mod echo;
+mod enroll;
 pub mod export;
 mod identify;
 mod merge;
@@ -42,6 +43,9 @@ pub use assemble::{
 };
 pub use cleanup::{cleanup_transcript, should_cleanup, CleanupStats};
 pub use correct::{correct_segment, correct_words, CorrectionDict};
+pub use enroll::{
+    auto_enroll_named_speakers, AutoEnrollOutcome, EnrollConflict, ENROLL_CONFLICT_THRESHOLD,
+};
 pub use export::{export_meeting, ExportError, ExportOutput, ExportPreset};
 pub use identify::{
     auto_identify_speakers, speaker_voiced_ms, AutoIdentification, IDENTIFY_MIN_VOICED_MS,
