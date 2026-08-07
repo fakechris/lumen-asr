@@ -1931,6 +1931,24 @@ function SettingsPanel({
   // Meeting watchdog settings (silence auto-stop minutes, calendar-end reminder).
   const [silenceAutoStopMinutes, setSilenceAutoStopMinutes] = useState(15);
   const [calendarEndReminder, setCalendarEndReminder] = useState(true);
+  // Debounce + latest-wins so rapid edits to either field don't race as
+  // independent writes (each call persists both fields, so an older in-flight
+  // write could otherwise clobber the newer one).
+  const watchdogSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveWatchdog = useCallback(
+    (minutes: number, reminder: boolean) => {
+      if (watchdogSaveTimer.current) clearTimeout(watchdogSaveTimer.current);
+      watchdogSaveTimer.current = setTimeout(() => {
+        void api
+          .setMeetingWatchdogConfig({
+            silenceAutoStopMinutes: minutes,
+            calendarEndReminder: reminder,
+          })
+          .catch((err) => onError(String(err)));
+      }, 400);
+    },
+    [onError],
+  );
   // null = still loading, "error" = lookup failed (never stuck on loading).
   const [buildInfo, setBuildInfo] = useState<BuildInfo | "error" | null>(null);
   useEffect(() => {
@@ -2727,16 +2745,7 @@ function SettingsPanel({
             onChange={(e) => {
               const next = Math.max(0, Math.floor(Number(e.target.value) || 0));
               setSilenceAutoStopMinutes(next);
-              void (async () => {
-                try {
-                  await api.setMeetingWatchdogConfig({
-                    silenceAutoStopMinutes: next,
-                    calendarEndReminder,
-                  });
-                } catch (err) {
-                  onError(String(err));
-                }
-              })();
+              saveWatchdog(next, calendarEndReminder);
             }}
           />
         </div>
@@ -2749,16 +2758,7 @@ function SettingsPanel({
               onChange={(e) => {
                 const next = e.target.checked;
                 setCalendarEndReminder(next);
-                void (async () => {
-                  try {
-                    await api.setMeetingWatchdogConfig({
-                      silenceAutoStopMinutes,
-                      calendarEndReminder: next,
-                    });
-                  } catch (err) {
-                    onError(String(err));
-                  }
-                })();
+                saveWatchdog(silenceAutoStopMinutes, next);
               }}
             />{" "}
             日历结束时提醒停止录音

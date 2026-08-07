@@ -557,7 +557,12 @@ pub fn start_meeting_recording(
         .lock()
         .map(|cfg| cfg.meeting.silence_auto_stop_minutes)
         .unwrap_or(0);
-    if silence_minutes > 0 {
+    // The silence watchdog reads `MeetingRecorder::silence_seconds`, which only
+    // the plain cpal recorder feeds. When the AEC mic backend engaged
+    // (`aec_rate.is_some()`) it returns `None`, so the watchdog could never fire
+    // — don't start a thread that can only spin. (AEC-path silence detection is a
+    // follow-up.)
+    if silence_minutes > 0 && aec_rate.is_none() {
         let watchdog = spawn_meeting_watchdog(app.clone(), meeting_id.to_string(), silence_minutes);
         if let Ok(mut guard) = state.meeting_watchdog.lock() {
             *guard = Some(watchdog);
@@ -565,6 +570,8 @@ pub fn start_meeting_recording(
             watchdog.0.store(true, Ordering::SeqCst);
             tracing::warn!("meeting watchdog lock poisoned; skipping silence auto-stop monitoring");
         }
+    } else if silence_minutes > 0 {
+        tracing::info!("silence auto-stop unavailable on the AEC mic path this recording");
     }
 
     tracing::info!(meeting_id = %meeting_id, "meeting recording started");
@@ -662,8 +669,6 @@ fn spawn_calendar_end_reminder(
     end_epoch_seconds: f64,
 ) {
     std::thread::spawn(move || {
-        let wait = (end_epoch_seconds - now_epoch_seconds()).max(0.0);
-        std::thread::sleep(Duration::from_secs_f64(wait));
         let store = match Store::open(default_db_path()) {
             Ok(store) => store,
             Err(e) => {
@@ -671,6 +676,25 @@ fn spawn_calendar_end_reminder(
                 return;
             }
         };
+        let still_recording = |store: &Store| {
+            matches!(
+                store.get_meeting(meeting_id),
+                Ok(Some(m)) if m.status == MeetingStatus::Recording
+            )
+        };
+        // Sleep toward the event end in short slices, re-checking status each one,
+        // so a meeting stopped before its scheduled end frees this thread within a
+        // slice instead of parking it (possibly for hours).
+        loop {
+            let remaining = end_epoch_seconds - now_epoch_seconds();
+            if remaining <= 0.0 {
+                break;
+            }
+            if !still_recording(&store) {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs_f64(remaining.min(15.0)));
+        }
         match store.get_meeting(meeting_id) {
             Ok(Some(meeting)) if meeting.status == MeetingStatus::Recording => {
                 tracing::info!(meeting_id = %meeting_id, "calendar meeting end reached while recording; reminding to stop");
