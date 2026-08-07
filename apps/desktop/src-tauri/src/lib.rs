@@ -603,6 +603,7 @@ pub fn run() {
             meeting_cmd::annotate_live_segment,
             meeting_cmd::list_live_annotations,
             meeting_cmd::delete_live_annotation,
+            meeting_cmd::rename_live_annotations,
             meeting_cmd::rename_speaker,
             meeting_cmd::reassign_segment_speaker,
             meeting_cmd::merge_speakers,

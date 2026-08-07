@@ -163,6 +163,9 @@ pub enum AnnotationNotice {
     /// The user cleared an annotation: retract that name's session
     /// voiceprint samples (simple rule — the whole group by name).
     Cleared { display_name: String },
+    /// The user renamed a mistyped name meeting-wide: relabel its session
+    /// voiceprint group so the corrected name (not the old one) keeps matching.
+    Renamed { old_name: String, new_name: String },
 }
 
 /// Bound of the command → worker annotation-notice queue. Notices are
@@ -650,6 +653,33 @@ impl SessionVoiceprints {
         self.by_name.len() != before
     }
 
+    /// Relabel a session group after the user fixed a mistyped name: move
+    /// `old`'s samples onto `new` (merging into an existing `new` group), so the
+    /// accumulated voiceprint is kept and the renamed speaker keeps matching
+    /// under the corrected name instead of the old one resurfacing. Returns
+    /// whether an `old` group existed.
+    fn rename(&mut self, old: &str, new: &str) -> bool {
+        if old == new {
+            return false;
+        }
+        let Some(index) = self.by_name.iter().position(|(n, _)| n.as_str() == old) else {
+            return false;
+        };
+        let (_, samples) = self.by_name.remove(index);
+        match self.by_name.iter_mut().find(|(n, _)| n.as_str() == new) {
+            Some((_, dest)) => {
+                for sample in samples {
+                    dest.push_back(sample);
+                    while dest.len() > SESSION_MAX_SAMPLES_PER_NAME {
+                        dest.pop_front();
+                    }
+                }
+            }
+            None => self.by_name.push((new.to_string(), samples)),
+        }
+        true
+    }
+
     /// Match one finalized utterance against the session set: per name the
     /// **best** cosine over its ≤ [`SESSION_MAX_SAMPLES_PER_NAME`] samples,
     /// highest best wins. Decision tiers (constants above):
@@ -727,6 +757,8 @@ enum VerifierMsg {
     },
     /// An annotation was cleared: drop that name's session samples.
     Retract { display_name: String },
+    /// A mistyped name was renamed meeting-wide: relabel its session samples.
+    Rename { old_name: String, new_name: String },
 }
 
 /// Handle to the long-lived embedder thread; dropping `tx` ends its loop and
@@ -896,6 +928,15 @@ fn run_verifier(
                     tracing::info!(
                         names = session.by_name.len(),
                         "session voiceprint retracted (annotation cleared)"
+                    );
+                }
+                continue;
+            }
+            VerifierMsg::Rename { old_name, new_name } => {
+                if session.rename(&old_name, &new_name) {
+                    tracing::info!(
+                        names = session.by_name.len(),
+                        "session voiceprint relabeled (annotation renamed)"
                     );
                 }
                 continue;
@@ -1168,6 +1209,9 @@ fn handle_annotation_notice(
         }
         AnnotationNotice::Cleared { display_name } => {
             verifier.enqueue_session(VerifierMsg::Retract { display_name });
+        }
+        AnnotationNotice::Renamed { old_name, new_name } => {
+            verifier.enqueue_session(VerifierMsg::Rename { old_name, new_name });
         }
     }
 }
@@ -1713,6 +1757,40 @@ mod tests {
                 .match_speaker(&probe(), VOICED_LONG)
                 .unwrap()
                 .provisional
+        );
+    }
+
+    #[test]
+    fn session_rename_relabels_and_merges_voiceprints() {
+        // Relabel: the accumulated voiceprint matches under the corrected name,
+        // and the old name is gone (not resurfacing in future live chips).
+        let mut session = SessionVoiceprints::default();
+        session.seed("客户A", toward(0.90));
+        assert!(session.rename("客户A", "客户甲"));
+        assert_eq!(
+            session
+                .match_speaker(&probe(), VOICED_LONG)
+                .unwrap()
+                .display_name,
+            "客户甲"
+        );
+        assert!(!session.retract("客户A"), "old name should be gone");
+        assert!(
+            !session.rename("不存在", "客户乙"),
+            "unknown source is a no-op"
+        );
+
+        // Merge into an existing group: the target keeps matching.
+        let mut merge = SessionVoiceprints::default();
+        merge.seed("客户A", toward(0.90));
+        merge.seed("客户B", toward(0.20));
+        assert!(merge.rename("客户A", "客户B"));
+        assert_eq!(
+            merge
+                .match_speaker(&probe(), VOICED_LONG)
+                .unwrap()
+                .display_name,
+            "客户B"
         );
     }
 

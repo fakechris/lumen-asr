@@ -577,6 +577,12 @@ export const api = {
   deleteLiveAnnotation: (annotationId: string) =>
     invoke<boolean>("delete_live_annotation", { annotationId }),
 
+  /** Rename a mistyped speaker name across a whole meeting (the chip's 重命名
+   * action): every line marked `oldName` becomes `newName`. Resolves the number
+   * of annotations updated. */
+  renameLiveAnnotations: (meetingId: string, oldName: string, newName: string) =>
+    invoke<number>("rename_live_annotations", { meetingId, oldName, newName }),
+
   // ---- Speaker voiceprint enrollment (M5) -------------------------------
   // The identity library is local-only (JSON under the Lumen identity dir);
   // embeddings never leave the machine and never cross IPC.

@@ -940,6 +940,9 @@ function LiveTranscript({
   // brand-new name (Enter → first match, or create). Only one menu is open at
   // a time, so one query string suffices; it resets on open/close.
   const [menuQuery, setMenuQuery] = useState("");
+  // When set, the open menu is in "rename this speaker" mode: the input edits
+  // the existing name and submitting renames every line marked with it.
+  const [renameFrom, setRenameFrom] = useState<string | null>(null);
 
   useEffect(() => {
     let disposed = false;
@@ -973,6 +976,7 @@ function LiveTranscript({
     setMenuFor(null);
     setMenuPos(null);
     setMenuQuery("");
+    setRenameFrom(null);
   }, []);
 
   /** Open the annotate menu for a line, positioned from the chip's viewport
@@ -1080,6 +1084,32 @@ function LiveTranscript({
       }
     },
     [annotations, meetingId, onError, closeMenus],
+  );
+
+  /** Rename a mistyped name across the whole meeting: every line marked
+   * `oldName` becomes the new name. Fixes a typo without re-annotating each
+   * line one by one. */
+  const renameAnnotationName = useCallback(
+    async (oldName: string, rawNew: string) => {
+      const next = rawNew.trim();
+      if (!next || next === oldName) {
+        closeMenus();
+        return;
+      }
+      try {
+        await api.renameLiveAnnotations(meetingId, oldName, next);
+        // Relabel chips immediately from local state — no event round trip.
+        setAnnotations((prev) =>
+          prev.map((a) =>
+            a.display_name === oldName ? { ...a, display_name: next } : a,
+          ),
+        );
+        closeMenus();
+      } catch (e) {
+        onError(String(e));
+      }
+    },
+    [meetingId, onError, closeMenus],
   );
 
   useEffect(() => {
@@ -1306,6 +1336,64 @@ function LiveTranscript({
                       {menuFor === seg.segmentId &&
                         menuPos &&
                         (() => {
+                          const menuStyle = {
+                            left: menuPos.left,
+                            top: menuPos.top,
+                            bottom: menuPos.bottom,
+                          };
+                          // Rename mode: edit the existing name; submitting
+                          // renames every line marked with it across the whole
+                          // meeting (fixes a typo without re-marking each line).
+                          if (renameFrom !== null) {
+                            return (
+                              <span
+                                className="meeting-live-annotate-menu"
+                                role="menu"
+                                style={menuStyle}
+                              >
+                                <input
+                                  className="meeting-live-annotate-input"
+                                  autoFocus
+                                  value={menuQuery}
+                                  placeholder="输入新名字…"
+                                  onChange={(e) => setMenuQuery(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") {
+                                      e.preventDefault();
+                                      void renameAnnotationName(
+                                        renameFrom,
+                                        menuQuery,
+                                      );
+                                    } else if (e.key === "Escape") {
+                                      // Return to the candidate menu, not close
+                                      // the whole menu (the document Esc handler
+                                      // would otherwise call closeMenus).
+                                      e.stopPropagation();
+                                      setRenameFrom(null);
+                                    }
+                                  }}
+                                />
+                                <button
+                                  type="button"
+                                  className="meeting-live-annotate-new"
+                                  onClick={() =>
+                                    void renameAnnotationName(
+                                      renameFrom,
+                                      menuQuery,
+                                    )
+                                  }
+                                >
+                                  保存改名
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setRenameFrom(null)}
+                                >
+                                  取消
+                                </button>
+                              </span>
+                            );
+                          }
                           // Prefix-filter the merged candidates by the search
                           // box (case-insensitive). Self also matches when the
                           // query is a prefix of "我". Enter applies the first
@@ -1328,11 +1416,7 @@ function LiveTranscript({
                             <span
                               className="meeting-live-annotate-menu"
                               role="menu"
-                              style={{
-                                left: menuPos.left,
-                                top: menuPos.top,
-                                bottom: menuPos.bottom,
-                              }}
+                              style={menuStyle}
                             >
                               <input
                                 className="meeting-live-annotate-input"
@@ -1383,6 +1467,17 @@ function LiveTranscript({
                                 <span className="muted-text meeting-live-annotate-empty">
                                   输入名字以新建
                                 </span>
+                              )}
+                              {namedBoundary && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setRenameFrom(namedBoundary.display_name);
+                                    setMenuQuery(namedBoundary.display_name);
+                                  }}
+                                >
+                                  重命名「{namedBoundary.display_name}」
+                                </button>
                               )}
                               <button
                                 type="button"
@@ -2061,7 +2156,10 @@ function MeetingDetailView({
           ) : (
             <h2 className="meeting-detail-title">
               {meeting ? meetingTitle(meeting) : "加载中…"}
-              {meeting && meeting.status !== "recording" && (
+              {/* Rename is allowed during recording too — the calendar link
+                  only fills an *untitled* meeting, so it never overwrites a
+                  title the user sets live. */}
+              {meeting && (
                 <button
                   type="button"
                   className="icon-btn meeting-detail-title-edit-btn"
