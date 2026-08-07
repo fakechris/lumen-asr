@@ -158,6 +158,17 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [powerWarning, setPowerWarning] = useState<string | null>(null);
+  // Info banner shown after the watchdog auto-stopped a silent recording.
+  const [autoStopNotice, setAutoStopNotice] = useState<string | null>(null);
+  // Calendar-linked meeting whose end time passed while still recording. A
+  // reminder with a Stop button — never an auto-stop.
+  const [calendarEnded, setCalendarEnded] = useState<{
+    meetingId: string;
+    title: string;
+  } | null>(null);
+  // Meetings we already asked to stop (auto-stop or calendar reminder), so a
+  // second event / click never fires a duplicate stop command.
+  const stoppedMeetingsRef = useRef<Set<string>>(new Set());
   const [recoveryNotices, setRecoveryNotices] = useState<
     { meetingId: string; text: string; ok: boolean }[]
   >([]);
@@ -369,6 +380,51 @@ export default function App() {
       cancelled = true;
       un?.();
       if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  // Silence auto-stop: the backend watchdog emits `meeting-auto-stop` when a
+  // recording has been silent past the configured threshold (a meeting nobody
+  // stopped). The FRONT-END owns the real stop path, so we call it here (guarded
+  // against a duplicate stop) and show a dismissible info banner.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let cancelled = false;
+    listen<{ meetingId: string; reason: string }>("meeting-auto-stop", (e) => {
+      const { meetingId } = e.payload;
+      if (stoppedMeetingsRef.current.has(meetingId)) return;
+      stoppedMeetingsRef.current.add(meetingId);
+      void api.stopMeetingRecording(meetingId).catch(() => {});
+      setAutoStopNotice("录音已因长时间无声自动停止。");
+    }).then((fn) => {
+      if (cancelled) fn();
+      else un = fn;
+    });
+    return () => {
+      cancelled = true;
+      un?.();
+    };
+  }, []);
+
+  // Calendar-end reminder: the backend emits `meeting-calendar-ended` when a
+  // calendar-linked meeting's end time passes while it is still recording. This
+  // is a REMINDER — show a banner with a Stop button; never auto-stop.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let cancelled = false;
+    listen<{ meetingId: string; title: string }>(
+      "meeting-calendar-ended",
+      (e) => {
+        if (stoppedMeetingsRef.current.has(e.payload.meetingId)) return;
+        setCalendarEnded(e.payload);
+      },
+    ).then((fn) => {
+      if (cancelled) fn();
+      else un = fn;
+    });
+    return () => {
+      cancelled = true;
+      un?.();
     };
   }, []);
 
@@ -675,6 +731,44 @@ export default function App() {
                 type="button"
                 className="linkish"
                 onClick={() => setPowerWarning(null)}
+              >
+                关闭
+              </button>
+            </div>
+          )}
+          {autoStopNotice && (
+            <div className="banner success" role="status">
+              {autoStopNotice}
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => setAutoStopNotice(null)}
+              >
+                关闭
+              </button>
+            </div>
+          )}
+          {calendarEnded && (
+            <div className="banner" role="status">
+              {`「${calendarEnded.title?.trim() || "本次会议"}」的日历时间已到，是否停止录音？`}
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => {
+                  const { meetingId } = calendarEnded;
+                  if (!stoppedMeetingsRef.current.has(meetingId)) {
+                    stoppedMeetingsRef.current.add(meetingId);
+                    void api.stopMeetingRecording(meetingId).catch(() => {});
+                  }
+                  setCalendarEnded(null);
+                }}
+              >
+                停止录音
+              </button>
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => setCalendarEnded(null)}
               >
                 关闭
               </button>
@@ -1834,6 +1928,9 @@ function SettingsPanel({
   const [postPasteSecs, setPostPasteSecs] = useState(20);
   const [detectionEnabled, setDetectionEnabled] = useState(false);
   const [detectionCapable, setDetectionCapable] = useState(false);
+  // Meeting watchdog settings (silence auto-stop minutes, calendar-end reminder).
+  const [silenceAutoStopMinutes, setSilenceAutoStopMinutes] = useState(15);
+  const [calendarEndReminder, setCalendarEndReminder] = useState(true);
   // null = still loading, "error" = lookup failed (never stuck on loading).
   const [buildInfo, setBuildInfo] = useState<BuildInfo | "error" | null>(null);
   useEffect(() => {
@@ -1903,6 +2000,13 @@ function SettingsPanel({
           setDetectionCapable(det.capabilityAvailable);
         } catch {
           /* detection status is best-effort */
+        }
+        try {
+          const wd = await api.getMeetingWatchdogConfig();
+          setSilenceAutoStopMinutes(wd.silenceAutoStopMinutes);
+          setCalendarEndReminder(wd.calendarEndReminder);
+        } catch {
+          /* watchdog settings are best-effort */
         }
       } catch (e) {
         onError(String(e));
@@ -2602,6 +2706,64 @@ function SettingsPanel({
             当前系统不支持会议检测所需的系统能力（需要较新的 macOS），此开关已停用。
           </p>
         )}
+
+        <hr className="settings-divider" />
+        <p className="muted-text">
+          看护正在进行的录音：长时间无人说话时自动停止，或在关联日历会议结束时提醒你停止。
+        </p>
+        <div className="form-row">
+          <label className="form-label" htmlFor="silence-auto-stop">
+            无声自动停止（分钟），0 关闭
+          </label>
+          <input
+            id="silence-auto-stop"
+            className="input"
+            type="number"
+            min={0}
+            step={1}
+            value={silenceAutoStopMinutes}
+            disabled={busy}
+            style={{ maxWidth: 120 }}
+            onChange={(e) => {
+              const next = Math.max(0, Math.floor(Number(e.target.value) || 0));
+              setSilenceAutoStopMinutes(next);
+              void (async () => {
+                try {
+                  await api.setMeetingWatchdogConfig({
+                    silenceAutoStopMinutes: next,
+                    calendarEndReminder,
+                  });
+                } catch (err) {
+                  onError(String(err));
+                }
+              })();
+            }}
+          />
+        </div>
+        <div className="form-row">
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={calendarEndReminder}
+              disabled={busy}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setCalendarEndReminder(next);
+                void (async () => {
+                  try {
+                    await api.setMeetingWatchdogConfig({
+                      silenceAutoStopMinutes,
+                      calendarEndReminder: next,
+                    });
+                  } catch (err) {
+                    onError(String(err));
+                  }
+                })();
+              }}
+            />{" "}
+            日历结束时提醒停止录音
+          </label>
+        </div>
       </section>
 
       <section className="card settings-section">

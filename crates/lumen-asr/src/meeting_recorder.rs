@@ -331,6 +331,90 @@ pub fn repair_wav_header(path: impl AsRef<Path>) -> io::Result<RepairedWav> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// VoicedTracker — how long the microphone has been effectively silent.
+//
+// The WAV writer thread already sees every mic chunk, so it doubles as the
+// silence probe for the unattended-recording watchdog: per chunk it advances a
+// running sample counter and, when the chunk's RMS clears a small threshold,
+// stamps the counter as the last "voiced" position. `silence_seconds` is then
+// `(total - last_voiced) / sample_rate`. Pure arithmetic behind atomics, so it
+// is `Send + Sync`, cheap on the writer thread, and unit-testable without cpal.
+//
+// Only the mic track is measured (the writer is shared with the system track,
+// which passes `None`): remote-participant audio is not evidence the person in
+// the room is still talking.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// RMS below which a mic chunk counts as silence. Room tone / fan noise sit well
+/// under this; ordinary speech is far above it. Not correctness-critical — it
+/// only decides when the silence timer advances.
+const SILENCE_RMS_THRESHOLD: f32 = 0.01;
+
+/// Shared, lock-free tracker of mic silence for the watchdog (see the section
+/// comment above). Cloned behind an `Arc`: the writer thread `observe`s chunks
+/// while the recorder reads `silence_seconds`.
+pub struct VoicedTracker {
+    total_samples: AtomicU64,
+    last_voiced_sample: AtomicU64,
+    sample_rate: AtomicU32,
+}
+
+impl Default for VoicedTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VoicedTracker {
+    /// A fresh tracker with no samples seen and an unknown (`0`) sample rate.
+    pub fn new() -> Self {
+        Self {
+            total_samples: AtomicU64::new(0),
+            last_voiced_sample: AtomicU64::new(0),
+            sample_rate: AtomicU32::new(0),
+        }
+    }
+
+    /// Arm the tracker for a new recording: zero the counters and record the
+    /// capture sample rate so `silence_seconds` can convert samples to seconds.
+    fn arm(&self, sample_rate: u32) {
+        self.total_samples.store(0, Ordering::SeqCst);
+        self.last_voiced_sample.store(0, Ordering::SeqCst);
+        self.sample_rate.store(sample_rate, Ordering::SeqCst);
+    }
+
+    /// Fold one mono chunk into the tracker: advance the sample counter and, if
+    /// the chunk is loud enough (RMS over [`SILENCE_RMS_THRESHOLD`]), reset the
+    /// silence timer by marking this position as the last voiced sample.
+    fn observe(&self, chunk: &[f32]) {
+        if chunk.is_empty() {
+            return;
+        }
+        let total = self
+            .total_samples
+            .fetch_add(chunk.len() as u64, Ordering::SeqCst)
+            + chunk.len() as u64;
+        let sum_sq: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        let rms = (sum_sq / chunk.len() as f64).sqrt() as f32;
+        if rms > SILENCE_RMS_THRESHOLD {
+            self.last_voiced_sample.store(total, Ordering::SeqCst);
+        }
+    }
+
+    /// Seconds of continuous silence at the mic since the last voiced chunk, or
+    /// `None` when the rate is unknown (never armed / not recording).
+    fn silence_seconds(&self) -> Option<f64> {
+        let sample_rate = self.sample_rate.load(Ordering::SeqCst);
+        if sample_rate == 0 {
+            return None;
+        }
+        let total = self.total_samples.load(Ordering::SeqCst);
+        let last = self.last_voiced_sample.load(Ordering::SeqCst);
+        Some((total.saturating_sub(last)) as f64 / sample_rate as f64)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Writer thread — owns a WavSink, drains sample chunks off the audio callback.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -348,7 +432,13 @@ enum WriterMsg {
     Finalize(Sender<io::Result<(u64, Vec<MeetingGap>)>>),
 }
 
-fn spawn_writer(mut sink: WavSink) -> (Sender<WriterMsg>, JoinHandle<()>) {
+/// Spawn the WAV writer thread. `voiced` is the mic silence tracker: it is
+/// `Some` only for the microphone track (the system track passes `None`, so
+/// remote-participant audio never counts as "someone is still in the room").
+fn spawn_writer(
+    mut sink: WavSink,
+    voiced: Option<Arc<VoicedTracker>>,
+) -> (Sender<WriterMsg>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<WriterMsg>();
     let handle = thread::Builder::new()
         .name("lumen-meeting-wav".into())
@@ -358,6 +448,11 @@ fn spawn_writer(mut sink: WavSink) -> (Sender<WriterMsg>, JoinHandle<()>) {
             while let Ok(msg) = rx.recv() {
                 match msg {
                     WriterMsg::Chunk { samples, arrived_at } => {
+                        // Feed the silence watchdog (mic track only) before any
+                        // gap padding, so it measures the real captured audio.
+                        if let Some(voiced) = &voiced {
+                            voiced.observe(&samples);
+                        }
                         // Before writing this chunk, pad any capture stall that
                         // preceded it so media time stays aligned to real time.
                         // Clamp the pad to the WAV's remaining capacity so a very
@@ -464,7 +559,8 @@ impl SystemTrackRecorder {
     pub fn create(out_path: impl Into<PathBuf>, sample_rate: u32) -> io::Result<Self> {
         let out_path = out_path.into();
         let sink = WavSink::create(&out_path, sample_rate)?;
-        let (writer_tx, writer_handle) = spawn_writer(sink);
+        // No silence tracker: only the mic track drives the watchdog.
+        let (writer_tx, writer_handle) = spawn_writer(sink, None);
         Ok(Self {
             writer_tx,
             writer_handle,
@@ -655,6 +751,9 @@ pub struct MeetingRecorder {
     /// Join handle for the control thread. Kept so [`Drop`] can wait for the
     /// thread's teardown (WAV finalize + writer join) to finish on shutdown.
     control_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Mic silence tracker shared with the writer thread, read by
+    /// [`silence_seconds`](Self::silence_seconds) for the watchdog.
+    voiced: Arc<VoicedTracker>,
 }
 
 impl Default for MeetingRecorder {
@@ -681,6 +780,8 @@ impl MeetingRecorder {
         let paused_flag = Arc::clone(&paused);
         let epoch = Arc::new(AtomicU64::new(0));
         let sample_rate_atom = Arc::new(AtomicU32::new(0));
+        let voiced = Arc::new(VoicedTracker::new());
+        let voiced_thread = Arc::clone(&voiced);
 
         let control_handle = thread::Builder::new()
             .name("lumen-meeting-rec".into())
@@ -703,6 +804,7 @@ impl MeetingRecorder {
                                 &paused_flag,
                                 &epoch,
                                 &sample_rate_atom,
+                                &voiced_thread,
                                 &mut session,
                             );
                             let _ = reply.send(res);
@@ -745,6 +847,7 @@ impl MeetingRecorder {
             paused,
             cmd_tx: Mutex::new(Some(tx)),
             control_handle: Mutex::new(Some(control_handle)),
+            voiced,
         }
     }
 
@@ -754,6 +857,18 @@ impl MeetingRecorder {
 
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Seconds of continuous microphone silence, for the unattended-recording
+    /// watchdog. `None` when not recording (or the sample rate is unknown),
+    /// which the watchdog treats as "can't tell — do not auto-stop". Note the
+    /// system-AEC mic path (`meeting_mic_aec`) does not feed this recorder, so
+    /// there it is always `None`.
+    pub fn silence_seconds(&self) -> Option<f64> {
+        if !self.recording.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.voiced.silence_seconds()
     }
 
     /// Begin a continuous recording into `out_path`. Returns the native sample
@@ -880,6 +995,7 @@ fn start_on_thread(
     paused: &Arc<AtomicBool>,
     epoch: &Arc<AtomicU64>,
     sample_rate_atom: &AtomicU32,
+    voiced: &Arc<VoicedTracker>,
     session: &mut Option<Session>,
 ) -> Result<u32, MeetingRecorderError> {
     if recording.swap(true, Ordering::SeqCst) {
@@ -909,6 +1025,8 @@ fn start_on_thread(
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
     sample_rate_atom.store(sample_rate, Ordering::SeqCst);
+    // Arm the mic silence watchdog for this session at the capture rate.
+    voiced.arm(sample_rate);
 
     let sink = match WavSink::create(&out_path, sample_rate) {
         Ok(s) => s,
@@ -917,7 +1035,7 @@ fn start_on_thread(
             return Err(MeetingRecorderError::Io(e.to_string()));
         }
     };
-    let (writer_tx, writer_handle) = spawn_writer(sink);
+    let (writer_tx, writer_handle) = spawn_writer(sink, Some(Arc::clone(voiced)));
 
     let session_epoch = epoch.fetch_add(1, Ordering::SeqCst) + 1;
     let stream_config: StreamConfig = config.clone().into();
@@ -1234,6 +1352,35 @@ mod tests {
         let mut d = GapDetector::new(16_000);
         assert_eq!(d.observe(1_600, at(10.0)), None);
         assert_eq!(d.observe(1_600, at(5.0)), None); // clock stepped back
+    }
+
+    #[test]
+    fn voiced_tracker_resets_on_loud_chunk_then_silence_grows() {
+        let tracker = VoicedTracker::new();
+        // Unarmed → cannot tell.
+        assert_eq!(tracker.silence_seconds(), None);
+
+        tracker.arm(16_000);
+        // Freshly armed, nothing seen yet: zero silence.
+        assert_eq!(tracker.silence_seconds(), Some(0.0));
+
+        // A loud chunk (RMS well over threshold) keeps silence at ~0.
+        tracker.observe(&[0.5f32; 1_600]); // 0.1 s of audio
+        assert_eq!(tracker.silence_seconds(), Some(0.0));
+
+        // Subsequent silent chunks grow the silence timer: 3 × 0.1 s = 0.3 s.
+        tracker.observe(&[0.0f32; 1_600]);
+        tracker.observe(&[0.0f32; 1_600]);
+        tracker.observe(&[0.0f32; 1_600]);
+        let silence = tracker.silence_seconds().expect("armed");
+        assert!(
+            (silence - 0.3).abs() < 1e-6,
+            "expected ~0.3 s silence, got {silence}"
+        );
+
+        // A loud chunk again snaps silence back to ~0.
+        tracker.observe(&[0.4f32; 1_600]);
+        assert_eq!(tracker.silence_seconds(), Some(0.0));
     }
 
     #[test]

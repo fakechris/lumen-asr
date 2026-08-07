@@ -135,6 +135,16 @@ export type MeetingDetectionStats = {
   stopDeclined: number;
 };
 
+/** Meeting watchdog settings: auto-stop after prolonged mic silence, and a
+ * prompt to stop when a calendar-linked meeting's end time passes. */
+export type MeetingWatchdogConfig = {
+  /** Minutes of continuous mic silence before an unattended recording
+   * auto-stops. `0` disables the auto-stop. */
+  silenceAutoStopMinutes: number;
+  /** Prompt to stop when a calendar-linked meeting's end time passes. */
+  calendarEndReminder: boolean;
+};
+
 export const api = {
   health: () => invoke<Health>("app_health"),
   buildInfo: () => invoke<BuildInfo>("build_info"),
@@ -499,6 +509,19 @@ export const api = {
   /** Read the local detection counters (all counting stays on this machine). */
   getMeetingDetectionStats: () =>
     invoke<MeetingDetectionStats>("get_meeting_detection_stats"),
+
+  /** Read the meeting watchdog settings (silence auto-stop minutes +
+   * calendar-end reminder) for the settings UI. */
+  getMeetingWatchdogConfig: () =>
+    invoke<MeetingWatchdogConfig>("get_meeting_watchdog_config"),
+
+  /** Persist the meeting watchdog settings; takes effect for the next
+   * recording. Resolves the stored values. */
+  setMeetingWatchdogConfig: (input: {
+    silenceAutoStopMinutes: number;
+    calendarEndReminder: boolean;
+  }) =>
+    invoke<MeetingWatchdogConfig>("set_meeting_watchdog_config", input),
 
   /** Read one meeting with its speakers, seq-ordered segments, and summaries. */
   getMeetingDetail: (meetingId: string) =>
