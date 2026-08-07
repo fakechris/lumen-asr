@@ -13,6 +13,7 @@ mod corrector_svc;
 mod detection_stats;
 mod dictation;
 mod edit_attribution;
+mod headless;
 mod hotkey;
 mod hotkey_validate;
 mod inject_cmd;
@@ -31,6 +32,8 @@ mod pipeline_attempt;
 mod provider_presets;
 mod session_debug;
 mod volume_mon;
+
+pub use headless::maybe_run_cli;
 
 #[cfg(test)]
 pub(crate) static MACOS_LIVE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
