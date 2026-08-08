@@ -2474,6 +2474,17 @@ pub struct SelfEnrollDto {
     pub skipped: usize,
 }
 
+/// Live progress of a self-enrollment run, emitted as `self-enroll-progress`
+/// so the UI can show activity instead of an opaque wait.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelfEnrollProgress {
+    scanned: usize,
+    enrolled: usize,
+    target: usize,
+}
+
 /// Register the user's own voice ("我") from the dictation recordings they
 /// already made: scan the most recent recordings, embed each one's voiced
 /// speech into a voiceprint sample, enroll them under `name` (default "我"),
@@ -2484,6 +2495,7 @@ pub struct SelfEnrollDto {
 /// recording had enough clear speech, or the voiceprint model is unavailable.
 #[tauri::command]
 pub fn enroll_self_from_recordings(
+    app: AppHandle,
     state: State<'_, AppState>,
     name: Option<String>,
 ) -> Result<SelfEnrollDto, String> {
@@ -2541,6 +2553,16 @@ pub fn enroll_self_from_recordings(
                 continue; // already a sample — don't re-add
             }
             dto.scanned += 1;
+            // Emit activity before the heavy embed so the UI shows progress
+            // rather than an opaque wait.
+            let _ = app.emit(
+                "self-enroll-progress",
+                SelfEnrollProgress {
+                    scanned: dto.scanned,
+                    enrolled: dto.enrolled,
+                    target: SELF_ENROLL_TARGET_SAMPLES,
+                },
+            );
             // A missing/corrupt recording is an expected per-file condition —
             // skip it. Only genuinely-rejected audio counts as skipped below;
             // model / store failures propagate rather than masquerading as "no
@@ -2623,7 +2645,7 @@ pub fn enroll_self_from_recordings(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (state, name);
+        let _ = (app, state, name);
         Err("当前构建不支持声纹注册".to_string())
     }
 }

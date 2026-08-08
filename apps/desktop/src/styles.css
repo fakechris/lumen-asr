@@ -4098,3 +4098,28 @@ button.meeting-seg-text.seekable:hover {
   gap: 6px;
   flex-shrink: 0;
 }
+
+/* ---- Voiceprint manager: busy spinner + sample states --------------- */
+.identity-inline-busy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  display: inline-block;
+  animation: identity-spin 0.7s linear infinite;
+}
+@keyframes identity-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.identity-sample-noaudio {
+  font-size: 12px;
+  white-space: nowrap;
+}

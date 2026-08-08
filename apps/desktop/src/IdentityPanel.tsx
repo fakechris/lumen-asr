@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 
 import { api } from "./api";
 import type { EnrolledSpeaker, EnrollConflict, Meeting } from "./types";
+
+type SelfProgress = { scanned: number; enrolled: number; target: number };
 
 /** Global voiceprint manager: the whole enrolled-identity library on one page.
  *
@@ -27,6 +30,15 @@ export function IdentityPanel({
   const [selfName, setSelfName] = useState("我");
   const [selfBusy, setSelfBusy] = useState(false);
   const [selfMsg, setSelfMsg] = useState<string | null>(null);
+  const [selfProgress, setSelfProgress] = useState<SelfProgress | null>(null);
+  // Which mutating action is in flight ("merge:<id>", "sample:<id>:<i>", …),
+  // so its button can show a busy state and double-clicks are ignored.
+  const [busy, setBusy] = useState<string | null>(null);
+  // Single audio player: only one sample plays at a time.
+  const [playing, setPlaying] = useState<string | null>(null);
+  const [loadingAudio, setLoadingAudio] = useState<string | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const refresh = useCallback(async () => {
@@ -77,58 +89,135 @@ export function IdentityPanel({
     setDraftName(identity.name);
   }, [onError]);
 
+  /** Stop and fully tear down the current player (idempotent). */
+  const stopAudio = useCallback(() => {
+    const audio = audioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.src = "";
+      audioRef.current = null;
+    }
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = null;
+    }
+    setPlaying(null);
+  }, []);
+
+  /** Play one sample. Only one plays at a time: clicking the playing sample
+   * stops it; clicking another stops the first and plays the new one. */
+  const playSample = useCallback(
+    async (identityId: string, index: number) => {
+      const key = `${identityId}:${index}`;
+      if (playing === key) {
+        stopAudio();
+        return;
+      }
+      stopAudio(); // stop whatever else is playing first
+      onError(null);
+      setLoadingAudio(key);
+      try {
+        const buf = await api.readVoiceprintSampleAudio(identityId, index);
+        const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+        const audio = new Audio(url);
+        audioRef.current = audio;
+        audioUrlRef.current = url;
+        const clear = () => {
+          if (audioUrlRef.current === url) {
+            URL.revokeObjectURL(url);
+            audioUrlRef.current = null;
+            audioRef.current = null;
+            setPlaying((p) => (p === key ? null : p));
+          }
+        };
+        audio.onended = clear;
+        audio.onerror = clear;
+        await audio.play();
+        setPlaying(key);
+      } catch (e) {
+        stopAudio();
+        onError(String(e));
+      } finally {
+        setLoadingAudio((k) => (k === key ? null : k));
+      }
+    },
+    [playing, stopAudio, onError],
+  );
+
+  // Stop playback when leaving the page / listen for self-enroll progress.
+  useEffect(() => stopAudio, [stopAudio]);
+  useEffect(() => {
+    const unlisten = listen<SelfProgress>("self-enroll-progress", (e) =>
+      setSelfProgress(e.payload),
+    );
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
   const commitRename = useCallback(async () => {
     const id = editingId;
     if (!id) return;
     const name = draftName.trim();
     setEditingId(null);
     const current = enrolled.find((i) => i.id === id);
-    if (!name || !current || name === current.name) return;
+    if (!name || !current || name === current.name || busy) return;
+    setBusy(`rename:${id}`);
     try {
       await api.renameEnrolledSpeaker(id, name);
       await refresh();
     } catch (e) {
       onError(String(e));
+    } finally {
+      setBusy(null);
     }
-  }, [editingId, draftName, enrolled, refresh, onError]);
+  }, [editingId, draftName, enrolled, busy, refresh, onError]);
 
   const toggleSelf = useCallback(
     async (identityId: string) => {
+      if (busy) return;
       onError(null);
+      setBusy(`self:${identityId}`);
       try {
         const next = selfIdentityId === identityId ? null : identityId;
         setSelfIdentityId(await api.setSelfIdentity(next));
       } catch (e) {
         onError(String(e));
+      } finally {
+        setBusy(null);
       }
     },
-    [selfIdentityId, onError],
+    [selfIdentityId, busy, onError],
   );
 
   const remove = useCallback(
     async (identity: EnrolledSpeaker) => {
       if (
+        busy ||
         !window.confirm(
           `删除声纹「${identity.name}」？已识别的会议不受影响，之后的会议将不再自动识别此人。`,
         )
       )
         return;
       onError(null);
+      setBusy(`remove:${identity.id}`);
       try {
         await api.removeEnrolledSpeaker(identity.id);
         await refresh();
       } catch (e) {
         onError(String(e));
+      } finally {
+        setBusy(null);
       }
     },
-    [refresh, onError],
+    [busy, refresh, onError],
   );
 
   const merge = useCallback(
     async (from: EnrolledSpeaker) => {
       const intoId = mergeInto[from.id];
       const into = enrolled.find((i) => i.id === intoId);
-      if (!into) return;
+      if (!into || busy) return;
       if (
         !window.confirm(
           `把「${from.name}」的所有声纹样本合并到「${into.name}」，然后删除「${from.name}」？用于两个名字其实是同一个人。`,
@@ -136,6 +225,7 @@ export function IdentityPanel({
       )
         return;
       onError(null);
+      setBusy(`merge:${from.id}`);
       try {
         await api.mergeEnrolledSpeakers(from.id, into.id);
         setMergeInto((prev) => {
@@ -146,17 +236,25 @@ export function IdentityPanel({
         await refresh();
       } catch (e) {
         onError(String(e));
+      } finally {
+        setBusy(null);
       }
     },
-    [mergeInto, enrolled, refresh, onError],
+    [mergeInto, enrolled, busy, refresh, onError],
   );
 
   const enrollSelf = useCallback(async () => {
+    if (selfBusy) return;
+    // When a self identity already exists, always top it up under its own name
+    // (never fork a second identity from an edited field).
+    const targetName =
+      enrolled.find((i) => i.id === selfIdentityId)?.name ?? selfName;
     setSelfBusy(true);
     setSelfMsg(null);
+    setSelfProgress(null);
     onError(null);
     try {
-      const r = await api.enrollSelfFromRecordings(selfName);
+      const r = await api.enrollSelfFromRecordings(targetName);
       setSelfMsg(
         `已标记「${r.name}」为「我」：新增 ${r.enrolled} 个声纹样本（扫描 ${r.scanned} 段录音）。`,
       );
@@ -165,24 +263,30 @@ export function IdentityPanel({
       onError(String(e));
     } finally {
       setSelfBusy(false);
+      setSelfProgress(null);
     }
-  }, [selfName, refresh, onError]);
+  }, [selfName, selfBusy, enrolled, selfIdentityId, refresh, onError]);
 
   const resolveConflict = useCallback(
     async (conflict: EnrollConflict, enrollAs: string | null) => {
+      if (busy) return;
       onError(null);
+      setBusy(`conflict:${conflict.id}`);
       try {
         await api.resolveEnrollConflict(conflict.id, enrollAs);
         await refresh();
       } catch (e) {
         onError(String(e));
+      } finally {
+        setBusy(null);
       }
     },
-    [refresh, onError],
+    [busy, refresh, onError],
   );
 
   const removeSample = useCallback(
     async (identity: EnrolledSpeaker, index: number) => {
+      if (busy) return;
       const last = identity.samples.length === 1;
       if (
         last &&
@@ -191,32 +295,20 @@ export function IdentityPanel({
         )
       )
         return;
+      // Stop playback if the sample being removed is the one playing.
+      if (playing === `${identity.id}:${index}`) stopAudio();
       onError(null);
+      setBusy(`sample:${identity.id}:${index}`);
       try {
         await api.removeSpeakerSample(identity.id, index);
         await refresh();
       } catch (e) {
         onError(String(e));
+      } finally {
+        setBusy(null);
       }
     },
-    [refresh, onError],
-  );
-
-  const playSample = useCallback(
-    async (identityId: string, index: number) => {
-      onError(null);
-      try {
-        const buf = await api.readVoiceprintSampleAudio(identityId, index);
-        const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
-        const audio = new Audio(url);
-        audio.onended = () => URL.revokeObjectURL(url);
-        audio.onerror = () => URL.revokeObjectURL(url);
-        await audio.play();
-      } catch (e) {
-        onError(String(e));
-      }
-    },
-    [onError],
+    [busy, playing, stopAudio, refresh, onError],
   );
 
   const toggleExpanded = useCallback((id: string) => {
@@ -250,6 +342,8 @@ export function IdentityPanel({
     [dateLabel],
   );
 
+  const selfIdentity = enrolled.find((i) => i.id === selfIdentityId) ?? null;
+
   return (
     <div className="card identity-panel">
       <header className="identity-head">
@@ -271,8 +365,10 @@ export function IdentityPanel({
         <div className="identity-self-row">
           <input
             className="identity-name-input"
-            value={selfName}
+            value={selfIdentity ? selfIdentity.name : selfName}
             onChange={(e) => setSelfName(e.target.value)}
+            disabled={selfBusy || !!selfIdentity}
+            title={selfIdentity ? "已注册，补充样本会加到这条身份" : undefined}
             aria-label="我的名字"
           />
           <button
@@ -281,14 +377,26 @@ export function IdentityPanel({
             disabled={selfBusy}
             onClick={() => void enrollSelf()}
           >
-            {selfBusy
-              ? "注册中…"
-              : selfIdentityId
-                ? "补充样本（扫描新录音）"
-                : "从我的听写录音注册"}
+            {selfBusy ? (
+              <span className="identity-inline-busy">
+                <span className="spinner" aria-hidden="true" />
+                注册中…
+              </span>
+            ) : selfIdentityId ? (
+              "补充样本（扫描新录音）"
+            ) : (
+              "从我的听写录音注册"
+            )}
           </button>
         </div>
-        {selfMsg && (
+        {selfBusy && (
+          <p className="identity-self-msg" role="status" aria-live="polite">
+            {selfProgress
+              ? `正在从录音中提取声纹…已扫描 ${selfProgress.scanned} 段，采集 ${selfProgress.enrolled}/${selfProgress.target}`
+              : "正在读取录音…"}
+          </p>
+        )}
+        {!selfBusy && selfMsg && (
           <p className="identity-self-msg" role="status" aria-live="polite">
             {selfMsg}
           </p>
@@ -314,6 +422,7 @@ export function IdentityPanel({
                   <button
                     type="button"
                     className="btn small"
+                    disabled={busy === `conflict:${c.id}`}
                     title={`同一个人：把这段声纹并入「${c.existingName}」`}
                     onClick={() => void resolveConflict(c, c.existingName)}
                   >
@@ -322,6 +431,7 @@ export function IdentityPanel({
                   <button
                     type="button"
                     className="btn small"
+                    disabled={busy === `conflict:${c.id}`}
                     title={`不同的人：单独注册为「${c.labelName}」`}
                     onClick={() => void resolveConflict(c, c.labelName)}
                   >
@@ -330,6 +440,7 @@ export function IdentityPanel({
                   <button
                     type="button"
                     className="btn small"
+                    disabled={busy === `conflict:${c.id}`}
                     title="先不处理，仅从列表移除"
                     onClick={() => void resolveConflict(c, null)}
                   >
@@ -398,6 +509,7 @@ export function IdentityPanel({
                     <button
                       type="button"
                       className="btn small"
+                      disabled={!!busy}
                       title={
                         isSelf
                           ? "取消「这是我」标注"
@@ -418,6 +530,7 @@ export function IdentityPanel({
                     <button
                       type="button"
                       className="btn small danger"
+                      disabled={!!busy}
                       onClick={() => void remove(identity)}
                     >
                       删除
@@ -453,7 +566,7 @@ export function IdentityPanel({
                     <button
                       type="button"
                       className="btn small"
-                      disabled={!mergeInto[identity.id]}
+                      disabled={!mergeInto[identity.id] || !!busy}
                       onClick={() => void merge(identity)}
                     >
                       合并
@@ -485,19 +598,42 @@ export function IdentityPanel({
                           )}
                         </div>
                         <span className="identity-sample-actions">
-                          {sample.hasAudio && (
-                            <button
-                              type="button"
-                              className="btn small"
-                              title="播放这段录音，确认是不是你"
-                              onClick={() => void playSample(identity.id, index)}
-                            >
-                              ▶ 播放
-                            </button>
+                          {sample.hasAudio ? (
+                            (() => {
+                              const key = `${identity.id}:${index}`;
+                              const isPlaying = playing === key;
+                              const isLoading = loadingAudio === key;
+                              return (
+                                <button
+                                  type="button"
+                                  className="btn small"
+                                  disabled={isLoading}
+                                  title={
+                                    isPlaying
+                                      ? "停止播放"
+                                      : "播放这段录音，确认是不是你"
+                                  }
+                                  onClick={() =>
+                                    void playSample(identity.id, index)
+                                  }
+                                >
+                                  {isLoading
+                                    ? "⏳ 加载"
+                                    : isPlaying
+                                      ? "⏸ 停止"
+                                      : "▶ 播放"}
+                                </button>
+                              );
+                            })()
+                          ) : (
+                            <span className="muted identity-sample-noaudio">
+                              旧样本·无法回放
+                            </span>
                           )}
                           <button
                             type="button"
                             className="btn small danger"
+                            disabled={busy === `sample:${identity.id}:${index}`}
                             title="删除这次样本"
                             onClick={() => void removeSample(identity, index)}
                           >
