@@ -20,6 +20,7 @@ pub fn maybe_run_cli() -> Option<i32> {
         Some("meeting") if args.get(1).map(String::as_str) == Some("process") => {
             Some(run_meeting_process(&args[2..]))
         }
+        Some("voiceprint-match") => Some(run_voiceprint_match(&args[1..])),
         Some("--help") | Some("-h") => {
             print_help();
             Some(0)
@@ -43,9 +44,90 @@ fn print_help() {
     eprintln!(
         "lumen-asr-desktop — headless commands:\n  \
          --build-info | --version        print `<version> <git-sha> <build-time>` and exit\n  \
-         meeting process <wav> [--json]  diarize + transcribe a mic WAV offline and print the transcript\n\
+         meeting process <wav> [--json]  diarize + transcribe a mic WAV offline and print the transcript\n  \
+         voiceprint-match <meeting_id>   score a stored meeting's speakers against the identity library (read-only)\n\
          \nWith no headless command the desktop app launches normally."
     );
+}
+
+/// `voiceprint-match <meeting_id>`: for a stored meeting, score each speaker's
+/// saved centroid against the enrolled identity library and print the best
+/// match + whether it would auto-tag. Read-only — does not reprocess or write
+/// anything — so it answers "would enrollment attribute this meeting now?"
+/// without a full reprocess. Meeting/identity names are the user's own data on
+/// their own machine, printed only to their terminal.
+fn run_voiceprint_match(args: &[String]) -> i32 {
+    let Some(meeting_id) = args.first() else {
+        eprintln!("usage: voiceprint-match <meeting_id>");
+        return 2;
+    };
+    let Ok(meeting) = meeting_id.parse::<uuid::Uuid>() else {
+        eprintln!("voiceprint-match: invalid meeting id `{meeting_id}`");
+        return 2;
+    };
+    let store = match lumen_store::Store::open(lumen_platform::default_db_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("voiceprint-match: open store: {error}");
+            return 1;
+        }
+    };
+    let identities =
+        match lumen_identity::IdentityStore::open(lumen_identity::default_identity_dir()) {
+            Ok(identities) => identities,
+            Err(error) => {
+                eprintln!("voiceprint-match: open identity library: {error}");
+                return 1;
+            }
+        };
+    let speakers = match store.list_speakers(meeting) {
+        Ok(speakers) => speakers,
+        Err(error) => {
+            eprintln!("voiceprint-match: list speakers: {error}");
+            return 1;
+        }
+    };
+    if speakers.is_empty() {
+        eprintln!("voiceprint-match: no speakers for meeting {meeting}");
+        return 1;
+    }
+    println!("label  current           best-match (score)   would-auto-tag");
+    for speaker in &speakers {
+        let embedding = match store.get_speaker_embedding(speaker.id) {
+            Ok(Some(embedding)) => embedding,
+            Ok(None) => {
+                println!(
+                    "{:<6} {:<16} (no centroid)",
+                    speaker.label,
+                    speaker.display_name.as_deref().unwrap_or("-")
+                );
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                    "voiceprint-match: read embedding for {}: {error}",
+                    speaker.label
+                );
+                continue;
+            }
+        };
+        let best = identities
+            .verify_speaker(&embedding)
+            .map(|report| format!("{} ({:.3})", report.display_name, report.best_score))
+            .unwrap_or_else(|| "— (library empty)".to_string());
+        let auto = identities
+            .match_speaker(&embedding)
+            .map(|(name, score)| format!("{name} ({score:.3})"))
+            .unwrap_or_else(|| "—".to_string());
+        println!(
+            "{:<6} {:<16} {:<20} {}",
+            speaker.label,
+            speaker.display_name.as_deref().unwrap_or("-"),
+            best,
+            auto
+        );
+    }
+    0
 }
 
 /// `meeting process <wav> [--json]`: run the offline diarize + transcribe

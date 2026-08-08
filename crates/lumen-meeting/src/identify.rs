@@ -119,6 +119,54 @@ pub fn auto_identify_speakers(
     assigned
 }
 
+/// Retroactively re-identify a **stored** meeting's speakers against the
+/// current identity library — the same match policy as
+/// [`auto_identify_speakers`], but keyed by persisted speaker **row id** rather
+/// than engine id, so it can run on a meeting processed before a voiceprint was
+/// enrolled ("回溯重认").
+///
+/// Only still-unnamed speakers (`display_name` is `None`) are touched, so a
+/// manual name — or a name assigned by an earlier run — is never overridden;
+/// speakers without a stored centroid or below [`IDENTIFY_MIN_VOICED_MS`] are
+/// left alone. `centroids`/`voiced_ms` are keyed by `speaker.id`. Mutates the
+/// matched speakers in place and returns what changed.
+pub fn reidentify_speakers(
+    speakers: &mut [Speaker],
+    centroids: &BTreeMap<uuid::Uuid, Vec<f32>>,
+    voiced_ms: &BTreeMap<uuid::Uuid, u64>,
+    identities: &IdentityStore,
+) -> Vec<AutoIdentification> {
+    let mut assigned = Vec::new();
+    if identities.list().is_empty() {
+        return assigned;
+    }
+    for speaker in speakers.iter_mut() {
+        if speaker.display_name.is_some() {
+            continue; // only fill 说话人N; never override manual or a prior hit
+        }
+        let Some(embedding) = centroids.get(&speaker.id) else {
+            continue; // no stored centroid (pre-v9 meeting / non-diarized)
+        };
+        if voiced_ms.get(&speaker.id).copied().unwrap_or(0) < IDENTIFY_MIN_VOICED_MS {
+            continue;
+        }
+        if let Some(report) = identities.match_speaker_report(embedding) {
+            speaker.display_name = Some(report.display_name.clone());
+            speaker.identity_id = Some(report.identity_id);
+            speaker.attribution_origin =
+                Some(lumen_core::attribution_origin::VERIFICATION.to_string());
+            speaker.attribution_confidence = Some(f64::from(report.best_score));
+            assigned.push(AutoIdentification {
+                label: speaker.label.clone(),
+                name: report.display_name,
+                identity_id: report.identity_id,
+                score: report.best_score,
+            });
+        }
+    }
+    assigned
+}
+
 /// Open the identity library at `identity_dir` (when configured) and run
 /// [`auto_identify_speakers`], logging each hit (cluster label + score; the
 /// matched real name is PII and deliberately kept out of logs). Failures to
@@ -232,6 +280,47 @@ mod tests {
         // provenance written.
         assert_eq!(speakers[1].display_name, None);
         assert_eq!(speakers[1].attribution_origin, None);
+    }
+
+    #[test]
+    fn reidentify_fills_unnamed_and_never_overrides_a_named_speaker() {
+        let (_dir, identities) = identity_store_with(&[("我", 0.1)]);
+        let meeting = Uuid::new_v4();
+        // S1: unnamed, sounds like 我 → should be filled.
+        let s1 = Speaker::new(meeting, "S1");
+        // S2: manually named 海燕 but *also* carries the 我 voice → must stay 海燕.
+        let mut s2 = Speaker::new(meeting, "S2");
+        s2.display_name = Some("海燕".into());
+        s2.attribution_origin = Some(lumen_core::attribution_origin::MANUAL.into());
+        // S3: unnamed, different voice → stays unnamed.
+        let s3 = Speaker::new(meeting, "S3");
+        let centroids = BTreeMap::from([(s1.id, emb(0.1)), (s2.id, emb(0.1)), (s3.id, emb(7.7))]);
+        let voiced = BTreeMap::from([
+            (s1.id, IDENTIFY_MIN_VOICED_MS + 1),
+            (s2.id, IDENTIFY_MIN_VOICED_MS + 1),
+            (s3.id, IDENTIFY_MIN_VOICED_MS + 1),
+        ]);
+        let mut speakers = vec![s1, s2, s3];
+
+        let assigned = reidentify_speakers(&mut speakers, &centroids, &voiced, &identities);
+
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].label, "S1");
+        assert_eq!(assigned[0].name, "我");
+        assert_eq!(speakers[0].display_name.as_deref(), Some("我"));
+        assert_eq!(
+            speakers[0].attribution_origin.as_deref(),
+            Some(lumen_core::attribution_origin::VERIFICATION)
+        );
+        // Manual 海燕 untouched even though its voice matches 我.
+        assert_eq!(speakers[1].display_name.as_deref(), Some("海燕"));
+        assert_eq!(
+            speakers[1].attribution_origin.as_deref(),
+            Some(lumen_core::attribution_origin::MANUAL)
+        );
+        // Dissimilar speaker stays unnamed. Re-running is a no-op (idempotent).
+        assert_eq!(speakers[2].display_name, None);
+        assert!(reidentify_speakers(&mut speakers, &centroids, &voiced, &identities).is_empty());
     }
 
     #[test]

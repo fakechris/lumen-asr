@@ -505,6 +505,13 @@ export type EnrolledSample = {
   hasAudio: boolean;
 };
 
+/** Outcome of retroactively re-identifying a meeting against the voiceprint
+ * library (回溯重认). */
+export type ReidentifyResult = {
+  updated: { label: string; name: string; score: number }[];
+  examined: number;
+};
+
 /** Outcome of registering the user's own voice from dictation recordings. */
 export type SelfEnrollResult = {
   identityId: string | null;

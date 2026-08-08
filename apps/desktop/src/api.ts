@@ -702,6 +702,13 @@ export const api = {
       name: name ?? null,
     }),
 
+  /** Retroactively re-identify a stored meeting's unnamed speakers against the
+   * current voiceprint library (fills 说话人N, never overrides manual names). */
+  reidentifyMeeting: (meetingId: string) =>
+    invoke<import("./types").ReidentifyResult>("reidentify_meeting", {
+      meetingId,
+    }),
+
   /** Which of a meeting's speakers have a stored voiceprint (enrollable). */
   getMeetingVoiceprints: (meetingId: string) =>
     invoke<import("./types").SpeakerVoiceprint[]>("get_meeting_voiceprints", {

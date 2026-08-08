@@ -2650,6 +2650,87 @@ pub fn enroll_self_from_recordings(
     }
 }
 
+/// One retroactively re-identified speaker (cluster label → enrolled name).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReidentifyHitDto {
+    pub label: String,
+    pub name: String,
+    pub score: f32,
+}
+
+/// Outcome of re-running voiceprint matching over a stored meeting.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReidentifyDto {
+    /// Speakers newly named this run.
+    pub updated: Vec<ReidentifyHitDto>,
+    /// Still-unnamed speakers that were eligible to match.
+    pub examined: usize,
+}
+
+/// Retroactively re-identify a stored meeting's speakers against the *current*
+/// identity library ("回溯重认"): fill any still-unnamed 说话人N whose saved
+/// centroid now matches an enrolled voiceprint, using the same policy as
+/// processing-time auto-identification. Manual names (and names from an earlier
+/// run) are never overridden. Uses the meeting's already-stored centroids — no
+/// re-diarization or re-transcription — so it is fast and non-destructive.
+#[tauri::command]
+pub fn reidentify_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<ReidentifyDto, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    let (mut speakers, centroids, voiced) = with_store(&state, |s| {
+        let speakers = s.list_speakers(id).map_err(|e| e.to_string())?;
+        let segments = s.list_segments(id).map_err(|e| e.to_string())?;
+        let mut centroids = std::collections::BTreeMap::new();
+        let mut voiced = std::collections::BTreeMap::new();
+        for speaker in &speakers {
+            if let Some(embedding) = s
+                .get_speaker_embedding(speaker.id)
+                .map_err(|e| e.to_string())?
+            {
+                centroids.insert(speaker.id, embedding);
+            }
+            let ms: u64 = segments
+                .iter()
+                .filter(|seg| seg.speaker_id == Some(speaker.id))
+                .map(|seg| ((seg.end_seconds - seg.start_seconds).max(0.0) * 1000.0).round() as u64)
+                .sum();
+            voiced.insert(speaker.id, ms);
+        }
+        Ok((speakers, centroids, voiced))
+    })?;
+    let examined = speakers.iter().filter(|s| s.display_name.is_none()).count();
+
+    let identities = open_identity_store()?;
+    let hits = lumen_meeting::reidentify_speakers(&mut speakers, &centroids, &voiced, &identities);
+
+    // Persist only the speakers that changed.
+    let changed: std::collections::HashSet<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+    with_store(&state, |s| {
+        for speaker in &speakers {
+            if changed.contains(speaker.label.as_str()) {
+                s.upsert_speaker(speaker).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    })?;
+    tracing::info!(meeting_id = %id, updated = hits.len(), "retroactive re-identification");
+    Ok(ReidentifyDto {
+        updated: hits
+            .into_iter()
+            .map(|h| ReidentifyHitDto {
+                label: h.label,
+                name: h.name,
+                score: h.score,
+            })
+            .collect(),
+        examined,
+    })
+}
+
 /// Report which of a meeting's speakers have a stored voiceprint embedding, so
 /// the UI can offer "注册声纹" only where enrollment is actually possible.
 #[tauri::command]
