@@ -4,8 +4,34 @@
 //!
 //! `stdout` carries the machine-readable result (build line / transcript);
 //! human-facing progress and errors go to `stderr`.
+//!
+//! Production offline path (file → speakers + timestamps [+ optional translation]):
+//! ```text
+//! lumen-asr-desktop meeting process <audio>
+//!   --engine sensevoice|qwen|mlx-whisper|whisper
+//!   --lang Spanish|es|zh|auto|…
+//!   --format text|json|transcript-v1|bilingual
+//!   --translate zh              # add Chinese translations per segment
+//!   [--max-speakers N]
+//!   [--min-turn-seconds 1.5]    # absorb short false-speaker fragments
+//! ```
+//! Non-WAV inputs (m4a/mp3/…) are converted via `ffmpeg` to 16 kHz mono PCM.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+use lumen_asr::{
+    qwen_ready, resolve_qwen_asr_dir, resolve_sensevoice_dir, sensevoice_ready, whisper_ready,
+    AsrEngine, MlxWhisperAsr, MlxWhisperConfig, QwenAsr, QwenAsrConfig, SenseVoiceSherpaAsr,
+    WhisperAsr, DEFAULT_MLX_WHISPER_MODEL,
+};
+use lumen_meeting::{export_meeting, DiarModels, ExportPreset, MeetingOptions};
+use lumen_prompts::{
+    build_system_prompt_from, Casing, CleanupLevel, IntentSpec, PromptBuildInput, PunctPolicy,
+    Style,
+};
+use lumen_transcript::{Media, Provenance, Segment as TSegment, Speaker as TSpeaker, TranscriptV1};
 
 /// Inspect the process arguments before the Tauri app builds. Returns
 /// `Some(exit_code)` when the invocation was a headless command (the caller
@@ -43,10 +69,23 @@ fn print_build_info() {
 fn print_help() {
     eprintln!(
         "lumen-asr-desktop — headless commands:\n  \
-         --build-info | --version        print `<version> <git-sha> <build-time>` and exit\n  \
-         meeting process <wav> [--json]  diarize + transcribe a mic WAV offline and print the transcript\n  \
-         voiceprint-match <meeting_id>   score a stored meeting's speakers against the identity library (read-only)\n\
-         \nWith no headless command the desktop app launches normally."
+         --build-info | --version\n  \
+         meeting process <audio> [options]\n    \
+           Offline diarize + per-turn ASR. Accepts wav/m4a/mp3 (ffmpeg).\n    \
+           --engine sensevoice|qwen|mlx-whisper|whisper\n    \
+           --lang <hint>                     e.g. Spanish, es, zh, auto\n    \
+           --format text|json|transcript-v1|bilingual\n    \
+           --translate zh[,en,…]             LLM translate each segment (needs corrector)\n    \
+           --json                            alias for --format json\n    \
+           --max-speakers N                  diar clustering cap (default: 6)\n    \
+           --min-turn-seconds SEC            absorb shorter diar fragments (default: 1.5)\n  \
+         voiceprint-match <meeting_id>\n\
+         \nWith no headless command the desktop app launches normally.\n\
+         \nEngines:\n  \
+         sensevoice    sherpa-onnx (zh/en/ja/ko/yue) — dictation default\n  \
+         qwen          Qwen3-ASR MLX (Metal) — multi-lingual production path\n  \
+         mlx-whisper   mlx-whisper large-v3-turbo (Metal) — production Whisper\n  \
+         whisper       sherpa-onnx Whisper (CPU) — not for large multi-lingual"
     );
 }
 
@@ -130,36 +169,407 @@ fn run_voiceprint_match(args: &[String]) -> i32 {
     0
 }
 
-/// `meeting process <wav> [--json]`: run the offline diarize + transcribe
-/// pipeline on a single mic WAV and print the transcript (one line per segment,
-/// or a JSON array with `--json`). Exercises the exact production ASR path, so
-/// it doubles as a way to reprocess a recording and observe resource use.
-fn run_meeting_process(args: &[String]) -> i32 {
-    let mut wav: Option<String> = None;
-    let mut json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" => json = true,
-            other if !other.starts_with('-') && wav.is_none() => wav = Some(other.to_string()),
-            other => {
-                eprintln!("meeting process: unexpected argument `{other}`");
-                return 2;
-            }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineChoice {
+    SenseVoice,
+    Qwen,
+    /// mlx-whisper Metal (production Whisper).
+    MlxWhisper,
+    /// sherpa-onnx Whisper (CPU).
+    Whisper,
+}
+
+impl EngineChoice {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "sensevoice" | "sv" | "local_sensevoice" => Some(Self::SenseVoice),
+            "qwen" | "qwen3" | "qwen3-asr" | "local_qwen" => Some(Self::Qwen),
+            "mlx-whisper" | "mlx_whisper" | "whisper-mlx" | "whisper_mlx" => Some(Self::MlxWhisper),
+            "whisper" | "local_whisper" | "sherpa-whisper" => Some(Self::Whisper),
+            _ => None,
         }
     }
-    let Some(wav) = wav else {
-        eprintln!("usage: meeting process <wav> [--json]");
-        return 2;
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SenseVoice => "sensevoice",
+            Self::Qwen => "qwen",
+            Self::MlxWhisper => "mlx-whisper",
+            Self::Whisper => "whisper",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Text,
+    Json,
+    TranscriptV1,
+    /// Human bilingual blocks (source + each --translate lang).
+    Bilingual,
+}
+
+impl OutputFormat {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "text" | "txt" => Some(Self::Text),
+            "json" | "segments" => Some(Self::Json),
+            "transcript-v1" | "transcript_v1" | "v1" | "lumen-transcript" => {
+                Some(Self::TranscriptV1)
+            }
+            "bilingual" | "bi" | "es-zh" => Some(Self::Bilingual),
+            _ => None,
+        }
+    }
+}
+
+struct MeetingProcessCli {
+    audio: PathBuf,
+    engine: EngineChoice,
+    lang: Option<String>,
+    format: OutputFormat,
+    max_speakers: usize,
+    min_turn_seconds: f64,
+    /// Target languages for per-segment LLM translation (e.g. ["zh"]).
+    translate_langs: Vec<String>,
+    mlx_whisper_model: String,
+}
+
+fn parse_meeting_process_args(args: &[String]) -> Result<MeetingProcessCli, String> {
+    let mut audio: Option<PathBuf> = None;
+    let mut engine = EngineChoice::SenseVoice;
+    let mut lang: Option<String> = None;
+    let mut format = OutputFormat::Text;
+    let mut max_speakers: usize = 6;
+    let mut min_turn_seconds: f64 = lumen_meeting::DEFAULT_MIN_TURN_SECONDS;
+    let mut translate_langs: Vec<String> = Vec::new();
+    let mut mlx_whisper_model = DEFAULT_MLX_WHISPER_MODEL.to_string();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--json" => format = OutputFormat::Json,
+            "--engine" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "missing value for --engine".to_string())?;
+                engine = EngineChoice::parse(v).ok_or_else(|| {
+                    format!("unknown --engine `{v}` (sensevoice|qwen|mlx-whisper|whisper)")
+                })?;
+            }
+            flag if flag.starts_with("--engine=") => {
+                let v = &flag["--engine=".len()..];
+                engine = EngineChoice::parse(v).ok_or_else(|| {
+                    format!("unknown --engine `{v}` (sensevoice|qwen|mlx-whisper|whisper)")
+                })?;
+            }
+            "--lang" | "--language" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "missing value for --lang".to_string())?;
+                lang = Some(v.clone());
+            }
+            flag if flag.starts_with("--lang=") => {
+                lang = Some(flag["--lang=".len()..].to_string());
+            }
+            flag if flag.starts_with("--language=") => {
+                lang = Some(flag["--language=".len()..].to_string());
+            }
+            "--format" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "missing value for --format".to_string())?;
+                format = OutputFormat::parse(v).ok_or_else(|| {
+                    format!("unknown --format `{v}` (text|json|transcript-v1|bilingual)")
+                })?;
+            }
+            flag if flag.starts_with("--format=") => {
+                let v = &flag["--format=".len()..];
+                format = OutputFormat::parse(v).ok_or_else(|| {
+                    format!("unknown --format `{v}` (text|json|transcript-v1|bilingual)")
+                })?;
+            }
+            "--translate" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "missing value for --translate".to_string())?;
+                translate_langs.extend(split_langs(v));
+            }
+            flag if flag.starts_with("--translate=") => {
+                translate_langs.extend(split_langs(&flag["--translate=".len()..]));
+            }
+            "--max-speakers" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "missing value for --max-speakers".to_string())?;
+                max_speakers = v
+                    .parse()
+                    .map_err(|_| format!("invalid --max-speakers `{v}`"))?;
+            }
+            flag if flag.starts_with("--max-speakers=") => {
+                let v = &flag["--max-speakers=".len()..];
+                max_speakers = v
+                    .parse()
+                    .map_err(|_| format!("invalid --max-speakers `{v}`"))?;
+            }
+            "--min-turn-seconds" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "missing value for --min-turn-seconds".to_string())?;
+                min_turn_seconds = v
+                    .parse()
+                    .map_err(|_| format!("invalid --min-turn-seconds `{v}`"))?;
+            }
+            flag if flag.starts_with("--min-turn-seconds=") => {
+                let v = &flag["--min-turn-seconds=".len()..];
+                min_turn_seconds = v
+                    .parse()
+                    .map_err(|_| format!("invalid --min-turn-seconds `{v}`"))?;
+            }
+            "--mlx-whisper-model" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "missing value for --mlx-whisper-model".to_string())?;
+                mlx_whisper_model = v.clone();
+            }
+            flag if flag.starts_with("--mlx-whisper-model=") => {
+                mlx_whisper_model = flag["--mlx-whisper-model=".len()..].to_string();
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unexpected argument `{other}`"));
+            }
+            other if audio.is_none() => audio = Some(PathBuf::from(other)),
+            other => return Err(format!("unexpected positional argument `{other}`")),
+        }
+        i += 1;
+    }
+    let audio = audio.ok_or_else(|| {
+        "usage: meeting process <audio> [--engine …] [--lang …] [--format …] [--translate zh]"
+            .to_string()
+    })?;
+    // bilingual format implies Chinese translation if none specified
+    if format == OutputFormat::Bilingual && translate_langs.is_empty() {
+        translate_langs.push("zh".into());
+    }
+    Ok(MeetingProcessCli {
+        audio,
+        engine,
+        lang,
+        format,
+        max_speakers,
+        min_turn_seconds,
+        translate_langs,
+        mlx_whisper_model,
+    })
+}
+
+fn split_langs(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+/// Convert compressed audio to 16 kHz mono PCM WAV via ffmpeg when needed.
+/// Returns `(wav_path, temp_dir_to_cleanup)`.
+fn ensure_wav(path: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(ext.as_str(), "wav" | "wave") {
+        return Ok((path.to_path_buf(), None));
+    }
+    if !path.is_file() {
+        return Err(format!("no such file: {}", path.display()));
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "lumen-headless-audio-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("create temp dir: {e}"))?;
+    let out = tmp.join("input.16k.wav");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            &path.display().to_string(),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+        ])
+        .arg(&out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| {
+            format!("ffmpeg failed to start ({e}). Install ffmpeg to process m4a/mp3/…")
+        })?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "ffmpeg failed converting {} (exit {status})",
+            path.display()
+        ));
+    }
+    eprintln!(
+        "meeting process: converted {} → 16 kHz mono wav",
+        path.display()
+    );
+    Ok((out, Some(tmp)))
+}
+
+fn normalize_lang_hint(raw: &str, engine: EngineChoice) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    // Qwen worker prefers full language names; Whisper/SenseVoice use short codes.
+    match engine {
+        EngineChoice::Qwen => Some(match t.to_ascii_lowercase().as_str() {
+            "es" | "spa" | "spanish" | "español" | "espanol" => "Spanish".into(),
+            "en" | "eng" | "english" => "English".into(),
+            "zh" | "zh-cn" | "zh-hans" | "chinese" | "中文" => "Chinese".into(),
+            "ja" | "jpn" | "japanese" => "Japanese".into(),
+            "ko" | "kor" | "korean" => "Korean".into(),
+            "fr" | "fra" | "french" => "French".into(),
+            "de" | "deu" | "german" => "German".into(),
+            "pt" | "por" | "portuguese" => "Portuguese".into(),
+            "it" | "ita" | "italian" => "Italian".into(),
+            _ => t.to_string(),
+        }),
+        EngineChoice::Whisper | EngineChoice::SenseVoice | EngineChoice::MlxWhisper => {
+            Some(match t.to_ascii_lowercase().as_str() {
+                "spanish" | "español" | "espanol" | "spa" => "es".into(),
+                "english" | "eng" => "en".into(),
+                "chinese" | "中文" | "zh-cn" | "zh-hans" => "zh".into(),
+                "japanese" | "jpn" => "ja".into(),
+                "korean" | "kor" => "ko".into(),
+                "yue" | "cantonese" => "yue".into(),
+                _ => t.to_ascii_lowercase(),
+            })
+        }
+    }
+}
+
+fn python_for_mlx() -> PathBuf {
+    crate::config::AppConfig::load()
+        .asr
+        .qwen_python_executable()
+}
+
+fn build_engine(
+    choice: EngineChoice,
+    lang: Option<&str>,
+    mlx_whisper_model: &str,
+) -> Result<Box<dyn AsrEngine>, String> {
+    match choice {
+        EngineChoice::SenseVoice => {
+            let dir = resolve_sensevoice_dir(None)
+                .ok_or_else(|| "no SenseVoice model dir resolved — install it first".to_string())?;
+            if !sensevoice_ready(&dir) {
+                return Err(format!(
+                    "SenseVoice model not ready under {}",
+                    dir.display()
+                ));
+            }
+            let mut eng = SenseVoiceSherpaAsr::new(dir);
+            if let Some(l) = lang {
+                eng = eng.with_language(l);
+            }
+            eprintln!(
+                "meeting process: engine=sensevoice dir={}",
+                eng.model_dir().display()
+            );
+            Ok(Box::new(eng))
+        }
+        EngineChoice::Qwen => {
+            let dir = resolve_qwen_asr_dir(None)
+                .ok_or_else(|| "no Qwen3-ASR model dir resolved — install it first".to_string())?;
+            if !qwen_ready(&dir) {
+                return Err(format!("Qwen3-ASR model not ready under {}", dir.display()));
+            }
+            let python = python_for_mlx();
+            let language = lang.map(|s| s.to_string());
+            eprintln!(
+                "meeting process: engine=qwen (MLX) dir={} python={} lang={:?}",
+                dir.display(),
+                python.display(),
+                language
+            );
+            let cfg = QwenAsrConfig::product(python, dir, language, Duration::from_secs(600));
+            Ok(Box::new(QwenAsr::new(cfg)))
+        }
+        EngineChoice::MlxWhisper => {
+            let python = python_for_mlx();
+            let language = lang.map(|s| s.to_string());
+            eprintln!(
+                "meeting process: engine=mlx-whisper (Metal) model={} python={} lang={:?}",
+                mlx_whisper_model,
+                python.display(),
+                language
+            );
+            let cfg = MlxWhisperConfig::product(
+                python,
+                mlx_whisper_model,
+                language,
+                Duration::from_secs(900),
+            );
+            Ok(Box::new(MlxWhisperAsr::new(cfg)))
+        }
+        EngineChoice::Whisper => {
+            let dir = lumen_asr::default_whisper_dir();
+            if !whisper_ready(&dir) {
+                return Err(format!(
+                    "Whisper model not ready under {} (CPU sherpa; use --engine mlx-whisper for production)",
+                    dir.display()
+                ));
+            }
+            let mut eng = WhisperAsr::new(dir);
+            if let Some(l) = lang {
+                eng = eng.with_language(l);
+            } else {
+                eng = eng.with_language("en");
+            }
+            eprintln!(
+                "meeting process: engine=whisper (sherpa CPU) dir={} — prefer --engine mlx-whisper",
+                eng.model_dir().display()
+            );
+            Ok(Box::new(eng))
+        }
+    }
+}
+
+/// `meeting process <audio> [options]`: offline diarize + per-turn ASR.
+fn run_meeting_process(args: &[String]) -> i32 {
+    let cli = match parse_meeting_process_args(args) {
+        Ok(c) => c,
+        Err(error) => {
+            eprintln!("meeting process: {error}");
+            return 2;
+        }
     };
-    let wav_path = Path::new(&wav);
-    if !wav_path.is_file() {
-        eprintln!("meeting process: no such file: {wav}");
+    if !cli.audio.is_file() {
+        eprintln!("meeting process: no such file: {}", cli.audio.display());
         return 2;
     }
 
-    // Pipeline stage logs (diarize/transcribe timings) go to stderr so stdout
-    // stays clean for the transcript. Best-effort: a missing subscriber just
-    // means no logs.
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -168,70 +578,185 @@ fn run_meeting_process(args: &[String]) -> i32 {
         )
         .try_init();
 
-    let Some(sv_dir) = lumen_asr::resolve_sensevoice_dir(None) else {
-        eprintln!("meeting process: no SenseVoice model dir resolved — install it first");
-        return 1;
+    let (wav_path, audio_tmp) = match ensure_wav(&cli.audio) {
+        Ok(v) => v,
+        Err(error) => {
+            eprintln!("meeting process: {error}");
+            return 1;
+        }
     };
-    if !lumen_asr::sensevoice_ready(&sv_dir) {
-        eprintln!(
-            "meeting process: SenseVoice model not found under {} — install it first",
-            sv_dir.display()
-        );
-        return 1;
-    }
-    let engine = lumen_asr::SenseVoiceSherpaAsr::new(sv_dir);
-    let diar_models =
-        lumen_meeting::DiarModels::under_root(lumen_asr::lumen_models_dir().join("diar"));
 
-    let opts = lumen_meeting::MeetingOptions {
-        max_speakers: Some(6),
+    let lang_norm = cli
+        .lang
+        .as_deref()
+        .and_then(|l| normalize_lang_hint(l, cli.engine));
+
+    let engine = match build_engine(cli.engine, lang_norm.as_deref(), &cli.mlx_whisper_model) {
+        Ok(e) => e,
+        Err(error) => {
+            eprintln!("meeting process: {error}");
+            if let Some(tmp) = audio_tmp {
+                let _ = std::fs::remove_dir_all(tmp);
+            }
+            return 1;
+        }
+    };
+
+    let diar_models = DiarModels::under_root(lumen_asr::lumen_models_dir().join("diar"));
+
+    let opts = MeetingOptions {
+        max_speakers: Some(cli.max_speakers),
+        language_hint: lang_norm.clone(),
+        min_turn_seconds: Some(cli.min_turn_seconds),
+        title: Some(
+            cli.audio
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "offline".into()),
+        ),
         ..Default::default()
     };
 
-    // A throwaway store in a private, exclusively-created dir: `create_dir` fails
-    // if the path already exists, so a pre-planted path can't be hijacked, and
-    // removing the whole dir at the end clears the SQLite `-wal`/`-shm` sidecars
-    // too. This command transcribes and prints; it never touches the real library.
     let dir = std::env::temp_dir().join(format!("lumen-headless-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     if let Err(error) = std::fs::create_dir(&dir) {
         eprintln!("meeting process: create temp dir: {error}");
+        if let Some(tmp) = audio_tmp {
+            let _ = std::fs::remove_dir_all(tmp);
+        }
         return 1;
     }
 
     let code = {
         let store = match lumen_store::Store::open(dir.join("headless.sqlite")) {
-            Ok(store) => store,
+            Ok(s) => s,
             Err(error) => {
                 eprintln!("meeting process: open store: {error}");
                 let _ = std::fs::remove_dir_all(&dir);
+                if let Some(tmp) = &audio_tmp {
+                    let _ = std::fs::remove_dir_all(tmp);
+                }
                 return 1;
             }
         };
+
         let outcome = tauri::async_runtime::block_on(lumen_meeting::transcribe_meeting(
-            wav_path,
+            &wav_path,
             &diar_models,
-            &engine,
+            engine.as_ref(),
             &store,
             &opts,
         ));
         match outcome {
-            Ok(meeting_id) => match store.list_segments(meeting_id) {
-                Ok(segments) => print_segments(&segments, json),
-                Err(error) => {
-                    eprintln!("meeting process: read segments: {error}");
-                    1
+            Ok(meeting_id) => {
+                // Optional per-segment LLM translation (e.g. --translate zh).
+                // Keep all error paths as `i32` values so temp dirs still clean up.
+                match if cli.translate_langs.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    translate_segments(&store, meeting_id, &cli.translate_langs)
+                } {
+                    Err(error) => {
+                        eprintln!("meeting process: translate: {error}");
+                        1
+                    }
+                    Ok(translations) => match cli.format {
+                        OutputFormat::Text | OutputFormat::Json => {
+                            match store.list_segments(meeting_id) {
+                                Ok(segments) => {
+                                    if cli.format == OutputFormat::Json && !translations.is_empty()
+                                    {
+                                        print_segments_with_translations(
+                                            &segments,
+                                            &translations,
+                                            true,
+                                        )
+                                    } else if !translations.is_empty() {
+                                        print_bilingual(&segments, &translations)
+                                    } else {
+                                        print_segments(&segments, cli.format == OutputFormat::Json)
+                                    }
+                                }
+                                Err(error) => {
+                                    eprintln!("meeting process: read segments: {error}");
+                                    1
+                                }
+                            }
+                        }
+                        OutputFormat::Bilingual => match store.list_segments(meeting_id) {
+                            Ok(segments) => print_bilingual(&segments, &translations),
+                            Err(error) => {
+                                eprintln!("meeting process: read segments: {error}");
+                                1
+                            }
+                        },
+                        OutputFormat::TranscriptV1 => match store.get_meeting_detail(meeting_id) {
+                            Ok(Some(mut detail)) => {
+                                detail.meeting.language =
+                                    lang_norm.clone().or_else(|| cli.lang.clone());
+                                detail.meeting.audio_path = Some(cli.audio.display().to_string());
+                                if translations.is_empty() {
+                                    match export_meeting(&detail, ExportPreset::DataJson) {
+                                        Ok(out) => {
+                                            println!("{}", out.content);
+                                            0
+                                        }
+                                        Err(error) => {
+                                            eprintln!(
+                                                "meeting process: export transcript-v1: {error}"
+                                            );
+                                            1
+                                        }
+                                    }
+                                } else {
+                                    match export_transcript_v1_with_translations(
+                                        &detail,
+                                        &translations,
+                                        cli.engine.as_str(),
+                                    ) {
+                                        Ok(json) => {
+                                            println!("{json}");
+                                            0
+                                        }
+                                        Err(error) => {
+                                            eprintln!(
+                                                "meeting process: export bilingual transcript-v1: {error}"
+                                            );
+                                            1
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                eprintln!("meeting process: meeting missing after process");
+                                1
+                            }
+                            Err(error) => {
+                                eprintln!("meeting process: load detail: {error}");
+                                1
+                            }
+                        },
+                    },
                 }
-            },
+            }
             Err(error) => {
                 eprintln!("meeting process: {error}");
                 1
             }
         }
-        // `store` drops here, closing the SQLite handles before the dir is removed.
     };
 
     let _ = std::fs::remove_dir_all(&dir);
+    if let Some(tmp) = audio_tmp {
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+    if code == 0 {
+        eprintln!(
+            "meeting process: done engine={} format={:?}",
+            cli.engine.as_str(),
+            cli.format
+        );
+    }
     code
 }
 
@@ -250,20 +775,12 @@ fn print_segments(segments: &[lumen_core::TranscriptSegment], json: bool) -> i32
             }
         };
     }
-    // Label speakers S1, S2, … in first-seen order for a readable transcript.
-    use std::collections::HashMap;
-    let mut labels: HashMap<uuid::Uuid, String> = HashMap::new();
+    let labels = speaker_labels(segments);
     for seg in segments {
-        let who = match seg.speaker_id {
-            Some(id) => {
-                let next = labels.len() + 1;
-                labels
-                    .entry(id)
-                    .or_insert_with(|| format!("S{next}"))
-                    .clone()
-            }
-            None => "?".to_string(),
-        };
+        let who = seg
+            .speaker_id
+            .and_then(|id| labels.get(&id).cloned())
+            .unwrap_or_else(|| "?".into());
         println!(
             "[{:>8.1}-{:<8.1}] {}: {}",
             seg.start_seconds, seg.end_seconds, who, seg.text
@@ -276,4 +793,238 @@ fn print_segments(segments: &[lumen_core::TranscriptSegment], json: bool) -> i32
         if labels.len() == 1 { "" } else { "s" }
     );
     0
+}
+
+fn speaker_labels(
+    segments: &[lumen_core::TranscriptSegment],
+) -> std::collections::HashMap<uuid::Uuid, String> {
+    use std::collections::HashMap;
+    let mut labels: HashMap<uuid::Uuid, String> = HashMap::new();
+    for seg in segments {
+        if let Some(id) = seg.speaker_id {
+            let next = labels.len() + 1;
+            labels.entry(id).or_insert_with(|| format!("S{next}"));
+        }
+    }
+    labels
+}
+
+/// Per-segment translations: index aligned with `list_segments` order.
+/// Each entry is a map lang → text (e.g. "zh" → "……").
+type SegmentTranslations = Vec<std::collections::BTreeMap<String, String>>;
+
+fn translate_segments(
+    store: &lumen_store::Store,
+    meeting_id: uuid::Uuid,
+    langs: &[String],
+) -> Result<SegmentTranslations, String> {
+    let segments = store.list_segments(meeting_id).map_err(|e| e.to_string())?;
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cfg = crate::config::AppConfig::load();
+    let corrector = crate::corrector_svc::build_corrector(&cfg.corrector)
+        .map_err(|e| format!("corrector: {e}"))?;
+    if !cfg.corrector.enabled || cfg.corrector.provider == "none" {
+        return Err(
+            "translation requires a configured LLM corrector (Settings → AI cleanup / config.toml [corrector])"
+                .into(),
+        );
+    }
+
+    let mut out: SegmentTranslations = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        let mut map = std::collections::BTreeMap::new();
+        let src = seg.text.trim();
+        if src.is_empty() {
+            out.push(map);
+            continue;
+        }
+        for lang in langs {
+            let target = display_lang_name(lang);
+            let prompt_input = PromptBuildInput {
+                cleanup: CleanupLevel::Light,
+                style: Style::Neutral,
+                casing: Casing::Sentence,
+                punctuation: PunctPolicy::default(),
+                polish: vec![],
+                custom: None,
+                intent: IntentSpec::Translate {
+                    target_language: target.clone(),
+                    style: Some("faithful".into()),
+                },
+            };
+            let system = build_system_prompt_from(&prompt_input);
+            let temperature = CleanupLevel::Light.temperature();
+            eprintln!(
+                "meeting process: translate segment {}/{} → {lang}…",
+                i + 1,
+                segments.len()
+            );
+            let result = tauri::async_runtime::block_on(lumen_corrector::correct_or_fallback_with(
+                corrector.as_ref(),
+                src,
+                lumen_corrector::DictionaryContext::default(),
+                system,
+                temperature,
+            ));
+            if result.model_applied {
+                map.insert(lang.clone(), result.text.trim().to_string());
+            } else {
+                eprintln!(
+                    "meeting process: translate segment {} → {lang} fell back ({:?})",
+                    i + 1,
+                    result.fallback_reason
+                );
+                map.insert(lang.clone(), result.text.trim().to_string());
+            }
+        }
+        out.push(map);
+    }
+    Ok(out)
+}
+
+fn display_lang_name(code: &str) -> String {
+    match code.to_ascii_lowercase().as_str() {
+        "zh" | "zh-cn" | "zh-hans" | "cn" | "chinese" => "Chinese".into(),
+        "en" | "eng" | "english" => "English".into(),
+        "es" | "spa" | "spanish" => "Spanish".into(),
+        "ja" | "jpn" | "japanese" => "Japanese".into(),
+        other => other.to_string(),
+    }
+}
+
+fn print_bilingual(
+    segments: &[lumen_core::TranscriptSegment],
+    translations: &SegmentTranslations,
+) -> i32 {
+    let labels = speaker_labels(segments);
+    for (i, seg) in segments.iter().enumerate() {
+        let who = seg
+            .speaker_id
+            .and_then(|id| labels.get(&id).cloned())
+            .unwrap_or_else(|| "?".into());
+        println!(
+            "[{:>8.1}-{:<8.1}] {}:",
+            seg.start_seconds, seg.end_seconds, who
+        );
+        println!("  ES: {}", seg.text);
+        if let Some(map) = translations.get(i) {
+            for (lang, text) in map {
+                let tag = lang.to_ascii_uppercase();
+                println!("  {tag}: {text}");
+            }
+        }
+        println!();
+    }
+    eprintln!(
+        "({} segments, bilingual langs={:?})",
+        segments.len(),
+        translations
+            .first()
+            .map(|m| m.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    0
+}
+
+fn print_segments_with_translations(
+    segments: &[lumen_core::TranscriptSegment],
+    translations: &SegmentTranslations,
+    pretty: bool,
+) -> i32 {
+    #[derive(serde::Serialize)]
+    struct Row<'a> {
+        start_seconds: f64,
+        end_seconds: f64,
+        speaker_id: Option<uuid::Uuid>,
+        text: &'a str,
+        translations: std::collections::BTreeMap<String, String>,
+    }
+    let rows: Vec<Row> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| Row {
+            start_seconds: s.start_seconds,
+            end_seconds: s.end_seconds,
+            speaker_id: s.speaker_id,
+            text: &s.text,
+            translations: translations.get(i).cloned().unwrap_or_default(),
+        })
+        .collect();
+    let text = if pretty {
+        serde_json::to_string_pretty(&rows)
+    } else {
+        serde_json::to_string(&rows)
+    };
+    match text {
+        Ok(t) => {
+            println!("{t}");
+            0
+        }
+        Err(e) => {
+            eprintln!("meeting process: serialize: {e}");
+            1
+        }
+    }
+}
+
+fn export_transcript_v1_with_translations(
+    detail: &lumen_core::MeetingDetail,
+    translations: &SegmentTranslations,
+    engine: &str,
+) -> Result<String, String> {
+    use std::collections::HashMap;
+    let label_of: HashMap<uuid::Uuid, &str> = detail
+        .speakers
+        .iter()
+        .map(|s| (s.id, s.label.as_str()))
+        .collect();
+
+    let t_segments: Vec<TSegment> = detail
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            let mut ts = TSegment::new(seg.start_seconds, seg.end_seconds, seg.text.clone())
+                .with_id(seg.seq.to_string());
+            if let Some(label) = seg.speaker_id.and_then(|id| label_of.get(&id)) {
+                ts = ts.with_speaker((*label).to_string());
+            }
+            if let Some(map) = translations.get(i) {
+                for (lang, text) in map {
+                    ts = ts.with_translation(lang.clone(), text.clone());
+                }
+            }
+            ts
+        })
+        .collect();
+
+    let t_speakers: Vec<TSpeaker> = detail
+        .speakers
+        .iter()
+        .map(|s| {
+            let mut ts = TSpeaker::new(s.label.clone());
+            if let Some(name) = &s.display_name {
+                ts = ts.with_display_name(name.clone());
+            }
+            ts
+        })
+        .collect();
+
+    let media = Media {
+        path: detail.meeting.audio_path.clone(),
+        duration_seconds: detail.meeting.duration_seconds,
+        ..Media::default()
+    };
+    let mut provenance = Provenance::new("lumen-meeting");
+    provenance.engine = Some(format!("diar-rs+{engine}"));
+    provenance.language = detail.meeting.language.clone();
+    provenance.created_at = Some(detail.meeting.created_at.to_rfc3339());
+
+    let doc = TranscriptV1::new(t_segments)
+        .with_provenance(provenance)
+        .with_media(media)
+        .with_speakers(t_speakers);
+    doc.to_json_string_pretty().map_err(|e| e.to_string())
 }

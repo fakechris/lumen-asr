@@ -36,6 +36,7 @@ mod progress;
 #[cfg(all(target_os = "macos", feature = "diarize"))]
 mod self_enroll;
 mod spread;
+mod turns;
 mod unify;
 
 pub use annotate::{reconcile_annotations, resolve_annotation_names, AnnotationReconciliation};
@@ -68,6 +69,7 @@ pub use spread::{
     match_clusters_to_seeds, spread_annotations, Candidate, Seed, SpreadAssignment, SpreadOutcome,
     SPREAD_MIN_MARGIN, SPREAD_MIN_SCORE,
 };
+pub use turns::{merge_short_diar_turns, DEFAULT_MIN_TURN_SECONDS};
 pub use unify::{
     unify_cross_track_speakers, EchoSpeakerEvidence, SpeakerUnification, UnifyEvidence,
     ECHO_UNIFY_MIN_PAIRS, ECHO_UNIFY_MIN_RATIO,
