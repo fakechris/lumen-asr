@@ -660,95 +660,96 @@ fn run_meeting_process(args: &[String]) -> i32 {
         match outcome {
             Ok(meeting_id) => {
                 // Optional per-segment LLM translation (e.g. --translate zh).
-                let translations = if cli.translate_langs.is_empty() {
-                    Vec::new()
+                // Keep all error paths as `i32` values so temp dirs still clean up.
+                match if cli.translate_langs.is_empty() {
+                    Ok(Vec::new())
                 } else {
-                    match translate_segments(
-                        &store,
-                        meeting_id,
-                        &cli.translate_langs,
-                    ) {
-                        Ok(t) => t,
-                        Err(error) => {
-                            eprintln!("meeting process: translate: {error}");
-                            return 1;
-                        }
+                    translate_segments(&store, meeting_id, &cli.translate_langs)
+                } {
+                    Err(error) => {
+                        eprintln!("meeting process: translate: {error}");
+                        1
                     }
-                };
-
-                match cli.format {
-                    OutputFormat::Text | OutputFormat::Json => match store.list_segments(meeting_id)
-                    {
-                        Ok(segments) => {
-                            if cli.format == OutputFormat::Json && !translations.is_empty() {
-                                print_segments_with_translations(
-                                    &segments,
-                                    &translations,
-                                    true,
-                                )
-                            } else if !translations.is_empty() {
-                                print_bilingual(&segments, &translations)
-                            } else {
-                                print_segments(&segments, cli.format == OutputFormat::Json)
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!("meeting process: read segments: {error}");
-                            1
-                        }
-                    },
-                    OutputFormat::Bilingual => match store.list_segments(meeting_id) {
-                        Ok(segments) => print_bilingual(&segments, &translations),
-                        Err(error) => {
-                            eprintln!("meeting process: read segments: {error}");
-                            1
-                        }
-                    },
-                    OutputFormat::TranscriptV1 => match store.get_meeting_detail(meeting_id) {
-                        Ok(Some(mut detail)) => {
-                            detail.meeting.language =
-                                lang_norm.clone().or_else(|| cli.lang.clone());
-                            detail.meeting.audio_path = Some(cli.audio.display().to_string());
-                            if translations.is_empty() {
-                                match export_meeting(&detail, ExportPreset::DataJson) {
-                                    Ok(out) => {
-                                        println!("{}", out.content);
-                                        0
-                                    }
-                                    Err(error) => {
-                                        eprintln!(
-                                            "meeting process: export transcript-v1: {error}"
-                                        );
-                                        1
+                    Ok(translations) => match cli.format {
+                        OutputFormat::Text | OutputFormat::Json => {
+                            match store.list_segments(meeting_id) {
+                                Ok(segments) => {
+                                    if cli.format == OutputFormat::Json && !translations.is_empty()
+                                    {
+                                        print_segments_with_translations(
+                                            &segments,
+                                            &translations,
+                                            true,
+                                        )
+                                    } else if !translations.is_empty() {
+                                        print_bilingual(&segments, &translations)
+                                    } else {
+                                        print_segments(
+                                            &segments,
+                                            cli.format == OutputFormat::Json,
+                                        )
                                     }
                                 }
-                            } else {
-                                match export_transcript_v1_with_translations(
-                                    &detail,
-                                    &translations,
-                                    cli.engine.as_str(),
-                                ) {
-                                    Ok(json) => {
-                                        println!("{json}");
-                                        0
-                                    }
-                                    Err(error) => {
-                                        eprintln!(
-                                            "meeting process: export bilingual transcript-v1: {error}"
-                                        );
-                                        1
-                                    }
+                                Err(error) => {
+                                    eprintln!("meeting process: read segments: {error}");
+                                    1
                                 }
                             }
                         }
-                        Ok(None) => {
-                            eprintln!("meeting process: meeting missing after process");
-                            1
-                        }
-                        Err(error) => {
-                            eprintln!("meeting process: load detail: {error}");
-                            1
-                        }
+                        OutputFormat::Bilingual => match store.list_segments(meeting_id) {
+                            Ok(segments) => print_bilingual(&segments, &translations),
+                            Err(error) => {
+                                eprintln!("meeting process: read segments: {error}");
+                                1
+                            }
+                        },
+                        OutputFormat::TranscriptV1 => match store.get_meeting_detail(meeting_id) {
+                            Ok(Some(mut detail)) => {
+                                detail.meeting.language =
+                                    lang_norm.clone().or_else(|| cli.lang.clone());
+                                detail.meeting.audio_path =
+                                    Some(cli.audio.display().to_string());
+                                if translations.is_empty() {
+                                    match export_meeting(&detail, ExportPreset::DataJson) {
+                                        Ok(out) => {
+                                            println!("{}", out.content);
+                                            0
+                                        }
+                                        Err(error) => {
+                                            eprintln!(
+                                                "meeting process: export transcript-v1: {error}"
+                                            );
+                                            1
+                                        }
+                                    }
+                                } else {
+                                    match export_transcript_v1_with_translations(
+                                        &detail,
+                                        &translations,
+                                        cli.engine.as_str(),
+                                    ) {
+                                        Ok(json) => {
+                                            println!("{json}");
+                                            0
+                                        }
+                                        Err(error) => {
+                                            eprintln!(
+                                                "meeting process: export bilingual transcript-v1: {error}"
+                                            );
+                                            1
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                eprintln!("meeting process: meeting missing after process");
+                                1
+                            }
+                            Err(error) => {
+                                eprintln!("meeting process: load detail: {error}");
+                                1
+                            }
+                        },
                     },
                 }
             }
