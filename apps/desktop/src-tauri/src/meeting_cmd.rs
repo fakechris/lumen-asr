@@ -2421,9 +2421,9 @@ pub fn set_self_identity(
 /// How many recent dictation recordings self-enrollment scans, and how many
 /// good voiceprint samples it stops at — enough for a robust multi-sample "我"
 /// identity without walking the whole history.
-#[cfg(all(target_os = "macos", feature = "diarize"))]
+#[cfg(target_os = "macos")]
 const SELF_ENROLL_SCAN_LIMIT: u32 = 40;
-#[cfg(all(target_os = "macos", feature = "diarize"))]
+#[cfg(target_os = "macos")]
 const SELF_ENROLL_TARGET_SAMPLES: usize = 6;
 
 /// Outcome of a self-enrollment run.
@@ -2455,7 +2455,7 @@ pub fn enroll_self_from_recordings(
     state: State<'_, AppState>,
     name: Option<String>,
 ) -> Result<SelfEnrollDto, String> {
-    #[cfg(all(target_os = "macos", feature = "diarize"))]
+    #[cfg(target_os = "macos")]
     {
         let emb_model = lumen_asr::lumen_models_dir().join("diar").join("emb.onnx");
         if !emb_model.is_file() {
@@ -2555,7 +2555,7 @@ pub fn enroll_self_from_recordings(
         );
         Ok(dto)
     }
-    #[cfg(not(all(target_os = "macos", feature = "diarize")))]
+    #[cfg(not(target_os = "macos"))]
     {
         let _ = (state, name);
         Err("当前构建不支持声纹注册".to_string())
