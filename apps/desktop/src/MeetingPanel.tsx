@@ -2673,6 +2673,8 @@ function MeetingSideInfo({
   const [enrolled, setEnrolled] = useState<EnrolledSpeaker[]>([]);
   const [enrollingId, setEnrollingId] = useState<string | null>(null);
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [reidentifying, setReidentifying] = useState(false);
+  const [reidMsg, setReidMsg] = useState<string | null>(null);
 
   const meetingId = detail.meeting.id;
 
@@ -2723,6 +2725,33 @@ function MeetingSideInfo({
     },
     [selfIdentityId, onError],
   );
+
+  /** 回溯重认: re-run voiceprint matching over this meeting with the current
+   * library, filling any 说话人N that now matches an enrolled voice. Manual
+   * names are never touched. Updates the labels in place. */
+  const reidentify = useCallback(async () => {
+    setReidentifying(true);
+    setReidMsg(null);
+    onError(null);
+    try {
+      const r = await api.reidentifyMeeting(meetingId);
+      for (const hit of r.updated) {
+        const speaker = detail.speakers.find((s) => s.label === hit.label);
+        if (speaker) onRenamed(speaker.id, hit.name);
+      }
+      setReidMsg(
+        r.updated.length > 0
+          ? `已更新 ${r.updated.length} 位：${r.updated
+              .map((h) => `${h.label}→${h.name}`)
+              .join("、")}`
+          : `没有可自动识别的说话人（${r.examined} 位未命名的都没匹配到已注册声纹）`,
+      );
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setReidentifying(false);
+    }
+  }, [meetingId, detail.speakers, onRenamed, onError]);
 
   useEffect(() => {
     void refreshEnrollment();
@@ -2892,6 +2921,20 @@ function MeetingSideInfo({
           </ul>
         )}
       </section>
+      {enrolled.length > 0 && (
+        <section className="meeting-side-sec">
+          <button
+            type="button"
+            className="btn small"
+            disabled={reidentifying}
+            title="用当前声纹库重新识别未命名的说话人（不会改动你手动标注的名字）"
+            onClick={() => void reidentify()}
+          >
+            {reidentifying ? "识别中…" : "按声纹库重新识别"}
+          </button>
+          {reidMsg && <p className="meeting-reid-msg muted">{reidMsg}</p>}
+        </section>
+      )}
       {enrolled.length > 0 && (
         <section className="meeting-side-sec">
           <button

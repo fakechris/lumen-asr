@@ -4123,3 +4123,8 @@ button.meeting-seg-text.seekable:hover {
   font-size: 12px;
   white-space: nowrap;
 }
+
+.meeting-reid-msg {
+  margin: 6px 0 0;
+  font-size: 12px;
+}

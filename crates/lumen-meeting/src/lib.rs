@@ -50,7 +50,8 @@ pub use enroll::{
 };
 pub use export::{export_meeting, ExportError, ExportOutput, ExportPreset};
 pub use identify::{
-    auto_identify_speakers, speaker_voiced_ms, AutoIdentification, IDENTIFY_MIN_VOICED_MS,
+    auto_identify_speakers, reidentify_speakers, speaker_voiced_ms, AutoIdentification,
+    IDENTIFY_MIN_VOICED_MS,
 };
 pub use merge::{merge_tracks, system_speaker_offset, MergedTake, TrackTake};
 #[cfg(all(target_os = "macos", feature = "diarize"))]
