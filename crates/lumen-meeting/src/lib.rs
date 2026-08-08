@@ -33,6 +33,8 @@ mod pipeline;
 mod preflight;
 mod process;
 mod progress;
+#[cfg(all(target_os = "macos", feature = "diarize"))]
+mod self_enroll;
 mod spread;
 mod unify;
 
@@ -59,6 +61,8 @@ pub use progress::{
     overall_percent, ProcessingPlan, ProcessingProgress, ProcessingStage, ProcessingTrack,
     ProgressReporter,
 };
+#[cfg(all(target_os = "macos", feature = "diarize"))]
+pub use self_enroll::embed_voiced_region;
 pub use spread::{
     match_clusters_to_seeds, spread_annotations, Candidate, Seed, SpreadAssignment, SpreadOutcome,
     SPREAD_MIN_MARGIN, SPREAD_MIN_SCORE,

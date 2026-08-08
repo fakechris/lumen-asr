@@ -687,6 +687,13 @@ export const api = {
   setSelfIdentity: (identityId: string | null) =>
     invoke<string | null>("set_self_identity", { identityId }),
 
+  /** Register the user's own voice ("我") from their recent dictation
+   * recordings and mark that identity as self. `name` defaults to "我". */
+  enrollSelfFromRecordings: (name?: string | null) =>
+    invoke<import("./types").SelfEnrollResult>("enroll_self_from_recordings", {
+      name: name ?? null,
+    }),
+
   /** Which of a meeting's speakers have a stored voiceprint (enrollable). */
   getMeetingVoiceprints: (meetingId: string) =>
     invoke<import("./types").SpeakerVoiceprint[]>("get_meeting_voiceprints", {

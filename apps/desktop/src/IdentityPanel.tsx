@@ -24,6 +24,9 @@ export function IdentityPanel({
   const [draftName, setDraftName] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [mergeInto, setMergeInto] = useState<Record<string, string>>({});
+  const [selfName, setSelfName] = useState("我");
+  const [selfBusy, setSelfBusy] = useState(false);
+  const [selfMsg, setSelfMsg] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const refresh = useCallback(async () => {
@@ -148,6 +151,23 @@ export function IdentityPanel({
     [mergeInto, enrolled, refresh, onError],
   );
 
+  const enrollSelf = useCallback(async () => {
+    setSelfBusy(true);
+    setSelfMsg(null);
+    onError(null);
+    try {
+      const r = await api.enrollSelfFromRecordings(selfName);
+      setSelfMsg(
+        `已从 ${r.enrolled} 段录音注册「${r.name}」并标记为「我」（扫描 ${r.scanned} 段）。`,
+      );
+      await refresh();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setSelfBusy(false);
+    }
+  }, [selfName, refresh, onError]);
+
   const resolveConflict = useCallback(
     async (conflict: EnrollConflict, enrollAs: string | null) => {
       onError(null);
@@ -222,6 +242,31 @@ export function IdentityPanel({
           标记「这是我」。全部保存在本机，声纹数据不会离开设备。
         </p>
       </header>
+
+      <section className="identity-self-enroll">
+        <h3>这是我</h3>
+        <p className="muted">
+          从你最近的听写录音里提取声音，注册为「我」。之后会议里认出你时会直接显示「我」。
+          需要几段有清晰说话的听写录音。
+        </p>
+        <div className="identity-self-row">
+          <input
+            className="identity-name-input"
+            value={selfName}
+            onChange={(e) => setSelfName(e.target.value)}
+            aria-label="我的名字"
+          />
+          <button
+            type="button"
+            className="btn"
+            disabled={selfBusy}
+            onClick={() => void enrollSelf()}
+          >
+            {selfBusy ? "注册中…" : "从我的听写录音注册"}
+          </button>
+        </div>
+        {selfMsg && <p className="identity-self-msg">{selfMsg}</p>}
+      </section>
 
       {conflicts.length > 0 && (
         <section className="identity-conflicts">

@@ -500,6 +500,15 @@ export type EnrolledSample = {
   sourceMeetingId?: string | null;
 };
 
+/** Outcome of registering the user's own voice from dictation recordings. */
+export type SelfEnrollResult = {
+  identityId: string | null;
+  name: string;
+  enrolled: number;
+  scanned: number;
+  skipped: number;
+};
+
 /** A queued auto-enroll conflict: a meeting labelled `speakerId` as `labelName`,
  * but that voice matched the already-enrolled `existingName` (cosine `score`),
  * so the enrollment was withheld for the user to resolve. */
