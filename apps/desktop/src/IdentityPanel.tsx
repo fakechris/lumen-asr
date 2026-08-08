@@ -352,6 +352,11 @@ export function IdentityPanel({
           跨会议的全局声纹库：重命名、合并同一个人的两条声纹、删除某次样本，
           标记「这是我」。全部保存在本机，声纹数据不会离开设备。
         </p>
+        <p className="muted identity-hint">
+          注册声纹需要本人的声音：<b>你自己</b>用下方「这是我」从听写录音注册；
+          <b>其他人</b>在会议里给说话人填上真实姓名、处理后会自动加入这里，
+          或在会议详情点「注册声纹」。
+        </p>
       </header>
 
       <section className="identity-self-enroll">
