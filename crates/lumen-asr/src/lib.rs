@@ -18,7 +18,8 @@ pub use meeting_recorder::{
     SystemTrackSender, WavSink, LIVE_TAP_CAPACITY,
 };
 pub use mlx_whisper::{
-    MlxWhisperAsr, MlxWhisperConfig, DEFAULT_MLX_WHISPER_MODEL, PRODUCT_WORKER as MLX_WHISPER_WORKER,
+    MlxWhisperAsr, MlxWhisperConfig, DEFAULT_MLX_WHISPER_MODEL,
+    PRODUCT_WORKER as MLX_WHISPER_WORKER,
 };
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).

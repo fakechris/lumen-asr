@@ -184,9 +184,7 @@ impl EngineChoice {
         match s.trim().to_ascii_lowercase().as_str() {
             "sensevoice" | "sv" | "local_sensevoice" => Some(Self::SenseVoice),
             "qwen" | "qwen3" | "qwen3-asr" | "local_qwen" => Some(Self::Qwen),
-            "mlx-whisper" | "mlx_whisper" | "whisper-mlx" | "whisper_mlx" => {
-                Some(Self::MlxWhisper)
-            }
+            "mlx-whisper" | "mlx_whisper" | "whisper-mlx" | "whisper_mlx" => Some(Self::MlxWhisper),
             "whisper" | "local_whisper" | "sherpa-whisper" => Some(Self::Whisper),
             _ => None,
         }
@@ -257,17 +255,13 @@ fn parse_meeting_process_args(args: &[String]) -> Result<MeetingProcessCli, Stri
                     .get(i)
                     .ok_or_else(|| "missing value for --engine".to_string())?;
                 engine = EngineChoice::parse(v).ok_or_else(|| {
-                    format!(
-                        "unknown --engine `{v}` (sensevoice|qwen|mlx-whisper|whisper)"
-                    )
+                    format!("unknown --engine `{v}` (sensevoice|qwen|mlx-whisper|whisper)")
                 })?;
             }
             flag if flag.starts_with("--engine=") => {
                 let v = &flag["--engine=".len()..];
                 engine = EngineChoice::parse(v).ok_or_else(|| {
-                    format!(
-                        "unknown --engine `{v}` (sensevoice|qwen|mlx-whisper|whisper)"
-                    )
+                    format!("unknown --engine `{v}` (sensevoice|qwen|mlx-whisper|whisper)")
                 })?;
             }
             "--lang" | "--language" => {
@@ -597,11 +591,7 @@ fn run_meeting_process(args: &[String]) -> i32 {
         .as_deref()
         .and_then(|l| normalize_lang_hint(l, cli.engine));
 
-    let engine = match build_engine(
-        cli.engine,
-        lang_norm.as_deref(),
-        &cli.mlx_whisper_model,
-    ) {
+    let engine = match build_engine(cli.engine, lang_norm.as_deref(), &cli.mlx_whisper_model) {
         Ok(e) => e,
         Err(error) => {
             eprintln!("meeting process: {error}");
@@ -684,10 +674,7 @@ fn run_meeting_process(args: &[String]) -> i32 {
                                     } else if !translations.is_empty() {
                                         print_bilingual(&segments, &translations)
                                     } else {
-                                        print_segments(
-                                            &segments,
-                                            cli.format == OutputFormat::Json,
-                                        )
+                                        print_segments(&segments, cli.format == OutputFormat::Json)
                                     }
                                 }
                                 Err(error) => {
@@ -707,8 +694,7 @@ fn run_meeting_process(args: &[String]) -> i32 {
                             Ok(Some(mut detail)) => {
                                 detail.meeting.language =
                                     lang_norm.clone().or_else(|| cli.lang.clone());
-                                detail.meeting.audio_path =
-                                    Some(cli.audio.display().to_string());
+                                detail.meeting.audio_path = Some(cli.audio.display().to_string());
                                 if translations.is_empty() {
                                     match export_meeting(&detail, ExportPreset::DataJson) {
                                         Ok(out) => {
@@ -832,9 +818,7 @@ fn translate_segments(
     meeting_id: uuid::Uuid,
     langs: &[String],
 ) -> Result<SegmentTranslations, String> {
-    let segments = store
-        .list_segments(meeting_id)
-        .map_err(|e| e.to_string())?;
+    let segments = store.list_segments(meeting_id).map_err(|e| e.to_string())?;
     if segments.is_empty() {
         return Ok(Vec::new());
     }
@@ -877,15 +861,13 @@ fn translate_segments(
                 i + 1,
                 segments.len()
             );
-            let result = tauri::async_runtime::block_on(
-                lumen_corrector::correct_or_fallback_with(
-                    corrector.as_ref(),
-                    src,
-                    lumen_corrector::DictionaryContext::default(),
-                    system,
-                    temperature,
-                ),
-            );
+            let result = tauri::async_runtime::block_on(lumen_corrector::correct_or_fallback_with(
+                corrector.as_ref(),
+                src,
+                lumen_corrector::DictionaryContext::default(),
+                system,
+                temperature,
+            ));
             if result.model_applied {
                 map.insert(lang.clone(), result.text.trim().to_string());
             } else {
@@ -967,10 +949,7 @@ fn print_segments_with_translations(
             end_seconds: s.end_seconds,
             speaker_id: s.speaker_id,
             text: &s.text,
-            translations: translations
-                .get(i)
-                .cloned()
-                .unwrap_or_default(),
+            translations: translations.get(i).cloned().unwrap_or_default(),
         })
         .collect();
     let text = if pretty {
@@ -1047,6 +1026,5 @@ fn export_transcript_v1_with_translations(
         .with_provenance(provenance)
         .with_media(media)
         .with_speakers(t_speakers);
-    doc.to_json_string_pretty()
-        .map_err(|e| e.to_string())
+    doc.to_json_string_pretty().map_err(|e| e.to_string())
 }

@@ -23,11 +23,7 @@ pub const DEFAULT_MIN_TURN_SECONDS: f64 = 1.5;
 /// never reorders turns.
 pub fn merge_short_diar_turns(turns: &[DiarTurn], min_seconds: f64) -> Vec<DiarTurn> {
     let min_seconds = min_seconds.max(0.0);
-    let mut raw: Vec<DiarTurn> = turns
-        .iter()
-        .copied()
-        .filter(|t| t.end > t.start)
-        .collect();
+    let mut raw: Vec<DiarTurn> = turns.iter().copied().filter(|t| t.end > t.start).collect();
     if raw.is_empty() {
         return Vec::new();
     }
@@ -90,11 +86,7 @@ mod tests {
     #[test]
     fn absorbs_short_s2_into_previous_s1() {
         // Real pattern from the Spanish dogfood: long S1, 0.75s S2, long S1.
-        let turns = vec![
-            t(0.0, 100.0, 0),
-            t(100.0, 100.75, 1),
-            t(100.75, 200.0, 0),
-        ];
+        let turns = vec![t(0.0, 100.0, 0), t(100.0, 100.75, 1), t(100.75, 200.0, 0)];
         let out = merge_short_diar_turns(&turns, 1.5);
         // short S2 → absorbed into S1; consecutive S1 collapse → one turn
         assert_eq!(out.len(), 1);
