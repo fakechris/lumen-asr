@@ -2,20 +2,23 @@
 //! Lumen cluster crates.
 //!
 //! The engines (SenseVoice / Whisper via sherpa-onnx, Qwen3-ASR MLX worker,
-//! OpenAI-compatible HTTP) live in `lumen-asr-engine`, and model path
-//! resolution / readiness / install locking / downloads live in
-//! `lumen-models` (both from the `lumen-suite` repository). This crate only
-//! keeps what is product-specific: cpal microphone capture and thin status
-//! helpers that combine the two shared layers.
+//! OpenAI-compatible HTTP) live in `lumen-asr-engine`. Product-specific engines
+//! that are not yet in the shared suite (e.g. mlx-whisper Metal) live here.
+//! Model path resolution / readiness / install locking / downloads live in
+//! `lumen-models`.
 
 mod audio;
 mod meeting_recorder;
+mod mlx_whisper;
 
 pub use audio::{AudioCapture, AudioDeviceInfo, AudioError, CaptureResult};
 pub use meeting_recorder::{
     live_tap_channel, repair_wav_header, LiveAudioPacket, LiveTapSender, MeetingRecorder,
     MeetingRecorderError, RecordingSummary, RepairedWav, SampleSink, SystemTrackRecorder,
     SystemTrackSender, WavSink, LIVE_TAP_CAPACITY,
+};
+pub use mlx_whisper::{
+    MlxWhisperAsr, MlxWhisperConfig, DEFAULT_MLX_WHISPER_MODEL, PRODUCT_WORKER as MLX_WHISPER_WORKER,
 };
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).

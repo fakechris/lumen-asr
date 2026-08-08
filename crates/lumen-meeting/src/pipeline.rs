@@ -78,6 +78,10 @@ pub struct MeetingOptions {
     /// Upper bound on speaker count for clustering (maps to diar-rs
     /// `ahc_max_speakers`). `None` keeps the diar-rs default.
     pub max_speakers: Option<usize>,
+    /// Absorb diar turns shorter than this many seconds into a neighbour so
+    /// brief noise does not become a false extra speaker. `None` uses
+    /// [`crate::DEFAULT_MIN_TURN_SECONDS`] (1.5). Set to `Some(0.0)` to disable.
+    pub min_turn_seconds: Option<f64>,
     /// Run the batched LLM transcript-cleanup pass (fillers / punctuation /
     /// code-switch) after dictionary correction. Only effective when an LLM
     /// corrector is also supplied to [`process_meeting`](crate::process_meeting)
@@ -436,7 +440,7 @@ pub(crate) fn diarize_wav(
     // preflight's voiced spans instead of failing the run: the per-turn ASR
     // loop then transcribes exactly the audible audio, attributed to one
     // "说话人" cluster. Clustering quality is lost; the content is not.
-    let turns: Vec<DiarTurn> = match diarize(wav, &model_paths, &cfg) {
+    let raw_turns: Vec<DiarTurn> = match diarize(wav, &model_paths, &cfg) {
         Ok(result) => result
             .timeline
             .iter()
@@ -452,6 +456,22 @@ pub(crate) fn diarize_wav(
             scan.fallback_turns()
         }
     };
+
+    // Absorb sub-second noise fragments so they do not become false speakers
+    // (e.g. a 0.7s "S2" between long monologue turns).
+    let min_turn = opts
+        .min_turn_seconds
+        .unwrap_or(crate::DEFAULT_MIN_TURN_SECONDS);
+    let before = raw_turns.len();
+    let turns = crate::merge_short_diar_turns(&raw_turns, min_turn);
+    if turns.len() != before {
+        tracing::info!(
+            before,
+            after = turns.len(),
+            min_turn_seconds = min_turn,
+            "merged short diar turns"
+        );
+    }
 
     // Best-effort per-speaker voiceprint centroids for enrollment/matching.
     // A failure here degrades to "no embeddings" (no enrollment for this

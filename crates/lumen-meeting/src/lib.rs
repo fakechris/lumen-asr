@@ -33,6 +33,7 @@ mod pipeline;
 mod preflight;
 mod process;
 mod progress;
+mod turns;
 #[cfg(all(target_os = "macos", feature = "diarize"))]
 mod self_enroll;
 mod spread;
@@ -57,6 +58,7 @@ pub use merge::{merge_tracks, system_speaker_offset, MergedTake, TrackTake};
 #[cfg(all(target_os = "macos", feature = "diarize"))]
 pub use pipeline::LiveVoiceprintEmbedder;
 pub use pipeline::{transcribe_meeting, DiarModels, MeetingError, MeetingOptions};
+pub use turns::{merge_short_diar_turns, DEFAULT_MIN_TURN_SECONDS};
 pub use process::{process_meeting, reconcile_stored_annotations, MinutesConfig, ProcessError};
 pub use progress::{
     overall_percent, ProcessingPlan, ProcessingProgress, ProcessingStage, ProcessingTrack,

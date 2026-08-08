@@ -10,15 +10,17 @@ description = "Mic capture + product glue over the shared lumen-suite ASR crates
 # OpenAI-compatible HTTP engine that this product always offered.
 lumen-asr-engine = { workspace = true, features = ["cloud"] }
 lumen-models = { workspace = true }
+async-trait = { workspace = true }
 cpal = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
-tokio = { workspace = true }
-tempfile = "3"
 # Standard WAV reader used only to assert that a crash-recovered file is
 # readable by an off-the-shelf decoder (already in the workspace lockfile).
 hound = "3"

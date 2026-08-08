@@ -52,7 +52,20 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 - **Terminal pane observation** — follow edits in Herdr, tmux, and Zellij instead of depending only on Accessibility text
 - **Auditable pipeline records** — immutable attempts, context provenance, and edit-observation outcomes alongside session history
 - **Independent local model selections** — switch SenseVoice, Qwen3-ASR, and Whisper without overwriting each other’s paths or cleanup profile
+- **Offline file CLI** — diarize + per-turn ASR on whole recordings (m4a/mp3/wav), with Metal **Qwen** / **mlx-whisper**, short-turn merge, and optional bilingual LLM translation; see [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)
 - **First-run onboarding** for Microphone + Accessibility  
+
+### Offline file transcription (CLI)
+
+Headless mode on the desktop binary (no GUI, no meeting library writes):
+
+```bash
+./target/release/lumen-asr-desktop meeting process ./recording.m4a \
+  --engine mlx-whisper --lang es \
+  --format bilingual --translate zh
+```
+
+Engines: `sensevoice` (CJK dictation), `qwen` (MLX multi-lingual), `mlx-whisper` (Metal Whisper turbo), `whisper` (sherpa CPU only). Full flags and model layout: [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md).
 
 ### Requirements
 
@@ -269,6 +282,19 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 - **个人词库**：从已归因的插入后修改中生成术语与替换候选
 - **终端 pane 观察**：直接跟踪 Herdr、tmux、Zellij 中的修改，不只依赖辅助功能文本
 - **可审计流水线记录**：在会话历史之外保存不可变尝试、上下文来源与编辑观察结果
+- **整段录音 CLI**：对 m4a/mp3/wav 做说话人分段 + 逐段 ASR（Metal **Qwen** / **mlx-whisper**）、短段合并、可选双语 LLM 翻译；详见 [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)
+
+### 整段录音离线转写（CLI）
+
+桌面二进制的 headless 模式（不启 GUI、不写入会议库）：
+
+```bash
+./target/release/lumen-asr-desktop meeting process ./recording.m4a \
+  --engine mlx-whisper --lang es \
+  --format bilingual --translate zh
+```
+
+引擎：`sensevoice`（听写/CJK）、`qwen`（MLX 多语）、`mlx-whisper`（Metal Whisper）、`whisper`（sherpa CPU）。完整参数与模型目录见 [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)。
 - **本地模型独立配置**：切换 SenseVoice、Qwen3-ASR、Whisper 时保留各自路径与整理配置
 - 首次启动 **引导**：麦克风 + 辅助功能  
 
