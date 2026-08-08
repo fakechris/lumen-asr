@@ -666,6 +666,14 @@ export const api = {
       sampleIndex,
     }),
 
+  /** Raw WAV bytes of one voiceprint sample's source recording, for playback.
+   * Only call when the sample's `hasAudio` is true. */
+  readVoiceprintSampleAudio: (identityId: string, sampleIndex: number) =>
+    invoke<ArrayBuffer>("read_voiceprint_sample_audio", {
+      identityId,
+      sampleIndex,
+    }),
+
   /** Unresolved auto-enroll conflicts (same voice labelled under a different
    * name than an already-enrolled person), newest first. */
   listEnrollConflicts: () =>

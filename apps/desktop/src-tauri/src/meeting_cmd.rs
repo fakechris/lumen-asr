@@ -2078,6 +2078,11 @@ pub struct EnrolledSampleDto {
     pub enrolled_at: String,
     pub voiced_ms: u64,
     pub source_meeting_id: Option<String>,
+    /// A short human label (e.g. what was said) for a recognizable list.
+    pub source_label: Option<String>,
+    /// Whether this sample maps to a playable recording (the file path itself
+    /// stays server-side; playback goes through `read_voiceprint_sample_audio`).
+    pub has_audio: bool,
 }
 
 impl From<&lumen_identity::EnrolledIdentity> for EnrolledSpeakerDto {
@@ -2101,6 +2106,11 @@ impl From<&lumen_identity::EnrolledIdentity> for EnrolledSpeakerDto {
                     enrolled_at: s.enrolled_at.to_rfc3339(),
                     voiced_ms: s.voiced_ms,
                     source_meeting_id: s.source_meeting_id.map(|id| id.to_string()),
+                    source_label: s.source_label.clone(),
+                    has_audio: s
+                        .source_audio_path
+                        .as_deref()
+                        .is_some_and(|p| std::path::Path::new(p).is_file()),
                 })
                 .collect(),
         }
@@ -2297,6 +2307,28 @@ pub fn remove_speaker_sample(
         .map(EnrolledSpeakerDto::from))
 }
 
+/// Return the raw WAV bytes of one voiceprint sample's source recording, so the
+/// UI can play it back and the user can confirm the sample is really them. The
+/// file path is taken from the *stored* sample (never the client) and must
+/// still exist on disk. Fails when the sample has no playable source.
+#[tauri::command]
+pub fn read_voiceprint_sample_audio(
+    identity_id: String,
+    sample_index: usize,
+) -> Result<tauri::ipc::Response, String> {
+    let id = parse_id(&identity_id, "identity")?;
+    let identities = open_identity_store()?;
+    let path = identities
+        .list()
+        .iter()
+        .find(|i| i.id == id)
+        .and_then(|i| i.samples.get(sample_index))
+        .and_then(|s| s.source_audio_path.clone())
+        .ok_or_else(|| "该样本没有可播放的录音".to_string())?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取录音失败：{e}"))?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 /// One queued auto-enroll conflict for the manager UI: a meeting labelled a
 /// speaker `labelName`, but that voice matched the already-enrolled
 /// `existingName` (cosine `score`), so the enrollment was withheld.
@@ -2421,9 +2453,9 @@ pub fn set_self_identity(
 /// How many recent dictation recordings self-enrollment scans, and how many
 /// good voiceprint samples it stops at — enough for a robust multi-sample "我"
 /// identity without walking the whole history.
-#[cfg(all(target_os = "macos", feature = "diarize"))]
+#[cfg(target_os = "macos")]
 const SELF_ENROLL_SCAN_LIMIT: u32 = 40;
-#[cfg(all(target_os = "macos", feature = "diarize"))]
+#[cfg(target_os = "macos")]
 const SELF_ENROLL_TARGET_SAMPLES: usize = 6;
 
 /// Outcome of a self-enrollment run.
@@ -2442,6 +2474,17 @@ pub struct SelfEnrollDto {
     pub skipped: usize,
 }
 
+/// Live progress of a self-enrollment run, emitted as `self-enroll-progress`
+/// so the UI can show activity instead of an opaque wait.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelfEnrollProgress {
+    scanned: usize,
+    enrolled: usize,
+    target: usize,
+}
+
 /// Register the user's own voice ("我") from the dictation recordings they
 /// already made: scan the most recent recordings, embed each one's voiced
 /// speech into a voiceprint sample, enroll them under `name` (default "我"),
@@ -2452,10 +2495,11 @@ pub struct SelfEnrollDto {
 /// recording had enough clear speech, or the voiceprint model is unavailable.
 #[tauri::command]
 pub fn enroll_self_from_recordings(
+    app: AppHandle,
     state: State<'_, AppState>,
     name: Option<String>,
 ) -> Result<SelfEnrollDto, String> {
-    #[cfg(all(target_os = "macos", feature = "diarize"))]
+    #[cfg(target_os = "macos")]
     {
         let emb_model = lumen_asr::lumen_models_dir().join("diar").join("emb.onnx");
         if !emb_model.is_file() {
@@ -2474,6 +2518,19 @@ pub fn enroll_self_from_recordings(
                 .map_err(|e| e.to_string())
         })?;
         let mut identities = open_identity_store()?;
+        // Recordings already sampled for this name — a re-scan tops up with new
+        // recordings instead of re-embedding the same ones.
+        let already_sampled: std::collections::HashSet<String> = identities
+            .list()
+            .iter()
+            .find(|i| i.name == name)
+            .map(|i| {
+                i.samples
+                    .iter()
+                    .filter_map(|s| s.source_audio_path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         // Whether this name already had an identity: decides if a later rollback
         // can safely delete it (only when this run created it from scratch).
         let existed_before = identities.list().iter().any(|i| i.name == name);
@@ -2489,16 +2546,29 @@ pub fn enroll_self_from_recordings(
             if dto.enrolled >= SELF_ENROLL_TARGET_SAMPLES {
                 break;
             }
-            let Some(path) = session.audio_path.as_deref() else {
+            let Some(path) = session.audio_path.clone() else {
                 continue;
             };
+            if already_sampled.contains(&path) {
+                continue; // already a sample — don't re-add
+            }
             dto.scanned += 1;
+            // Emit activity before the heavy embed so the UI shows progress
+            // rather than an opaque wait.
+            let _ = app.emit(
+                "self-enroll-progress",
+                SelfEnrollProgress {
+                    scanned: dto.scanned,
+                    enrolled: dto.enrolled,
+                    target: SELF_ENROLL_TARGET_SAMPLES,
+                },
+            );
             // A missing/corrupt recording is an expected per-file condition —
             // skip it. Only genuinely-rejected audio counts as skipped below;
             // model / store failures propagate rather than masquerading as "no
             // clear speech".
             let Ok((samples, sample_rate)) =
-                crate::session_debug::read_wav_mono_f32(std::path::Path::new(path))
+                crate::session_debug::read_wav_mono_f32(std::path::Path::new(&path))
             else {
                 dto.skipped += 1;
                 continue;
@@ -2506,11 +2576,26 @@ pub fn enroll_self_from_recordings(
             match lumen_meeting::embed_voiced_region(&mut embedder, &samples, sample_rate)
                 .map_err(|e| format!("voiceprint model failed: {e}"))?
             {
-                // Source is a dictation session, not a meeting — leave the
-                // sample's source_meeting_id unset.
                 Some((embedding, voiced_ms)) => {
+                    // A dictation session, not a meeting: record the WAV path so
+                    // the sample plays back, and the transcript as its label.
+                    let label = session
+                        .corrected
+                        .as_deref()
+                        .or(session.asr_raw.as_deref())
+                        .map(|t| t.trim().chars().take(40).collect::<String>())
+                        .filter(|t| !t.is_empty());
                     let identity = identities
-                        .enroll(&name, &embedding, voiced_ms, None)
+                        .enroll_sample(
+                            &name,
+                            &embedding,
+                            voiced_ms,
+                            lumen_identity::SampleSource {
+                                meeting_id: None,
+                                audio_path: Some(path),
+                                label,
+                            },
+                        )
                         .map_err(|e| format!("enroll: {e}"))?;
                     dto.enrolled += 1;
                     dto.identity_id = Some(identity.id.to_string());
@@ -2521,10 +2606,13 @@ pub fn enroll_self_from_recordings(
         }
 
         if dto.enrolled == 0 {
-            return Err(
-                "最近的听写录音里没有足够清晰的语音来注册声纹，多说几句再录一段听写试试"
-                    .to_string(),
-            );
+            // Nothing scanned means every recent recording was already a sample;
+            // otherwise the recordings had too little clear speech.
+            return Err(if dto.scanned == 0 {
+                "没有新的听写录音可以补充声纹，先去做几次听写再回来".to_string()
+            } else {
+                "最近的听写录音里没有足够清晰的语音来注册声纹，多说几句再录一段听写试试".to_string()
+            });
         }
         // Mark the freshly enrolled identity as the user themself. If persisting
         // the config fails and this run *created* the identity, roll the library
@@ -2555,9 +2643,9 @@ pub fn enroll_self_from_recordings(
         );
         Ok(dto)
     }
-    #[cfg(not(all(target_os = "macos", feature = "diarize")))]
+    #[cfg(not(target_os = "macos"))]
     {
-        let _ = (state, name);
+        let _ = (app, state, name);
         Err("当前构建不支持声纹注册".to_string())
     }
 }

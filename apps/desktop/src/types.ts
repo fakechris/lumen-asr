@@ -498,6 +498,11 @@ export type EnrolledSample = {
   enrolledAt: string;
   voicedMs: number;
   sourceMeetingId?: string | null;
+  /** Short human label (e.g. what was said), for a recognizable list. */
+  sourceLabel?: string | null;
+  /** Whether the sample maps to a playable recording (via
+   * `readVoiceprintSampleAudio`). */
+  hasAudio: boolean;
 };
 
 /** Outcome of registering the user's own voice from dictation recordings. */
