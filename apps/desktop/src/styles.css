@@ -4108,8 +4108,8 @@ button.meeting-seg-text.seekable:hover {
 .spinner {
   width: 12px;
   height: 12px;
-  border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
-  border-top-color: currentColor;
+  border: 2px solid color-mix(in srgb, currentcolor 30%, transparent);
+  border-top-color: currentcolor;
   border-radius: 50%;
   display: inline-block;
   animation: identity-spin 0.7s linear infinite;

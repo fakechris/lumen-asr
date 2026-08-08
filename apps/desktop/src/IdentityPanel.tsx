@@ -39,6 +39,9 @@ export function IdentityPanel({
   const [loadingAudio, setLoadingAudio] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
+  // Bumped on every stop/new play so an older in-flight fetch can detect it was
+  // superseded and abort before creating/playing a second player.
+  const audioRequestRef = useRef(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const refresh = useCallback(async () => {
@@ -89,8 +92,10 @@ export function IdentityPanel({
     setDraftName(identity.name);
   }, [onError]);
 
-  /** Stop and fully tear down the current player (idempotent). */
+  /** Stop and fully tear down the current player (idempotent). Bumps the
+   * request generation so any in-flight fetch aborts instead of playing. */
   const stopAudio = useCallback(() => {
+    audioRequestRef.current += 1;
     const audio = audioRef.current;
     if (audio) {
       audio.pause();
@@ -102,10 +107,12 @@ export function IdentityPanel({
       audioUrlRef.current = null;
     }
     setPlaying(null);
+    setLoadingAudio(null);
   }, []);
 
   /** Play one sample. Only one plays at a time: clicking the playing sample
-   * stops it; clicking another stops the first and plays the new one. */
+   * stops it; clicking another stops the first and plays the new one. A fetch
+   * that is superseded (another click before it resolves) aborts cleanly. */
   const playSample = useCallback(
     async (identityId: string, index: number) => {
       const key = `${identityId}:${index}`;
@@ -113,11 +120,13 @@ export function IdentityPanel({
         stopAudio();
         return;
       }
-      stopAudio(); // stop whatever else is playing first
+      stopAudio(); // stop whatever else is playing first (bumps the generation)
+      const request = audioRequestRef.current;
       onError(null);
       setLoadingAudio(key);
       try {
         const buf = await api.readVoiceprintSampleAudio(identityId, index);
+        if (audioRequestRef.current !== request) return; // superseded
         const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
         const audio = new Audio(url);
         audioRef.current = audio;
@@ -133,10 +142,16 @@ export function IdentityPanel({
         audio.onended = clear;
         audio.onerror = clear;
         await audio.play();
+        if (audioRequestRef.current !== request) {
+          audio.pause();
+          return;
+        }
         setPlaying(key);
       } catch (e) {
-        stopAudio();
-        onError(String(e));
+        if (audioRequestRef.current === request) {
+          stopAudio();
+          onError(String(e));
+        }
       } finally {
         setLoadingAudio((k) => (k === key ? null : k));
       }
@@ -244,12 +259,13 @@ export function IdentityPanel({
   );
 
   const enrollSelf = useCallback(async () => {
-    if (selfBusy) return;
+    if (selfBusy || busy) return;
     // When a self identity already exists, always top it up under its own name
     // (never fork a second identity from an edited field).
     const targetName =
       enrolled.find((i) => i.id === selfIdentityId)?.name ?? selfName;
     setSelfBusy(true);
+    setBusy("self-enroll"); // hold the shared lock: no concurrent library writes
     setSelfMsg(null);
     setSelfProgress(null);
     onError(null);
@@ -263,9 +279,10 @@ export function IdentityPanel({
       onError(String(e));
     } finally {
       setSelfBusy(false);
+      setBusy(null);
       setSelfProgress(null);
     }
-  }, [selfName, selfBusy, enrolled, selfIdentityId, refresh, onError]);
+  }, [selfName, selfBusy, busy, enrolled, selfIdentityId, refresh, onError]);
 
   const resolveConflict = useCallback(
     async (conflict: EnrollConflict, enrollAs: string | null) => {
@@ -295,8 +312,9 @@ export function IdentityPanel({
         )
       )
         return;
-      // Stop playback if the sample being removed is the one playing.
-      if (playing === `${identity.id}:${index}`) stopAudio();
+      // Stop playback/loading if the sample being removed is the active one.
+      const key = `${identity.id}:${index}`;
+      if (playing === key || loadingAudio === key) stopAudio();
       onError(null);
       setBusy(`sample:${identity.id}:${index}`);
       try {
@@ -308,7 +326,7 @@ export function IdentityPanel({
         setBusy(null);
       }
     },
-    [busy, playing, stopAudio, refresh, onError],
+    [busy, playing, loadingAudio, stopAudio, refresh, onError],
   );
 
   const toggleExpanded = useCallback((id: string) => {
