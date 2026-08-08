@@ -112,6 +112,31 @@ pub struct VoiceprintSample {
     pub enrolled_at: DateTime<Utc>,
     /// The meeting this sample was enrolled from, when known.
     pub source_meeting_id: Option<Uuid>,
+    /// Path to the recording this sample was embedded from, when it maps to a
+    /// single playable file (e.g. a dictation WAV for self-enrollment). Lets the
+    /// UI play the sample back so the user can confirm it's really them, and
+    /// dedupe re-scans by source. `None` for meeting centroids (averaged over
+    /// many turns) and legacy samples.
+    #[serde(default)]
+    pub source_audio_path: Option<String>,
+    /// A short human label for the sample — e.g. what was said in that
+    /// recording — so the list is recognizable at a glance. `None` when unknown.
+    #[serde(default)]
+    pub source_label: Option<String>,
+}
+
+/// Provenance for a newly enrolled sample (see [`IdentityStore::enroll_sample`]).
+/// All fields optional — `default()` records no provenance, the plain
+/// [`enroll`](IdentityStore::enroll) behavior.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SampleSource {
+    /// The meeting this sample came from, when it came from a meeting.
+    pub meeting_id: Option<Uuid>,
+    /// Path to the single recording this sample was embedded from, when one
+    /// exists (e.g. a dictation WAV) — makes the sample playable.
+    pub audio_path: Option<String>,
+    /// A short human label (e.g. what was said), for a recognizable list.
+    pub label: Option<String>,
 }
 
 /// One enrolled identity: a real name bound to one or more voiceprint samples.
@@ -164,6 +189,8 @@ impl PersistedIdentity {
                 voiced_ms: 0, // unknown for legacy records
                 enrolled_at: self.enrolled_at?,
                 source_meeting_id: self.source_meeting_id,
+                source_audio_path: None,
+                source_label: None,
             });
         }
         samples.retain(|s| s.embedding.len() == EMBEDDING_DIM);
@@ -319,6 +346,27 @@ impl IdentityStore {
         voiced_ms: u64,
         source_meeting_id: Option<Uuid>,
     ) -> Result<EnrolledIdentity, IdentityError> {
+        self.enroll_sample(
+            name,
+            embedding,
+            voiced_ms,
+            SampleSource {
+                meeting_id: source_meeting_id,
+                ..SampleSource::default()
+            },
+        )
+    }
+
+    /// Like [`enroll`](Self::enroll), but records the sample's full provenance
+    /// ([`SampleSource`]) — its source recording path and a human label — so the
+    /// UI can play the sample back and dedupe re-scans by source.
+    pub fn enroll_sample(
+        &mut self,
+        name: &str,
+        embedding: &[f32],
+        voiced_ms: u64,
+        source: SampleSource,
+    ) -> Result<EnrolledIdentity, IdentityError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(IdentityError::EmptyName);
@@ -345,7 +393,9 @@ impl IdentityStore {
             embedding: embedding.to_vec(),
             voiced_ms,
             enrolled_at: Utc::now(),
-            source_meeting_id,
+            source_meeting_id: source.meeting_id,
+            source_audio_path: source.audio_path,
+            source_label: source.label,
         });
         // Samples are kept oldest-first (stable sort, so same-instant samples
         // keep insertion order); evict from the front when over the cap.
@@ -1065,6 +1115,33 @@ mod tests {
         std::fs::remove_file(dir.path().join(format!("{}.json", identity.id))).unwrap();
         assert!(store.remove(identity.id).unwrap());
         assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn enroll_sample_persists_source_provenance() {
+        let (dir, mut store) = store();
+        store
+            .enroll_sample(
+                "我",
+                &emb(0.1),
+                VOICED_OK,
+                SampleSource {
+                    audio_path: Some("/debug/123/audio_16k.wav".into()),
+                    label: Some("你好世界".into()),
+                    ..SampleSource::default()
+                },
+            )
+            .unwrap();
+        // Survives a reopen (written to disk, not just memory).
+        let store = IdentityStore::open(dir.path()).unwrap();
+        let sample = &store.list()[0].samples[0];
+        assert_eq!(
+            sample.source_audio_path.as_deref(),
+            Some("/debug/123/audio_16k.wav")
+        );
+        assert_eq!(sample.source_label.as_deref(), Some("你好世界"));
+        // Plain enroll leaves provenance empty.
+        assert_eq!(store.list()[0].samples[0].source_meeting_id, None);
     }
 
     #[test]

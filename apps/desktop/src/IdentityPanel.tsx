@@ -158,7 +158,7 @@ export function IdentityPanel({
     try {
       const r = await api.enrollSelfFromRecordings(selfName);
       setSelfMsg(
-        `已从 ${r.enrolled} 段录音注册「${r.name}」并标记为「我」（扫描 ${r.scanned} 段）。`,
+        `已标记「${r.name}」为「我」：新增 ${r.enrolled} 个声纹样本（扫描 ${r.scanned} 段录音）。`,
       );
       await refresh();
     } catch (e) {
@@ -200,6 +200,23 @@ export function IdentityPanel({
       }
     },
     [refresh, onError],
+  );
+
+  const playSample = useCallback(
+    async (identityId: string, index: number) => {
+      onError(null);
+      try {
+        const buf = await api.readVoiceprintSampleAudio(identityId, index);
+        const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+        const audio = new Audio(url);
+        audio.onended = () => URL.revokeObjectURL(url);
+        audio.onerror = () => URL.revokeObjectURL(url);
+        await audio.play();
+      } catch (e) {
+        onError(String(e));
+      }
+    },
+    [onError],
   );
 
   const toggleExpanded = useCallback((id: string) => {
@@ -247,7 +264,9 @@ export function IdentityPanel({
         <h3>这是我</h3>
         <p className="muted">
           从你最近的听写录音里提取声音，注册为「我」。之后会议里认出你时会直接显示「我」。
-          需要几段有清晰说话的听写录音。
+          {selfIdentityId
+            ? "已注册过——再次点击会扫描更新的录音、补充新样本（不会重复已有的）。"
+            : "需要几段有清晰说话的听写录音。"}
         </p>
         <div className="identity-self-row">
           <input
@@ -262,7 +281,11 @@ export function IdentityPanel({
             disabled={selfBusy}
             onClick={() => void enrollSelf()}
           >
-            {selfBusy ? "注册中…" : "从我的听写录音注册"}
+            {selfBusy
+              ? "注册中…"
+              : selfIdentityId
+                ? "补充样本（扫描新录音）"
+                : "从我的听写录音注册"}
           </button>
         </div>
         {selfMsg && (
@@ -375,9 +398,14 @@ export function IdentityPanel({
                     <button
                       type="button"
                       className="btn small"
+                      title={
+                        isSelf
+                          ? "取消「这是我」标注"
+                          : "把这条声纹标记为你自己"
+                      }
                       onClick={() => void toggleSelf(identity.id)}
                     >
-                      {isSelf ? "取消我" : "这是我"}
+                      {isSelf ? "取消标注" : "这是我"}
                     </button>
                     <button
                       type="button"
@@ -440,20 +468,42 @@ export function IdentityPanel({
                         key={`${sample.enrolledAt}-${index}`}
                         className="identity-sample"
                       >
-                        <span className="muted">
-                          {formatDate(sample.enrolledAt)} ·{" "}
-                          {meetingLabel(sample.sourceMeetingId)}
-                          {sample.voicedMs > 0 &&
-                            ` · ${(sample.voicedMs / 1000).toFixed(0)}s`}
+                        <div className="identity-sample-info">
+                          <span className="muted">
+                            {formatDate(sample.enrolledAt)} ·{" "}
+                            {meetingLabel(sample.sourceMeetingId)}
+                            {sample.voicedMs > 0 &&
+                              ` · ${(sample.voicedMs / 1000).toFixed(0)}s`}
+                          </span>
+                          {sample.sourceLabel && (
+                            <span
+                              className="identity-sample-text"
+                              title={sample.sourceLabel}
+                            >
+                              「{sample.sourceLabel}」
+                            </span>
+                          )}
+                        </div>
+                        <span className="identity-sample-actions">
+                          {sample.hasAudio && (
+                            <button
+                              type="button"
+                              className="btn small"
+                              title="播放这段录音，确认是不是你"
+                              onClick={() => void playSample(identity.id, index)}
+                            >
+                              ▶ 播放
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="btn small danger"
+                            title="删除这次样本"
+                            onClick={() => void removeSample(identity, index)}
+                          >
+                            删除样本
+                          </button>
                         </span>
-                        <button
-                          type="button"
-                          className="btn small danger"
-                          title="删除这次样本"
-                          onClick={() => void removeSample(identity, index)}
-                        >
-                          删除样本
-                        </button>
                       </li>
                     ))}
                   </ul>

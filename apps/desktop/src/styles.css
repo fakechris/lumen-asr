@@ -4078,3 +4078,23 @@ button.meeting-seg-text.seekable:hover {
   font-size: 13px;
   color: var(--accent);
 }
+
+/* ---- Sample row: info (date + transcript) left, actions right -------- */
+.identity-sample-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.identity-sample-text {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 42ch;
+}
+.identity-sample-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
