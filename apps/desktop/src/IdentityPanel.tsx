@@ -265,7 +265,11 @@ export function IdentityPanel({
             {selfBusy ? "注册中…" : "从我的听写录音注册"}
           </button>
         </div>
-        {selfMsg && <p className="identity-self-msg">{selfMsg}</p>}
+        {selfMsg && (
+          <p className="identity-self-msg" role="status" aria-live="polite">
+            {selfMsg}
+          </p>
+        )}
       </section>
 
       {conflicts.length > 0 && (

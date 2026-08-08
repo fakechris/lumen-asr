@@ -2474,6 +2474,9 @@ pub fn enroll_self_from_recordings(
                 .map_err(|e| e.to_string())
         })?;
         let mut identities = open_identity_store()?;
+        // Whether this name already had an identity: decides if a later rollback
+        // can safely delete it (only when this run created it from scratch).
+        let existed_before = identities.list().iter().any(|i| i.name == name);
 
         let mut dto = SelfEnrollDto {
             identity_id: None,
@@ -2490,25 +2493,30 @@ pub fn enroll_self_from_recordings(
                 continue;
             };
             dto.scanned += 1;
+            // A missing/corrupt recording is an expected per-file condition —
+            // skip it. Only genuinely-rejected audio counts as skipped below;
+            // model / store failures propagate rather than masquerading as "no
+            // clear speech".
             let Ok((samples, sample_rate)) =
                 crate::session_debug::read_wav_mono_f32(std::path::Path::new(path))
             else {
                 dto.skipped += 1;
                 continue;
             };
-            match lumen_meeting::embed_voiced_region(&mut embedder, &samples, sample_rate) {
-                Ok(Some((embedding, voiced_ms))) => {
-                    // Source is a dictation session, not a meeting — leave the
-                    // sample's source_meeting_id unset.
-                    match identities.enroll(&name, &embedding, voiced_ms, None) {
-                        Ok(identity) => {
-                            dto.enrolled += 1;
-                            dto.identity_id = Some(identity.id.to_string());
-                        }
-                        Err(_) => dto.skipped += 1,
-                    }
+            match lumen_meeting::embed_voiced_region(&mut embedder, &samples, sample_rate)
+                .map_err(|e| format!("voiceprint model failed: {e}"))?
+            {
+                // Source is a dictation session, not a meeting — leave the
+                // sample's source_meeting_id unset.
+                Some((embedding, voiced_ms)) => {
+                    let identity = identities
+                        .enroll(&name, &embedding, voiced_ms, None)
+                        .map_err(|e| format!("enroll: {e}"))?;
+                    dto.enrolled += 1;
+                    dto.identity_id = Some(identity.id.to_string());
                 }
-                _ => dto.skipped += 1,
+                // Too little voiced speech in this recording — expected, skip.
+                None => dto.skipped += 1,
             }
         }
 
@@ -2518,14 +2526,27 @@ pub fn enroll_self_from_recordings(
                     .to_string(),
             );
         }
-        // Mark the freshly enrolled identity as the user themself.
+        // Mark the freshly enrolled identity as the user themself. If persisting
+        // the config fails and this run *created* the identity, roll the library
+        // back so we don't leave a half-registered "我"; when it merely added
+        // samples to a pre-existing identity, keep them (they're bounded by the
+        // sample cap) and surface that the mark, not the enrollment, failed.
         if let Some(id) = dto.identity_id.clone() {
             let mut cfg = state
                 .config
                 .lock()
                 .map_err(|_| "config lock poisoned".to_string())?;
-            cfg.meeting.self_identity_id = Some(id);
-            cfg.save()?;
+            cfg.meeting.self_identity_id = Some(id.clone());
+            if let Err(error) = cfg.save() {
+                drop(cfg);
+                if !existed_before {
+                    if let Ok(uuid) = parse_id(&id, "identity") {
+                        let _ = identities.remove(uuid);
+                    }
+                    return Err(format!("保存设置失败，已撤销注册：{error}"));
+                }
+                return Err(format!("声纹样本已注册，但标记「我」失败：{error}"));
+            }
         }
         tracing::info!(
             enrolled = dto.enrolled,
