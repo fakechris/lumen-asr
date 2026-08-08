@@ -4051,3 +4051,30 @@ button.meeting-seg-text.seekable:hover {
   gap: 6px;
   flex-wrap: wrap;
 }
+
+/* ---- Self-enrollment (这是我) --------------------------------------- */
+.identity-self-enroll {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.identity-self-enroll h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+.identity-self-enroll > p {
+  margin: 0 0 10px;
+  max-width: 60ch;
+}
+.identity-self-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.identity-self-msg {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--accent);
+}

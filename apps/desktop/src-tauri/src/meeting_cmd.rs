@@ -2418,6 +2418,150 @@ pub fn set_self_identity(
     Ok(identity_id)
 }
 
+/// How many recent dictation recordings self-enrollment scans, and how many
+/// good voiceprint samples it stops at — enough for a robust multi-sample "我"
+/// identity without walking the whole history.
+#[cfg(all(target_os = "macos", feature = "diarize"))]
+const SELF_ENROLL_SCAN_LIMIT: u32 = 40;
+#[cfg(all(target_os = "macos", feature = "diarize"))]
+const SELF_ENROLL_TARGET_SAMPLES: usize = 6;
+
+/// Outcome of a self-enrollment run.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfEnrollDto {
+    /// The identity samples were added to (`None` only when none qualified).
+    pub identity_id: Option<String>,
+    /// The name enrolled under (default "我").
+    pub name: String,
+    /// Voiceprint samples added this run.
+    pub enrolled: usize,
+    /// Recordings examined.
+    pub scanned: usize,
+    /// Recordings skipped (too little clear speech, unreadable, or rejected).
+    pub skipped: usize,
+}
+
+/// Register the user's own voice ("我") from the dictation recordings they
+/// already made: scan the most recent recordings, embed each one's voiced
+/// speech into a voiceprint sample, enroll them under `name` (default "我"),
+/// and mark that identity as *self* so meetings auto-label them "我".
+///
+/// Recordings with less than the voiced-speech floor are skipped; the run stops
+/// once enough samples are collected for a robust identity. Fails only when no
+/// recording had enough clear speech, or the voiceprint model is unavailable.
+#[tauri::command]
+pub fn enroll_self_from_recordings(
+    state: State<'_, AppState>,
+    name: Option<String>,
+) -> Result<SelfEnrollDto, String> {
+    #[cfg(all(target_os = "macos", feature = "diarize"))]
+    {
+        let emb_model = lumen_asr::lumen_models_dir().join("diar").join("emb.onnx");
+        if !emb_model.is_file() {
+            return Err("缺少声纹模型（diar/emb.onnx），无法从录音注册声纹".to_string());
+        }
+        let name = name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or("我")
+            .to_string();
+
+        let mut embedder = lumen_meeting::LiveVoiceprintEmbedder::load(&emb_model)?;
+        let sessions = with_store(&state, |s| {
+            s.list_sessions(SELF_ENROLL_SCAN_LIMIT)
+                .map_err(|e| e.to_string())
+        })?;
+        let mut identities = open_identity_store()?;
+        // Whether this name already had an identity: decides if a later rollback
+        // can safely delete it (only when this run created it from scratch).
+        let existed_before = identities.list().iter().any(|i| i.name == name);
+
+        let mut dto = SelfEnrollDto {
+            identity_id: None,
+            name: name.clone(),
+            enrolled: 0,
+            scanned: 0,
+            skipped: 0,
+        };
+        for session in sessions {
+            if dto.enrolled >= SELF_ENROLL_TARGET_SAMPLES {
+                break;
+            }
+            let Some(path) = session.audio_path.as_deref() else {
+                continue;
+            };
+            dto.scanned += 1;
+            // A missing/corrupt recording is an expected per-file condition —
+            // skip it. Only genuinely-rejected audio counts as skipped below;
+            // model / store failures propagate rather than masquerading as "no
+            // clear speech".
+            let Ok((samples, sample_rate)) =
+                crate::session_debug::read_wav_mono_f32(std::path::Path::new(path))
+            else {
+                dto.skipped += 1;
+                continue;
+            };
+            match lumen_meeting::embed_voiced_region(&mut embedder, &samples, sample_rate)
+                .map_err(|e| format!("voiceprint model failed: {e}"))?
+            {
+                // Source is a dictation session, not a meeting — leave the
+                // sample's source_meeting_id unset.
+                Some((embedding, voiced_ms)) => {
+                    let identity = identities
+                        .enroll(&name, &embedding, voiced_ms, None)
+                        .map_err(|e| format!("enroll: {e}"))?;
+                    dto.enrolled += 1;
+                    dto.identity_id = Some(identity.id.to_string());
+                }
+                // Too little voiced speech in this recording — expected, skip.
+                None => dto.skipped += 1,
+            }
+        }
+
+        if dto.enrolled == 0 {
+            return Err(
+                "最近的听写录音里没有足够清晰的语音来注册声纹，多说几句再录一段听写试试"
+                    .to_string(),
+            );
+        }
+        // Mark the freshly enrolled identity as the user themself. If persisting
+        // the config fails and this run *created* the identity, roll the library
+        // back so we don't leave a half-registered "我"; when it merely added
+        // samples to a pre-existing identity, keep them (they're bounded by the
+        // sample cap) and surface that the mark, not the enrollment, failed.
+        if let Some(id) = dto.identity_id.clone() {
+            let mut cfg = state
+                .config
+                .lock()
+                .map_err(|_| "config lock poisoned".to_string())?;
+            cfg.meeting.self_identity_id = Some(id.clone());
+            if let Err(error) = cfg.save() {
+                drop(cfg);
+                if !existed_before {
+                    if let Ok(uuid) = parse_id(&id, "identity") {
+                        let _ = identities.remove(uuid);
+                    }
+                    return Err(format!("保存设置失败，已撤销注册：{error}"));
+                }
+                return Err(format!("声纹样本已注册，但标记「我」失败：{error}"));
+            }
+        }
+        tracing::info!(
+            enrolled = dto.enrolled,
+            scanned = dto.scanned,
+            "self-enrolled from dictation recordings"
+        );
+        Ok(dto)
+    }
+    #[cfg(not(all(target_os = "macos", feature = "diarize")))]
+    {
+        let _ = (state, name);
+        Err("当前构建不支持声纹注册".to_string())
+    }
+}
+
 /// Report which of a meeting's speakers have a stored voiceprint embedding, so
 /// the UI can offer "注册声纹" only where enrollment is actually possible.
 #[tauri::command]
