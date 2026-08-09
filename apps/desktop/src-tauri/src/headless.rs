@@ -594,7 +594,8 @@ fn run_meeting_process(args: &[String]) -> i32 {
         .lang
         .as_deref()
         .and_then(|l| normalize_lang_hint(l, cli.engine));
-    let source_tag = source_lang_tag(cli.lang.as_deref().or(lang_norm.as_deref()));
+    // Prefer normalized form so aliases like "Español" → "es" tag as ES, not SRC.
+    let source_tag = source_lang_tag(lang_norm.as_deref().or(cli.lang.as_deref()));
 
     let engine = match build_engine(cli.engine, lang_norm.as_deref(), &cli.mlx_whisper_model) {
         Ok(e) => e,
@@ -837,8 +838,7 @@ fn translate_segments(
         );
     }
 
-    // TODO(meeting-cli): per-segment N×M LLM calls; batch via the minutes-style
-    // multi-segment channel when translation volume becomes a bottleneck.
+    // Per-segment translation (serial). Batching is optional later if volume hurts.
     let mut out: SegmentTranslations = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
         let mut map = std::collections::BTreeMap::new();
@@ -919,7 +919,7 @@ fn source_lang_tag(lang: Option<&str>) -> String {
         .next()
         .unwrap_or(lower.as_str());
     match primary {
-        "es" | "spa" | "spanish" => "ES".into(),
+        "es" | "spa" | "spanish" | "español" | "espanol" => "ES".into(),
         "zh" | "cn" | "chinese" | "中文" => "ZH".into(),
         "en" | "eng" | "english" => "EN".into(),
         "ja" | "jpn" | "japanese" => "JA".into(),
@@ -1129,9 +1129,19 @@ mod tests {
         assert_eq!(source_lang_tag(Some("Chinese")), "ZH");
         assert_eq!(source_lang_tag(Some("es")), "ES");
         assert_eq!(source_lang_tag(Some("Spanish")), "ES");
+        assert_eq!(source_lang_tag(Some("Español")), "ES");
         assert_eq!(source_lang_tag(Some("en")), "EN");
         assert_eq!(source_lang_tag(None), "SRC");
         assert_eq!(source_lang_tag(Some("auto")), "SRC");
+    }
+
+    #[test]
+    fn source_tag_prefers_normalized_alias() {
+        // Mirrors run_meeting_process: tag from lang_norm, not raw CLI.
+        let raw = "Español";
+        let norm = normalize_lang_hint(raw, EngineChoice::MlxWhisper);
+        assert_eq!(norm.as_deref(), Some("es"));
+        assert_eq!(source_lang_tag(norm.as_deref().or(Some(raw))), "ES");
     }
 
     #[test]

@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
-"""EXPERIMENTAL one-off dogfood helper — NOT the production offline contract.
+"""Experimental offline file transcription helper (not the production CLI).
 
-Prefer the headless CLI (product path):
+Prefer:
 
   lumen-asr-desktop meeting process <audio> --engine mlx-whisper --lang es \\
     --format bilingual --translate zh
 
-This script was used to prototype diar → Qwen/mlx-whisper and cut-style
-word-assign before the CLI landed. It may drift from headless behaviour;
-do not wire agents/MCP/CI to it. Word-assign / timeline editing belong in
-lumen-cut (product matrix), not here.
+Example:
 
-Typical (experiments only):
   python scripts/offline_file_transcript.py \\
-    --audio ~/Downloads/talk.m4a \\
+    --audio ./talk.m4a \\
     --engine qwen \\
     --lang Spanish \\
     --desktop-bin ./target/release/lumen-asr-desktop \\
-    --out /tmp/lumen-es-bar/prod
+    --out /tmp/out
 """
 
 from __future__ import annotations

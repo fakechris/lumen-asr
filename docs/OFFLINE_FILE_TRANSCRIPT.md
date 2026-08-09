@@ -111,11 +111,12 @@ meeting process talk.m4a --engine qwen --lang Spanish
 
 ## Translation
 
-Requires a configured **LLM corrector** (`~/Library/Application Support/LumenAsr/config.toml` `[corrector]`, or Settings → AI cleanup). Uses the same prompt layer as the translate hotkey (`IntentSpec::Translate`).
+Requires a configured **LLM corrector** (`~/Library/Application Support/LumenAsr/config.toml` `[corrector]`, or Settings → AI cleanup).
 
-If a segment falls back (LLM error / disabled path), that language is **omitted** from
-`translations` / bilingual lines — the source text is never written as a fake translation
-(so Cut import of `transcript-v1` stays honest).
+Per-segment LLM failures omit that language from `translations` / bilingual lines — the
+source text is never written as a fake translation (so Cut import of `transcript-v1`
+stays honest). A **disabled or missing** corrector is different: the whole
+`--translate` / bilingual run exits with status `1` and does not emit partial output.
 
 ```bash
 # Spanish ASR + Chinese translation, human bilingual layout
@@ -174,12 +175,9 @@ uv pip install --python "$LUMEN_QWEN_PYTHON" mlx-qwen3-asr mlx-whisper
 
 ## Optional helper script (experimental)
 
-`scripts/offline_file_transcript.py` — **one-off dogfood / experiment**, not the
-production contract. It can reuse a diar turns JSON and run Qwen / mlx-whisper
-outside the desktop binary, and still contains cut-style word-assign prototypes.
-
-Prefer `lumen-asr-desktop meeting process` for anything agents/MCP or Cut import
-should depend on. Do not extend the script in parallel with the headless CLI.
+`scripts/offline_file_transcript.py` can reuse a diar turns JSON and run Qwen /
+mlx-whisper outside the desktop binary for local experiments. Supported
+production path: `lumen-asr-desktop meeting process`.
 
 ---
 
