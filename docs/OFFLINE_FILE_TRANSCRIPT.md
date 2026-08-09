@@ -68,7 +68,8 @@ time windows; ASR owns text**.
   `[start–end] S1: …`
 - **`json`** — store segment rows (or rows + `translations` if `--translate` set)
 - **`transcript-v1`** — [`lumen-transcript.v1`](../contracts) interchange (Cut import). With `--translate`, each segment may include `translations.{lang}`
-- **`bilingual`** — human blocks; implies `--translate zh` if no translate list given:
+- **`bilingual`** — human blocks; implies `--translate zh` if no translate list given.
+  Source line tag comes from `--lang` (e.g. `ES` / `ZH` / `EN`); missing/`auto` → `SRC`.
 
 ```text
 [   4.5-14.6  ] S1:
@@ -81,7 +82,9 @@ time windows; ASR owns text**.
 ## Short-turn merge (false speakers)
 
 After diarization, turns shorter than `--min-turn-seconds` (default **1.5 s**) are
-absorbed into a neighbour, then consecutive same-speaker runs are collapsed.
+absorbed into a neighbour **only when the silence gap is ≤ 2.0 s**, then consecutive
+same-speaker runs are collapsed. Distant short fragments are left alone so ASR is
+not handed a silence-padded multi-second slice.
 
 Implementation: `crates/lumen-meeting/src/turns.rs` (`merge_short_diar_turns`),
 applied in `pipeline::diarize_wav`.
@@ -90,9 +93,30 @@ Typical effect on monologue + noise: `before=11 after=7` speaker fragments.
 
 ---
 
+## Engine vs language
+
+Default engine is **sensevoice** (zh/en/ja/ko/yue only). Passing `--lang es` (or any
+non-official SenseVoice language) **errors** unless you pick a multi-lingual engine:
+
+```bash
+# Wrong (rejected): sensevoice + Spanish
+meeting process talk.m4a --lang es
+
+# Right:
+meeting process talk.m4a --engine mlx-whisper --lang es
+meeting process talk.m4a --engine qwen --lang Spanish
+```
+
+---
+
 ## Translation
 
-Requires a configured **LLM corrector** (`~/Library/Application Support/LumenAsr/config.toml` `[corrector]`, or Settings → AI cleanup). Uses the same prompt layer as the translate hotkey (`IntentSpec::Translate`).
+Requires a configured **LLM corrector** (`~/Library/Application Support/LumenAsr/config.toml` `[corrector]`, or Settings → AI cleanup).
+
+Per-segment LLM failures omit that language from `translations` / bilingual lines — the
+source text is never written as a fake translation (so Cut import of `transcript-v1`
+stays honest). A **disabled or missing** corrector is different: the whole
+`--translate` / bilingual run exits with status `1` and does not emit partial output.
 
 ```bash
 # Spanish ASR + Chinese translation, human bilingual layout
@@ -149,12 +173,11 @@ uv pip install --python "$LUMEN_QWEN_PYTHON" mlx-qwen3-asr mlx-whisper
 
 ---
 
-## Optional helper script
+## Optional helper script (experimental)
 
-`scripts/offline_file_transcript.py` — dogfood helper that can reuse a diar turns
-JSON and run Qwen / mlx-whisper outside the desktop binary. Prefer the headless
-CLI for the production contract; the script is for experiments and assign-style
-pipelines.
+`scripts/offline_file_transcript.py` can reuse a diar turns JSON and run Qwen /
+mlx-whisper outside the desktop binary for local experiments. Supported
+production path: `lumen-asr-desktop meeting process`.
 
 ---
 

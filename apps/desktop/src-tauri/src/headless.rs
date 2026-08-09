@@ -569,6 +569,10 @@ fn run_meeting_process(args: &[String]) -> i32 {
         eprintln!("meeting process: no such file: {}", cli.audio.display());
         return 2;
     }
+    if let Err(error) = check_engine_lang(cli.engine, cli.lang.as_deref()) {
+        eprintln!("meeting process: {error}");
+        return 2;
+    }
 
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -590,6 +594,8 @@ fn run_meeting_process(args: &[String]) -> i32 {
         .lang
         .as_deref()
         .and_then(|l| normalize_lang_hint(l, cli.engine));
+    // Prefer normalized form so aliases like "Español" → "es" tag as ES, not SRC.
+    let source_tag = source_lang_tag(lang_norm.as_deref().or(cli.lang.as_deref()));
 
     let engine = match build_engine(cli.engine, lang_norm.as_deref(), &cli.mlx_whisper_model) {
         Ok(e) => e,
@@ -672,7 +678,7 @@ fn run_meeting_process(args: &[String]) -> i32 {
                                             true,
                                         )
                                     } else if !translations.is_empty() {
-                                        print_bilingual(&segments, &translations)
+                                        print_bilingual(&segments, &translations, &source_tag)
                                     } else {
                                         print_segments(&segments, cli.format == OutputFormat::Json)
                                     }
@@ -684,7 +690,7 @@ fn run_meeting_process(args: &[String]) -> i32 {
                             }
                         }
                         OutputFormat::Bilingual => match store.list_segments(meeting_id) {
-                            Ok(segments) => print_bilingual(&segments, &translations),
+                            Ok(segments) => print_bilingual(&segments, &translations, &source_tag),
                             Err(error) => {
                                 eprintln!("meeting process: read segments: {error}");
                                 1
@@ -832,6 +838,7 @@ fn translate_segments(
         );
     }
 
+    // Per-segment translation (serial). Batching is optional later if volume hurts.
     let mut out: SegmentTranslations = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
         let mut map = std::collections::BTreeMap::new();
@@ -871,12 +878,14 @@ fn translate_segments(
             if result.model_applied {
                 map.insert(lang.clone(), result.text.trim().to_string());
             } else {
+                // Do not write source text into translations.{lang}: Cut and
+                // other consumers of lumen-transcript.v1 cannot tell fallback
+                // pollution from a real translation.
                 eprintln!(
-                    "meeting process: translate segment {} → {lang} fell back ({:?})",
+                    "meeting process: translate segment {} → {lang} skipped (fallback {:?})",
                     i + 1,
                     result.fallback_reason
                 );
-                map.insert(lang.clone(), result.text.trim().to_string());
             }
         }
         out.push(map);
@@ -894,9 +903,86 @@ fn display_lang_name(code: &str) -> String {
     }
 }
 
+/// Compact uppercase tag for the bilingual source line (from `--lang`).
+///
+/// Unknown / missing / auto → `SRC` so we never hardcode a dogfood language.
+fn source_lang_tag(lang: Option<&str>) -> String {
+    let Some(raw) = lang.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "SRC".into();
+    };
+    let lower = raw.to_ascii_lowercase();
+    if lower == "auto" {
+        return "SRC".into();
+    }
+    let primary = lower
+        .split(['-', '_', ' '])
+        .next()
+        .unwrap_or(lower.as_str());
+    match primary {
+        "es" | "spa" | "spanish" | "español" | "espanol" => "ES".into(),
+        "zh" | "cn" | "chinese" | "中文" => "ZH".into(),
+        "en" | "eng" | "english" => "EN".into(),
+        "ja" | "jpn" | "japanese" => "JA".into(),
+        "ko" | "kor" | "korean" => "KO".into(),
+        "yue" | "cantonese" => "YUE".into(),
+        "fr" | "fra" | "french" => "FR".into(),
+        "de" | "deu" | "german" => "DE".into(),
+        "pt" | "por" | "portuguese" => "PT".into(),
+        other if other.len() <= 8 && other.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            other.to_ascii_uppercase()
+        }
+        _ => "SRC".into(),
+    }
+}
+
+/// SenseVoice official languages; anything else with that engine is garbage.
+fn sensevoice_supports_lang(lang: &str) -> bool {
+    let lower = lang.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower == "auto" {
+        return true;
+    }
+    let primary = lower
+        .split(['-', '_', ' '])
+        .next()
+        .unwrap_or(lower.as_str());
+    matches!(
+        primary,
+        "zh" | "cn"
+            | "chinese"
+            | "中文"
+            | "en"
+            | "eng"
+            | "english"
+            | "ja"
+            | "jpn"
+            | "japanese"
+            | "ko"
+            | "kor"
+            | "korean"
+            | "yue"
+            | "cantonese"
+    )
+}
+
+/// Reject engine/language pairs that will silently produce garbage text.
+fn check_engine_lang(engine: EngineChoice, lang: Option<&str>) -> Result<(), String> {
+    let Some(raw) = lang.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    match engine {
+        EngineChoice::SenseVoice if !sensevoice_supports_lang(raw) => Err(format!(
+            "engine `sensevoice` does not support language `{raw}` \
+             (official: zh/en/ja/ko/yue). Use `--engine mlx-whisper` or `--engine qwen` \
+             for multi-lingual file ASR, or omit `--lang` for CJK dictation defaults"
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn print_bilingual(
     segments: &[lumen_core::TranscriptSegment],
     translations: &SegmentTranslations,
+    source_tag: &str,
 ) -> i32 {
     let labels = speaker_labels(segments);
     for (i, seg) in segments.iter().enumerate() {
@@ -908,7 +994,7 @@ fn print_bilingual(
             "[{:>8.1}-{:<8.1}] {}:",
             seg.start_seconds, seg.end_seconds, who
         );
-        println!("  ES: {}", seg.text);
+        println!("  {source_tag}: {}", seg.text);
         if let Some(map) = translations.get(i) {
             for (lang, text) in map {
                 let tag = lang.to_ascii_uppercase();
@@ -918,7 +1004,7 @@ fn print_bilingual(
         println!();
     }
     eprintln!(
-        "({} segments, bilingual langs={:?})",
+        "({} segments, bilingual source={source_tag} langs={:?})",
         segments.len(),
         translations
             .first()
@@ -1027,4 +1113,89 @@ fn export_transcript_v1_with_translations(
         .with_media(media)
         .with_speakers(t_speakers);
     doc.to_json_string_pretty().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn source_lang_tag_from_cli_not_hardcoded_es() {
+        assert_eq!(source_lang_tag(Some("zh")), "ZH");
+        assert_eq!(source_lang_tag(Some("Chinese")), "ZH");
+        assert_eq!(source_lang_tag(Some("es")), "ES");
+        assert_eq!(source_lang_tag(Some("Spanish")), "ES");
+        assert_eq!(source_lang_tag(Some("Español")), "ES");
+        assert_eq!(source_lang_tag(Some("en")), "EN");
+        assert_eq!(source_lang_tag(None), "SRC");
+        assert_eq!(source_lang_tag(Some("auto")), "SRC");
+    }
+
+    #[test]
+    fn source_tag_prefers_normalized_alias() {
+        // Mirrors run_meeting_process: tag from lang_norm, not raw CLI.
+        let raw = "Español";
+        let norm = normalize_lang_hint(raw, EngineChoice::MlxWhisper);
+        assert_eq!(norm.as_deref(), Some("es"));
+        assert_eq!(source_lang_tag(norm.as_deref().or(Some(raw))), "ES");
+    }
+
+    #[test]
+    fn sensevoice_rejects_spanish() {
+        let err = check_engine_lang(EngineChoice::SenseVoice, Some("es")).unwrap_err();
+        assert!(err.contains("sensevoice"), "{err}");
+        assert!(err.contains("mlx-whisper") || err.contains("qwen"), "{err}");
+    }
+
+    #[test]
+    fn sensevoice_accepts_official_langs() {
+        for lang in ["zh", "en", "ja", "ko", "yue", "auto", "Chinese"] {
+            check_engine_lang(EngineChoice::SenseVoice, Some(lang)).unwrap();
+        }
+        check_engine_lang(EngineChoice::SenseVoice, None).unwrap();
+    }
+
+    #[test]
+    fn multilingual_engines_accept_spanish() {
+        check_engine_lang(EngineChoice::MlxWhisper, Some("es")).unwrap();
+        check_engine_lang(EngineChoice::Qwen, Some("Spanish")).unwrap();
+    }
+
+    #[test]
+    fn parse_bilingual_defaults_translate_zh() {
+        let cli = parse_meeting_process_args(&args(&[
+            "talk.m4a",
+            "--format",
+            "bilingual",
+            "--engine",
+            "mlx-whisper",
+            "--lang",
+            "es",
+        ]))
+        .unwrap();
+        assert_eq!(cli.format, OutputFormat::Bilingual);
+        assert_eq!(cli.translate_langs, vec!["zh".to_string()]);
+        assert_eq!(cli.engine, EngineChoice::MlxWhisper);
+        assert_eq!(cli.lang.as_deref(), Some("es"));
+    }
+
+    #[test]
+    fn parse_engine_and_min_turn() {
+        let cli = parse_meeting_process_args(&args(&[
+            "a.wav",
+            "--engine=qwen",
+            "--min-turn-seconds",
+            "0",
+            "--lang",
+            "Spanish",
+        ]))
+        .unwrap();
+        assert_eq!(cli.engine, EngineChoice::Qwen);
+        assert!((cli.min_turn_seconds - 0.0).abs() < 1e-9);
+        assert_eq!(cli.lang.as_deref(), Some("Spanish"));
+    }
 }
