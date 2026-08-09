@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Offline file → speaker-attributed transcript (production dogfood helper).
+"""EXPERIMENTAL one-off dogfood helper — NOT the production offline contract.
 
-Architecture mirrors lumen-meeting / lumen-cut:
-  1. ffmpeg → 16 kHz mono wav
-  2. diar timeline (from lumen-asr-desktop meeting process, or a turns JSON)
-  3. per-turn ASR with Qwen3-ASR (MLX) and/or full-file Whisper (mlx-whisper)
-  4. optional cut-style assign of full-file words onto diar turns
-  5. emit lumen-transcript.v1 + human text
+Prefer the headless CLI (product path):
 
-Typical:
+  lumen-asr-desktop meeting process <audio> --engine mlx-whisper --lang es \\
+    --format bilingual --translate zh
+
+This script was used to prototype diar → Qwen/mlx-whisper and cut-style
+word-assign before the CLI landed. It may drift from headless behaviour;
+do not wire agents/MCP/CI to it. Word-assign / timeline editing belong in
+lumen-cut (product matrix), not here.
+
+Typical (experiments only):
   python scripts/offline_file_transcript.py \\
-    --audio ~/Downloads/pope\\ termino.m4a \\
+    --audio ~/Downloads/talk.m4a \\
     --engine qwen \\
     --lang Spanish \\
     --desktop-bin ./target/release/lumen-asr-desktop \\

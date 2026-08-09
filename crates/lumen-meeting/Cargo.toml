@@ -36,7 +36,9 @@ lumen-asr-engine = { workspace = true }
 # so the default build/test (pure assembly + storage) needs neither the git
 # fetch, the C++ toolchain, nor the ONNX Runtime download.
 [target.'cfg(target_os = "macos")'.dependencies]
-diar-rs = { git = "https://github.com/fakechris/lumen-suite.git", rev = "8719c032f6dc5dbc8c16c694150517547d623131", optional = true }
+# Pin must match workspace suite deps in root Cargo.toml so cargo resolves
+# one checkout of lumen-suite (not diar-rs at an older rev + four crates at another).
+diar-rs = { git = "https://github.com/fakechris/lumen-suite.git", rev = "541541a006b9c41425f2379d2acd468b1269ef4e", optional = true }
 
 [features]
 default = []
