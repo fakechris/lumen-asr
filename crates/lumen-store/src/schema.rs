@@ -25,8 +25,11 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// additive `live_annotations.unassigned` column (a "无" boundary — from here on
 /// no manual speaker — for the timeline-based annotation model); v16 adds the
 /// `enroll_conflicts` queue (same-voice/different-name auto-enroll conflicts);
-/// v17 recreates it with the `speaker_id` foreign key.
-pub(crate) const SCHEMA_VERSION: i64 = 17;
+/// v17 recreates it with the `speaker_id` foreign key; v18 adds durable
+/// observed-insertion sessions, append-only edit revisions, learning proposals,
+/// and the feedback outbox.
+#[cfg(test)]
+pub(crate) const SCHEMA_VERSION: i64 = 18;
 
 pub(crate) const HISTORY_TEXT_WHITESPACE: &str =
     "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
@@ -653,11 +656,109 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(ENROLL_CONFLICTS_DDL)?;
     }
     conn.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-        [SCHEMA_VERSION],
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (17)",
+        [],
+    )?;
+
+    // v18: persistent edit-learning sessions and their durable feedback queue.
+    conn.execute_batch(EDIT_LEARNING_SCHEMA_V18)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (18)",
+        [],
     )?;
     Ok(())
 }
+
+const EDIT_LEARNING_SCHEMA_V18: &str = r#"
+    CREATE TABLE IF NOT EXISTS edit_sessions (
+      id TEXT PRIMARY KEY NOT NULL,
+      dictation_session_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      surface_key_hash TEXT NOT NULL,
+      adapter_kind TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (
+        state IN (
+          'inserted', 'observing', 'editing', 'quiescent',
+          'suspended', 'finalized', 'failed'
+        )
+      ),
+      target_app_name TEXT,
+      target_bundle_id TEXT,
+      target_fingerprint_hash TEXT NOT NULL,
+      original_text TEXT NOT NULL,
+      original_text_hash TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      last_edit_at TEXT,
+      finalized_at TEXT,
+      end_reason TEXT,
+      relocation_attempts INTEGER NOT NULL DEFAULT 0,
+      revision_count INTEGER NOT NULL DEFAULT 0,
+      final_edit_distance REAL,
+      FOREIGN KEY(dictation_session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+      FOREIGN KEY(attempt_id) REFERENCES dictation_attempts(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_edit_sessions_dictation
+      ON edit_sessions(dictation_session_id, started_at);
+    CREATE INDEX IF NOT EXISTS idx_edit_sessions_attempt
+      ON edit_sessions(attempt_id);
+    CREATE INDEX IF NOT EXISTS idx_edit_sessions_state
+      ON edit_sessions(state, last_seen_at);
+
+    CREATE TABLE IF NOT EXISTS edit_revisions (
+      id TEXT PRIMARY KEY NOT NULL,
+      edit_session_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      observed_at TEXT NOT NULL,
+      trigger TEXT NOT NULL,
+      after_text TEXT NOT NULL,
+      after_text_hash TEXT NOT NULL,
+      normalized_edit_distance REAL NOT NULL,
+      locator_confidence REAL NOT NULL,
+      bounded INTEGER NOT NULL,
+      quiescent INTEGER NOT NULL,
+      final_revision INTEGER NOT NULL,
+      UNIQUE(edit_session_id, ordinal),
+      FOREIGN KEY(edit_session_id) REFERENCES edit_sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS learning_proposals (
+      id TEXT PRIMARY KEY NOT NULL,
+      edit_session_id TEXT NOT NULL,
+      revision_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      risk TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (
+        status IN ('proposed', 'confirmed', 'rejected', 'superseded')
+      ),
+      policy_version INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      decided_at TEXT,
+      FOREIGN KEY(edit_session_id) REFERENCES edit_sessions(id) ON DELETE CASCADE,
+      FOREIGN KEY(revision_id) REFERENCES edit_revisions(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_learning_proposals_session_status
+      ON learning_proposals(edit_session_id, status, created_at);
+
+    CREATE TABLE IF NOT EXISTS feedback_outbox (
+      id TEXT PRIMARY KEY NOT NULL,
+      edit_session_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      message TEXT NOT NULL,
+      proposal_ids_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      delivered_at TEXT,
+      acknowledged_at TEXT,
+      FOREIGN KEY(edit_session_id) REFERENCES edit_sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_feedback_outbox_pending
+      ON feedback_outbox(acknowledged_at, created_at);
+"#;
 
 /// Canonical definition of the auto-enroll conflict queue (v16 table, v17 adds
 /// the `speaker_id` foreign key). Both foreign keys cascade so a conflict is
@@ -1823,8 +1924,60 @@ mod tests {
     fn migrate_is_idempotent_across_repeated_runs() {
         let connection = Connection::open_in_memory().unwrap();
         migrate(&connection).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO meetings (id, created_at, status)
+                VALUES ('m1', '2026-08-09T00:00:00Z', 'completed');
+                INSERT INTO speakers (id, meeting_id, label)
+                VALUES ('sp1', 'm1', 'S1');
+                INSERT INTO enroll_conflicts (
+                  id, meeting_id, speaker_id, label_name, existing_name,
+                  score, created_at, resolved
+                ) VALUES (
+                  'c1', 'm1', 'sp1', 'Alice', 'Alicia',
+                  0.91, '2026-08-09T00:00:00Z', 0
+                );
+                INSERT INTO sessions (id, created_at, status)
+                VALUES ('s1', '2026-08-09T00:00:00Z', 'completed');
+                INSERT INTO dictation_attempts (
+                  id, session_id, attempt_ordinal, created_at,
+                  pipeline_identity_json, pipeline_metrics_json,
+                  pipeline_inputs_json, status
+                ) VALUES (
+                  'a1', 's1', 1, '2026-08-09T00:00:00Z',
+                  '{}', '{}', '{}', 'completed'
+                );
+                INSERT INTO edit_sessions (
+                  id, dictation_session_id, attempt_id, surface_key_hash,
+                  adapter_kind, state, target_fingerprint_hash,
+                  original_text, original_text_hash, started_at, last_seen_at
+                ) VALUES (
+                  'e1', 's1', 'a1', 'surface', 'test', 'observing',
+                  'fingerprint', 'original', 'original-hash',
+                  '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z'
+                );
+                "#,
+            )
+            .unwrap();
         // Running again must not fail (CREATE IF NOT EXISTS / INSERT OR IGNORE).
         migrate(&connection).unwrap();
+        let conflict_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM enroll_conflicts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            conflict_count, 1,
+            "repeated migrations must not drop v17 data"
+        );
+        let edit_session_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM edit_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            edit_session_count, 1,
+            "repeated migrations must not drop v18 data"
+        );
         let version: i64 = connection
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                 row.get(0)

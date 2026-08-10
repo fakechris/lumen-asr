@@ -2393,6 +2393,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-edit-learning"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "lumen-identity"
 version = "0.1.0"
 dependencies = [
@@ -2495,6 +2504,7 @@ dependencies = [
  "chrono",
  "lumen-core",
  "lumen-dictionary",
+ "lumen-edit-learning",
  "rusqlite",
  "serde",
  "serde_json",

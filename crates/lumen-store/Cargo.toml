@@ -10,6 +10,7 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 lumen-core = { workspace = true }
 lumen-dictionary = { workspace = true }
+lumen-edit-learning = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

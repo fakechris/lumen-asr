@@ -12,8 +12,12 @@ use lumen_core::{
     SessionRecord, SessionStatus,
 };
 use lumen_dictionary::DictionaryEntry;
+use lumen_edit_learning::{
+    EditRevisionRecord, EditSessionRecord, FeedbackNotice, LearningProposalRecord,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -24,6 +28,7 @@ pub(crate) const LEGACY_EMPTY_CAPTURE_MESSAGE: &str =
     "no audio captured (0 samples) — hold longer or check mic";
 pub const DEFAULT_ATTEMPT_PAGE_SIZE: u32 = 100;
 pub const MAX_ATTEMPT_PAGE_SIZE: u32 = 500;
+pub const MAX_FEEDBACK_PAGE_SIZE: u32 = 500;
 
 /// One user edit associated with a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -656,6 +661,497 @@ impl Store {
         Ok(())
     }
 
+    pub fn create_edit_learning_session(&self, record: &EditSessionRecord) -> Result<()> {
+        let changed = self.conn.execute(
+            r#"
+            INSERT INTO edit_sessions (
+              id, dictation_session_id, attempt_id, surface_key_hash, adapter_kind,
+              state, target_app_name, target_bundle_id, target_fingerprint_hash,
+              original_text, original_text_hash, started_at, last_seen_at,
+              last_edit_at, finalized_at, end_reason, relocation_attempts,
+              revision_count, final_edit_distance
+            )
+            SELECT
+              ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19
+            FROM dictation_attempts AS attempt
+            WHERE attempt.id=?3 AND attempt.session_id=?2
+            "#,
+            params![
+                record.id.to_string(),
+                record.dictation_session_id.to_string(),
+                record.attempt_id.to_string(),
+                record.surface_key_hash,
+                record.adapter_kind,
+                record.state.as_str(),
+                record.target_app_name,
+                record.target_bundle_id,
+                record.target_fingerprint_hash,
+                record.original_text,
+                record.original_text_hash,
+                record.started_at.to_rfc3339(),
+                record.last_seen_at.to_rfc3339(),
+                record.last_edit_at.map(|value| value.to_rfc3339()),
+                record.finalized_at.map(|value| value.to_rfc3339()),
+                record.end_reason,
+                i64::from(record.relocation_attempts),
+                i64::from(record.revision_count),
+                record.final_edit_distance,
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!(
+                "edit-learning parent attempt not ready: session_id={}, attempt_id={}",
+                record.dictation_session_id,
+                record.attempt_id
+            );
+        }
+        Ok(())
+    }
+
+    pub fn update_edit_learning_session(&self, record: &EditSessionRecord) -> Result<()> {
+        let changed = self.conn.execute(
+            r#"
+            UPDATE edit_sessions
+            SET state=?2,
+                last_seen_at=?3,
+                last_edit_at=?4,
+                finalized_at=?5,
+                end_reason=?6,
+                relocation_attempts=?7,
+                revision_count=?8,
+                final_edit_distance=?9
+            WHERE id=?1
+            "#,
+            params![
+                record.id.to_string(),
+                record.state.as_str(),
+                record.last_seen_at.to_rfc3339(),
+                record.last_edit_at.map(|value| value.to_rfc3339()),
+                record.finalized_at.map(|value| value.to_rfc3339()),
+                record.end_reason,
+                i64::from(record.relocation_attempts),
+                i64::from(record.revision_count),
+                record.final_edit_distance,
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("edit-learning session not found: {}", record.id);
+        }
+        Ok(())
+    }
+
+    pub fn append_edit_learning_revision(&self, record: &EditRevisionRecord) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO edit_revisions (
+              id, edit_session_id, ordinal, observed_at, trigger,
+              after_text, after_text_hash, normalized_edit_distance,
+              locator_confidence, bounded, quiescent, final_revision
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+            "#,
+            params![
+                record.id.to_string(),
+                record.edit_session_id.to_string(),
+                i64::from(record.ordinal),
+                record.observed_at.to_rfc3339(),
+                record.trigger,
+                record.after_text,
+                record.after_text_hash,
+                record.normalized_edit_distance,
+                record.locator_confidence,
+                record.bounded,
+                record.quiescent,
+                record.final_revision,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist review candidates and their durable notification as one unit.
+    /// This prevents a crash from leaving proposals that can no longer reach
+    /// the user through the feedback outbox.
+    pub fn save_edit_learning_proposals_with_feedback(
+        &self,
+        records: &[LearningProposalRecord],
+        notice: &FeedbackNotice,
+    ) -> Result<()> {
+        if records.is_empty() {
+            anyhow::bail!("cannot enqueue proposal feedback without proposals");
+        }
+        if records
+            .iter()
+            .any(|record| record.edit_session_id != notice.edit_session_id)
+        {
+            anyhow::bail!("proposal feedback crosses edit-learning sessions");
+        }
+        let proposal_ids = records
+            .iter()
+            .map(|record| record.id)
+            .collect::<HashSet<_>>();
+        let notice_ids = notice.proposal_ids.iter().copied().collect::<HashSet<_>>();
+        if proposal_ids != notice_ids || notice.proposal_ids.len() != records.len() {
+            anyhow::bail!("proposal feedback ids do not match persisted proposals");
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        save_edit_learning_proposals_on(&transaction, records)?;
+        enqueue_edit_learning_feedback_on(&transaction, notice)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn supersede_edit_learning_proposals(
+        &self,
+        edit_session_id: Uuid,
+        current_revision_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let revision_belongs_to_session: bool = transaction.query_row(
+            r#"
+            SELECT EXISTS(
+              SELECT 1 FROM edit_revisions
+              WHERE id=?1 AND edit_session_id=?2
+            )
+            "#,
+            params![current_revision_id.to_string(), edit_session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !revision_belongs_to_session {
+            anyhow::bail!(
+                "edit-learning revision does not belong to session: revision_id={}, session_id={}",
+                current_revision_id,
+                edit_session_id
+            );
+        }
+        let proposal_ids = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT id
+                FROM learning_proposals
+                WHERE edit_session_id=?1
+                  AND revision_id<>?2
+                  AND status='proposed'
+                ORDER BY created_at, id
+                "#,
+            )?;
+            let rows = statement.query_map(
+                params![edit_session_id.to_string(), current_revision_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.map(|row| {
+                let value = row?;
+                Uuid::parse_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !proposal_ids.is_empty() {
+            let now = Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                UPDATE learning_proposals
+                SET status='superseded', decided_at=?3
+                WHERE edit_session_id=?1
+                  AND revision_id<>?2
+                  AND status='proposed'
+                "#,
+                params![
+                    edit_session_id.to_string(),
+                    current_revision_id.to_string(),
+                    now,
+                ],
+            )?;
+            let proposal_statuses = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, status FROM learning_proposals WHERE edit_session_id=?1",
+                )?;
+                let rows = statement.query_map([edit_session_id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.map(|row| {
+                    let (id, status) = row?;
+                    let id = Uuid::parse_str(&id).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok((id, status))
+                })
+                .collect::<rusqlite::Result<HashMap<_, _>>>()?
+            };
+            let notices_to_acknowledge = {
+                let mut statement = transaction.prepare(
+                    r#"
+                    SELECT id, proposal_ids_json
+                    FROM feedback_outbox
+                    WHERE edit_session_id=?1
+                      AND acknowledged_at IS NULL
+                      AND kind IN (
+                        'learning_candidates_ready',
+                        'learning_confirmation_required'
+                      )
+                    "#,
+                )?;
+                let rows = statement.query_map([edit_session_id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.map(|row| {
+                    let (notice_id, proposal_ids_json) = row?;
+                    let proposal_ids: Vec<Uuid> = serde_json::from_str(&proposal_ids_json)
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    Ok((notice_id, proposal_ids))
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (notice_id, notice_proposal_ids) in notices_to_acknowledge {
+                let has_only_resolved_proposals = !notice_proposal_ids.is_empty()
+                    && notice_proposal_ids.iter().all(|proposal_id| {
+                        proposal_statuses
+                            .get(proposal_id)
+                            .is_some_and(|status| status != "proposed")
+                    });
+                if has_only_resolved_proposals {
+                    transaction.execute(
+                        "UPDATE feedback_outbox SET acknowledged_at=?2 WHERE id=?1",
+                        params![notice_id, now],
+                    )?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(proposal_ids)
+    }
+
+    pub fn decide_edit_learning_proposal(&self, proposal_id: Uuid, decision: &str) -> Result<bool> {
+        if decision != "rejected" {
+            anyhow::bail!("unsupported edit-learning proposal decision");
+        }
+        let changed = self.conn.execute(
+            r#"
+            UPDATE learning_proposals
+            SET status='rejected', decided_at=?2
+            WHERE id=?1 AND status='proposed'
+            "#,
+            params![proposal_id.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn confirm_edit_learning_proposal(
+        &self,
+        proposal_id: Uuid,
+        entry: &DictionaryEntry,
+    ) -> Result<bool> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let proposal = transaction
+            .query_row(
+                r#"
+                SELECT kind, payload_json
+                FROM learning_proposals
+                WHERE id=?1 AND status='proposed'
+                "#,
+                params![proposal_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((proposal_kind, payload_json)) = proposal else {
+            transaction.rollback()?;
+            return Ok(false);
+        };
+        let payload: serde_json::Value = serde_json::from_str(&payload_json)
+            .context("invalid persisted learning proposal payload")?;
+        let matches_proposal = match proposal_kind.as_str() {
+            "term" => {
+                entry.kind == DictEntryKind::Term
+                    && entry.term.as_deref() == payload.get("term").and_then(|value| value.as_str())
+                    && entry.from_text.is_none()
+                    && entry.to_text.is_none()
+            }
+            "replacement" => {
+                entry.kind == DictEntryKind::Replacement
+                    && entry.from_text.as_deref()
+                        == payload.get("fromText").and_then(|value| value.as_str())
+                    && entry.to_text.as_deref()
+                        == payload.get("toText").and_then(|value| value.as_str())
+                    && entry.term.is_none()
+            }
+            _ => false,
+        } && entry.source == DictEntrySource::Learned
+            && entry.confirmed;
+        if !matches_proposal {
+            anyhow::bail!("dictionary entry does not match learning proposal");
+        }
+        let matching_dictionary_entry_exists: bool = match entry.kind {
+            DictEntryKind::Term => transaction.query_row(
+                r#"
+                SELECT EXISTS(
+                  SELECT 1 FROM dictionary_entries
+                  WHERE kind='term'
+                    AND term=?1
+                    AND from_text IS NULL
+                    AND to_text IS NULL
+                    AND confirmed=1
+                )
+                "#,
+                [entry.term.as_deref()],
+                |row| row.get(0),
+            )?,
+            DictEntryKind::Replacement => transaction.query_row(
+                r#"
+                SELECT EXISTS(
+                  SELECT 1 FROM dictionary_entries
+                  WHERE kind='replacement'
+                    AND from_text=?1
+                    AND to_text=?2
+                    AND term IS NULL
+                    AND confirmed=1
+                )
+                "#,
+                params![entry.from_text.as_deref(), entry.to_text.as_deref()],
+                |row| row.get(0),
+            )?,
+        };
+        let changed = transaction.execute(
+            r#"
+            UPDATE learning_proposals
+            SET status='confirmed', decided_at=?2
+            WHERE id=?1 AND status='proposed'
+            "#,
+            params![proposal_id.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        if changed != 1 {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+        if !matching_dictionary_entry_exists {
+            upsert_dictionary_entry_on(&transaction, entry)?;
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Remove stored full-text edit evidence while preserving hashes, lifecycle
+    /// metadata, and compact review proposals.
+    pub fn redact_edit_learning_evidence_text(&self) -> Result<(usize, usize)> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let sessions = transaction.execute(
+            "UPDATE edit_sessions SET original_text='' WHERE original_text<>''",
+            [],
+        )?;
+        let revisions = transaction.execute(
+            "UPDATE edit_revisions SET after_text='' WHERE after_text<>''",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok((sessions, revisions))
+    }
+
+    /// A native surface handle cannot survive a desktop process restart. Close
+    /// stale non-terminal rows explicitly so persisted lifecycle state matches
+    /// the in-memory observer set after launch.
+    pub fn finalize_incomplete_edit_learning_sessions(&self, reason: &str) -> Result<usize> {
+        let changed = self.conn.execute(
+            r#"
+            UPDATE edit_sessions
+            SET state='finalized', finalized_at=?1, end_reason=?2
+            WHERE state NOT IN ('finalized', 'failed')
+            "#,
+            params![Utc::now().to_rfc3339(), reason],
+        )?;
+        Ok(changed)
+    }
+
+    pub fn enqueue_edit_learning_feedback(&self, notice: &FeedbackNotice) -> Result<()> {
+        enqueue_edit_learning_feedback_on(&self.conn, notice)
+    }
+
+    pub fn list_edit_learning_revisions(
+        &self,
+        edit_session_id: Uuid,
+    ) -> Result<Vec<EditRevisionRecord>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, edit_session_id, ordinal, observed_at, trigger,
+                   after_text, after_text_hash, normalized_edit_distance,
+                   locator_confidence, bounded, quiescent, final_revision
+            FROM edit_revisions
+            WHERE edit_session_id=?1
+            ORDER BY ordinal ASC
+            "#,
+        )?;
+        let rows = statement.query_map([edit_session_id.to_string()], map_edit_revision)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_edit_learning_proposals(
+        &self,
+        edit_session_id: Uuid,
+    ) -> Result<Vec<LearningProposalRecord>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, edit_session_id, revision_id, kind, payload_json,
+                   confidence, risk, status, policy_version, created_at
+            FROM learning_proposals
+            WHERE edit_session_id=?1
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )?;
+        let rows = statement.query_map([edit_session_id.to_string()], map_learning_proposal)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_pending_edit_learning_feedback(&self, limit: u32) -> Result<Vec<FeedbackNotice>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, edit_session_id, kind, message, proposal_ids_json,
+                   created_at, delivered_at, acknowledged_at
+            FROM feedback_outbox
+            WHERE acknowledged_at IS NULL
+            ORDER BY created_at ASC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map(
+            [i64::from(limit.clamp(1, MAX_FEEDBACK_PAGE_SIZE))],
+            map_feedback_notice,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn mark_edit_learning_feedback_delivered(&self, notice_id: Uuid) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE feedback_outbox SET delivered_at=COALESCE(delivered_at, ?2) WHERE id=?1",
+            params![notice_id.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("edit-learning feedback notice not found: {notice_id}");
+        }
+        Ok(())
+    }
+
+    pub fn acknowledge_edit_learning_feedback(&self, notice_id: Uuid) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE feedback_outbox SET acknowledged_at=COALESCE(acknowledged_at, ?2) WHERE id=?1",
+            params![notice_id.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("edit-learning feedback notice not found: {notice_id}");
+        }
+        Ok(())
+    }
+
     pub fn list_context_snapshots(&self, session_id: Uuid) -> Result<Vec<ContextSnapshotRecord>> {
         let mut statement = self.conn.prepare(
             r#"
@@ -1109,34 +1605,7 @@ impl Store {
     }
 
     pub fn upsert_dictionary_entry(&self, e: &DictionaryEntry) -> Result<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO dictionary_entries (
-              id, kind, term, from_text, to_text, source, hit_count, confirmed, updated_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-            ON CONFLICT(id) DO UPDATE SET
-              kind=excluded.kind,
-              term=excluded.term,
-              from_text=excluded.from_text,
-              to_text=excluded.to_text,
-              source=excluded.source,
-              hit_count=excluded.hit_count,
-              confirmed=excluded.confirmed,
-              updated_at=excluded.updated_at
-            "#,
-            params![
-                e.id.to_string(),
-                dict_kind_str(e.kind),
-                e.term,
-                e.from_text,
-                e.to_text,
-                dict_source_str(e.source),
-                e.hit_count,
-                e.confirmed as i32,
-                e.updated_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+        upsert_dictionary_entry_on(&self.conn, e)
     }
 
     pub fn list_dictionary(&self) -> Result<Vec<DictionaryEntry>> {
@@ -1232,6 +1701,93 @@ impl Store {
         let rows = stmt.query_map(params![limit], map_edit)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+}
+
+fn upsert_dictionary_entry_on(connection: &Connection, entry: &DictionaryEntry) -> Result<()> {
+    connection.execute(
+        r#"
+        INSERT INTO dictionary_entries (
+          id, kind, term, from_text, to_text, source, hit_count, confirmed, updated_at
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+        ON CONFLICT(id) DO UPDATE SET
+          kind=excluded.kind,
+          term=excluded.term,
+          from_text=excluded.from_text,
+          to_text=excluded.to_text,
+          source=excluded.source,
+          hit_count=excluded.hit_count,
+          confirmed=excluded.confirmed,
+          updated_at=excluded.updated_at
+        "#,
+        params![
+            entry.id.to_string(),
+            dict_kind_str(entry.kind),
+            entry.term,
+            entry.from_text,
+            entry.to_text,
+            dict_source_str(entry.source),
+            entry.hit_count,
+            entry.confirmed as i32,
+            entry.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn save_edit_learning_proposals_on(
+    connection: &Connection,
+    records: &[LearningProposalRecord],
+) -> Result<()> {
+    let mut statement = connection.prepare(
+        r#"
+        INSERT INTO learning_proposals (
+          id, edit_session_id, revision_id, kind, payload_json,
+          confidence, risk, status, policy_version, created_at
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+        "#,
+    )?;
+    for record in records {
+        serde_json::from_str::<serde_json::Value>(&record.payload_json)
+            .context("learning proposal payload must be valid JSON")?;
+        statement.execute(params![
+            record.id.to_string(),
+            record.edit_session_id.to_string(),
+            record.revision_id.to_string(),
+            record.kind,
+            record.payload_json,
+            record.confidence,
+            record.risk,
+            record.status,
+            i64::from(record.policy_version),
+            record.created_at.to_rfc3339(),
+        ])?;
+    }
+    Ok(())
+}
+
+fn enqueue_edit_learning_feedback_on(
+    connection: &Connection,
+    notice: &FeedbackNotice,
+) -> Result<()> {
+    connection.execute(
+        r#"
+        INSERT INTO feedback_outbox (
+          id, edit_session_id, kind, message, proposal_ids_json,
+          created_at, delivered_at, acknowledged_at
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+        "#,
+        params![
+            notice.id.to_string(),
+            notice.edit_session_id.to_string(),
+            notice.kind,
+            notice.message,
+            serde_json::to_string(&notice.proposal_ids)?,
+            notice.created_at.to_rfc3339(),
+            notice.delivered_at.map(|value| value.to_rfc3339()),
+            notice.acknowledged_at.map(|value| value.to_rfc3339()),
+        ],
+    )?;
+    Ok(())
 }
 
 fn save_edit_observation_on(connection: &Connection, record: &EditObservationRecord) -> Result<()> {
@@ -1670,6 +2226,55 @@ fn map_edit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EditEventRecord> {
     })
 }
 
+fn map_edit_revision(row: &rusqlite::Row<'_>) -> rusqlite::Result<EditRevisionRecord> {
+    Ok(EditRevisionRecord {
+        id: parse_uuid_column(row, 0)?,
+        edit_session_id: parse_uuid_column(row, 1)?,
+        ordinal: row.get::<_, u32>(2)?,
+        observed_at: parse_dt(&row.get::<_, String>(3)?),
+        trigger: row.get(4)?,
+        after_text: row.get(5)?,
+        after_text_hash: row.get(6)?,
+        normalized_edit_distance: row.get(7)?,
+        locator_confidence: row.get(8)?,
+        bounded: row.get(9)?,
+        quiescent: row.get(10)?,
+        final_revision: row.get(11)?,
+    })
+}
+
+fn map_learning_proposal(row: &rusqlite::Row<'_>) -> rusqlite::Result<LearningProposalRecord> {
+    Ok(LearningProposalRecord {
+        id: parse_uuid_column(row, 0)?,
+        edit_session_id: parse_uuid_column(row, 1)?,
+        revision_id: parse_uuid_column(row, 2)?,
+        kind: row.get(3)?,
+        payload_json: row.get(4)?,
+        confidence: row.get(5)?,
+        risk: row.get(6)?,
+        status: row.get(7)?,
+        policy_version: row.get::<_, u32>(8)?,
+        created_at: parse_dt(&row.get::<_, String>(9)?),
+    })
+}
+
+fn map_feedback_notice(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedbackNotice> {
+    let proposal_ids_json: String = row.get(4)?;
+    let proposal_ids = serde_json::from_str(&proposal_ids_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(FeedbackNotice {
+        id: parse_uuid_column(row, 0)?,
+        edit_session_id: parse_uuid_column(row, 1)?,
+        kind: row.get(2)?,
+        message: row.get(3)?,
+        proposal_ids,
+        created_at: parse_dt(&row.get::<_, String>(5)?),
+        delivered_at: row.get::<_, Option<String>>(6)?.as_deref().map(parse_dt),
+        acknowledged_at: row.get::<_, Option<String>>(7)?.as_deref().map(parse_dt),
+    })
+}
+
 fn parse_edit_source(s: &str) -> EditSource {
     match s {
         "post_paste_ax" => EditSource::PostPasteAx,
@@ -1764,6 +2369,10 @@ fn parse_dict_source(s: &str) -> DictEntrySource {
 mod tests {
     use super::*;
     use lumen_dictionary::DictionaryEntry;
+    use lumen_edit_learning::{
+        EditRevisionRecord, EditSessionRecord, EditSessionState, FeedbackNotice,
+        LearningProposalRecord,
+    };
 
     #[test]
     fn session_and_dict_roundtrip() {
@@ -2891,5 +3500,347 @@ mod tests {
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].sanitized_hash, "first");
         assert_eq!(snapshots[1].sanitized_hash, "second");
+    }
+
+    #[test]
+    fn edit_learning_sessions_keep_append_only_revisions_and_durable_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("edit-learning.sqlite")).unwrap();
+        let dictation = SessionRecord::new();
+        store.save_session(&dictation).unwrap();
+        let attempt = store
+            .append_dictation_attempt(DictationAttemptRecord::new(dictation.id))
+            .unwrap();
+        let now = Utc::now();
+        let session = EditSessionRecord {
+            id: Uuid::new_v4(),
+            dictation_session_id: dictation.id,
+            attempt_id: attempt.id,
+            surface_key_hash: "surface".into(),
+            adapter_kind: "test".into(),
+            state: EditSessionState::Observing,
+            target_app_name: Some("Editor".into()),
+            target_bundle_id: Some("test.editor".into()),
+            target_fingerprint_hash: "fingerprint".into(),
+            original_text: "original".into(),
+            original_text_hash: "original-hash".into(),
+            started_at: now,
+            last_seen_at: now,
+            last_edit_at: None,
+            finalized_at: None,
+            end_reason: None,
+            relocation_attempts: 0,
+            revision_count: 0,
+            final_edit_distance: None,
+        };
+        store.create_edit_learning_session(&session).unwrap();
+
+        let first = EditRevisionRecord {
+            id: Uuid::new_v4(),
+            edit_session_id: session.id,
+            ordinal: 1,
+            observed_at: now,
+            trigger: "burst_quiescence".into(),
+            after_text: "first edit".into(),
+            after_text_hash: "first-hash".into(),
+            normalized_edit_distance: 0.5,
+            locator_confidence: 1.0,
+            bounded: true,
+            quiescent: true,
+            final_revision: false,
+        };
+        let mut second = first.clone();
+        second.id = Uuid::new_v4();
+        second.ordinal = 2;
+        second.after_text = "second edit".into();
+        second.after_text_hash = "second-hash".into();
+        store.append_edit_learning_revision(&first).unwrap();
+        store.append_edit_learning_revision(&second).unwrap();
+
+        let proposal = LearningProposalRecord {
+            id: Uuid::new_v4(),
+            edit_session_id: session.id,
+            revision_id: second.id,
+            kind: "term".into(),
+            payload_json: r#"{"term":"DSH"}"#.into(),
+            confidence: 0.8,
+            risk: "reviewable".into(),
+            status: "proposed".into(),
+            policy_version: 1,
+            created_at: now,
+        };
+        let mut confirmed_proposal = proposal.clone();
+        confirmed_proposal.id = Uuid::new_v4();
+        confirmed_proposal.revision_id = first.id;
+        confirmed_proposal.payload_json = r#"{"term":"ConfirmedTerm"}"#.into();
+        let notice = FeedbackNotice {
+            id: Uuid::new_v4(),
+            edit_session_id: session.id,
+            kind: "learning_candidates_ready".into(),
+            message: "候选已准备".into(),
+            proposal_ids: vec![proposal.id, confirmed_proposal.id],
+            created_at: now,
+            delivered_at: None,
+            acknowledged_at: None,
+        };
+        store
+            .save_edit_learning_proposals_with_feedback(
+                &[proposal.clone(), confirmed_proposal.clone()],
+                &notice,
+            )
+            .unwrap();
+        assert!(store
+            .conn
+            .execute(
+                "UPDATE edit_sessions SET state='invalid' WHERE id=?1",
+                [session.id.to_string()],
+            )
+            .is_err());
+        assert!(store
+            .conn
+            .execute(
+                "UPDATE learning_proposals SET status='invalid' WHERE id=?1",
+                [proposal.id.to_string()],
+            )
+            .is_err());
+        let mut rollback_valid = proposal.clone();
+        rollback_valid.id = Uuid::new_v4();
+        let mut rollback_invalid = proposal.clone();
+        rollback_invalid.id = Uuid::new_v4();
+        rollback_invalid.payload_json = "not-json".into();
+        let rollback_notice = FeedbackNotice {
+            id: Uuid::new_v4(),
+            proposal_ids: vec![rollback_valid.id, rollback_invalid.id],
+            ..notice.clone()
+        };
+        assert!(store
+            .save_edit_learning_proposals_with_feedback(
+                &[rollback_valid.clone(), rollback_invalid.clone()],
+                &rollback_notice,
+            )
+            .is_err());
+        let proposal_ids = store
+            .list_edit_learning_proposals(session.id)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        assert!(!proposal_ids.contains(&rollback_valid.id));
+        assert!(!proposal_ids.contains(&rollback_invalid.id));
+        assert!(!store
+            .list_pending_edit_learning_feedback(10)
+            .unwrap()
+            .iter()
+            .any(|pending| pending.id == rollback_notice.id));
+        let mut mismatched_entry = DictionaryEntry::term("UnrelatedTerm");
+        mismatched_entry.source = DictEntrySource::Learned;
+        let mismatch = store
+            .confirm_edit_learning_proposal(confirmed_proposal.id, &mismatched_entry)
+            .unwrap_err();
+        assert!(mismatch
+            .to_string()
+            .contains("does not match learning proposal"));
+        assert!(store.find_term("UnrelatedTerm").unwrap().is_none());
+        assert!(store
+            .list_edit_learning_proposals(session.id)
+            .unwrap()
+            .iter()
+            .any(|candidate| {
+                candidate.id == confirmed_proposal.id && candidate.status == "proposed"
+            }));
+        let mut confirmed_entry = DictionaryEntry::term("ConfirmedTerm");
+        confirmed_entry.source = DictEntrySource::Learned;
+        assert!(store
+            .confirm_edit_learning_proposal(confirmed_proposal.id, &confirmed_entry)
+            .unwrap());
+        assert!(store
+            .find_term("ConfirmedTerm")
+            .unwrap()
+            .is_some_and(|entry| entry.confirmed));
+
+        let mut duplicate_proposal = confirmed_proposal.clone();
+        duplicate_proposal.id = Uuid::new_v4();
+        duplicate_proposal.status = "proposed".into();
+        let duplicate_notice = FeedbackNotice {
+            id: Uuid::new_v4(),
+            proposal_ids: vec![duplicate_proposal.id],
+            ..notice.clone()
+        };
+        store
+            .save_edit_learning_proposals_with_feedback(
+                &[duplicate_proposal.clone()],
+                &duplicate_notice,
+            )
+            .unwrap();
+        let mut duplicate_entry = DictionaryEntry::term("ConfirmedTerm");
+        duplicate_entry.source = DictEntrySource::Learned;
+        assert!(store
+            .confirm_edit_learning_proposal(duplicate_proposal.id, &duplicate_entry)
+            .unwrap());
+        let duplicate_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dictionary_entries WHERE kind='term' AND term='ConfirmedTerm'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(duplicate_count, 1);
+
+        let mut rejected_proposal = proposal.clone();
+        rejected_proposal.id = Uuid::new_v4();
+        rejected_proposal.payload_json = r#"{"term":"RejectedTerm"}"#.into();
+        let rejected_notice = FeedbackNotice {
+            id: Uuid::new_v4(),
+            proposal_ids: vec![rejected_proposal.id],
+            ..notice.clone()
+        };
+        store
+            .save_edit_learning_proposals_with_feedback(
+                &[rejected_proposal.clone()],
+                &rejected_notice,
+            )
+            .unwrap();
+        assert!(store
+            .decide_edit_learning_proposal(rejected_proposal.id, "rejected")
+            .unwrap());
+        assert!(!store
+            .decide_edit_learning_proposal(rejected_proposal.id, "rejected")
+            .unwrap());
+        assert!(store
+            .decide_edit_learning_proposal(rejected_proposal.id, "reverted")
+            .is_err());
+
+        let mut third = second.clone();
+        third.id = Uuid::new_v4();
+        third.ordinal = 3;
+        third.after_text = "third edit".into();
+        third.after_text_hash = "third-hash".into();
+        store.append_edit_learning_revision(&third).unwrap();
+        let mut current_proposal = proposal.clone();
+        current_proposal.id = Uuid::new_v4();
+        current_proposal.revision_id = third.id;
+        current_proposal.payload_json = r#"{"term":"CurrentTerm"}"#.into();
+        let current_notice = FeedbackNotice {
+            id: Uuid::new_v4(),
+            proposal_ids: vec![current_proposal.id],
+            ..notice.clone()
+        };
+        store
+            .save_edit_learning_proposals_with_feedback(
+                &[current_proposal.clone()],
+                &current_notice,
+            )
+            .unwrap();
+
+        assert!(store
+            .supersede_edit_learning_proposals(session.id, Uuid::new_v4())
+            .is_err());
+        assert!(store
+            .list_edit_learning_proposals(session.id)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.id == proposal.id && candidate.status == "proposed"));
+        assert_eq!(
+            store
+                .supersede_edit_learning_proposals(session.id, third.id)
+                .unwrap(),
+            vec![proposal.id]
+        );
+        let proposals = store.list_edit_learning_proposals(session.id).unwrap();
+        assert_eq!(
+            proposals
+                .iter()
+                .find(|candidate| candidate.id == proposal.id)
+                .unwrap()
+                .status,
+            "superseded"
+        );
+        assert_eq!(
+            proposals
+                .iter()
+                .find(|candidate| candidate.id == confirmed_proposal.id)
+                .unwrap()
+                .status,
+            "confirmed"
+        );
+        assert_eq!(
+            proposals
+                .iter()
+                .find(|candidate| candidate.id == current_proposal.id)
+                .unwrap()
+                .status,
+            "proposed"
+        );
+
+        assert_eq!(
+            store.list_edit_learning_revisions(session.id).unwrap(),
+            vec![first, second, third]
+        );
+        assert_eq!(
+            store.list_pending_edit_learning_feedback(10).unwrap(),
+            vec![current_notice.clone()]
+        );
+        store
+            .mark_edit_learning_feedback_delivered(current_notice.id)
+            .unwrap();
+        store
+            .acknowledge_edit_learning_feedback(current_notice.id)
+            .unwrap();
+        assert!(store
+            .mark_edit_learning_feedback_delivered(Uuid::new_v4())
+            .is_err());
+        assert!(store
+            .acknowledge_edit_learning_feedback(Uuid::new_v4())
+            .is_err());
+        assert!(store
+            .list_pending_edit_learning_feedback(10)
+            .unwrap()
+            .is_empty());
+
+        let (sessions_redacted, revisions_redacted) =
+            store.redact_edit_learning_evidence_text().unwrap();
+        assert_eq!((sessions_redacted, revisions_redacted), (1, 3));
+        assert_eq!(store.redact_edit_learning_evidence_text().unwrap(), (0, 0));
+        assert!(store
+            .list_edit_learning_revisions(session.id)
+            .unwrap()
+            .iter()
+            .all(|revision| revision.after_text.is_empty()));
+        let persisted_original: String = store
+            .conn
+            .query_row(
+                "SELECT original_text FROM edit_sessions WHERE id=?1",
+                [session.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(persisted_original.is_empty());
+
+        assert_eq!(
+            store
+                .finalize_incomplete_edit_learning_sessions("application_restarted")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .finalize_incomplete_edit_learning_sessions("application_restarted")
+                .unwrap(),
+            0
+        );
+        let persisted_lifecycle: (String, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT state, end_reason FROM edit_sessions WHERE id=?1",
+                [session.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted_lifecycle.0, "finalized");
+        assert_eq!(
+            persisted_lifecycle.1.as_deref(),
+            Some("application_restarted")
+        );
     }
 }
