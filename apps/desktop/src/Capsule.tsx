@@ -23,6 +23,7 @@ type DictationEvent =
       phase: "done";
       outcome: { text: string; fallbackReason?: string | null };
     }
+  | { phase: "notice"; message: string }
   | { phase: "error"; message: string }
   | { phase: "cancelled" };
 
@@ -51,6 +52,9 @@ export default function Capsule() {
         if (p.targetLanguage != null) setTargetLang(p.targetLanguage);
       } else if (p.phase === "error") {
         setPhase("error");
+        setMessage(p.message);
+      } else if (p.phase === "notice") {
+        setPhase("notice");
         setMessage(p.message);
       } else if (p.phase === "done") {
         if (p.outcome.fallbackReason) {

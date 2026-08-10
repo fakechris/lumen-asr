@@ -13,7 +13,7 @@ use lumen_core::{
 };
 use lumen_dictionary::DictionaryEntry;
 use lumen_edit_learning::{
-    EditRevisionRecord, EditSessionRecord, FeedbackNotice, LearningProposalRecord,
+    EditRevisionRecord, EditSessionRecord, EditSessionState, FeedbackNotice, LearningProposalRecord,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -29,6 +29,7 @@ pub(crate) const LEGACY_EMPTY_CAPTURE_MESSAGE: &str =
 pub const DEFAULT_ATTEMPT_PAGE_SIZE: u32 = 100;
 pub const MAX_ATTEMPT_PAGE_SIZE: u32 = 500;
 pub const MAX_FEEDBACK_PAGE_SIZE: u32 = 500;
+pub const EDIT_LEARNING_PARENT_NOT_READY: &str = "edit-learning parent attempt not ready";
 
 /// One user edit associated with a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -662,50 +663,7 @@ impl Store {
     }
 
     pub fn create_edit_learning_session(&self, record: &EditSessionRecord) -> Result<()> {
-        let changed = self.conn.execute(
-            r#"
-            INSERT INTO edit_sessions (
-              id, dictation_session_id, attempt_id, surface_key_hash, adapter_kind,
-              state, target_app_name, target_bundle_id, target_fingerprint_hash,
-              original_text, original_text_hash, started_at, last_seen_at,
-              last_edit_at, finalized_at, end_reason, relocation_attempts,
-              revision_count, final_edit_distance
-            )
-            SELECT
-              ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19
-            FROM dictation_attempts AS attempt
-            WHERE attempt.id=?3 AND attempt.session_id=?2
-            "#,
-            params![
-                record.id.to_string(),
-                record.dictation_session_id.to_string(),
-                record.attempt_id.to_string(),
-                record.surface_key_hash,
-                record.adapter_kind,
-                record.state.as_str(),
-                record.target_app_name,
-                record.target_bundle_id,
-                record.target_fingerprint_hash,
-                record.original_text,
-                record.original_text_hash,
-                record.started_at.to_rfc3339(),
-                record.last_seen_at.to_rfc3339(),
-                record.last_edit_at.map(|value| value.to_rfc3339()),
-                record.finalized_at.map(|value| value.to_rfc3339()),
-                record.end_reason,
-                i64::from(record.relocation_attempts),
-                i64::from(record.revision_count),
-                record.final_edit_distance,
-            ],
-        )?;
-        if changed != 1 {
-            anyhow::bail!(
-                "edit-learning parent attempt not ready: session_id={}, attempt_id={}",
-                record.dictation_session_id,
-                record.attempt_id
-            );
-        }
-        Ok(())
+        create_edit_learning_session_on(&self.conn, record)
     }
 
     pub fn update_edit_learning_session(&self, record: &EditSessionRecord) -> Result<()> {
@@ -767,6 +725,72 @@ impl Store {
         Ok(())
     }
 
+    /// Append a fresh revision and retire every older pending candidate and
+    /// candidate notice for the same edit session in one transaction.
+    pub fn append_edit_learning_revision_and_supersede(
+        &self,
+        record: &EditRevisionRecord,
+    ) -> Result<Vec<Uuid>> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        transaction.execute(
+            r#"
+            INSERT INTO edit_revisions (
+              id, edit_session_id, ordinal, observed_at, trigger,
+              after_text, after_text_hash, normalized_edit_distance,
+              locator_confidence, bounded, quiescent, final_revision
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+            "#,
+            params![
+                record.id.to_string(),
+                record.edit_session_id.to_string(),
+                i64::from(record.ordinal),
+                record.observed_at.to_rfc3339(),
+                record.trigger,
+                record.after_text,
+                record.after_text_hash,
+                record.normalized_edit_distance,
+                record.locator_confidence,
+                record.bounded,
+                record.quiescent,
+                record.final_revision,
+            ],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        let proposal_ids = supersede_other_revision_proposals_on(
+            &transaction,
+            record.edit_session_id,
+            record.id,
+            &now,
+        )?;
+        transaction.execute(
+            r#"
+            UPDATE feedback_outbox
+            SET acknowledged_at=?2
+            WHERE edit_session_id=?1
+              AND acknowledged_at IS NULL
+              AND kind='edit_recorded'
+            "#,
+            params![record.edit_session_id.to_string(), now],
+        )?;
+        if !proposal_ids.is_empty() {
+            transaction.execute(
+                r#"
+                UPDATE feedback_outbox
+                SET acknowledged_at=?2
+                WHERE edit_session_id=?1
+                  AND acknowledged_at IS NULL
+                  AND kind IN (
+                    'learning_candidates_ready',
+                    'learning_confirmation_required'
+                  )
+                "#,
+                params![record.edit_session_id.to_string(), now],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(proposal_ids)
+    }
+
     /// Persist review candidates and their durable notification as one unit.
     /// This prevents a crash from leaving proposals that can no longer reach
     /// the user through the feedback outbox.
@@ -793,7 +817,30 @@ impl Store {
             anyhow::bail!("proposal feedback ids do not match persisted proposals");
         }
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        acknowledge_replaced_edit_learning_feedback_on(&transaction, notice.edit_session_id)?;
         save_edit_learning_proposals_on(&transaction, records)?;
+        enqueue_edit_learning_feedback_on(&transaction, notice)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Persist a terminal observation failure and its durable notice together.
+    pub fn save_edit_learning_observation_failure_with_feedback(
+        &self,
+        record: &EditSessionRecord,
+        notice: &FeedbackNotice,
+    ) -> Result<()> {
+        if record.id != notice.edit_session_id {
+            anyhow::bail!("observation failure feedback crosses edit-learning sessions");
+        }
+        if record.state != EditSessionState::Failed || notice.kind != "observation_unavailable" {
+            anyhow::bail!("observation failure transaction requires terminal failure records");
+        }
+        if !notice.proposal_ids.is_empty() {
+            anyhow::bail!("observation failure feedback cannot reference proposals");
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        create_edit_learning_session_on(&transaction, record)?;
         enqueue_edit_learning_feedback_on(&transaction, notice)?;
         transaction.commit()?;
         Ok(())
@@ -822,49 +869,14 @@ impl Store {
                 edit_session_id
             );
         }
-        let proposal_ids = {
-            let mut statement = transaction.prepare(
-                r#"
-                SELECT id
-                FROM learning_proposals
-                WHERE edit_session_id=?1
-                  AND revision_id<>?2
-                  AND status='proposed'
-                ORDER BY created_at, id
-                "#,
-            )?;
-            let rows = statement.query_map(
-                params![edit_session_id.to_string(), current_revision_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )?;
-            rows.map(|row| {
-                let value = row?;
-                Uuid::parse_str(&value).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })
-            })
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let now = Utc::now().to_rfc3339();
+        let proposal_ids = supersede_other_revision_proposals_on(
+            &transaction,
+            edit_session_id,
+            current_revision_id,
+            &now,
+        )?;
         if !proposal_ids.is_empty() {
-            let now = Utc::now().to_rfc3339();
-            transaction.execute(
-                r#"
-                UPDATE learning_proposals
-                SET status='superseded', decided_at=?3
-                WHERE edit_session_id=?1
-                  AND revision_id<>?2
-                  AND status='proposed'
-                "#,
-                params![
-                    edit_session_id.to_string(),
-                    current_revision_id.to_string(),
-                    now,
-                ],
-            )?;
             let proposal_statuses = {
                 let mut statement = transaction.prepare(
                     "SELECT id, status FROM learning_proposals WHERE edit_session_id=?1",
@@ -1074,7 +1086,28 @@ impl Store {
     }
 
     pub fn enqueue_edit_learning_feedback(&self, notice: &FeedbackNotice) -> Result<()> {
-        enqueue_edit_learning_feedback_on(&self.conn, notice)
+        if notice.kind != "edit_recorded" {
+            return enqueue_edit_learning_feedback_on(&self.conn, notice);
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        acknowledge_replaced_edit_learning_feedback_on(&transaction, notice.edit_session_id)?;
+        enqueue_edit_learning_feedback_on(&transaction, notice)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Delete only feedback that the user already acknowledged and that is
+    /// older than the supplied cutoff. Pending notices remain durable.
+    pub fn purge_acknowledged_edit_learning_feedback_before(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM feedback_outbox WHERE acknowledged_at IS NOT NULL AND acknowledged_at<?1",
+                [cutoff.to_rfc3339()],
+            )
+            .map_err(Into::into)
     }
 
     pub fn list_edit_learning_revisions(
@@ -1765,6 +1798,108 @@ fn save_edit_learning_proposals_on(
     Ok(())
 }
 
+fn create_edit_learning_session_on(
+    connection: &Connection,
+    record: &EditSessionRecord,
+) -> Result<()> {
+    let changed = connection.execute(
+        r#"
+        INSERT INTO edit_sessions (
+          id, dictation_session_id, attempt_id, surface_key_hash, adapter_kind,
+          state, target_app_name, target_bundle_id, target_fingerprint_hash,
+          original_text, original_text_hash, started_at, last_seen_at,
+          last_edit_at, finalized_at, end_reason, relocation_attempts,
+          revision_count, final_edit_distance
+        )
+        SELECT
+          ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19
+        FROM dictation_attempts AS attempt
+        WHERE attempt.id=?3 AND attempt.session_id=?2
+        "#,
+        params![
+            record.id.to_string(),
+            record.dictation_session_id.to_string(),
+            record.attempt_id.to_string(),
+            record.surface_key_hash,
+            record.adapter_kind,
+            record.state.as_str(),
+            record.target_app_name,
+            record.target_bundle_id,
+            record.target_fingerprint_hash,
+            record.original_text,
+            record.original_text_hash,
+            record.started_at.to_rfc3339(),
+            record.last_seen_at.to_rfc3339(),
+            record.last_edit_at.map(|value| value.to_rfc3339()),
+            record.finalized_at.map(|value| value.to_rfc3339()),
+            record.end_reason,
+            i64::from(record.relocation_attempts),
+            i64::from(record.revision_count),
+            record.final_edit_distance,
+        ],
+    )?;
+    if changed != 1 {
+        anyhow::bail!(
+            "{EDIT_LEARNING_PARENT_NOT_READY}: session_id={}, attempt_id={}",
+            record.dictation_session_id,
+            record.attempt_id
+        );
+    }
+    Ok(())
+}
+
+fn supersede_other_revision_proposals_on(
+    connection: &Connection,
+    edit_session_id: Uuid,
+    current_revision_id: Uuid,
+    decided_at: &str,
+) -> Result<Vec<Uuid>> {
+    let proposal_ids = {
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id
+            FROM learning_proposals
+            WHERE edit_session_id=?1
+              AND revision_id<>?2
+              AND status='proposed'
+            ORDER BY created_at, id
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![edit_session_id.to_string(), current_revision_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.map(|row| {
+            let value = row?;
+            Uuid::parse_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !proposal_ids.is_empty() {
+        connection.execute(
+            r#"
+            UPDATE learning_proposals
+            SET status='superseded', decided_at=?3
+            WHERE edit_session_id=?1
+              AND revision_id<>?2
+              AND status='proposed'
+            "#,
+            params![
+                edit_session_id.to_string(),
+                current_revision_id.to_string(),
+                decided_at,
+            ],
+        )?;
+    }
+    Ok(proposal_ids)
+}
+
 fn enqueue_edit_learning_feedback_on(
     connection: &Connection,
     notice: &FeedbackNotice,
@@ -1786,6 +1921,23 @@ fn enqueue_edit_learning_feedback_on(
             notice.delivered_at.map(|value| value.to_rfc3339()),
             notice.acknowledged_at.map(|value| value.to_rfc3339()),
         ],
+    )?;
+    Ok(())
+}
+
+fn acknowledge_replaced_edit_learning_feedback_on(
+    connection: &Connection,
+    edit_session_id: Uuid,
+) -> Result<()> {
+    connection.execute(
+        r#"
+        UPDATE feedback_outbox
+        SET acknowledged_at=?2
+        WHERE edit_session_id=?1
+          AND acknowledged_at IS NULL
+          AND kind IN ('edit_recorded', 'learning_candidates_superseded')
+        "#,
+        params![edit_session_id.to_string(), Utc::now().to_rfc3339(),],
     )?;
     Ok(())
 }
@@ -3716,7 +3868,98 @@ mod tests {
         third.ordinal = 3;
         third.after_text = "third edit".into();
         third.after_text_hash = "third-hash".into();
-        store.append_edit_learning_revision(&third).unwrap();
+        let recorded_notice = FeedbackNotice {
+            id: Uuid::new_v4(),
+            edit_session_id: session.id,
+            kind: "edit_recorded".into(),
+            message: "修改已记录".into(),
+            proposal_ids: Vec::new(),
+            created_at: now,
+            delivered_at: None,
+            acknowledged_at: None,
+        };
+        store
+            .enqueue_edit_learning_feedback(&recorded_notice)
+            .unwrap();
+        let mut rolled_back_revision = third.clone();
+        rolled_back_revision.id = Uuid::new_v4();
+        rolled_back_revision.ordinal = 30;
+        assert!(store
+            .supersede_edit_learning_proposals(session.id, Uuid::new_v4())
+            .is_err());
+        assert!(store
+            .list_edit_learning_proposals(session.id)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.id == proposal.id && candidate.status == "proposed"));
+        store
+            .conn
+            .execute_batch(
+                r#"
+                CREATE TEMP TRIGGER reject_proposal_supersession
+                BEFORE UPDATE OF status ON learning_proposals
+                WHEN NEW.status='superseded'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced supersession failure');
+                END;
+                "#,
+            )
+            .unwrap();
+        assert!(store
+            .append_edit_learning_revision_and_supersede(&rolled_back_revision)
+            .is_err());
+        assert!(!store
+            .list_edit_learning_revisions(session.id)
+            .unwrap()
+            .iter()
+            .any(|revision| revision.id == rolled_back_revision.id));
+        assert!(store
+            .list_pending_edit_learning_feedback(20)
+            .unwrap()
+            .iter()
+            .any(|pending| pending.id == recorded_notice.id));
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_proposal_supersession")
+            .unwrap();
+        assert_eq!(
+            store
+                .append_edit_learning_revision_and_supersede(&third)
+                .unwrap(),
+            vec![proposal.id]
+        );
+        assert!(!store
+            .list_pending_edit_learning_feedback(20)
+            .unwrap()
+            .iter()
+            .any(|pending| pending.id == recorded_notice.id));
+        let superseded_notice = FeedbackNotice {
+            id: Uuid::new_v4(),
+            edit_session_id: session.id,
+            kind: "learning_candidates_superseded".into(),
+            message: "旧候选已撤回".into(),
+            proposal_ids: Vec::new(),
+            created_at: now,
+            delivered_at: None,
+            acknowledged_at: None,
+        };
+        store
+            .enqueue_edit_learning_feedback(&superseded_notice)
+            .unwrap();
+        let final_recorded_notice = FeedbackNotice {
+            id: Uuid::new_v4(),
+            ..recorded_notice.clone()
+        };
+        store
+            .enqueue_edit_learning_feedback(&final_recorded_notice)
+            .unwrap();
+        let pending = store.list_pending_edit_learning_feedback(20).unwrap();
+        assert!(pending
+            .iter()
+            .any(|notice| notice.id == final_recorded_notice.id));
+        assert!(!pending
+            .iter()
+            .any(|notice| notice.id == superseded_notice.id));
         let mut current_proposal = proposal.clone();
         current_proposal.id = Uuid::new_v4();
         current_proposal.revision_id = third.id;
@@ -3733,20 +3976,6 @@ mod tests {
             )
             .unwrap();
 
-        assert!(store
-            .supersede_edit_learning_proposals(session.id, Uuid::new_v4())
-            .is_err());
-        assert!(store
-            .list_edit_learning_proposals(session.id)
-            .unwrap()
-            .iter()
-            .any(|candidate| candidate.id == proposal.id && candidate.status == "proposed"));
-        assert_eq!(
-            store
-                .supersede_edit_learning_proposals(session.id, third.id)
-                .unwrap(),
-            vec![proposal.id]
-        );
         let proposals = store.list_edit_learning_proposals(session.id).unwrap();
         assert_eq!(
             proposals
@@ -3798,6 +4027,52 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        let mut failed_session = session.clone();
+        failed_session.id = Uuid::new_v4();
+        failed_session.state = EditSessionState::Failed;
+        failed_session.finalized_at = Some(now);
+        failed_session.end_reason = Some("surface_unavailable".into());
+        let failed_notice = FeedbackNotice {
+            id: Uuid::new_v4(),
+            edit_session_id: failed_session.id,
+            kind: "observation_unavailable".into(),
+            message: "监听不可用".into(),
+            proposal_ids: Vec::new(),
+            created_at: now,
+            delivered_at: None,
+            acknowledged_at: None,
+        };
+        store
+            .conn
+            .execute_batch(&format!(
+                r#"
+                CREATE TEMP TRIGGER reject_failure_notice
+                BEFORE INSERT ON feedback_outbox
+                WHEN NEW.id='{}'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced feedback failure');
+                END;
+                "#,
+                failed_notice.id
+            ))
+            .unwrap();
+        assert!(store
+            .save_edit_learning_observation_failure_with_feedback(&failed_session, &failed_notice,)
+            .is_err());
+        let failed_session_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM edit_sessions WHERE id=?1",
+                [failed_session.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed_session_count, 0);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_failure_notice")
+            .unwrap();
+
         let (sessions_redacted, revisions_redacted) =
             store.redact_edit_learning_evidence_text().unwrap();
         assert_eq!((sessions_redacted, revisions_redacted), (1, 3));
@@ -3841,6 +4116,86 @@ mod tests {
         assert_eq!(
             persisted_lifecycle.1.as_deref(),
             Some("application_restarted")
+        );
+    }
+
+    #[test]
+    fn acknowledged_edit_learning_feedback_is_indexed_and_purged_without_losing_pending_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("feedback-retention.sqlite")).unwrap();
+        let dictation = SessionRecord::new();
+        store.save_session(&dictation).unwrap();
+        let attempt = store
+            .append_dictation_attempt(DictationAttemptRecord::new(dictation.id))
+            .unwrap();
+        let now = Utc::now();
+        let session = EditSessionRecord {
+            id: Uuid::new_v4(),
+            dictation_session_id: dictation.id,
+            attempt_id: attempt.id,
+            surface_key_hash: "surface".into(),
+            adapter_kind: "test".into(),
+            state: EditSessionState::Observing,
+            target_app_name: Some("Editor".into()),
+            target_bundle_id: Some("test.editor".into()),
+            target_fingerprint_hash: "fingerprint".into(),
+            original_text: String::new(),
+            original_text_hash: "original-hash".into(),
+            started_at: now,
+            last_seen_at: now,
+            last_edit_at: None,
+            finalized_at: None,
+            end_reason: None,
+            relocation_attempts: 0,
+            revision_count: 0,
+            final_edit_distance: None,
+        };
+        store.create_edit_learning_session(&session).unwrap();
+
+        let acknowledged = FeedbackNotice {
+            id: Uuid::new_v4(),
+            edit_session_id: session.id,
+            kind: "edit_recorded".into(),
+            message: "已记录".into(),
+            proposal_ids: Vec::new(),
+            created_at: now,
+            delivered_at: None,
+            acknowledged_at: None,
+        };
+        store.enqueue_edit_learning_feedback(&acknowledged).unwrap();
+        store
+            .acknowledge_edit_learning_feedback(acknowledged.id)
+            .unwrap();
+        let pending = FeedbackNotice {
+            id: Uuid::new_v4(),
+            kind: "observation_unavailable".into(),
+            message: "待处理".into(),
+            ..acknowledged.clone()
+        };
+        store.enqueue_edit_learning_feedback(&pending).unwrap();
+
+        let indexes = store
+            .conn
+            .prepare("PRAGMA index_list(feedback_outbox)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(indexes
+            .iter()
+            .any(|name| name == "idx_feedback_outbox_session_pending_kind"));
+        assert_eq!(
+            store
+                .purge_acknowledged_edit_learning_feedback_before(
+                    Utc::now() + chrono::Duration::seconds(1),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.list_pending_edit_learning_feedback(10).unwrap(),
+            vec![pending]
         );
     }
 }

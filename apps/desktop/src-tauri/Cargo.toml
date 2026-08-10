@@ -12,6 +12,7 @@ tauri-build = { version = "2", features = [] }
 chrono = { workspace = true }
 
 [dependencies]
+anyhow = { workspace = true }
 tauri = { version = "2", features = ["macos-private-api", "protocol-asset"] }
 tauri-plugin-shell = "2"
 tauri-plugin-global-shortcut = "2"
@@ -26,6 +27,7 @@ lumen-core = { workspace = true }
 lumen-meeting = { workspace = true }
 lumen-identity = { workspace = true }
 lumen-dictionary = { workspace = true }
+lumen-edit-learning = { workspace = true }
 lumen-asr = { workspace = true }
 lumen-corrector = { workspace = true }
 lumen-prompts = { workspace = true }

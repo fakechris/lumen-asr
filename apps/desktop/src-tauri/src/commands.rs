@@ -329,6 +329,8 @@ pub struct ConfirmLearnInput {
     pub session_id: Option<String>,
     pub before_text: Option<String>,
     pub after_text: Option<String>,
+    /// Durable proposal to confirm atomically with the dictionary write.
+    pub proposal_id: Option<String>,
 }
 
 #[tauri::command]
@@ -336,6 +338,12 @@ pub fn confirm_learn(
     state: State<'_, AppState>,
     input: ConfirmLearnInput,
 ) -> Result<DictionaryEntry, String> {
+    let proposal_id = input
+        .proposal_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let mut entry = match input.kind.as_str() {
         "replacement" => {
             let from = input
@@ -367,6 +375,17 @@ pub fn confirm_learn(
     entry.confirmed = true;
 
     with_store(&state, |s| {
+        if let Some(proposal_id) = proposal_id {
+            let confirmed = s
+                .confirm_edit_learning_proposal(proposal_id, &entry)
+                .map_err(|error| error.to_string())?;
+            if !confirmed {
+                return Err("learning proposal is no longer pending".into());
+            }
+        } else {
+            s.upsert_dictionary_entry(&entry)
+                .map_err(|error| error.to_string())?;
+        }
         if let (Some(sid), Some(before), Some(after)) = (
             input.session_id.as_ref(),
             input.before_text.as_ref(),
@@ -378,8 +397,6 @@ pub fn confirm_learn(
                 }
             }
         }
-        s.upsert_dictionary_entry(&entry)
-            .map_err(|e| e.to_string())?;
         Ok(entry)
     })
 }

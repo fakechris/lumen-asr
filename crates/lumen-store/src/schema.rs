@@ -27,9 +27,9 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// `enroll_conflicts` queue (same-voice/different-name auto-enroll conflicts);
 /// v17 recreates it with the `speaker_id` foreign key; v18 adds durable
 /// observed-insertion sessions, append-only edit revisions, learning proposals,
-/// and the feedback outbox.
+/// and the feedback outbox; v19 indexes per-session feedback replacement.
 #[cfg(test)]
-pub(crate) const SCHEMA_VERSION: i64 = 18;
+pub(crate) const SCHEMA_VERSION: i64 = 19;
 
 pub(crate) const HISTORY_TEXT_WHITESPACE: &str =
     "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
@@ -666,6 +666,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (18)",
         [],
     )?;
+    // v19: accelerate replacement of acknowledged edit-learning notices for
+    // one session without scanning the durable outbox.
+    conn.execute_batch(EDIT_LEARNING_SCHEMA_V19)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (19)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -758,6 +765,11 @@ const EDIT_LEARNING_SCHEMA_V18: &str = r#"
 
     CREATE INDEX IF NOT EXISTS idx_feedback_outbox_pending
       ON feedback_outbox(acknowledged_at, created_at);
+"#;
+
+const EDIT_LEARNING_SCHEMA_V19: &str = r#"
+    CREATE INDEX IF NOT EXISTS idx_feedback_outbox_session_pending_kind
+      ON feedback_outbox(edit_session_id, acknowledged_at, kind);
 "#;
 
 /// Canonical definition of the auto-enroll conflict queue (v16 table, v17 adds

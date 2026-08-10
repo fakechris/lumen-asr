@@ -30,11 +30,14 @@ import type {
   CorrectorStatus,
   DictationAttemptRecord,
   DictionaryEntry,
+  EditLearningFeedback,
+  EditLearningObservability,
   EditEvent,
   EditObservation,
   Health,
   LearnCandidate,
   LearningConfig,
+  LearningProposal,
   SessionRecord,
   TabId,
 } from "./types";
@@ -53,6 +56,39 @@ function formatTime(iso: string): string {
   } catch {
     return iso;
   }
+}
+
+function candidateFromLearningProposal(
+  proposal: LearningProposal,
+): LearnCandidate | null {
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(proposal.payload_json) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (proposal.kind === "term" && typeof payload.term === "string") {
+    return {
+      kind: "term",
+      term: payload.term,
+      reason: `听写后编辑证据 · 置信度 ${Math.round(proposal.confidence * 100)}%`,
+      proposal_id: proposal.id,
+    };
+  }
+  if (
+    proposal.kind === "replacement" &&
+    typeof payload.fromText === "string" &&
+    typeof payload.toText === "string"
+  ) {
+    return {
+      kind: "replacement",
+      from_text: payload.fromText,
+      to_text: payload.toText,
+      reason: `需要确认的听写纠正 · 置信度 ${Math.round(proposal.confidence * 100)}%`,
+      proposal_id: proposal.id,
+    };
+  }
+  return null;
 }
 
 function editObservationReasonLabel(reason: string): string {
@@ -177,10 +213,16 @@ export default function App() {
   // Meetings we already asked to stop (auto-stop or calendar reminder), so a
   // second event / click never fires a duplicate stop command.
   const stoppedMeetingsRef = useRef<Set<string>>(new Set());
+  const handledEditFeedbackRef = useRef<Set<string>>(new Set());
+  const [editLearningNotices, setEditLearningNotices] = useState<
+    EditLearningFeedback[]
+  >([]);
   const [recoveryNotices, setRecoveryNotices] = useState<
     { meetingId: string; text: string; ok: boolean }[]
   >([]);
   const [editFeedbackRevision, setEditFeedbackRevision] = useState(0);
+  const [editLearningObservability, setEditLearningObservability] =
+    useState<EditLearningObservability | null>(null);
   const [busy, setBusy] = useState(false);
   const [hotkeyLabel, setHotkeyLabel] = useState("⌥Space");
   const [hotkeyEnabled, setHotkeyEnabledUi] = useState(true);
@@ -252,41 +294,86 @@ export default function App() {
     }
   }, []);
 
-  // Persisted post-insert feedback. Keep it visible without stealing the
-  // user's current tab; candidates remain ready if they later open Learning.
-  useEffect(() => {
-    let un: (() => void) | undefined;
-    listen<{
-      editEventId?: string | null;
-      sessionId: string;
-      beforeText: string;
-      afterText: string;
-      candidates: LearnCandidate[];
-      autoPromoted: DictionaryEntry[];
-      message: string;
-    }>("edit-feedback-captured", (e) => {
-      const p = e.payload;
-      setLearnBefore(p.beforeText);
-      setLearnAfter(p.afterText);
-      setCandidates(p.candidates || []);
-      setSessionLearn({
-        sessionId: p.sessionId,
-        baseline: p.beforeText,
-        candidates: p.candidates || [],
-      });
-      setEditFeedbackRevision((value) => value + 1);
-      setNotice(
-        p.candidates?.length
-          ? `已记录你对听写结果的修改，并发现 ${p.candidates.length} 个可学习候选。`
-          : "已记录你对听写结果的修改。"
+  const loadEditLearningCandidates = useCallback(
+    async (feedback: EditLearningFeedback) => {
+      const proposals = await api.listEditLearningProposals(
+        feedback.edit_session_id,
       );
-      setError(null);
-      if (p.autoPromoted?.length) void refreshDict();
+      const nextCandidates = proposals
+        .filter(
+          (proposal) =>
+            proposal.status === "proposed" &&
+            feedback.proposal_ids.includes(proposal.id),
+        )
+        .map(candidateFromLearningProposal)
+        .filter((candidate): candidate is LearnCandidate => candidate !== null);
+      const replacement = nextCandidates.find(
+        (candidate) => candidate.kind === "replacement",
+      );
+      const term = nextCandidates.find((candidate) => candidate.kind === "term");
+      setLearnBefore(replacement?.from_text ?? "");
+      setLearnAfter(replacement?.to_text ?? term?.term ?? "");
+      setCandidates(nextCandidates);
+      setSessionLearn(null);
+      setEditFeedbackRevision((value) => value + 1);
+    },
+    [],
+  );
+
+  // Durable edit-learning feedback. The live event is only an accelerator;
+  // startup also drains the outbox so a hidden or closed UI never loses it.
+  useEffect(() => {
+    let disposed = false;
+    let un: (() => void) | undefined;
+    const showFeedback = async (feedback: EditLearningFeedback) => {
+      if (disposed || handledEditFeedbackRef.current.has(feedback.id)) return;
+      handledEditFeedbackRef.current.add(feedback.id);
+      setEditLearningNotices((current) =>
+        current.some((notice) => notice.id === feedback.id)
+          ? current
+          : [
+              ...current.filter(
+                (notice) => notice.edit_session_id !== feedback.edit_session_id,
+              ),
+              feedback,
+            ],
+      );
+      try {
+        if (feedback.proposal_ids.length) {
+          await loadEditLearningCandidates(feedback);
+        } else {
+          setEditFeedbackRevision((value) => value + 1);
+        }
+        if (disposed) return;
+        void api
+          .getEditLearningObservability()
+          .then((snapshot) => {
+            if (!disposed) setEditLearningObservability(snapshot);
+          })
+          .catch(() => undefined);
+      } catch (reason) {
+        if (!disposed) setError(String(reason));
+      }
+    };
+    listen<EditLearningFeedback>("edit-learning-feedback", (event) => {
+      void showFeedback(event.payload);
     }).then((fn) => {
-      un = fn;
+      if (disposed) fn();
+      else {
+        un = fn;
+        void api
+          .listEditLearningFeedback(100)
+          .then((notices) => notices.forEach((notice) => void showFeedback(notice)))
+          .catch((reason) => {
+            if (!disposed) setError(String(reason));
+          });
+      }
     });
-    return () => un?.();
-  }, [refreshDict]);
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  }, [loadEditLearningCandidates]);
 
   useEffect(() => {
     let un: (() => void) | undefined;
@@ -560,6 +647,12 @@ export default function App() {
 
   useEffect(() => {
     if (tab === "history" || tab === "overview") void refreshSessions();
+    if (tab === "overview") {
+      void api
+        .getEditLearningObservability()
+        .then(setEditLearningObservability)
+        .catch(() => setEditLearningObservability(null));
+    }
     if (tab === "dictionary" || tab === "overview" || tab === "learn")
       void refreshDict();
     if (tab === "settings") {
@@ -716,6 +809,44 @@ export default function App() {
         </nav>
 
         <div className="content">
+          {editLearningNotices.map((feedback) => (
+            <div
+              key={feedback.id}
+              className={`banner ${
+                feedback.kind === "observation_unavailable" ? "error" : "success"
+              }`}
+              role={feedback.kind === "observation_unavailable" ? "alert" : "status"}
+            >
+              {feedback.message}
+              {feedback.proposal_ids.length > 0 && (
+                <button
+                  type="button"
+                  className="linkish"
+                  onClick={() => {
+                    void loadEditLearningCandidates(feedback)
+                      .then(() => setTab("learn"))
+                      .catch((reason) => setError(String(reason)));
+                  }}
+                >
+                  查看候选
+                </button>
+              )}
+              <button
+                type="button"
+                className="linkish"
+                onClick={() => {
+                  setEditLearningNotices((current) =>
+                    current.filter((notice) => notice.id !== feedback.id),
+                  );
+                  void api
+                    .acknowledgeEditLearningFeedback(feedback.id)
+                    .catch((reason) => setError(String(reason)));
+                }}
+              >
+                关闭
+              </button>
+            </div>
+          ))}
           {error && (
             <div className="banner error" role="alert">
               {error}
@@ -851,6 +982,7 @@ export default function App() {
                 health={health}
                 sessions={sessions}
                 dictCount={dict.length}
+                editLearning={editLearningObservability}
                 busy={busy}
                 onSeed={() =>
                   run("seed", async () => {
@@ -961,6 +1093,7 @@ export default function App() {
                       sessionId: sessionLearn?.sessionId,
                       beforeText: learnBefore,
                       afterText: learnAfter,
+                      proposalId: c.proposal_id,
                     });
                     setCandidates((prev) =>
                       prev.filter(
@@ -975,6 +1108,16 @@ export default function App() {
                     );
                     await refreshDict();
                     await refreshHealth();
+                  })
+                }
+                onReject={(c) =>
+                  run("reject learn", async () => {
+                    if (c.proposal_id) {
+                      await api.decideEditLearningProposal(c.proposal_id, "rejected");
+                    }
+                    setCandidates((prev) =>
+                      prev.filter((candidate) => candidate !== c),
+                    );
                   })
                 }
               />
@@ -3417,20 +3560,10 @@ function SettingsPanel({
             粘贴后监听目标输入框改动（需辅助功能）
           </label>
         </div>
-        <div className="form-row">
-          <label className="form-label">
-            监听秒数
-          </label>
-          <input
-            className="input"
-            type="number"
-            min={5}
-            max={120}
-            value={postPasteSecs}
-            disabled={busy}
-            onChange={(e) => setPostPasteSecs(Number(e.target.value) || 20)}
-          />
-        </div>
+        <p className="muted-text" style={{ fontSize: "0.85rem" }}>
+          无固定停顿超时：短暂停顿和多次修改不会结束监听。会话默认最多保留 24
+          小时，并在目标内容清空、输入面失效、同输入框开始下一次听写或应用重启时结束。
+        </p>
         {learning && (
           <p className="muted-text" style={{ fontSize: "0.85rem" }}>
             当前：autoPromote={String(learning.autoPromote)} N=
@@ -3510,6 +3643,7 @@ function Overview({
   health,
   sessions,
   dictCount,
+  editLearning,
   busy,
   onSeed,
   onGoto,
@@ -3517,6 +3651,7 @@ function Overview({
   health: Health | null;
   sessions: SessionRecord[];
   dictCount: number;
+  editLearning: EditLearningObservability | null;
   busy: boolean;
   onSeed: () => void;
   onGoto: (t: TabId) => void;
@@ -3548,6 +3683,30 @@ function Overview({
             <dt>Corrector</dt>
             <dd>
               {health.corrector_enabled ? health.corrector_label : "关闭"}
+            </dd>
+            <dt>编辑观察</dt>
+            <dd>
+              {editLearning
+                ? `${editLearning.active_sessions} 活跃 · ${editLearning.revisions_recorded} revision`
+                : "加载中"}
+            </dd>
+            <dt>观察恢复</dt>
+            <dd>
+              {editLearning
+                ? `${editLearning.recoveries}/${editLearning.suspensions} · ${editLearning.sessions_failed_to_start} 次未启动 · ${editLearning.persistence_failures} 持久化失败`
+                : "—"}
+            </dd>
+            <dt>归因防护</dt>
+            <dd>
+              {editLearning
+                ? `${editLearning.content_boundary_finalizations} 次内容边界结束 · ${editLearning.same_surface_sessions_finalized} 次同输入框换代 · ${editLearning.insertion_target_mismatches} 次目标不匹配阻断`
+                : "—"}
+            </dd>
+            <dt>观察隐私/延迟</dt>
+            <dd>
+              {editLearning
+                ? `${editLearning.evidence_records_redacted} 条正文已脱敏 · snapshot max ${editLearning.snapshot_latency_ms_max} ms`
+                : "—"}
             </dd>
           </dl>
         ) : (
@@ -4326,6 +4485,7 @@ function LearnPanel({
   onAfter,
   onSuggest,
   onConfirm,
+  onReject,
 }: {
   before: string;
   after: string;
@@ -4336,6 +4496,7 @@ function LearnPanel({
   onAfter: (v: string) => void;
   onSuggest: () => void;
   onConfirm: (c: LearnCandidate) => void;
+  onReject: (c: LearnCandidate) => void;
 }) {
   return (
     <section className="card">
@@ -4402,6 +4563,14 @@ function LearnPanel({
                   onClick={() => onConfirm(c)}
                 >
                   确认加入词典
+                </button>
+                <button
+                  type="button"
+                  className="btn small ghost"
+                  disabled={busy}
+                  onClick={() => onReject(c)}
+                >
+                  忽略
                 </button>
               </li>
             ))}
