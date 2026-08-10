@@ -28,6 +28,7 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// v17 recreates it with the `speaker_id` foreign key; v18 adds durable
 /// observed-insertion sessions, append-only edit revisions, learning proposals,
 /// and the feedback outbox.
+#[cfg(test)]
 pub(crate) const SCHEMA_VERSION: i64 = 18;
 
 pub(crate) const HISTORY_TEXT_WHITESPACE: &str =
@@ -662,8 +663,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // v18: persistent edit-learning sessions and their durable feedback queue.
     conn.execute_batch(EDIT_LEARNING_SCHEMA_V18)?;
     conn.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
-        [SCHEMA_VERSION],
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (18)",
+        [],
     )?;
     Ok(())
 }
@@ -675,7 +676,12 @@ const EDIT_LEARNING_SCHEMA_V18: &str = r#"
       attempt_id TEXT NOT NULL,
       surface_key_hash TEXT NOT NULL,
       adapter_kind TEXT NOT NULL,
-      state TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (
+        state IN (
+          'inserted', 'observing', 'editing', 'quiescent',
+          'suspended', 'finalized', 'failed'
+        )
+      ),
       target_app_name TEXT,
       target_bundle_id TEXT,
       target_fingerprint_hash TEXT NOT NULL,
@@ -717,9 +723,6 @@ const EDIT_LEARNING_SCHEMA_V18: &str = r#"
       FOREIGN KEY(edit_session_id) REFERENCES edit_sessions(id) ON DELETE CASCADE
     );
 
-    CREATE INDEX IF NOT EXISTS idx_edit_revisions_session
-      ON edit_revisions(edit_session_id, ordinal);
-
     CREATE TABLE IF NOT EXISTS learning_proposals (
       id TEXT PRIMARY KEY NOT NULL,
       edit_session_id TEXT NOT NULL,
@@ -728,7 +731,9 @@ const EDIT_LEARNING_SCHEMA_V18: &str = r#"
       payload_json TEXT NOT NULL,
       confidence REAL NOT NULL,
       risk TEXT NOT NULL,
-      status TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (
+        status IN ('proposed', 'confirmed', 'rejected', 'superseded')
+      ),
       policy_version INTEGER NOT NULL,
       created_at TEXT NOT NULL,
       decided_at TEXT,
@@ -1933,6 +1938,25 @@ mod tests {
                   'c1', 'm1', 'sp1', 'Alice', 'Alicia',
                   0.91, '2026-08-09T00:00:00Z', 0
                 );
+                INSERT INTO sessions (id, created_at, status)
+                VALUES ('s1', '2026-08-09T00:00:00Z', 'completed');
+                INSERT INTO dictation_attempts (
+                  id, session_id, attempt_ordinal, created_at,
+                  pipeline_identity_json, pipeline_metrics_json,
+                  pipeline_inputs_json, status
+                ) VALUES (
+                  'a1', 's1', 1, '2026-08-09T00:00:00Z',
+                  '{}', '{}', '{}', 'completed'
+                );
+                INSERT INTO edit_sessions (
+                  id, dictation_session_id, attempt_id, surface_key_hash,
+                  adapter_kind, state, target_fingerprint_hash,
+                  original_text, original_text_hash, started_at, last_seen_at
+                ) VALUES (
+                  'e1', 's1', 'a1', 'surface', 'test', 'observing',
+                  'fingerprint', 'original', 'original-hash',
+                  '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z'
+                );
                 "#,
             )
             .unwrap();
@@ -1946,6 +1970,13 @@ mod tests {
         assert_eq!(
             conflict_count, 1,
             "repeated migrations must not drop v17 data"
+        );
+        let edit_session_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM edit_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            edit_session_count, 1,
+            "repeated migrations must not drop v18 data"
         );
         let version: i64 = connection
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
