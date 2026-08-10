@@ -149,6 +149,10 @@ pub fn process_edit(
     let candidates = candidates_from_edit(&before, &after);
     let mut auto_promoted = Vec::new();
     if learning.auto_promote {
+        let edit_hits = store
+            .count_identical_edits(&before, &after)
+            .unwrap_or(0)
+            .max(1);
         for candidate in &candidates {
             if candidate.kind != DictEntryKind::Replacement {
                 continue;
@@ -156,10 +160,6 @@ pub fn process_edit(
             let (Some(from), Some(to)) = (&candidate.from_text, &candidate.to_text) else {
                 continue;
             };
-            let edit_hits = store
-                .count_identical_edits(&before, &after)
-                .unwrap_or(0)
-                .max(1);
             let mut entry = store
                 .find_replacement(from, to)
                 .map_err(|error| error.to_string())?

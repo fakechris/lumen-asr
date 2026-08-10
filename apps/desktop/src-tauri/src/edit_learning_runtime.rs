@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
+const ACKNOWLEDGED_FEEDBACK_RETENTION_DAYS: i64 = 30;
+
 pub(crate) struct DesktopEditLearning {
     engine: Arc<EditLearningEngine>,
     pending: Mutex<Option<Arc<dyn SurfaceReservation>>>,
@@ -54,6 +56,21 @@ impl DesktopEditLearning {
                     Err(error) => tracing::warn!(
                         error = %error,
                         "could not redact stored edit-learning plaintext evidence"
+                    ),
+                }
+                let feedback_cutoff =
+                    Utc::now() - chrono::Duration::days(ACKNOWLEDGED_FEEDBACK_RETENTION_DAYS);
+                match database.purge_acknowledged_edit_learning_feedback_before(feedback_cutoff) {
+                    Ok(count) if count > 0 => tracing::info!(
+                        purged_feedback_records = count,
+                        retention_days = ACKNOWLEDGED_FEEDBACK_RETENTION_DAYS,
+                        "purged acknowledged edit-learning feedback"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        retention_days = ACKNOWLEDGED_FEEDBACK_RETENTION_DAYS,
+                        "could not purge acknowledged edit-learning feedback"
                     ),
                 }
             }
@@ -403,7 +420,9 @@ impl DesktopEditLearningRepository {
 
 fn parent_not_ready(result: Result<(), RepositoryError>) -> Result<(), RepositoryError> {
     match result {
-        Err(RepositoryError::Failure(message)) if message.contains("parent attempt not ready") => {
+        Err(RepositoryError::Failure(message))
+            if message.contains(lumen_store::EDIT_LEARNING_PARENT_NOT_READY) =>
+        {
             Err(RepositoryError::ParentNotReady)
         }
         result => result,

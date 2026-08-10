@@ -2168,6 +2168,7 @@ mod tests {
         notices: Mutex<Vec<FeedbackNotice>>,
         parent_failures_remaining: std::sync::atomic::AtomicUsize,
         fail_proposal_batch: AtomicBool,
+        fail_feedback_enqueue: AtomicBool,
     }
 
     impl EditLearningRepository for MemoryRepository {
@@ -2247,6 +2248,11 @@ mod tests {
         }
 
         fn enqueue_feedback(&self, notice: &FeedbackNotice) -> Result<(), RepositoryError> {
+            if self.fail_feedback_enqueue.load(Ordering::Relaxed) {
+                return Err(RepositoryError::Unavailable(
+                    "test feedback enqueue failure".into(),
+                ));
+            }
             self.notices.lock().push(notice.clone());
             Ok(())
         }
@@ -2812,6 +2818,9 @@ mod tests {
     #[tokio::test]
     async fn edit_without_dictionary_candidates_still_creates_durable_feedback() {
         let repository = Arc::new(MemoryRepository::default());
+        repository
+            .fail_feedback_enqueue
+            .store(true, Ordering::Relaxed);
         let feedback = Arc::new(RecordingFeedback::default());
         let engine = Arc::new(EditLearningEngine::new(
             repository.clone(),
@@ -2835,6 +2844,14 @@ mod tests {
             .unwrap();
 
         *surface.text.lock() = "hello world!".into();
+        wait_until(|| engine.observability().persistence_failures >= 1).await;
+
+        assert!(repository.notices.lock().is_empty());
+        assert!(feedback.notices.lock().is_empty());
+        assert_eq!(engine.observability().feedback_enqueued, 0);
+        repository
+            .fail_feedback_enqueue
+            .store(false, Ordering::Relaxed);
         wait_until(|| repository.notices.lock().len() == 1).await;
 
         assert!(repository.proposals.lock().is_empty());
