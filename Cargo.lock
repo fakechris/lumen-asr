@@ -2484,15 +2484,18 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "block2",
+ "chrono",
  "core-foundation",
  "core-graphics 0.24.0",
  "lumen-core",
+ "lumen-edit-learning",
  "lumen-inject",
  "lumen-platform",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

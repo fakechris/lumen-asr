@@ -1,6 +1,7 @@
 //! macOS platform adapters: permissions, text injection, frontmost app, hotkeys.
 
 mod calendar;
+mod edit_surface;
 mod focused_field;
 mod hotkey_tap;
 mod inject;
@@ -16,6 +17,7 @@ pub use calendar::{
     request_access as calendar_request_access, select_event_in_window, CalendarCandidate,
     CalendarEventInfo, CALENDAR_LOOKBACK_MINUTES,
 };
+pub use edit_surface::MacAccessibilitySurfaceAdapter;
 pub use focused_field::{focused_text_field_snapshot, FocusedTextFieldSnapshot};
 pub use hotkey_tap::{
     physical_fn_down, start_monitor, start_multi_monitor, stop_monitor, HotkeyBinding, HotkeyEdge,
@@ -44,6 +46,27 @@ use lumen_core::FocusInfo;
 use lumen_platform::{FrontmostApp, PlatformError};
 
 pub struct MacFrontmost;
+
+#[cfg(test)]
+mod edit_surface_contract_tests {
+    use super::MacAccessibilitySurfaceAdapter;
+    use lumen_edit_learning::{SurfaceAdapter, SurfaceErrorKind, TargetHint};
+
+    #[test]
+    fn accessibility_surface_reservation_requires_a_captured_process_id() {
+        let error = match MacAccessibilitySurfaceAdapter.reserve(&TargetHint {
+            app_name: Some("Editor".into()),
+            bundle_id: Some("test.editor".into()),
+            process_id: None,
+        }) {
+            Ok(_) => panic!("a target without pid cannot own a native AX element"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind, SurfaceErrorKind::TemporarilyUnavailable);
+        assert_eq!(error.code, "target_process_id_unavailable");
+    }
+}
 
 #[async_trait]
 impl FrontmostApp for MacFrontmost {
