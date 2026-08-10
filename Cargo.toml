@@ -5,6 +5,7 @@ members = [
   "crates/lumen-asr",
   "crates/lumen-corrector",
   "crates/lumen-dictionary",
+  "crates/lumen-edit-learning",
   "crates/lumen-store",
   "crates/lumen-meeting",
   "crates/lumen-identity",
@@ -19,6 +20,7 @@ default-members = [
   "crates/lumen-asr",
   "crates/lumen-corrector",
   "crates/lumen-dictionary",
+  "crates/lumen-edit-learning",
   "crates/lumen-store",
   "crates/lumen-meeting",
   "crates/lumen-identity",
@@ -52,6 +54,7 @@ lumen-core = { path = "crates/lumen-core" }
 lumen-asr = { path = "crates/lumen-asr" }
 lumen-corrector = { path = "crates/lumen-corrector" }
 lumen-dictionary = { path = "crates/lumen-dictionary" }
+lumen-edit-learning = { path = "crates/lumen-edit-learning" }
 lumen-store = { path = "crates/lumen-store" }
 lumen-meeting = { path = "crates/lumen-meeting" }
 lumen-identity = { path = "crates/lumen-identity" }

@@ -1,0 +1,11 @@
+[package]
+name = "lumen-edit-learning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Persistent observed-insertion sessions and edit-learning records"
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
