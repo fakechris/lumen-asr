@@ -3,9 +3,19 @@ name = "lumen-edit-learning"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Persistent observed-insertion sessions and edit-learning records"
+description = "Persistent observed-insertion sessions and edit-learning policy"
 
 [dependencies]
+async-trait = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
+lumen-dictionary = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+parking_lot = { workspace = true }
