@@ -411,6 +411,60 @@ export type LearnCandidate = {
   from_text?: string | null;
   to_text?: string | null;
   reason: string;
+  proposal_id?: string;
+};
+
+export type LearningProposal = {
+  id: string;
+  edit_session_id: string;
+  revision_id: string;
+  kind: "term" | "replacement" | string;
+  payload_json: string;
+  confidence: number;
+  risk: string;
+  status: string;
+  policy_version: number;
+  created_at: string;
+};
+
+export type EditLearningFeedback = {
+  id: string;
+  edit_session_id: string;
+  kind: string;
+  message: string;
+  proposal_ids: string[];
+  created_at: string;
+  delivered_at?: string | null;
+  acknowledged_at?: string | null;
+};
+
+export type EditLearningObservability = {
+  active_sessions: number;
+  reservations_started: number;
+  reservations_succeeded: number;
+  reservations_failed: number;
+  sessions_started: number;
+  sessions_failed_to_start: number;
+  snapshots_observed: number;
+  snapshots_unavailable: number;
+  suspensions: number;
+  recoveries: number;
+  revisions_recorded: number;
+  proposals_created: number;
+  proposals_superseded: number;
+  proposal_persistence_retries: number;
+  feedback_enqueued: number;
+  parent_persistence_retries: number;
+  persistence_failures: number;
+  sessions_evicted: number;
+  same_surface_sessions_finalized: number;
+  evidence_records_redacted: number;
+  insertion_target_mismatches: number;
+  surface_transition_timeouts: number;
+  content_boundary_finalizations: number;
+  snapshot_latency_ms_total: number;
+  snapshot_latency_ms_max: number;
+  poll_backoffs: number;
 };
 
 export type TabId =

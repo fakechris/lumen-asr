@@ -12,7 +12,7 @@ mod corrector_probe;
 mod corrector_svc;
 mod detection_stats;
 mod dictation;
-mod edit_attribution;
+mod edit_learning_runtime;
 mod headless;
 mod hotkey;
 mod hotkey_validate;
@@ -49,7 +49,7 @@ use lumen_store::{SessionArtifactPaths, Store};
 use mode_arbiter::CaptureArbiter;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Manager;
 
@@ -254,7 +254,8 @@ pub struct QwenRuntimeStatus {
 }
 
 pub struct AppState {
-    pub store: Mutex<Option<Store>>,
+    pub store: Arc<Mutex<Option<Store>>>,
+    pub(crate) edit_learning: edit_learning_runtime::DesktopEditLearning,
     pub audio: AudioCapture,
     /// Independent continuous recorder for meetings (never touches `audio`).
     pub meeting_recorder: MeetingRecorder,
@@ -487,6 +488,9 @@ pub fn run() {
         }
     };
 
+    let store = Arc::new(Mutex::new(store));
+    let edit_learning = edit_learning_runtime::DesktopEditLearning::new(store.clone());
+
     let initial_engine = dictation::engine_kind_for_provider(&app_config.asr.provider)
         .unwrap_or(EngineKind::SenseVoice);
     // Backward compatible: an explicit, valid config override wins; otherwise the
@@ -524,7 +528,8 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(AppState {
-            store: Mutex::new(store),
+            store,
+            edit_learning,
             audio,
             meeting_recorder: MeetingRecorder::new(),
             meeting_power_guard: Mutex::new(None),
@@ -644,6 +649,11 @@ pub fn run() {
             learning::get_learning_config,
             learning::save_learning_config,
             learning::process_edit,
+            edit_learning_runtime::get_edit_learning_observability,
+            edit_learning_runtime::list_edit_learning_feedback,
+            edit_learning_runtime::acknowledge_edit_learning_feedback,
+            edit_learning_runtime::list_edit_learning_proposals,
+            edit_learning_runtime::decide_edit_learning_proposal,
             onboard::get_onboarding_state,
             onboard::set_onboarding_step,
             onboard::skip_onboarding,
@@ -672,6 +682,10 @@ pub fn run() {
             if let Err(e) = capsule::ensure_capsule(app.handle()) {
                 tracing::warn!(error = %e, "capsule window create failed");
             }
+
+            app.state::<AppState>()
+                .edit_learning
+                .attach_app_handle(app.handle().clone());
 
             // Log AX status only — wizard/settings open System Settings on demand.
             permissions_cmd::bootstrap_permissions();

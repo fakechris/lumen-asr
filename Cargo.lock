@@ -2265,6 +2265,7 @@ dependencies = [
 name = "lumen-asr-desktop"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "blake3",
  "chrono",
@@ -2275,6 +2276,7 @@ dependencies = [
  "lumen-core",
  "lumen-corrector",
  "lumen-dictionary",
+ "lumen-edit-learning",
  "lumen-identity",
  "lumen-inject",
  "lumen-meeting",

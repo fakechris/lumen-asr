@@ -9,11 +9,14 @@ import type {
   DictationAttemptRecord,
   DictionaryEntry,
   EditEvent,
+  EditLearningFeedback,
+  EditLearningObservability,
   EditObservation,
   ExportOutput,
   ExportPreset,
   Health,
   LearnCandidate,
+  LearningProposal,
   LiveAnnotation,
   Meeting,
   MeetingDetail,
@@ -407,6 +410,16 @@ export const api = {
     invoke<EditEvent[]>("list_edit_events", { sessionId }),
   listEditObservations: (sessionId: string) =>
     invoke<EditObservation[]>("list_edit_observations", { sessionId }),
+  getEditLearningObservability: () =>
+    invoke<EditLearningObservability>("get_edit_learning_observability"),
+  listEditLearningFeedback: (limit = 100) =>
+    invoke<EditLearningFeedback[]>("list_edit_learning_feedback", { limit }),
+  acknowledgeEditLearningFeedback: (noticeId: string) =>
+    invoke<void>("acknowledge_edit_learning_feedback", { noticeId }),
+  listEditLearningProposals: (editSessionId: string) =>
+    invoke<LearningProposal[]>("list_edit_learning_proposals", { editSessionId }),
+  decideEditLearningProposal: (proposalId: string, decision: "rejected") =>
+    invoke<void>("decide_edit_learning_proposal", { proposalId, decision }),
 
   recordEditEvent: (input: {
     sessionId: string;
@@ -426,6 +439,7 @@ export const api = {
     sessionId?: string;
     beforeText?: string;
     afterText?: string;
+    proposalId?: string;
   }) => invoke<DictionaryEntry>("confirm_learn", { input }),
 
   listDictionary: () => invoke<DictionaryEntry[]>("list_dictionary"),

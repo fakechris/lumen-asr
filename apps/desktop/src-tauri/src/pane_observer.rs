@@ -66,41 +66,6 @@ impl LockedPane {
     pub fn snapshot(&self) -> Result<PaneSnapshot, String> {
         self.inner.snapshot()
     }
-
-    #[cfg(test)]
-    pub fn test_snapshot(observer_id: &'static str, fingerprint: &str, text: &str) -> Self {
-        Self {
-            inner: Arc::new(TestPane {
-                observer_id,
-                fingerprint: fingerprint.to_owned(),
-                text: text.to_owned(),
-            }),
-        }
-    }
-}
-
-#[cfg(test)]
-struct TestPane {
-    observer_id: &'static str,
-    fingerprint: String,
-    text: String,
-}
-
-#[cfg(test)]
-impl PaneHandle for TestPane {
-    fn observer_id(&self) -> &'static str {
-        self.observer_id
-    }
-
-    fn fingerprint_material(&self) -> String {
-        self.fingerprint.clone()
-    }
-
-    fn snapshot(&self) -> Result<PaneSnapshot, String> {
-        Ok(PaneSnapshot {
-            text: self.text.clone(),
-        })
-    }
 }
 
 trait CommandRunner: Send + Sync {

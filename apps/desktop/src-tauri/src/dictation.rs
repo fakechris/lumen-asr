@@ -662,13 +662,18 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     if let Err(e) = state.capture.begin_dictation() {
         tracing::warn!(error = %e, "arbiter begin_dictation (meeting active?)");
     }
-    crate::learning::cancel_post_insert_watches();
     let pane_observation_enabled = state
         .config
         .lock()
         .map(|config| config.inject.auto_insert && config.learning.post_paste_capture)
         .unwrap_or(false);
     if pane_observation_enabled {
+        let reserved = state.edit_learning.reserve_target(target.as_ref());
+        tracing::info!(
+            target_bundle_id = ?target.as_ref().and_then(|value| value.bundle_id.as_deref()),
+            reserved,
+            "edit-learning target reservation attempted at recording start"
+        );
         // Recording is already live while we synchronously lock the exact outer
         // surface; provider-specific probing then continues in the background.
         let pane_target = target.as_ref().and_then(|target| {
@@ -682,6 +687,9 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
         // dictation has moved on.
         discover_pane_target(pane_target, pane_discovery.generation);
     } else {
+        state
+            .edit_learning
+            .clear_pending("post_paste_capture_disabled");
         cancel_pane_target_discovery();
     }
     Ok(())
@@ -815,6 +823,12 @@ pub async fn stop_and_transcribe_inner(
     app: Option<&AppHandle>,
 ) -> Result<TranscribeOutcome, String> {
     let pipeline_started = Instant::now();
+    let clear_unconsumed_edit_target = || {
+        state
+            .edit_learning
+            .clear_pending("dictation_ended_before_observed_insertion");
+        cancel_pane_target_discovery();
+    };
     let active_context = state.context.take_active();
     let target = TARGET.lock().ok().and_then(|guard| guard.clone());
     let mut rec = SessionRecord::new();
@@ -879,6 +893,7 @@ pub async fn stop_and_transcribe_inner(
             if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
                 tracing::warn!(error = %persist_error, "failed to persist capture stop failure");
             }
+            clear_unconsumed_edit_target();
             return Err(error);
         }
     };
@@ -933,6 +948,7 @@ pub async fn stop_and_transcribe_inner(
         if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
             tracing::warn!(error = %persist_error, "failed to persist capture failure");
         }
+        clear_unconsumed_edit_target();
         return Err(error);
     }
 
@@ -973,6 +989,7 @@ pub async fn stop_and_transcribe_inner(
         if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
             tracing::warn!(error = %persist_error, "failed to persist silent capture failure");
         }
+        clear_unconsumed_edit_target();
         return Err(error.to_string());
     }
 
@@ -1006,6 +1023,7 @@ pub async fn stop_and_transcribe_inner(
             if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
                 tracing::warn!(error = %persist_error, "failed to persist ASR failure");
             }
+            clear_unconsumed_edit_target();
             return Err(error);
         }
     };
@@ -1018,7 +1036,7 @@ pub async fn stop_and_transcribe_inner(
     );
 
     tracing::info!(?intent, "running corrector with session intent");
-    let correction = run_corrector_stage(
+    let correction = match run_corrector_stage(
         state,
         &cfg,
         &enhanced_text,
@@ -1026,7 +1044,14 @@ pub async fn stop_and_transcribe_inner(
         captured_context.as_ref(),
         &mut attempt,
     )
-    .await?;
+    .await
+    {
+        Ok(correction) => correction,
+        Err(error) => {
+            clear_unconsumed_edit_target();
+            return Err(error);
+        }
+    };
     let corrected_text = correction.text;
     let corrector_engine = correction.engine;
     let fallback_reason = correction.fallback_reason;
@@ -1050,18 +1075,22 @@ pub async fn stop_and_transcribe_inner(
 
     // Discovery started with recording. Join it before insertion so the
     // post-insert anchor itself is never delayed by provider probing.
-    let pane_target = if cfg.inject.auto_insert
+    let mut pane_target = if cfg.inject.auto_insert
         && !corrected_text.is_empty()
         && cfg.learning.post_paste_capture
     {
         take_discovered_pane_target()
     } else {
+        state
+            .edit_learning
+            .clear_pending("observed_insertion_not_requested");
         cancel_pane_target_discovery();
         None
     };
 
     let mut insert_strategy = InsertStrategy::None;
     let mut did_insert = false;
+    let mut observation_started = false;
     let mut insertion_outcome = InsertionOutcome::NotRequested;
     let mut frontmost_before_insert = None;
     let insert_started = Instant::now();
@@ -1073,6 +1102,9 @@ pub async fn stop_and_transcribe_inner(
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let insert_available = false;
         if !insert_available {
+            state
+                .edit_learning
+                .clear_pending("cross_app_insertion_unavailable");
             #[cfg(target_os = "macos")]
             tracing::error!(
                 "Accessibility not granted; cannot inject into other apps. Open System Settings → Privacy & Security → Accessibility and enable this process"
@@ -1131,13 +1163,33 @@ pub async fn stop_and_transcribe_inner(
                 }
             }
 
-            match crate::inject_cmd::insert_with_config(&cfg.inject, &corrected_text).await {
+            let insertion = if cfg.learning.post_paste_capture {
+                state
+                    .edit_learning
+                    .insert(
+                        &cfg.inject,
+                        rec.id,
+                        attempt.id,
+                        &corrected_text,
+                        target.as_ref(),
+                        pane_target.take(),
+                    )
+                    .await
+                    .map(|outcome| {
+                        observation_started = outcome.observation_started;
+                        outcome.insertion
+                    })
+            } else {
+                crate::inject_cmd::insert_with_config(&cfg.inject, &corrected_text).await
+            };
+            match insertion {
                 Ok(out) => {
                     insert_strategy = out.strategy;
                     insertion_outcome = insertion_outcome_for_strategy(insert_strategy);
                     did_insert = insertion_outcome == InsertionOutcome::Inserted;
                     tracing::info!(
                         ?insert_strategy,
+                        observation_started,
                         frontmost = ?frontmost_app_name(),
                         "auto-insert done"
                     );
@@ -1162,40 +1214,7 @@ pub async fn stop_and_transcribe_inner(
     attempt
         .pipeline_metrics
         .set_insertion_outcome(insertion_outcome);
-    // Anchor edit observation immediately after insertion. Debug WAV and database persistence
-    // below are synchronous and can otherwise let a fast correction remove the original text
-    // before the watcher has started.
-    let watch_post_paste = if did_insert && cfg.learning.post_paste_capture {
-        match (app, target.clone()) {
-            (Some(app), Some(target)) => {
-                crate::learning::spawn_post_insert_watch(
-                    app.clone(),
-                    crate::learning::PostInsertWatchRequest {
-                        session_id: rec.id,
-                        attempt_id: attempt.id,
-                        inserted_text: corrected_text.clone(),
-                        target,
-                        pane_target,
-                    },
-                    cfg.learning.post_paste_seconds,
-                )
-                .await
-            }
-            (Some(app), None) => {
-                crate::learning::schedule_unavailable_post_insert_observation(
-                    app.clone(),
-                    rec.id,
-                    attempt.id,
-                    corrected_text.clone(),
-                    "target_metadata_unavailable",
-                );
-                false
-            }
-            _ => false,
-        }
-    } else {
-        false
-    };
+    let watch_post_paste = did_insert && observation_started;
     attempt.inserted = did_insert.then(|| corrected_text.clone());
     attempt.status = AttemptStatus::Completed;
     attempt.pipeline_metrics.total_ms = elapsed_ms(pipeline_started);
@@ -1530,6 +1549,10 @@ pub fn cancel_recording(state: State<'_, AppState>) -> Result<(), String> {
 
 pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
     state.context.clear_active();
+    state
+        .edit_learning
+        .clear_pending("dictation_cancelled_before_insertion");
+    cancel_pane_target_discovery();
     if state.audio.is_recording() {
         let _ = state.audio.stop();
     }
@@ -1820,6 +1843,9 @@ pub enum DictationUiEvent {
     Error {
         message: String,
     },
+    Notice {
+        message: String,
+    },
     Cancelled,
 }
 
@@ -1840,6 +1866,51 @@ fn intent_ui_label(intent: &IntentSpec) -> (String, Option<String>, String) {
 
 pub fn emit_dictation(app: &AppHandle, event: DictationUiEvent) {
     let _ = app.emit("dictation", &event);
+}
+
+/// Shows background edit-learning feedback in the capsule only while the
+/// dictation UI is idle. Active recording/processing feedback always wins.
+pub(crate) fn show_transient_background_notice(
+    app: &AppHandle,
+    message: String,
+    is_error: bool,
+) -> bool {
+    let notice_epoch = {
+        let _transition = UI_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if PHASE.load(Ordering::SeqCst) != PHASE_IDLE {
+            tracing::debug!(
+                is_error,
+                "edit-learning capsule notice deferred because dictation UI is active"
+            );
+            return false;
+        }
+        let notice_epoch = UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        crate::capsule::set_capsule_visible(app, true, "edit-learning");
+        let event = if is_error {
+            DictationUiEvent::Error { message }
+        } else {
+            DictationUiEvent::Notice { message }
+        };
+        emit_dictation(app, event);
+        notice_epoch
+    };
+
+    let app_for_notice = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let _transition = UI_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if UI_NOTICE_EPOCH.load(Ordering::SeqCst) == notice_epoch
+            && PHASE.load(Ordering::SeqCst) == PHASE_IDLE
+        {
+            emit_dictation(&app_for_notice, DictationUiEvent::Idle);
+            crate::capsule::set_capsule_visible(&app_for_notice, false, "idle");
+        }
+    });
+    true
 }
 
 fn finish_with_transient_error(app: &AppHandle, message: String) {
@@ -2109,8 +2180,19 @@ mod attempt_metric_tests {
     use lumen_dictionary::DictionaryEntry;
     use lumen_store::{Store, MAX_ATTEMPT_PAGE_SIZE};
     use std::path::Path;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
+
+    #[test]
+    fn background_notice_has_a_capsule_safe_serialization_contract() {
+        let value = serde_json::to_value(DictationUiEvent::Notice {
+            message: "已记录修改".into(),
+        })
+        .unwrap();
+
+        assert_eq!(value["phase"], "notice");
+        assert_eq!(value["message"], "已记录修改");
+    }
 
     /// Minimal `AppState` for meeting-engine selection tests, pointing SenseVoice
     /// at `sensevoice_dir`. All other engines/dirs are placeholders under `dir`.
@@ -2119,8 +2201,12 @@ mod attempt_metric_tests {
         let context = crate::context_capture::ContextRecorder::new(&config.context, dir);
         let qwen = crate::qwen_engine_from_config(&config.asr);
         let qwen_executable = qwen.python_executable().to_path_buf();
+        let store = Arc::new(Mutex::new(Some(
+            Store::open(dir.join("capture.sqlite")).unwrap(),
+        )));
         AppState {
-            store: Mutex::new(Some(Store::open(dir.join("capture.sqlite")).unwrap())),
+            edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(store.clone()),
+            store,
             audio: AudioCapture::new(),
             meeting_recorder: lumen_asr::MeetingRecorder::new(),
             meeting_power_guard: std::sync::Mutex::new(None),
@@ -2295,10 +2381,12 @@ mod attempt_metric_tests {
         let context = crate::context_capture::ContextRecorder::new(&config.context, dir.path());
         let qwen = crate::qwen_engine_from_config(&config.asr);
         let qwen_executable = qwen.python_executable().to_path_buf();
+        let store = Arc::new(Mutex::new(Some(
+            Store::open(dir.path().join("capture.sqlite")).unwrap(),
+        )));
         let state = AppState {
-            store: Mutex::new(Some(
-                Store::open(dir.path().join("capture.sqlite")).unwrap(),
-            )),
+            edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(store.clone()),
+            store,
             audio: AudioCapture::new(),
             meeting_recorder: lumen_asr::MeetingRecorder::new(),
             meeting_power_guard: std::sync::Mutex::new(None),

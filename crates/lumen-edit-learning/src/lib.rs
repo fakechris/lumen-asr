@@ -1363,6 +1363,43 @@ impl EditLearningEngine {
     ) -> bool {
         let proposals = proposals_from_revision(&record.original_text, revision);
         if proposals.is_empty() {
+            let notice = FeedbackNotice {
+                id: Uuid::new_v4(),
+                edit_session_id: record.id,
+                kind: "edit_recorded".into(),
+                message: "已记录这次修改，未发现需要加入词典的词汇或替换候选。".into(),
+                proposal_ids: Vec::new(),
+                created_at: Utc::now(),
+                delivered_at: None,
+                acknowledged_at: None,
+            };
+            if let Err(error) = self.repository.enqueue_feedback(&notice) {
+                self.metrics
+                    .persistence_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    edit_session_id = %record.id,
+                    attempt_id = %record.attempt_id,
+                    revision_id = %revision.id,
+                    revision_ordinal = revision.ordinal,
+                    notice_id = %notice.id,
+                    error = %error,
+                    "edit-learning recorded-edit feedback persistence failed"
+                );
+                return false;
+            }
+            self.metrics
+                .feedback_enqueued
+                .fetch_add(1, Ordering::Relaxed);
+            self.feedback.publish(&notice);
+            tracing::info!(
+                edit_session_id = %record.id,
+                attempt_id = %record.attempt_id,
+                revision_id = %revision.id,
+                revision_ordinal = revision.ordinal,
+                learning_quiescence_ms = self.config.learning_quiescence.as_millis() as u64,
+                "edit-learning edit recorded without dictionary candidates"
+            );
             return true;
         }
         let term_count = proposals
@@ -2769,6 +2806,42 @@ mod tests {
         assert_eq!(repository.notices.lock().len(), 1);
         assert_eq!(feedback.notices.lock().len(), 1);
         assert_eq!(engine.observability().proposals_created, 1);
+        assert_eq!(engine.observability().feedback_enqueued, 1);
+    }
+
+    #[tokio::test]
+    async fn edit_without_dictionary_candidates_still_creates_durable_feedback() {
+        let repository = Arc::new(MemoryRepository::default());
+        let feedback = Arc::new(RecordingFeedback::default());
+        let engine = Arc::new(EditLearningEngine::new(
+            repository.clone(),
+            feedback.clone(),
+            fast_config(),
+        ));
+        let surface = surface("recorded-without-candidates");
+        engine
+            .insert(
+                surface.clone(),
+                Arc::new(AppendExecutor {
+                    surface: surface.clone(),
+                }),
+                ObservedInsertion {
+                    dictation_session_id: Uuid::new_v4(),
+                    attempt_id: Uuid::new_v4(),
+                    text: "hello world".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        *surface.text.lock() = "hello world!".into();
+        wait_until(|| repository.notices.lock().len() == 1).await;
+
+        assert!(repository.proposals.lock().is_empty());
+        assert_eq!(repository.notices.lock()[0].kind, "edit_recorded");
+        assert!(repository.notices.lock()[0].proposal_ids.is_empty());
+        assert_eq!(feedback.notices.lock()[0].kind, "edit_recorded");
+        assert_eq!(engine.observability().proposals_created, 0);
         assert_eq!(engine.observability().feedback_enqueued, 1);
     }
 
