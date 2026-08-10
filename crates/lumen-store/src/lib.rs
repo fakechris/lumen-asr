@@ -766,13 +766,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn save_edit_learning_proposals(&self, records: &[LearningProposalRecord]) -> Result<()> {
-        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        save_edit_learning_proposals_on(&transaction, records)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
     /// Persist review candidates and their durable notification as one unit.
     /// This prevents a crash from leaving proposals that can no longer reach
     /// the user through the feedback outbox.
@@ -872,32 +865,17 @@ impl Store {
     }
 
     pub fn decide_edit_learning_proposal(&self, proposal_id: Uuid, decision: &str) -> Result<bool> {
-        let allowed_source_statuses = match decision {
-            "rejected" => &["proposed"][..],
-            "reverted" => &["confirmed", "auto_added"][..],
-            _ => anyhow::bail!("unsupported edit-learning proposal decision"),
-        };
-        let placeholders = std::iter::repeat_n("?", allowed_source_statuses.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "UPDATE learning_proposals \
-             SET status=?1, decided_at=?2 \
-             WHERE id=?3 AND status IN ({placeholders})"
-        );
-        let mut values = vec![
-            rusqlite::types::Value::Text(decision.to_owned()),
-            rusqlite::types::Value::Text(Utc::now().to_rfc3339()),
-            rusqlite::types::Value::Text(proposal_id.to_string()),
-        ];
-        values.extend(
-            allowed_source_statuses
-                .iter()
-                .map(|status| rusqlite::types::Value::Text((*status).to_owned())),
-        );
-        let changed = self
-            .conn
-            .execute(&sql, rusqlite::params_from_iter(values))?;
+        if decision != "rejected" {
+            anyhow::bail!("unsupported edit-learning proposal decision");
+        }
+        let changed = self.conn.execute(
+            r#"
+            UPDATE learning_proposals
+            SET status='rejected', decided_at=?2
+            WHERE id=?1 AND status='proposed'
+            "#,
+            params![proposal_id.to_string(), Utc::now().to_rfc3339()],
+        )?;
         Ok(changed == 1)
     }
 
