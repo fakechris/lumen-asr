@@ -489,7 +489,10 @@ pub fn run() {
     };
 
     let store = Arc::new(Mutex::new(store));
-    let edit_learning = edit_learning_runtime::DesktopEditLearning::new(store.clone());
+    let edit_learning = edit_learning_runtime::DesktopEditLearning::new(
+        store.clone(),
+        app_config.learning.persist_edit_evidence_text,
+    );
 
     let initial_engine = dictation::engine_kind_for_provider(&app_config.asr.provider)
         .unwrap_or(EngineKind::SenseVoice);

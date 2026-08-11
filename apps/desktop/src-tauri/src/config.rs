@@ -835,6 +835,9 @@ pub struct LearningConfig {
     pub post_paste_capture: bool,
     /// Seconds to watch after paste before giving up.
     pub post_paste_seconds: u64,
+    /// Persist full dictated/edited evidence locally. Disabled by default;
+    /// hashes and compact review proposals are still stored.
+    pub persist_edit_evidence_text: bool,
 }
 
 impl Default for LearningConfig {
@@ -844,6 +847,7 @@ impl Default for LearningConfig {
             auto_promote_threshold: 3,
             post_paste_capture: true,
             post_paste_seconds: 20,
+            persist_edit_evidence_text: false,
         }
     }
 }

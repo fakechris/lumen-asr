@@ -44,6 +44,10 @@ import type {
 
 const IS_WINDOWS = navigator.userAgent.includes("Windows");
 
+// Edit-learning feedback banners auto-dismiss after this long. They are
+// informational only — the actionable candidates stay in the Learn panel.
+const EDIT_LEARNING_NOTICE_TTL_MS = 8000;
+
 function previewText(s?: string | null, n = 72): string {
   if (!s) return "—";
   const t = s.replace(/\s+/g, " ").trim();
@@ -217,6 +221,9 @@ export default function App() {
   const [editLearningNotices, setEditLearningNotices] = useState<
     EditLearningFeedback[]
   >([]);
+  // Mirror of editLearningNotices for code paths that need the current value
+  // without being a state-updater (single-banner supersede + auto-dismiss).
+  const editLearningNoticesRef = useRef<EditLearningFeedback[]>([]);
   const [recoveryNotices, setRecoveryNotices] = useState<
     { meetingId: string; text: string; ok: boolean }[]
   >([]);
@@ -295,10 +302,13 @@ export default function App() {
   }, []);
 
   const loadEditLearningCandidates = useCallback(
-    async (feedback: EditLearningFeedback) => {
+    async (feedback: EditLearningFeedback, guard?: () => boolean) => {
       const proposals = await api.listEditLearningProposals(
         feedback.edit_session_id,
       );
+      // A newer banner may have superseded this feedback while the proposals
+      // were loading — never let a stale request overwrite its candidates.
+      if (guard && !guard()) return;
       const nextCandidates = proposals
         .filter(
           (proposal) =>
@@ -320,27 +330,50 @@ export default function App() {
     [],
   );
 
+  // Dismiss a feedback banner and acknowledge it in the outbox so it does
+  // not resurface on the next launch. Used by the 关闭 button, the
+  // auto-dismiss timer, and single-banner supersede.
+  const dismissEditLearningNotice = useCallback((id: string) => {
+    editLearningNoticesRef.current = editLearningNoticesRef.current.filter(
+      (notice) => notice.id !== id,
+    );
+    setEditLearningNotices(editLearningNoticesRef.current);
+    void api
+      .acknowledgeEditLearningFeedback(id)
+      .catch((reason) => setError(String(reason)));
+  }, []);
+
   // Durable edit-learning feedback. The live event is only an accelerator;
   // startup also drains the outbox so a hidden or closed UI never loses it.
+  // Only one banner is shown at a time and it auto-dismisses — these notices
+  // are informational; the actionable candidates live in the Learn panel.
   useEffect(() => {
     let disposed = false;
     let un: (() => void) | undefined;
+    const dismissTimers: number[] = [];
     const showFeedback = async (feedback: EditLearningFeedback) => {
       if (disposed || handledEditFeedbackRef.current.has(feedback.id)) return;
       handledEditFeedbackRef.current.add(feedback.id);
-      setEditLearningNotices((current) =>
-        current.some((notice) => notice.id === feedback.id)
-          ? current
-          : [
-              ...current.filter(
-                (notice) => notice.edit_session_id !== feedback.edit_session_id,
-              ),
-              feedback,
-            ],
-      );
+      if (!editLearningNoticesRef.current.some((n) => n.id === feedback.id)) {
+        // New feedback supersedes older banners — acknowledge them so they
+        // never pile up again on the next launch.
+        for (const notice of editLearningNoticesRef.current) {
+          void api.acknowledgeEditLearningFeedback(notice.id).catch(() => {});
+        }
+        editLearningNoticesRef.current = [feedback];
+        setEditLearningNotices([feedback]);
+        dismissTimers.push(
+          window.setTimeout(() => {
+            if (!disposed) dismissEditLearningNotice(feedback.id);
+          }, EDIT_LEARNING_NOTICE_TTL_MS),
+        );
+      }
       try {
         if (feedback.proposal_ids.length) {
-          await loadEditLearningCandidates(feedback);
+          await loadEditLearningCandidates(
+            feedback,
+            () => editLearningNoticesRef.current[0]?.id === feedback.id,
+          );
         } else {
           setEditFeedbackRevision((value) => value + 1);
         }
@@ -371,9 +404,10 @@ export default function App() {
     });
     return () => {
       disposed = true;
+      dismissTimers.forEach((timer) => window.clearTimeout(timer));
       un?.();
     };
-  }, [loadEditLearningCandidates]);
+  }, [loadEditLearningCandidates, dismissEditLearningNotice]);
 
   useEffect(() => {
     let un: (() => void) | undefined;
@@ -834,14 +868,7 @@ export default function App() {
               <button
                 type="button"
                 className="linkish"
-                onClick={() => {
-                  setEditLearningNotices((current) =>
-                    current.filter((notice) => notice.id !== feedback.id),
-                  );
-                  void api
-                    .acknowledgeEditLearningFeedback(feedback.id)
-                    .catch((reason) => setError(String(reason)));
-                }}
+                onClick={() => dismissEditLearningNotice(feedback.id)}
               >
                 关闭
               </button>
@@ -2079,6 +2106,7 @@ function SettingsPanel({
   const [promoteN, setPromoteN] = useState(3);
   const [postPaste, setPostPaste] = useState(true);
   const [postPasteSecs, setPostPasteSecs] = useState(20);
+  const [persistEditEvidenceText, setPersistEditEvidenceText] = useState(false);
   const [detectionEnabled, setDetectionEnabled] = useState(false);
   const [detectionCapable, setDetectionCapable] = useState(false);
   // Meeting watchdog settings (silence auto-stop minutes, calendar-end reminder).
@@ -2165,6 +2193,7 @@ function SettingsPanel({
         setPromoteN(ln.autoPromoteThreshold);
         setPostPaste(ln.postPasteCapture);
         setPostPasteSecs(ln.postPasteSeconds);
+        setPersistEditEvidenceText(ln.persistEditEvidenceText);
         try {
           const det = await api.getMeetingDetection();
           setDetectionEnabled(det.enabled);
@@ -3564,6 +3593,20 @@ function SettingsPanel({
           无固定停顿超时：短暂停顿和多次修改不会结束监听。会话默认最多保留 24
           小时，并在目标内容清空、输入面失效、同输入框开始下一次听写或应用重启时结束。
         </p>
+        <div className="form-row">
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={persistEditEvidenceText}
+              disabled={busy}
+              onChange={(e) => setPersistEditEvidenceText(e.target.checked)}
+            />{" "}
+            在本机数据库保留完整听写与修改文本
+          </label>
+        </div>
+        <p className="muted-text" style={{ fontSize: "0.85rem" }}>
+          默认关闭：仅保留哈希和待确认的词汇/替换候选，降低敏感正文持久化风险。
+        </p>
         {learning && (
           <p className="muted-text" style={{ fontSize: "0.85rem" }}>
             当前：autoPromote={String(learning.autoPromote)} N=
@@ -3585,6 +3628,7 @@ function SettingsPanel({
                     autoPromoteThreshold: promoteN,
                     postPasteCapture: postPaste,
                     postPasteSeconds: postPasteSecs,
+                    persistEditEvidenceText,
                   });
                   setLearning(ln);
                   onSaved();

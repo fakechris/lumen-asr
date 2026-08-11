@@ -21,6 +21,7 @@ const ACKNOWLEDGED_FEEDBACK_RETENTION_DAYS: i64 = 30;
 
 pub(crate) struct DesktopEditLearning {
     engine: Arc<EditLearningEngine>,
+    store: Arc<Mutex<Option<Store>>>,
     pending: Mutex<Option<Arc<dyn SurfaceReservation>>>,
     feedback: Arc<TauriFeedbackSink>,
 }
@@ -32,7 +33,7 @@ pub(crate) struct DesktopObservedInsertionOutcome {
 }
 
 impl DesktopEditLearning {
-    pub fn new(store: Arc<Mutex<Option<Store>>>) -> Self {
+    pub fn new(store: Arc<Mutex<Option<Store>>>, persist_evidence_text: bool) -> Self {
         if let Ok(guard) = store.lock() {
             if let Some(database) = guard.as_ref() {
                 match database.finalize_incomplete_edit_learning_sessions("application_restarted") {
@@ -46,17 +47,19 @@ impl DesktopEditLearning {
                         "could not finalize stale edit-learning sessions"
                     ),
                 }
-                match database.redact_edit_learning_evidence_text() {
-                    Ok((sessions, revisions)) if sessions + revisions > 0 => tracing::info!(
-                        session_records = sessions,
-                        revision_records = revisions,
-                        "redacted stored edit-learning plaintext evidence at startup"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!(
-                        error = %error,
-                        "could not redact stored edit-learning plaintext evidence"
-                    ),
+                if !persist_evidence_text {
+                    match database.redact_edit_learning_evidence_text() {
+                        Ok((sessions, revisions)) if sessions + revisions > 0 => tracing::info!(
+                            session_records = sessions,
+                            revision_records = revisions,
+                            "redacted stored edit-learning plaintext evidence at startup"
+                        ),
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "could not redact stored edit-learning plaintext evidence"
+                        ),
+                    }
                 }
                 let feedback_cutoff =
                     Utc::now() - chrono::Duration::days(ACKNOWLEDGED_FEEDBACK_RETENTION_DAYS);
@@ -75,15 +78,21 @@ impl DesktopEditLearning {
                 }
             }
         }
-        let repository = Arc::new(DesktopEditLearningRepository { store });
+        let repository = Arc::new(DesktopEditLearningRepository {
+            store: store.clone(),
+        });
         let feedback = Arc::new(TauriFeedbackSink::default());
         let engine = Arc::new(EditLearningEngine::new(
             repository,
             feedback.clone(),
-            EngineConfig::default(),
+            EngineConfig {
+                persist_evidence_text,
+                ..EngineConfig::default()
+            },
         ));
         Self {
             engine,
+            store,
             pending: Mutex::new(None),
             feedback,
         }
@@ -300,6 +309,32 @@ impl DesktopEditLearning {
 
     pub fn observability(&self) -> ObservabilitySnapshot {
         self.engine.observability()
+    }
+
+    pub fn set_persist_evidence_text(&self, enabled: bool) -> Result<(), String> {
+        self.engine.set_persist_evidence_text(enabled);
+        if enabled {
+            return Ok(());
+        }
+        // Disabling retention must redact existing plaintext; a failure here
+        // means sensitive evidence is still stored, so surface it to the
+        // caller instead of reporting success.
+        let guard = self
+            .store
+            .lock()
+            .map_err(|_| "store lock poisoned while redacting edit-learning evidence".to_owned())?;
+        let Some(store) = guard.as_ref() else {
+            return Ok(());
+        };
+        let (sessions, revisions) = store
+            .redact_edit_learning_evidence_text()
+            .map_err(|error| format!("edit-learning evidence redaction failed: {error}"))?;
+        tracing::info!(
+            session_records = sessions,
+            revision_records = revisions,
+            "redacted stored edit-learning plaintext evidence"
+        );
+        Ok(())
     }
 }
 

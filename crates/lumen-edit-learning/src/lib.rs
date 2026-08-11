@@ -3139,6 +3139,61 @@ mod tests {
         assert_eq!(engine.observability().proposals_superseded, 1);
     }
 
+    #[test]
+    fn cjk_word_edit_does_not_propose_the_whole_sentence_as_a_term() {
+        let revision = test_revision("请打开新项目");
+
+        let proposals = proposals_from_revision("请打开旧项目", &revision);
+        let payloads = proposals
+            .iter()
+            .map(|proposal| {
+                (
+                    proposal.kind.as_str(),
+                    serde_json::from_str::<serde_json::Value>(&proposal.payload_json).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(payloads
+            .iter()
+            .any(|(kind, payload)| *kind == "term" && payload["term"] == "新"));
+        assert!(!payloads.iter().any(|(kind, _)| *kind == "replacement"));
+        assert!(!payloads
+            .iter()
+            .any(|(_, payload)| payload["term"] == "请打开新项目"));
+    }
+
+    #[test]
+    fn ordinary_spelling_correction_requires_a_replacement_confirmation() {
+        let revision = test_revision("please use server today");
+
+        let proposals = proposals_from_revision("please use serber today", &revision);
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].kind, "replacement");
+        let payload: serde_json::Value = serde_json::from_str(&proposals[0].payload_json).unwrap();
+        assert_eq!(payload["fromText"], "serber");
+        assert_eq!(payload["toText"], "server");
+        assert_eq!(proposals[0].risk, "confirmation_required");
+    }
+
+    fn test_revision(after_text: &str) -> EditRevisionRecord {
+        EditRevisionRecord {
+            id: Uuid::new_v4(),
+            edit_session_id: Uuid::new_v4(),
+            ordinal: 1,
+            observed_at: Utc::now(),
+            trigger: "test".into(),
+            after_text: after_text.into(),
+            after_text_hash: hash_text(after_text),
+            normalized_edit_distance: 0.1,
+            locator_confidence: 1.0,
+            bounded: true,
+            quiescent: true,
+            final_revision: false,
+        }
+    }
+
     async fn wait_until(mut predicate: impl FnMut() -> bool) {
         for _ in 0..100 {
             if predicate() {
