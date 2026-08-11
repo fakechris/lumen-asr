@@ -2205,7 +2205,10 @@ mod attempt_metric_tests {
             Store::open(dir.join("capture.sqlite")).unwrap(),
         )));
         AppState {
-            edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(store.clone()),
+            edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(
+                store.clone(),
+                false,
+            ),
             store,
             audio: AudioCapture::new(),
             meeting_recorder: lumen_asr::MeetingRecorder::new(),
@@ -2385,7 +2388,10 @@ mod attempt_metric_tests {
             Store::open(dir.path().join("capture.sqlite")).unwrap(),
         )));
         let state = AppState {
-            edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(store.clone()),
+            edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(
+                store.clone(),
+                false,
+            ),
             store,
             audio: AudioCapture::new(),
             meeting_recorder: lumen_asr::MeetingRecorder::new(),

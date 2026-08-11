@@ -20,6 +20,7 @@ pub struct LearningConfigDto {
     /// Retained for configuration compatibility. The persistent engine uses
     /// semantic sessions and an independent retention policy.
     pub post_paste_seconds: u64,
+    pub persist_edit_evidence_text: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +30,7 @@ pub struct LearningConfigInput {
     pub auto_promote_threshold: Option<u32>,
     pub post_paste_capture: Option<bool>,
     pub post_paste_seconds: Option<u64>,
+    pub persist_edit_evidence_text: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,8 +84,23 @@ pub fn save_learning_config(
     if let Some(value) = input.post_paste_seconds {
         config.learning.post_paste_seconds = value.clamp(5, 120);
     }
-    config.save()?;
-    Ok(dto(&config.learning))
+    let persistence_change = input.persist_edit_evidence_text;
+    let previous_persistence = config.learning.persist_edit_evidence_text;
+    if let Some(value) = persistence_change {
+        config.learning.persist_edit_evidence_text = value;
+    }
+    if let Err(error) = config.save() {
+        // Roll the privacy-relevant field back so the live config cannot
+        // report retention as disabled while the engine still persists it.
+        config.learning.persist_edit_evidence_text = previous_persistence;
+        return Err(error);
+    }
+    let result = dto(&config.learning);
+    drop(config);
+    if let Some(value) = persistence_change {
+        state.edit_learning.set_persist_evidence_text(value)?;
+    }
+    Ok(result)
 }
 
 fn dto(config: &LearningConfig) -> LearningConfigDto {
@@ -92,6 +109,7 @@ fn dto(config: &LearningConfig) -> LearningConfigDto {
         auto_promote_threshold: config.auto_promote_threshold,
         post_paste_capture: config.post_paste_capture,
         post_paste_seconds: config.post_paste_seconds,
+        persist_edit_evidence_text: config.persist_edit_evidence_text,
     }
 }
 
@@ -218,6 +236,7 @@ mod tests {
             auto_promote_threshold: 3,
             post_paste_capture: true,
             post_paste_seconds: 20,
+            persist_edit_evidence_text: false,
         };
 
         let dto = dto(&config);
@@ -226,5 +245,6 @@ mod tests {
         assert_eq!(dto.auto_promote_threshold, 3);
         assert!(dto.post_paste_capture);
         assert_eq!(dto.post_paste_seconds, 20);
+        assert!(!dto.persist_edit_evidence_text);
     }
 }

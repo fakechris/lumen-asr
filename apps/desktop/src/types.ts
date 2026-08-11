@@ -97,6 +97,7 @@ export type LearningConfig = {
   autoPromoteThreshold: number;
   postPasteCapture: boolean;
   postPasteSeconds: number;
+  persistEditEvidenceText: boolean;
 };
 
 export type FocusInfo = {

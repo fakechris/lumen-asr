@@ -351,6 +351,7 @@ export const api = {
     autoPromoteThreshold?: number;
     postPasteCapture?: boolean;
     postPasteSeconds?: number;
+    persistEditEvidenceText?: boolean;
   }) => invoke<import("./types").LearningConfig>("save_learning_config", { input }),
   processEdit: (input: {
     beforeText: string;
