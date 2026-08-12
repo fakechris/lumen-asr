@@ -3177,6 +3177,27 @@ mod tests {
         assert_eq!(proposals[0].risk, "confirmation_required");
     }
 
+    #[test]
+    fn repeated_source_term_edit_preserves_the_full_corrected_token() {
+        let original = "Use wrong‑term here and keep wrong‑term later.";
+        let edited = "Use worktree here and keep wrong‑term later.";
+        let revision = test_revision(edited);
+
+        let proposals = proposals_from_revision(original, &revision);
+        let terms = proposals
+            .iter()
+            .filter(|proposal| proposal.kind == "term")
+            .map(|proposal| {
+                serde_json::from_str::<serde_json::Value>(&proposal.payload_json).unwrap()["term"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(terms, vec!["worktree"]);
+    }
+
     fn test_revision(after_text: &str) -> EditRevisionRecord {
         EditRevisionRecord {
             id: Uuid::new_v4(),

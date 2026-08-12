@@ -96,7 +96,7 @@ fn middle_span_candidates(
     after: &str,
     max_middle: usize,
 ) -> Option<Vec<LearnCandidate>> {
-    let (pre_len, suf_len) = common_affix_lens(before, after);
+    let (mut pre_len, mut suf_len) = common_affix_lens(before, after);
     // Need real shared context — pure whole-string swaps have pre=0,suf=0.
     if pre_len == 0 && suf_len == 0 {
         return None;
@@ -104,6 +104,22 @@ fn middle_span_candidates(
 
     let b_chars: Vec<char> = before.chars().collect();
     let a_chars: Vec<char> = after.chars().collect();
+    // Character-level affixes may stop inside a corrected technical term. For
+    // example, `wrong‑term` -> `worktree` shares the leading `w`; treating that
+    // `w` as context produces the broken candidate `orktree`. Widen only Latin
+    // or technical-token boundaries so CJK single-character edits keep their
+    // existing focused spans.
+    while pre_len > 0
+        && (splits_technical_token(&b_chars, pre_len) || splits_technical_token(&a_chars, pre_len))
+    {
+        pre_len -= 1;
+    }
+    while suf_len > 0
+        && (splits_technical_token(&b_chars, b_chars.len() - suf_len)
+            || splits_technical_token(&a_chars, a_chars.len() - suf_len))
+    {
+        suf_len -= 1;
+    }
     if pre_len + suf_len >= b_chars.len() || pre_len + suf_len >= a_chars.len() {
         return None;
     }
@@ -126,8 +142,12 @@ fn middle_span_candidates(
         return None;
     }
     // Avoid learning single punctuation-only swaps.
-    if from.chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace())
-        && to.chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+    if from
+        .chars()
+        .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+        && to
+            .chars()
+            .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
     {
         return None;
     }
@@ -181,6 +201,25 @@ fn is_cjk(c: char) -> bool {
     ('\u{4e00}'..='\u{9fff}').contains(&c)
         || ('\u{3400}'..='\u{4dbf}').contains(&c)
         || ('\u{f900}'..='\u{faff}').contains(&c)
+}
+
+fn splits_technical_token(chars: &[char], boundary: usize) -> bool {
+    boundary > 0
+        && boundary < chars.len()
+        && is_technical_token_char(chars, boundary - 1)
+        && is_technical_token_char(chars, boundary)
+}
+
+fn is_technical_token_char(chars: &[char], index: usize) -> bool {
+    let character = chars[index];
+    if character == '_' || (character.is_alphanumeric() && !is_cjk(character)) {
+        return true;
+    }
+    matches!(character, '-' | '.' | '\u{2010}' | '\u{2011}')
+        && index > 0
+        && index + 1 < chars.len()
+        && chars[index - 1].is_alphanumeric()
+        && chars[index + 1].is_alphanumeric()
 }
 
 /// Character counts of shared prefix and suffix (non-overlapping).
@@ -261,5 +300,35 @@ mod tests {
             .expect("replacement");
         assert_eq!(rep.from_text.as_deref(), Some("脱肯"));
         assert_eq!(rep.to_text.as_deref(), Some("Token"));
+    }
+
+    #[test]
+    fn middle_span_does_not_drop_a_shared_technical_token_prefix() {
+        let before = "Use wrong‑term here and keep wrong‑term later.";
+        let after = "Use worktree here and keep wrong‑term later.";
+
+        let candidates = candidates_from_edit(before, after);
+        let replacement = candidates
+            .iter()
+            .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+
+        assert_eq!(replacement.from_text.as_deref(), Some("wrong‑term"));
+        assert_eq!(replacement.to_text.as_deref(), Some("worktree"));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.kind == DictEntryKind::Term && candidate.term.as_deref() == Some("worktree")
+        }));
+    }
+
+    #[test]
+    fn middle_span_does_not_drop_a_shared_technical_token_suffix() {
+        let candidates = candidates_from_edit("Use serber here", "Use server here");
+        let replacement = candidates
+            .iter()
+            .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+
+        assert_eq!(replacement.from_text.as_deref(), Some("serber"));
+        assert_eq!(replacement.to_text.as_deref(), Some("server"));
     }
 }
