@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2118,11 +2119,24 @@ fn term_proposal(
 }
 
 fn tokens(value: &str) -> Vec<String> {
+    let graphemes: Vec<&str> = value.graphemes(true).collect();
     let mut tokens = Vec::new();
     let mut current = String::new();
-    for character in value.chars() {
-        if character.is_alphanumeric() || matches!(character, '_' | '-' | '.') {
-            current.push(character);
+    for (index, grapheme) in graphemes.iter().copied().enumerate() {
+        let starts_with_alphanumeric = grapheme.chars().next().is_some_and(char::is_alphanumeric);
+        let internal_apostrophe = matches!(grapheme, "'" | "\u{2019}")
+            && index > 0
+            && index + 1 < graphemes.len()
+            && graphemes[index - 1]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphabetic)
+            && graphemes[index + 1]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphabetic);
+        if starts_with_alphanumeric || matches!(grapheme, "_" | "-" | ".") || internal_apostrophe {
+            current.push_str(grapheme);
         } else if !current.is_empty() {
             tokens.push(std::mem::take(&mut current));
         }
@@ -3175,6 +3189,53 @@ mod tests {
         assert_eq!(payload["fromText"], "serber");
         assert_eq!(payload["toText"], "server");
         assert_eq!(proposals[0].risk, "confirmation_required");
+    }
+
+    #[test]
+    fn repeated_source_term_edit_preserves_the_full_corrected_token() {
+        let original = "Use wrong‑term here and keep wrong‑term later.";
+        let edited = "Use worktree here and keep wrong‑term later.";
+        let revision = test_revision(edited);
+
+        let proposals = proposals_from_revision(original, &revision);
+        let terms = proposals
+            .iter()
+            .filter(|proposal| proposal.kind == "term")
+            .map(|proposal| {
+                serde_json::from_str::<serde_json::Value>(&proposal.payload_json).unwrap()["term"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(terms, vec!["worktree"]);
+    }
+
+    #[test]
+    fn apostrophe_edit_preserves_the_full_words_in_the_proposal() {
+        let revision = test_revision("Use doesn't here");
+
+        let proposals = proposals_from_revision("Use don't here", &revision);
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].kind, "replacement");
+        let payload: serde_json::Value = serde_json::from_str(&proposals[0].payload_json).unwrap();
+        assert_eq!(payload["fromText"], "don't");
+        assert_eq!(payload["toText"], "doesn't");
+    }
+
+    #[test]
+    fn combining_character_edit_preserves_the_full_graphemes_in_the_proposal() {
+        let revision = test_revision("Use caff\u{301} here");
+
+        let proposals = proposals_from_revision("Use cafe\u{301} here", &revision);
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].kind, "replacement");
+        let payload: serde_json::Value = serde_json::from_str(&proposals[0].payload_json).unwrap();
+        assert_eq!(payload["fromText"], "cafe\u{301}");
+        assert_eq!(payload["toText"], "caff\u{301}");
     }
 
     fn test_revision(after_text: &str) -> EditRevisionRecord {

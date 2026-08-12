@@ -7,6 +7,8 @@
 use chrono::{DateTime, Utc};
 use lumen_core::{DictEntryKind, DictEntrySource};
 use serde::{Deserialize, Serialize};
+use unicode_script::{Script, UnicodeScript};
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,22 +98,39 @@ fn middle_span_candidates(
     after: &str,
     max_middle: usize,
 ) -> Option<Vec<LearnCandidate>> {
-    let (pre_len, suf_len) = common_affix_lens(before, after);
+    let b_graphemes: Vec<&str> = before.graphemes(true).collect();
+    let a_graphemes: Vec<&str> = after.graphemes(true).collect();
+    let (mut pre_len, mut suf_len) = common_affix_lens(&b_graphemes, &a_graphemes);
     // Need real shared context — pure whole-string swaps have pre=0,suf=0.
     if pre_len == 0 && suf_len == 0 {
         return None;
     }
 
-    let b_chars: Vec<char> = before.chars().collect();
-    let a_chars: Vec<char> = after.chars().collect();
-    if pre_len + suf_len >= b_chars.len() || pre_len + suf_len >= a_chars.len() {
+    // Shared affixes may stop inside a corrected technical term. For example,
+    // `wrong‑term` -> `worktree` shares the leading `w`; treating that `w` as
+    // context produces the broken candidate `orktree`. Widen Unicode Latin
+    // technical-token boundaries while keeping edits in other scripts focused.
+    // Grapheme boundaries keep decomposed accents attached to their base letter.
+    while pre_len > 0
+        && (splits_technical_token(&b_graphemes, pre_len)
+            || splits_technical_token(&a_graphemes, pre_len))
+    {
+        pre_len -= 1;
+    }
+    while suf_len > 0
+        && (splits_technical_token(&b_graphemes, b_graphemes.len() - suf_len)
+            || splits_technical_token(&a_graphemes, a_graphemes.len() - suf_len))
+    {
+        suf_len -= 1;
+    }
+    if pre_len + suf_len >= b_graphemes.len() || pre_len + suf_len >= a_graphemes.len() {
         return None;
     }
 
-    let from: String = b_chars[pre_len..b_chars.len() - suf_len].iter().collect();
-    let to: String = a_chars[pre_len..a_chars.len() - suf_len].iter().collect();
-    let from = from.trim();
-    let to = to.trim();
+    let from_span = b_graphemes[pre_len..b_graphemes.len() - suf_len].concat();
+    let to_span = a_graphemes[pre_len..a_graphemes.len() - suf_len].concat();
+    let from = from_span.trim();
+    let to = to_span.trim();
     if from.is_empty() || to.is_empty() || from == to {
         return None;
     }
@@ -119,15 +138,27 @@ fn middle_span_candidates(
     // (otherwise short_pair on the full text is equivalent / clearer).
     let from_n = from.chars().count();
     let to_n = to.chars().count();
-    if from_n >= b_chars.len() && to_n >= a_chars.len() {
+    if from.graphemes(true).count() >= b_graphemes.len()
+        && to.graphemes(true).count() >= a_graphemes.len()
+    {
         return None;
     }
-    if from_n > max_middle || to_n > max_middle {
+    const MAX_TECHNICAL_MIDDLE_CHARS: usize = 64;
+    let within_default_limit = from_n <= max_middle && to_n <= max_middle;
+    let within_technical_limit = from_n <= MAX_TECHNICAL_MIDDLE_CHARS
+        && to_n <= MAX_TECHNICAL_MIDDLE_CHARS
+        && is_complete_technical_token(from)
+        && is_complete_technical_token(to);
+    if !within_default_limit && !within_technical_limit {
         return None;
     }
     // Avoid learning single punctuation-only swaps.
-    if from.chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace())
-        && to.chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+    if from
+        .chars()
+        .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+        && to
+            .chars()
+            .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
     {
         return None;
     }
@@ -183,18 +214,56 @@ fn is_cjk(c: char) -> bool {
         || ('\u{f900}'..='\u{faff}').contains(&c)
 }
 
-/// Character counts of shared prefix and suffix (non-overlapping).
-fn common_affix_lens(a: &str, b: &str) -> (usize, usize) {
-    let ac: Vec<char> = a.chars().collect();
-    let bc: Vec<char> = b.chars().collect();
+fn splits_technical_token(graphemes: &[&str], boundary: usize) -> bool {
+    boundary > 0
+        && boundary < graphemes.len()
+        && is_technical_token_grapheme(graphemes, boundary - 1)
+        && is_technical_token_grapheme(graphemes, boundary)
+}
+
+fn is_technical_token_grapheme(graphemes: &[&str], index: usize) -> bool {
+    let grapheme = graphemes[index];
+    if grapheme == "_" || is_latin_word_component(grapheme) {
+        return true;
+    }
+
+    matches!(
+        grapheme,
+        "-" | "." | "\u{2010}" | "\u{2011}" | "'" | "\u{2019}"
+    ) && index > 0
+        && index + 1 < graphemes.len()
+        && is_latin_word_component(graphemes[index - 1])
+        && is_latin_word_component(graphemes[index + 1])
+}
+
+fn is_latin_word_component(grapheme: &str) -> bool {
+    let mut characters = grapheme.chars();
+    let Some(base) = characters.next() else {
+        return false;
+    };
+    (base.is_ascii_digit() || (base.is_alphabetic() && base.script() == Script::Latin))
+        && characters.all(|character| character.script() == Script::Inherited)
+}
+
+fn is_complete_technical_token(value: &str) -> bool {
+    let graphemes: Vec<&str> = value.graphemes(true).collect();
+    !graphemes.is_empty()
+        && graphemes
+            .iter()
+            .any(|grapheme| is_latin_word_component(grapheme))
+        && (0..graphemes.len()).all(|index| is_technical_token_grapheme(&graphemes, index))
+}
+
+/// Item counts of shared prefix and suffix (non-overlapping).
+fn common_affix_lens<T: PartialEq>(a: &[T], b: &[T]) -> (usize, usize) {
     let mut pre = 0usize;
-    while pre < ac.len() && pre < bc.len() && ac[pre] == bc[pre] {
+    while pre < a.len() && pre < b.len() && a[pre] == b[pre] {
         pre += 1;
     }
     let mut suf = 0usize;
-    while suf < ac.len().saturating_sub(pre)
-        && suf < bc.len().saturating_sub(pre)
-        && ac[ac.len() - 1 - suf] == bc[bc.len() - 1 - suf]
+    while suf < a.len().saturating_sub(pre)
+        && suf < b.len().saturating_sub(pre)
+        && a[a.len() - 1 - suf] == b[b.len() - 1 - suf]
     {
         suf += 1;
     }
@@ -261,5 +330,141 @@ mod tests {
             .expect("replacement");
         assert_eq!(rep.from_text.as_deref(), Some("脱肯"));
         assert_eq!(rep.to_text.as_deref(), Some("Token"));
+    }
+
+    #[test]
+    fn middle_span_does_not_drop_a_shared_technical_token_prefix() {
+        let before = "Use wrong‑term here and keep wrong‑term later.";
+        let after = "Use worktree here and keep wrong‑term later.";
+
+        let candidates = candidates_from_edit(before, after);
+        let replacement = candidates
+            .iter()
+            .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+
+        assert_eq!(replacement.from_text.as_deref(), Some("wrong‑term"));
+        assert_eq!(replacement.to_text.as_deref(), Some("worktree"));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.kind == DictEntryKind::Term && candidate.term.as_deref() == Some("worktree")
+        }));
+    }
+
+    #[test]
+    fn middle_span_does_not_drop_a_shared_technical_token_suffix() {
+        let candidates = candidates_from_edit("Use serber here", "Use server here");
+        let replacement = candidates
+            .iter()
+            .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+
+        assert_eq!(replacement.from_text.as_deref(), Some("serber"));
+        assert_eq!(replacement.to_text.as_deref(), Some("server"));
+    }
+
+    #[test]
+    fn middle_span_keeps_non_ascii_character_edits_focused() {
+        let candidates = candidates_from_edit("ひらがな", "ひらげな");
+        let replacement = candidates
+            .iter()
+            .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+
+        assert_eq!(replacement.from_text.as_deref(), Some("が"));
+        assert_eq!(replacement.to_text.as_deref(), Some("げ"));
+    }
+
+    #[test]
+    fn middle_span_keeps_non_latin_script_edits_focused() {
+        for (before, after, expected_from, expected_to) in [
+            ("Use かなかな here", "Use かにかな here", "な", "に"),
+            ("Use 가나가나 here", "Use 가다가나 here", "나", "다"),
+            ("Use 𠀀𠀁𠀀 here", "Use 𠀀𠀂𠀀 here", "𠀁", "𠀂"),
+        ] {
+            let candidates = candidates_from_edit(before, after);
+            let replacement = candidates
+                .iter()
+                .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+                .expect("replacement");
+
+            assert_eq!(replacement.from_text.as_deref(), Some(expected_from));
+            assert_eq!(replacement.to_text.as_deref(), Some(expected_to));
+        }
+    }
+
+    #[test]
+    fn technical_connectors_only_join_latin_token_interiors() {
+        for connector in ["-", ".", "\u{2010}", "\u{2011}", "'", "\u{2019}"] {
+            let interior_text = format!("a{connector}b");
+            let interior: Vec<&str> = interior_text.graphemes(true).collect();
+            assert!(is_technical_token_grapheme(&interior, 1));
+
+            let leading_text = format!("{connector}a");
+            let leading: Vec<&str> = leading_text.graphemes(true).collect();
+            assert!(!is_technical_token_grapheme(&leading, 0));
+
+            let trailing_text = format!("a{connector}");
+            let trailing: Vec<&str> = trailing_text.graphemes(true).collect();
+            assert!(!is_technical_token_grapheme(&trailing, 1));
+        }
+
+        assert!(is_technical_token_grapheme(&["_", "a"], 0));
+        assert!(is_technical_token_grapheme(&["a", "_"], 1));
+    }
+
+    #[test]
+    fn middle_span_preserves_apostrophes_inside_latin_words() {
+        let candidates = candidates_from_edit("Use don't here", "Use doesn't here");
+        let replacement = candidates
+            .iter()
+            .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+
+        assert_eq!(replacement.from_text.as_deref(), Some("don't"));
+        assert_eq!(replacement.to_text.as_deref(), Some("doesn't"));
+    }
+
+    #[test]
+    fn middle_span_preserves_accented_latin_words() {
+        let candidates = candidates_from_edit("Use résume here", "Use résumé here");
+        let replacement = candidates
+            .iter()
+            .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+
+        assert_eq!(replacement.from_text.as_deref(), Some("résume"));
+        assert_eq!(replacement.to_text.as_deref(), Some("résumé"));
+    }
+
+    #[test]
+    fn middle_span_does_not_split_combining_character_graphemes() {
+        let candidates = candidates_from_edit("Use cafe\u{301} here", "Use caff\u{301} here");
+        let replacement = candidates
+            .iter()
+            .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+
+        assert_eq!(replacement.from_text.as_deref(), Some("cafe\u{301}"));
+        assert_eq!(replacement.to_text.as_deref(), Some("caff\u{301}"));
+    }
+
+    #[test]
+    fn middle_span_allows_bounded_long_technical_replacements() {
+        let before = "Use very_long_technical_identifier_wrong now";
+        let after = "Use very_long_technical_identifier_right now";
+        let candidates = candidates_from_edit(before, after);
+        let replacement = candidates
+            .iter()
+            .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+
+        assert_eq!(
+            replacement.from_text.as_deref(),
+            Some("very_long_technical_identifier_wrong")
+        );
+        assert_eq!(
+            replacement.to_text.as_deref(),
+            Some("very_long_technical_identifier_right")
+        );
     }
 }

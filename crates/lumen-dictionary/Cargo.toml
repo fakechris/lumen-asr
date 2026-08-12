@@ -10,6 +10,8 @@ chrono = { workspace = true }
 lumen-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+unicode-script = { workspace = true }
+unicode-segmentation = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
