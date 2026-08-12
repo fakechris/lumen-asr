@@ -49,6 +49,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "stream"], default-features = false }
 regex = "1"
 toml = "0.8"
+unicode-script = "0.5"
+unicode-segmentation = "1"
 
 lumen-core = { path = "crates/lumen-core" }
 lumen-asr = { path = "crates/lumen-asr" }
