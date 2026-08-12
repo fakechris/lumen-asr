@@ -107,7 +107,7 @@ fn middle_span_candidates(
     // Character-level affixes may stop inside a corrected technical term. For
     // example, `wrong‑term` -> `worktree` shares the leading `w`; treating that
     // `w` as context produces the broken candidate `orktree`. Widen only Latin
-    // or technical-token boundaries so CJK single-character edits keep their
+    // or technical-token boundaries so non-ASCII character edits keep their
     // existing focused spans.
     while pre_len > 0
         && (splits_technical_token(&b_chars, pre_len) || splits_technical_token(&a_chars, pre_len))
@@ -212,14 +212,14 @@ fn splits_technical_token(chars: &[char], boundary: usize) -> bool {
 
 fn is_technical_token_char(chars: &[char], index: usize) -> bool {
     let character = chars[index];
-    if character == '_' || (character.is_alphanumeric() && !is_cjk(character)) {
+    if character == '_' || character.is_ascii_alphanumeric() {
         return true;
     }
     matches!(character, '-' | '.' | '\u{2010}' | '\u{2011}')
         && index > 0
         && index + 1 < chars.len()
-        && chars[index - 1].is_alphanumeric()
-        && chars[index + 1].is_alphanumeric()
+        && chars[index - 1].is_ascii_alphanumeric()
+        && chars[index + 1].is_ascii_alphanumeric()
 }
 
 /// Character counts of shared prefix and suffix (non-overlapping).
@@ -330,5 +330,17 @@ mod tests {
 
         assert_eq!(replacement.from_text.as_deref(), Some("serber"));
         assert_eq!(replacement.to_text.as_deref(), Some("server"));
+    }
+
+    #[test]
+    fn middle_span_keeps_non_ascii_character_edits_focused() {
+        let candidates = candidates_from_edit("ひらがな", "ひらげな");
+        let replacement = candidates
+            .iter()
+            .find(|candidate| candidate.kind == DictEntryKind::Replacement)
+            .expect("replacement");
+
+        assert_eq!(replacement.from_text.as_deref(), Some("が"));
+        assert_eq!(replacement.to_text.as_deref(), Some("げ"));
     }
 }
