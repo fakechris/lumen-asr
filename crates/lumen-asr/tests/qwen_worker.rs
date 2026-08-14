@@ -3,7 +3,7 @@ use lumen_asr::{
     QwenShadowStatus, QwenShadowTerm,
 };
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn temp_dir(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -19,6 +19,27 @@ fn python_executable() -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "python" } else { "python3" }))
+}
+
+fn worker_timeout() -> Duration {
+    // The integration-test binary starts several Python workers concurrently.
+    // Windows hosted runners can take more than five seconds to schedule a
+    // freshly spawned interpreter under that load, while local Unix runs do
+    // not need the longer failure budget.
+    Duration::from_secs(if cfg!(windows) { 15 } else { 5 })
+}
+
+async fn wait_for_startup_marker(path: &Path) -> bool {
+    let deadline = tokio::time::Instant::now() + worker_timeout();
+    loop {
+        if path.is_file() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 fn marker_lines(path: &Path) -> Vec<String> {
@@ -112,7 +133,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: Some("zh".into()),
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
     });
     let request = || AsrRequest {
@@ -200,7 +221,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: None,
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec![],
     });
 
@@ -302,7 +323,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: None,
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec![],
     });
 
@@ -375,7 +396,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: None,
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec![],
     });
 
@@ -469,7 +490,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: None,
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
     });
     let request = || AsrRequest {
@@ -520,7 +541,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: None,
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
     });
     let request = || AsrRequest {
@@ -575,7 +596,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: None,
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
     });
     let request = || AsrRequest {
@@ -587,16 +608,10 @@ for line in sys.stdin:
 
     let in_flight_engine = engine.clone();
     let in_flight = tokio::spawn(async move { in_flight_engine.transcribe(request()).await });
-    // Wait up to 5s for the worker subprocess to write its startup marker.
-    // 500ms was too tight on loaded Windows CI runners (python spawn + import
-    // + file write), causing spurious "worker did not start" failures.
-    for _ in 0..1000 {
-        if starts.is_file() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert!(starts.is_file(), "worker did not start");
+    assert!(
+        wait_for_startup_marker(&starts).await,
+        "worker did not start"
+    );
     assert!(engine.unload());
     assert_eq!(in_flight.await.unwrap().unwrap().text, "ok");
 
@@ -641,7 +656,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: None,
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
     });
     let request = || AsrRequest {
@@ -653,16 +668,10 @@ for line in sys.stdin:
 
     let first_engine = engine.clone();
     let first = tokio::spawn(async move { first_engine.transcribe(request()).await });
-    // Wait up to 5s for the worker subprocess to write its startup marker.
-    // 500ms was too tight on loaded Windows CI runners (python spawn + import
-    // + file write), causing spurious "worker did not start" failures.
-    for _ in 0..1000 {
-        if starts.is_file() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert!(starts.is_file(), "worker did not start");
+    assert!(
+        wait_for_startup_marker(&starts).await,
+        "worker did not start"
+    );
 
     let queued_engine = engine.clone();
     let queued = tokio::spawn(async move { queued_engine.transcribe(request()).await });
@@ -715,7 +724,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: None,
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
     });
     let request = || AsrRequest {
@@ -773,7 +782,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: None,
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec!["--startup-marker".into(), starts.display().to_string()],
     });
     let request = || AsrRequest {
@@ -827,7 +836,7 @@ for line in sys.stdin:
         worker_script: worker,
         model_dir: model,
         language: None,
-        timeout: std::time::Duration::from_secs(5),
+        timeout: worker_timeout(),
         extra_args: vec!["--pid-file".into(), pid_file.display().to_string()],
     });
     let runtime = tokio::runtime::Builder::new_current_thread()
