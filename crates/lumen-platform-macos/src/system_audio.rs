@@ -205,6 +205,7 @@ mod imp {
     use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2::sel;
     use objc2_foundation::{NSArray, NSNumber, NSString};
 
     type AudioObjectID = u32;
@@ -495,7 +496,11 @@ mod imp {
         // can restore it; this avoids silently losing remote audio after an app
         // update/relaunch during a long recording.
         unsafe {
-            let _: () = msg_send![&*desc, setProcessRestoreEnabled: Bool::YES];
+            let selector = sel!(setProcessRestoreEnabled:);
+            let supported: bool = msg_send![&*desc, respondsToSelector: selector];
+            if supported {
+                let _: () = msg_send![&*desc, setProcessRestoreEnabled: Bool::YES];
+            }
         }
 
         // SAFETY: `UUID` / `UUIDString` are documented properties.

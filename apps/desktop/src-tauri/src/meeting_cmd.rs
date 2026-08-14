@@ -126,10 +126,14 @@ fn remove_audio_file(path: &Path) {
 /// Lumen's meetings directory before any destructive replacement is allowed.
 fn owned_meeting_wav(path: &str) -> Result<PathBuf, String> {
     let meetings_dir = default_data_dir().join("meetings");
+    owned_meeting_wav_in(&meetings_dir, Path::new(path))
+}
+
+fn owned_meeting_wav_in(meetings_dir: &Path, path: &Path) -> Result<PathBuf, String> {
     let owned_dir = meetings_dir
         .canonicalize()
         .map_err(|error| format!("无法读取会议音频目录：{error}"))?;
-    let source = Path::new(path)
+    let source = path
         .canonicalize()
         .map_err(|error| format!("无法读取会议音频：{error}"))?;
     if source.parent() != Some(owned_dir.as_path())
@@ -604,7 +608,6 @@ fn spawn_meeting_watchdog(
                             reason: "silence",
                         },
                     );
-                    break;
                 }
                 SilenceWatchdogAction::None => {}
             }
@@ -1124,6 +1127,15 @@ pub fn stop_meeting_recording(
         return Ok(completed);
     }
 
+    // Stop the watchdog before the capture engines. Otherwise it can poll a
+    // just-finalized track once more and emit a stale auto-stop event while
+    // this command is already stopping the meeting.
+    if let Ok(mut guard) = state.meeting_watchdog.lock() {
+        if let Some(watchdog) = guard.take() {
+            watchdog.stop_and_join();
+        }
+    }
+
     // Try to stop + finalize the recorder, but *keep* the result — the recovery
     // below (restore hotkey + reset arbiter) must run on every path, success or
     // failure. This is finally/defer semantics: whatever happens to the
@@ -1196,14 +1208,6 @@ pub fn stop_meeting_recording(
         }
     }
 
-    // Stop the silence watchdog started with the recording, on every path.
-    // Signal it to exit and join (returns within a poll slice). A poisoned lock
-    // just means it is already gone.
-    if let Ok(mut guard) = state.meeting_watchdog.lock() {
-        if let Some(watchdog) = guard.take() {
-            watchdog.stop_and_join();
-        }
-    }
     let _ = app.emit(
         "meeting-silence-cleared",
         MeetingSilenceCleared {
@@ -1366,9 +1370,15 @@ pub fn accept_meeting_detection(
     let Some(accepted) = state.meeting_detection.accept() else {
         return Ok(String::new());
     };
+    // Native apps need both the catalog authorization and the accepted prompt.
+    // Browsers deliberately use per-prompt consent instead: their catalog
+    // `capture = false` default means "never capture without asking", and the
+    // prompt offers the explicit whole-browser vs mic-only choice every time.
     let should_capture = capture_system_audio
-        && (accepted.app_class == lumen_core::AppClass::Browser
-            || state.meeting_detection.capture_enabled(&accepted.bundle_id));
+        && match accepted.app_class {
+            lumen_core::AppClass::Browser => true,
+            _ => state.meeting_detection.capture_enabled(&accepted.bundle_id),
+        };
     let system_targets = should_capture
         .then(|| vec![accepted.bundle_id.clone()])
         .unwrap_or_default();
@@ -2442,10 +2452,20 @@ pub async fn delete_meeting(
         return Ok(false);
     };
     if let Some(mic) = audio_path.as_deref() {
-        remove_mic_audio_artifacts(Path::new(mic));
+        match owned_meeting_wav(mic) {
+            Ok(owned) => remove_mic_audio_artifacts(&owned),
+            Err(error) => {
+                tracing::warn!(path = %mic, %error, "skipping unowned meeting audio on delete")
+            }
+        }
     }
     if let Some(system) = system_audio_path.as_deref() {
-        remove_audio_file(Path::new(system));
+        match owned_meeting_wav(system) {
+            Ok(owned) => remove_audio_file(&owned),
+            Err(error) => {
+                tracing::warn!(path = %system, %error, "skipping unowned system audio on delete")
+            }
+        }
     }
     Ok(true)
 }
@@ -3401,8 +3421,8 @@ pub fn export_meeting(
 #[cfg(test)]
 mod tests {
     use super::{
-        combine_track_silence_seconds, merge_attendees_into_notes, prepare_meeting_trim,
-        read_timeline_offsets, remove_mic_audio_artifacts, system_trim_range,
+        combine_track_silence_seconds, merge_attendees_into_notes, owned_meeting_wav_in,
+        prepare_meeting_trim, read_timeline_offsets, remove_mic_audio_artifacts, system_trim_range,
         write_timeline_sidecar, MeetingRecordingDto, MeetingRecordingOwner, MeetingTimeline,
         SilenceWatchdogAction, SilenceWatchdogState,
     };
@@ -3478,6 +3498,27 @@ mod tests {
         assert!(!mic.exists());
         assert!(!timeline.exists());
         assert!(!echo.exists());
+    }
+
+    #[test]
+    fn owned_meeting_wav_rejects_files_outside_or_below_the_meetings_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let meetings = directory.path().join("meetings");
+        let nested = meetings.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let owned = meetings.join("owned.wav");
+        let outside = directory.path().join("outside.wav");
+        let nested_wav = nested.join("nested.wav");
+        for path in [&owned, &outside, &nested_wav] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+
+        assert_eq!(
+            owned_meeting_wav_in(&meetings, &owned).unwrap(),
+            owned.canonicalize().unwrap()
+        );
+        assert!(owned_meeting_wav_in(&meetings, &outside).is_err());
+        assert!(owned_meeting_wav_in(&meetings, &nested_wav).is_err());
     }
 
     #[test]

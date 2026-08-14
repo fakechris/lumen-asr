@@ -46,7 +46,7 @@ pub fn copy_pcm16_wav_range(
     start_seconds: f64,
     end_seconds: f64,
 ) -> Result<WavRangeSummary, WavRangeError> {
-    if source == destination {
+    if paths_refer_to_same_file(source, destination) {
         return Err(WavRangeError::SamePath);
     }
     if !start_seconds.is_finite()
@@ -65,6 +65,13 @@ pub fn copy_pcm16_wav_range(
         let _ = std::fs::remove_file(destination);
     }
     result
+}
+
+/// Compare file identity when both paths exist (covering symlinks, hard links,
+/// relative aliases, and case-folding filesystems). A new destination normally
+/// does not exist yet, so fall back to the literal comparison in that case.
+fn paths_refer_to_same_file(source: &Path, destination: &Path) -> bool {
+    source == destination || same_file::is_same_file(source, destination).unwrap_or(false)
 }
 
 fn copy_inner(
@@ -174,5 +181,27 @@ mod tests {
         assert!(copy_pcm16_wav_range(&source, &empty, 2.0, 3.0).is_err());
         assert!(!empty.exists());
         assert!(copy_pcm16_wav_range(&source, &source, 0.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn rejects_hard_link_and_relative_aliases_without_touching_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.wav");
+        let hard_link = dir.path().join("alias.wav");
+        write_fixture(&source);
+        std::fs::hard_link(&source, &hard_link).unwrap();
+
+        assert!(matches!(
+            copy_pcm16_wav_range(&source, &hard_link, 0.0, 1.0),
+            Err(WavRangeError::SamePath)
+        ));
+        assert_eq!(hound::WavReader::open(&source).unwrap().duration(), 20);
+
+        let relative_alias = dir.path().join(".").join("source.wav");
+        assert!(matches!(
+            copy_pcm16_wav_range(&source, &relative_alias, 0.0, 1.0),
+            Err(WavRangeError::SamePath)
+        ));
+        assert_eq!(hound::WavReader::open(&source).unwrap().duration(), 20);
     }
 }

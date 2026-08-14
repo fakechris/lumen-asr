@@ -802,10 +802,16 @@ mod tests {
         assert!(!has_show_prompt(
             &p.handle(DetectionInput::Tick { now_ms: 2_999 })
         ));
-        assert!(has_show_prompt(
-            &p.handle(DetectionInput::Tick { now_ms: 3_000 })
-        ));
+        let outs = p.handle(DetectionInput::Tick { now_ms: 3_000 });
+        assert!(has_show_prompt(&outs));
+        assert!(
+            !has_start(&outs),
+            "a browser must never start recording on its own"
+        );
         assert_eq!(p.phase(), "prompted");
+        assert!(has_start(
+            &p.handle(DetectionInput::UserAccepted { now_ms: 3_500 })
+        ));
     }
 
     // --- Signal disappearance cancels an unshown/shown prompt ---------------
