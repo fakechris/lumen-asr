@@ -127,6 +127,23 @@ export type MeetingDetectionStatus = {
   active: boolean;
 };
 
+export type MeetingAppKind = "meeting" | "browser";
+
+export type MeetingAppEntry = {
+  name: string;
+  kind: MeetingAppKind;
+  bundle_ids: string[];
+  detect: boolean;
+  capture: boolean;
+};
+
+export type MeetingAppCatalog = {
+  path: string;
+  version: number;
+  applications: MeetingAppEntry[];
+  loadError?: string | null;
+};
+
 /** Local-only meeting-detection counters (stored on this machine, never
  * uploaded) — how often detection prompted/suggested and what the user chose. */
 export type MeetingDetectionStats = {
@@ -501,10 +518,26 @@ export const api = {
   setMeetingDetectionEnabled: (enabled: boolean) =>
     invoke<MeetingDetectionStatus>("set_meeting_detection_enabled", { enabled }),
 
+  /** Runtime meeting/recording application catalog. The returned path is the
+   * user-owned TOML file; the executable contains no compiled app list. */
+  getMeetingAppCatalog: () =>
+    invoke<MeetingAppCatalog>("get_meeting_app_catalog"),
+
+  saveMeetingAppCatalog: (catalog: MeetingAppCatalog) =>
+    invoke<MeetingAppCatalog>("save_meeting_app_catalog", {
+      catalog: {
+        version: catalog.version,
+        application: catalog.applications,
+      },
+    }),
+
+  reloadMeetingAppCatalog: () =>
+    invoke<MeetingAppCatalog>("reload_meeting_app_catalog"),
+
   /** User accepted a detection prompt → start recording via the existing path.
    * Resolves the new meeting id, or "" if nothing was started. */
-  acceptMeetingDetection: () =>
-    invoke<string>("accept_meeting_detection"),
+  acceptMeetingDetection: (captureSystemAudio: boolean) =>
+    invoke<string>("accept_meeting_detection", { captureSystemAudio }),
 
   /** User dismissed a detection prompt (arms a per-app cooldown). */
   dismissMeetingDetection: () =>
@@ -538,6 +571,11 @@ export const api = {
   }) =>
     invoke<MeetingWatchdogConfig>("set_meeting_watchdog_config", input),
 
+  /** Keep recording after a prolonged-silence warning and re-arm the full
+   * configured silence interval from the acknowledgement point. */
+  continueMeetingAfterSilence: (meetingId: string) =>
+    invoke<void>("continue_meeting_after_silence", { meetingId }),
+
   /** Read one meeting with its speakers, seq-ordered segments, and summaries. */
   getMeetingDetail: (meetingId: string) =>
     invoke<MeetingDetail>("get_meeting_detail", { meetingId }),
@@ -552,6 +590,20 @@ export const api = {
    * ("未命名会议"). Resolves `true` if the meeting row was updated. */
   renameMeeting: (meetingId: string, title: string) =>
     invoke<boolean>("rename_meeting", { meetingId, title }),
+
+  /** Keep one continuous portion of a finished meeting, permanently replace
+   * its WAV files, and start transcript/minutes regeneration. Resolves the
+   * exact duration of the newly written mic WAV. */
+  trimMeetingAudio: (
+    meetingId: string,
+    startSeconds: number,
+    endSeconds: number,
+  ) =>
+    invoke<number>("trim_meeting_audio", {
+      meetingId,
+      startSeconds,
+      endSeconds,
+    }),
 
   /** Delete a meeting and all attached data (segments/speakers/summaries cascade)
    * plus its recorded WAV on disk. Irreversible. Resolves `true` if a row was
