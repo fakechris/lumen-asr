@@ -35,7 +35,7 @@ pub use power_assertion::MeetingPowerGuard;
 pub use power_monitor::{battery_status, install_will_sleep_observer, BatteryStatus};
 pub use system_audio::{
     capability_available as system_audio_capability_available, SystemAudioCapture,
-    SystemAudioError, SystemAudioSink,
+    SystemAudioError, SystemAudioSink, SystemAudioTarget,
 };
 pub use voice_processing::{
     voice_processing_supported, VoiceInputSink, VoiceProcessingError, VoiceProcessingInput,

@@ -25,17 +25,14 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use lumen_core::AppClass;
-
-/// One app currently holding an audio input, normalized and pre-classified.
+/// One app currently holding an audio input. Classification is intentionally
+/// deferred to the desktop runtime catalog rather than compiled here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveInput {
     /// Normalized bundle id (helper/renderer/GPU folded to the parent app).
     pub bundle_id: String,
     /// Stable per-session key (`<bundle>#<pid>`).
     pub session_key: String,
-    /// Classification (native meeting / browser / other).
-    pub app_class: AppClass,
 }
 
 /// A discrete change (or heartbeat) observed by the detector.
@@ -141,7 +138,7 @@ mod imp {
 
     use core_foundation::base::TCFType;
     use core_foundation::string::{CFString, CFStringRef};
-    use lumen_core::{classify_bundle_id, normalize_bundle_id};
+    use lumen_core::normalize_bundle_id;
 
     type AudioObjectID = u32;
     type OSStatus = i32;
@@ -298,7 +295,6 @@ mod imp {
             let pid = read_i32(object, PROCESS_PID).unwrap_or(-1);
             out.push(ActiveInput {
                 session_key: format!("{bundle}#{pid}"),
-                app_class: classify_bundle_id(&bundle),
                 bundle_id: bundle,
             });
         }

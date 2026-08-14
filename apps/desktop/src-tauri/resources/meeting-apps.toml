@@ -1,0 +1,117 @@
+version = 1
+
+# This is an install-time seed only. On first launch Lumen copies it to the
+# user data directory as `meeting-apps.toml`; future edits happen there and are
+# never overwritten by an application update.
+
+[[application]]
+name = "Zoom"
+kind = "meeting"
+bundle_ids = ["us.zoom.xos"]
+detect = true
+capture = true
+
+[[application]]
+name = "Microsoft Teams"
+kind = "meeting"
+bundle_ids = ["com.microsoft.teams", "com.microsoft.teams2"]
+detect = true
+capture = true
+
+[[application]]
+name = "腾讯会议"
+kind = "meeting"
+bundle_ids = ["com.tencent.meeting"]
+detect = true
+capture = true
+
+[[application]]
+name = "钉钉"
+kind = "meeting"
+bundle_ids = ["com.alibaba.DingTalkMac"]
+detect = true
+capture = true
+
+[[application]]
+name = "飞书 / Lark"
+kind = "meeting"
+bundle_ids = ["com.electron.lark"]
+detect = true
+capture = true
+
+[[application]]
+name = "Slack"
+kind = "meeting"
+bundle_ids = ["com.tinyspeck.slackmacgap"]
+detect = true
+capture = true
+
+[[application]]
+name = "微信"
+kind = "meeting"
+bundle_ids = ["com.tencent.xinWeChat"]
+detect = true
+capture = true
+
+[[application]]
+name = "企业微信"
+kind = "meeting"
+bundle_ids = ["com.tencent.WeWorkMac"]
+detect = true
+capture = true
+
+[[application]]
+name = "FaceTime"
+kind = "meeting"
+bundle_ids = ["com.apple.FaceTime"]
+detect = true
+capture = true
+
+[[application]]
+name = "Webex"
+kind = "meeting"
+bundle_ids = ["com.cisco.webexmeetingsapp", "com.webex.meetingmanager"]
+detect = true
+capture = true
+
+[[application]]
+name = "Google Chrome"
+kind = "browser"
+bundle_ids = ["com.google.Chrome", "com.google.Chrome.canary", "com.google.Chrome.beta"]
+detect = true
+capture = false
+
+[[application]]
+name = "Safari"
+kind = "browser"
+bundle_ids = ["com.apple.Safari"]
+detect = true
+capture = false
+
+[[application]]
+name = "Microsoft Edge"
+kind = "browser"
+bundle_ids = ["com.microsoft.edgemac"]
+detect = true
+capture = false
+
+[[application]]
+name = "Firefox"
+kind = "browser"
+bundle_ids = ["org.mozilla.firefox"]
+detect = true
+capture = false
+
+[[application]]
+name = "Brave"
+kind = "browser"
+bundle_ids = ["com.brave.Browser"]
+detect = true
+capture = false
+
+[[application]]
+name = "Arc"
+kind = "browser"
+bundle_ids = ["company.thebrowser.Browser"]
+detect = true
+capture = false

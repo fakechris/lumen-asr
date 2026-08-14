@@ -16,7 +16,7 @@
 
 use crate::mode_arbiter::HotkeyAction;
 use crate::AppState;
-use lumen_asr::{live_tap_channel, LIVE_TAP_CAPACITY};
+use lumen_asr::{copy_pcm16_wav_range, live_tap_channel, WavRangeError, LIVE_TAP_CAPACITY};
 use lumen_core::{
     LiveAnnotation, Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SegmentChannel,
     SummaryKind,
@@ -28,9 +28,9 @@ use lumen_meeting::{
 };
 use lumen_platform::{default_data_dir, default_db_path};
 use lumen_store::Store;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -48,7 +48,7 @@ use uuid::Uuid;
 /// aligning live-caption annotations with the offline transcript) reads this
 /// sidecar and can tighten the alignment; the format stays additive metadata,
 /// never a DB schema change.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct MeetingTimeline {
     /// Seconds from `t0` until the mic recorder was capturing.
     mic_offset_seconds: f64,
@@ -58,6 +58,91 @@ struct MeetingTimeline {
     system_offset_seconds: Option<f64>,
     /// RFC 3339 wall-clock timestamp of `t0`.
     t0_wall_clock: String,
+}
+
+/// Read the per-track recording offsets used to map the optional system WAV
+/// onto the mic player's timeline. Missing/old/corrupt metadata fails open to
+/// the near-common-start assumption used elsewhere in the meeting pipeline.
+fn read_timeline_offsets(path: &Path) -> (f64, Option<f64>) {
+    let Ok(json) = std::fs::read_to_string(path) else {
+        return (0.0, None);
+    };
+    let Ok(timeline) = serde_json::from_str::<MeetingTimeline>(&json) else {
+        return (0.0, None);
+    };
+    let finite = |seconds: f64| seconds.is_finite().then_some(seconds);
+    (
+        finite(timeline.mic_offset_seconds).unwrap_or(0.0),
+        timeline.system_offset_seconds.and_then(finite),
+    )
+}
+
+/// Map a range selected on the mic player's timeline into system-WAV local
+/// time. The third value is the system track's new positive start skew after
+/// both tracks are cropped. `None` means the system track begins after the
+/// entire kept interval and therefore contributes no audio.
+fn system_trim_range(start: f64, end: f64, system_skew: f64) -> Option<(f64, f64, f64)> {
+    let local_start = (start - system_skew).max(0.0);
+    let local_end = end - system_skew;
+    (local_end > local_start).then(|| {
+        let new_skew = (local_start + system_skew - start).max(0.0);
+        (local_start, local_end, new_skew)
+    })
+}
+
+fn echo_diagnostics_sidecar(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("meeting");
+    path.with_file_name(format!("{stem}.echo_suppression.json"))
+}
+
+/// Remove a mic WAV and the two sidecars derived from that exact recording.
+/// Every path is explicit; callers validate that the WAV is app-owned first.
+fn remove_mic_audio_artifacts(path: &Path) {
+    for artifact in [
+        path.to_path_buf(),
+        path.with_extension("timeline.json"),
+        echo_diagnostics_sidecar(path),
+    ] {
+        if artifact.exists() {
+            if let Err(error) = std::fs::remove_file(&artifact) {
+                tracing::warn!(path = %artifact.display(), %error, "could not remove replaced meeting artifact");
+            }
+        }
+    }
+}
+
+fn remove_audio_file(path: &Path) {
+    if path.exists() {
+        if let Err(error) = std::fs::remove_file(path) {
+            tracing::warn!(path = %path.display(), %error, "could not remove replaced meeting audio");
+        }
+    }
+}
+
+/// Resolve a stored meeting audio path and prove it is a direct WAV child of
+/// Lumen's meetings directory before any destructive replacement is allowed.
+fn owned_meeting_wav(path: &str) -> Result<PathBuf, String> {
+    let meetings_dir = default_data_dir().join("meetings");
+    owned_meeting_wav_in(&meetings_dir, Path::new(path))
+}
+
+fn owned_meeting_wav_in(meetings_dir: &Path, path: &Path) -> Result<PathBuf, String> {
+    let owned_dir = meetings_dir
+        .canonicalize()
+        .map_err(|error| format!("无法读取会议音频目录：{error}"))?;
+    let source = path
+        .canonicalize()
+        .map_err(|error| format!("无法读取会议音频：{error}"))?;
+    if source.parent() != Some(owned_dir.as_path())
+        || source.extension().and_then(|value| value.to_str()) != Some("wav")
+        || !source.is_file()
+    {
+        return Err("会议音频不在 Lumen 管理的目录中，不能执行破坏性剪辑".to_string());
+    }
+    Ok(source)
 }
 
 /// Best-effort sidecar write: a failure only costs the alignment metadata,
@@ -121,7 +206,7 @@ fn preferred_device(state: &State<'_, AppState>) -> Option<String> {
 }
 
 /// Serialized meeting recording result returned to the UI.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingRecordingDto {
     pub id: String,
@@ -129,6 +214,64 @@ pub struct MeetingRecordingDto {
     pub duration_seconds: f64,
     pub sample_rate: u32,
     pub status: String,
+}
+
+/// Ownership record for the process-global meeting capture engines.
+///
+/// The enclosing mutex is deliberately held for the whole start/stop command,
+/// not only while changing this value: releasing the capture arbiter midway
+/// through stop must not let a new start race with cleanup of the old global
+/// recorder, watchdog, or power guard.
+#[derive(Debug, Default)]
+pub struct MeetingRecordingOwner {
+    active_id: Option<Uuid>,
+    last_completed: Option<MeetingRecordingDto>,
+}
+
+impl MeetingRecordingOwner {
+    fn ensure_startable(&self) -> Result<(), String> {
+        if let Some(active_id) = self.active_id {
+            Err(format!("meeting {active_id} is already recording"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn started(&mut self, id: Uuid) {
+        self.active_id = Some(id);
+    }
+
+    /// `Ok(Some(_))` is an idempotent replay of the most recently completed
+    /// stop. `Ok(None)` authorizes stopping the active global recorders.
+    fn authorize_stop(&self, id: Uuid) -> Result<Option<MeetingRecordingDto>, String> {
+        if self.active_id == Some(id) {
+            return Ok(None);
+        }
+        if let Some(completed) = self
+            .last_completed
+            .as_ref()
+            .filter(|completed| completed.id == id.to_string())
+        {
+            return Ok(Some(completed.clone()));
+        }
+        match self.active_id {
+            Some(active_id) => Err(format!(
+                "meeting {id} is not active; current recording is {active_id}"
+            )),
+            None => Err(format!("meeting {id} is not recording")),
+        }
+    }
+
+    fn stopped_without_summary(&mut self, id: Uuid) {
+        if self.active_id == Some(id) {
+            self.active_id = None;
+        }
+    }
+
+    fn completed(&mut self, id: Uuid, summary: MeetingRecordingDto) {
+        self.stopped_without_summary(id);
+        self.last_completed = Some(summary);
+    }
 }
 
 /// Battery percent at or below which a meeting recording on battery power is
@@ -211,9 +354,37 @@ fn spawn_battery_poll(app: AppHandle, initially_warned: bool) -> (Arc<AtomicBool
     (stop, handle)
 }
 
-/// How often the silence watchdog re-checks the microphone while a meeting
-/// records. Small enough that a stop request is honored promptly.
-const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// How often the silence watchdog re-checks captured audio while a meeting
+/// records. One second keeps the visible countdown accurate while doing only
+/// a handful of atomic reads per tick.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Grace period shown after prolonged silence is detected. Any captured sound
+/// cancels it; otherwise the meeting is stopped when this countdown expires.
+const SILENCE_COUNTDOWN_SECONDS: u32 = 20;
+
+/// Handle stored in [`AppState`] for the one active silence watchdog.
+pub struct MeetingWatchdogHandle {
+    meeting_id: String,
+    stop: Arc<AtomicBool>,
+    continue_generation: Arc<AtomicU64>,
+    handle: JoinHandle<()>,
+}
+
+impl MeetingWatchdogHandle {
+    fn request_continue(&self, meeting_id: &str) -> Result<(), String> {
+        if self.meeting_id != meeting_id {
+            return Err("silence warning belongs to a different meeting".to_string());
+        }
+        self.continue_generation.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn stop_and_join(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.handle.join();
+    }
+}
 
 /// Payload of the `meeting-auto-stop` event: the front-end owns the real stop
 /// path, so the watchdog only *asks* it to stop (it never calls the stop
@@ -223,6 +394,23 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(10);
 pub struct MeetingAutoStop {
     pub meeting_id: String,
     pub reason: &'static str,
+}
+
+/// Payload emitted when all available recording tracks have stayed below the
+/// physical-volume threshold long enough to begin the grace-period countdown.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingSilenceWarning {
+    pub meeting_id: String,
+    pub countdown_seconds: u32,
+}
+
+/// Payload emitted when sound resumes or the user explicitly chooses to keep
+/// recording, so every open UI can retract a stale countdown.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingSilenceCleared {
+    pub meeting_id: String,
 }
 
 /// Payload of the `meeting-calendar-ended` event: a linked calendar meeting's
@@ -236,28 +424,142 @@ pub struct MeetingCalendarEnded {
     pub title: String,
 }
 
-/// Spawn a background thread that watches the active recording's microphone
-/// silence and, once it has been continuously silent for `minutes`, emits
-/// `meeting-auto-stop` so the front-end stops the recording (catching a meeting
-/// nobody ended). `MeetingRecorder::silence_seconds` returns `None` when it
-/// cannot tell — not recording, or the system-AEC mic path is active — which is
-/// treated as "can't tell, don't auto-stop". The thread only *emits*; it never
-/// calls the stop command itself.
-///
-/// Returns the stop flag + join handle so the stop command can signal and join
-/// it. Reads the recorder through the shared [`AppState`] each tick (like the
-/// offline pipeline), so it holds no `!Send` handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SilenceWatchdogAction {
+    None,
+    Warn,
+    Clear,
+    Stop,
+}
+
+/// Pure state machine behind the watchdog thread. Time is measured by captured
+/// samples rather than wall clock, so an intentional pause also pauses both the
+/// silence threshold and the grace-period countdown.
+struct SilenceWatchdogState {
+    threshold_seconds: f64,
+    countdown_seconds: f64,
+    baseline_seconds: f64,
+    last_silence_seconds: Option<f64>,
+    warned_at_seconds: Option<f64>,
+    continue_generation: u64,
+}
+
+impl SilenceWatchdogState {
+    fn new(threshold_seconds: f64, countdown_seconds: f64) -> Self {
+        Self {
+            threshold_seconds,
+            countdown_seconds,
+            baseline_seconds: 0.0,
+            last_silence_seconds: None,
+            warned_at_seconds: None,
+            continue_generation: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        silence_seconds: Option<f64>,
+        continue_generation: u64,
+    ) -> SilenceWatchdogAction {
+        if continue_generation != self.continue_generation {
+            self.continue_generation = continue_generation;
+            self.baseline_seconds = silence_seconds.unwrap_or(0.0);
+            self.last_silence_seconds = silence_seconds;
+            let warned = self.warned_at_seconds.take().is_some();
+            return if warned {
+                SilenceWatchdogAction::Clear
+            } else {
+                SilenceWatchdogAction::None
+            };
+        }
+
+        let Some(silence_seconds) = silence_seconds.filter(|value| value.is_finite()) else {
+            self.last_silence_seconds = None;
+            self.baseline_seconds = 0.0;
+            return if self.warned_at_seconds.take().is_some() {
+                SilenceWatchdogAction::Clear
+            } else {
+                SilenceWatchdogAction::None
+            };
+        };
+
+        // Each activity tracker is monotonic until a loud chunk resets it near
+        // zero. A decrease therefore means real sound resumed on at least one
+        // available track; re-arm from scratch and retract any warning.
+        if self
+            .last_silence_seconds
+            .is_some_and(|last| silence_seconds + 0.001 < last)
+        {
+            self.baseline_seconds = 0.0;
+            self.last_silence_seconds = Some(silence_seconds);
+            return if self.warned_at_seconds.take().is_some() {
+                SilenceWatchdogAction::Clear
+            } else {
+                SilenceWatchdogAction::None
+            };
+        }
+        self.last_silence_seconds = Some(silence_seconds);
+
+        let effective = (silence_seconds - self.baseline_seconds).max(0.0);
+        match self.warned_at_seconds {
+            Some(warned_at) if effective >= warned_at + self.countdown_seconds => {
+                SilenceWatchdogAction::Stop
+            }
+            Some(_) => SilenceWatchdogAction::None,
+            None if effective >= self.threshold_seconds => {
+                self.warned_at_seconds = Some(effective);
+                SilenceWatchdogAction::Warn
+            }
+            None => SilenceWatchdogAction::None,
+        }
+    }
+}
+
+/// Seconds since the most recent physical audio on any available meeting
+/// track. `min` is deliberate: sound on either the mic or system-output track
+/// means the meeting is still active. `None` is fail-open — no auto-stop when
+/// capture activity cannot be measured.
+fn active_meeting_silence_seconds(state: &AppState) -> Option<f64> {
+    let mic = state
+        .meeting_mic_aec
+        .silence_seconds()
+        .or_else(|| state.meeting_recorder.silence_seconds());
+    let system = state.meeting_system_audio.silence_seconds();
+    combine_track_silence_seconds(mic, system)
+}
+
+fn combine_track_silence_seconds(mic: Option<f64>, system: Option<f64>) -> Option<f64> {
+    let valid = |seconds: Option<f64>| seconds.filter(|value| value.is_finite() && *value >= 0.0);
+    let mic = valid(mic);
+    let system = valid(system);
+    match (mic, system) {
+        (Some(mic), Some(system)) => Some(mic.min(system)),
+        (Some(mic), None) => Some(mic),
+        (None, Some(system)) => Some(system),
+        (None, None) => None,
+    }
+}
+
+/// Spawn a background thread that watches physical volume on every available
+/// meeting track. Prolonged silence first emits a warning; after a 20-second
+/// grace period of continued silence it emits `meeting-auto-stop`. Sound or an
+/// explicit “continue recording” acknowledgement clears and re-arms it.
 fn spawn_meeting_watchdog(
     app: AppHandle,
     meeting_id: String,
     minutes: u32,
-) -> (Arc<AtomicBool>, JoinHandle<()>) {
+) -> MeetingWatchdogHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
+    let continue_generation = Arc::new(AtomicU64::new(0));
+    let continue_thread = Arc::clone(&continue_generation);
     let threshold_seconds = f64::from(minutes) * 60.0;
+    let thread_meeting_id = meeting_id.clone();
     let handle = std::thread::spawn(move || {
+        let mut watchdog =
+            SilenceWatchdogState::new(threshold_seconds, f64::from(SILENCE_COUNTDOWN_SECONDS));
         // Sleep in small slices so a stop request is honored promptly.
-        let step = Duration::from_millis(500);
+        let step = Duration::from_millis(250);
         while !stop_thread.load(Ordering::SeqCst) {
             let mut slept = Duration::ZERO;
             while slept < WATCHDOG_POLL_INTERVAL && !stop_thread.load(Ordering::SeqCst) {
@@ -267,29 +569,56 @@ fn spawn_meeting_watchdog(
             if stop_thread.load(Ordering::SeqCst) {
                 break;
             }
-            let silence = app.state::<AppState>().meeting_recorder.silence_seconds();
-            if let Some(seconds) = silence {
-                if seconds >= threshold_seconds {
+            let silence = active_meeting_silence_seconds(app.state::<AppState>().inner());
+            let generation = continue_thread.load(Ordering::SeqCst);
+            match watchdog.observe(silence, generation) {
+                SilenceWatchdogAction::Warn => {
+                    let seconds = silence.unwrap_or_default();
                     tracing::info!(
-                        meeting_id = %meeting_id,
+                        meeting_id = %thread_meeting_id,
                         silence_seconds = seconds,
-                        "meeting silent past the auto-stop threshold; asking the UI to stop"
+                        countdown_seconds = SILENCE_COUNTDOWN_SECONDS,
+                        "meeting silent past threshold; starting auto-stop countdown"
+                    );
+                    let _ = app.emit(
+                        "meeting-silence-warning",
+                        MeetingSilenceWarning {
+                            meeting_id: thread_meeting_id.clone(),
+                            countdown_seconds: SILENCE_COUNTDOWN_SECONDS,
+                        },
+                    );
+                }
+                SilenceWatchdogAction::Clear => {
+                    let _ = app.emit(
+                        "meeting-silence-cleared",
+                        MeetingSilenceCleared {
+                            meeting_id: thread_meeting_id.clone(),
+                        },
+                    );
+                }
+                SilenceWatchdogAction::Stop => {
+                    tracing::info!(
+                        meeting_id = %thread_meeting_id,
+                        "meeting remained silent through countdown; asking UI to stop"
                     );
                     let _ = app.emit(
                         "meeting-auto-stop",
                         MeetingAutoStop {
-                            meeting_id: meeting_id.clone(),
+                            meeting_id: thread_meeting_id.clone(),
                             reason: "silence",
                         },
                     );
-                    // The front-end will stop the recording (and join this
-                    // thread); our job is done.
-                    break;
                 }
+                SilenceWatchdogAction::None => {}
             }
         }
     });
-    (stop, handle)
+    MeetingWatchdogHandle {
+        meeting_id,
+        stop,
+        continue_generation,
+        handle,
+    }
 }
 
 /// Start a new meeting recording. Creates the meeting row (`Recording`), begins
@@ -301,6 +630,28 @@ pub fn start_meeting_recording(
     state: State<'_, AppState>,
     title: Option<String>,
 ) -> Result<String, String> {
+    start_meeting_recording_with_targets(app, state, title, None)
+}
+
+/// Internal start path used by the detection flow after the backend has
+/// matched and accepted a catalog entry. Keeping process targets out of the
+/// public Tauri command prevents renderer callers from bypassing the external
+/// catalog's capture policy.
+fn start_meeting_recording_with_targets(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    title: Option<String>,
+    system_audio_bundle_ids: Option<Vec<String>>,
+) -> Result<String, String> {
+    // Hold this guard through the whole start. The matching stop command uses
+    // the same guard, so no stop/start pair can overlap while operating on the
+    // process-global recorder objects.
+    let mut recording_owner = state
+        .meeting_recording_owner
+        .lock()
+        .map_err(|_| "meeting recording owner lock poisoned".to_string())?;
+    recording_owner.ensure_startable()?;
+
     // 1. Arbiter gate (rejects if a dictation capture or meeting is active).
     let action = state.capture.begin_meeting().map_err(|e| e.to_string())?;
 
@@ -436,6 +787,12 @@ pub fn start_meeting_recording(
     let mut system_feed: Option<crate::meeting_live::LiveTrackFeed> = None;
     let mut system_offset_seconds: Option<f64> = None;
     if system_audio_enabled {
+        // A detection-started recording supplies the exact accepted app (or an
+        // empty list for browser mic-only). A manual recording uses every
+        // native app explicitly enabled for capture in the external catalog.
+        // There is intentionally no global-system-audio fallback.
+        let targets = system_audio_bundle_ids
+            .unwrap_or_else(|| state.meeting_detection.manual_capture_bundle_ids());
         let (system_tap, system_rx) = if streaming_dir.is_some() && system_live_preview {
             let (tap, rx) = live_tap_channel("system", t0, LIVE_TAP_CAPACITY);
             (Some(tap), Some(rx))
@@ -443,9 +800,10 @@ pub fn start_meeting_recording(
             (None, None)
         };
         let system_path = dir.join(format!("{meeting_id}.system.wav"));
-        if let Some(system_rate) = state
-            .meeting_system_audio
-            .start(system_path.clone(), system_tap)
+        if let Some(system_rate) =
+            state
+                .meeting_system_audio
+                .start(system_path.clone(), targets, system_tap)
         {
             system_offset_seconds = Some(t0.elapsed().as_secs_f64());
             if let Some(rx) = system_rx {
@@ -547,9 +905,9 @@ pub fn start_meeting_recording(
         tracing::warn!("meeting battery poll lock poisoned; skipping low-battery monitoring");
     }
 
-    // Silence watchdog: auto-stop an unattended recording after N minutes of
-    // continuous mic silence (a meeting nobody stopped). Disabled when
-    // `silence_auto_stop_minutes` is 0. The thread only emits an event — the
+    // Silence watchdog: warn after N minutes with no physical audio on either
+    // available track, then auto-stop after a 20-second grace period. Disabled
+    // when `silence_auto_stop_minutes` is 0. The thread only emits events — the
     // front-end owns the real stop path. Same store-or-stop-on-poison handling
     // as the battery poll above.
     let silence_minutes = state
@@ -557,23 +915,17 @@ pub fn start_meeting_recording(
         .lock()
         .map(|cfg| cfg.meeting.silence_auto_stop_minutes)
         .unwrap_or(0);
-    // The silence watchdog reads `MeetingRecorder::silence_seconds`, which only
-    // the plain cpal recorder feeds. When the AEC mic backend engaged
-    // (`aec_rate.is_some()`) it returns `None`, so the watchdog could never fire
-    // — don't start a thread that can only spin. (AEC-path silence detection is a
-    // follow-up.)
-    if silence_minutes > 0 && aec_rate.is_none() {
+    if silence_minutes > 0 {
         let watchdog = spawn_meeting_watchdog(app.clone(), meeting_id.to_string(), silence_minutes);
         if let Ok(mut guard) = state.meeting_watchdog.lock() {
             *guard = Some(watchdog);
         } else {
-            watchdog.0.store(true, Ordering::SeqCst);
+            watchdog.stop_and_join();
             tracing::warn!("meeting watchdog lock poisoned; skipping silence auto-stop monitoring");
         }
-    } else if silence_minutes > 0 {
-        tracing::info!("silence auto-stop unavailable on the AEC mic path this recording");
     }
 
+    recording_owner.started(meeting_id);
     tracing::info!(meeting_id = %meeting_id, "meeting recording started");
     Ok(meeting_id.to_string())
 }
@@ -765,6 +1117,24 @@ pub fn stop_meeting_recording(
     meeting_id: String,
 ) -> Result<MeetingRecordingDto, String> {
     let id = Uuid::parse_str(&meeting_id).map_err(|e| format!("invalid meeting id: {e}"))?;
+    // Authorize the id before touching any global recorder. This also holds
+    // start/stop serialization until every old-session resource is cleaned up.
+    let mut recording_owner = state
+        .meeting_recording_owner
+        .lock()
+        .map_err(|_| "meeting recording owner lock poisoned".to_string())?;
+    if let Some(completed) = recording_owner.authorize_stop(id)? {
+        return Ok(completed);
+    }
+
+    // Stop the watchdog before the capture engines. Otherwise it can poll a
+    // just-finalized track once more and emit a stale auto-stop event while
+    // this command is already stopping the meeting.
+    if let Ok(mut guard) = state.meeting_watchdog.lock() {
+        if let Some(watchdog) = guard.take() {
+            watchdog.stop_and_join();
+        }
+    }
 
     // Try to stop + finalize the recorder, but *keep* the result — the recovery
     // below (restore hotkey + reset arbiter) must run on every path, success or
@@ -838,15 +1208,12 @@ pub fn stop_meeting_recording(
         }
     }
 
-    // Stop the silence watchdog started with the recording, on every path.
-    // Signal it to exit and join (returns within a poll slice). A poisoned lock
-    // just means it is already gone.
-    if let Ok(mut guard) = state.meeting_watchdog.lock() {
-        if let Some((stop, handle)) = guard.take() {
-            stop.store(true, Ordering::SeqCst);
-            let _ = handle.join();
-        }
-    }
+    let _ = app.emit(
+        "meeting-silence-cleared",
+        MeetingSilenceCleared {
+            meeting_id: meeting_id.clone(),
+        },
+    );
 
     // Same finally semantics for meeting detection: whether the recorder stop
     // below succeeded or failed, the recording is over, so the policy must
@@ -856,7 +1223,14 @@ pub fn stop_meeting_recording(
     // unless it is tracking an accepted recording). Also retracts a
     // still-visible "meeting seems over" suggestion, since the question is
     // now moot however the stop was initiated.
-    state.meeting_detection.recording_finished(&app);
+    let detection_enabled = state
+        .config
+        .lock()
+        .map(|config| config.meeting.detection_enabled)
+        .unwrap_or(false);
+    state
+        .meeting_detection
+        .recording_finished(&app, detection_enabled);
 
     // Now that the mic and hotkey are restored, surface any recorder failure.
     // Mark the meeting Failed so it does not linger in `Recording`.
@@ -868,12 +1242,13 @@ pub fn stop_meeting_recording(
                 s.fail_meeting(id, Some(&reason)).map_err(|e| e.to_string())
             });
             tracing::warn!(meeting_id = %id, error = %e, "meeting recorder stop failed");
+            recording_owner.stopped_without_summary(id);
             return Err(e);
         }
     };
     let audio_path = summary.wav_path.to_string_lossy().to_string();
 
-    with_store(&state, |s| {
+    if let Err(error) = with_store(&state, |s| {
         s.set_meeting_audio(
             id,
             &audio_path,
@@ -881,7 +1256,10 @@ pub fn stop_meeting_recording(
             MeetingStatus::Processing,
         )
         .map_err(|e| e.to_string())
-    })?;
+    }) {
+        recording_owner.stopped_without_summary(id);
+        return Err(error);
+    }
 
     // Reconcile the system track: keep it only when it finalized with real
     // audio; an empty or failed track is removed and its path cleared so the
@@ -910,13 +1288,15 @@ pub fn stop_meeting_recording(
     // Kick off transcription in the background so the stop command returns now.
     spawn_meeting_processing(app, id, summary.wav_path.clone(), system_wav);
 
-    Ok(MeetingRecordingDto {
+    let result = MeetingRecordingDto {
         id: meeting_id,
         audio_path,
         duration_seconds: summary.duration_seconds,
         sample_rate: summary.sample_rate,
         status: MeetingStatus::Processing.as_str().to_string(),
-    })
+    };
+    recording_owner.completed(id, result.clone());
+    Ok(result)
 }
 
 /// Serialized meeting-detection status for the settings toggle.
@@ -985,14 +1365,32 @@ pub fn set_meeting_detection_enabled(
 pub fn accept_meeting_detection(
     app: AppHandle,
     state: State<'_, AppState>,
+    capture_system_audio: bool,
 ) -> Result<String, String> {
-    if !state.meeting_detection.accept() {
+    let Some(accepted) = state.meeting_detection.accept() else {
         return Ok(String::new());
-    }
+    };
+    // Native apps need both the catalog authorization and the accepted prompt.
+    // Browsers deliberately use per-prompt consent instead: their catalog
+    // `capture = false` default means "never capture without asking", and the
+    // prompt offers the explicit whole-browser vs mic-only choice every time.
+    let should_capture = capture_system_audio
+        && match accepted.app_class {
+            lumen_core::AppClass::Browser => true,
+            _ => state.meeting_detection.capture_enabled(&accepted.bundle_id),
+        };
+    let system_targets = should_capture
+        .then(|| vec![accepted.bundle_id.clone()])
+        .unwrap_or_default();
     // Reuse the proven start command (arbiter gate, hotkey suspend, recorder).
     // If it fails, tell the policy so it does not sit in `recording` forever
     // (which would reject every future candidate as busy).
-    match start_meeting_recording(app.clone(), state.clone(), None) {
+    match start_meeting_recording_with_targets(
+        app.clone(),
+        state.clone(),
+        None,
+        Some(system_targets),
+    ) {
         Ok(id) => {
             // Remember which meeting this detection started so the
             // end-of-meeting stop suggestion can reference (and stop) it.
@@ -1000,10 +1398,62 @@ pub fn accept_meeting_detection(
             Ok(id)
         }
         Err(e) => {
-            state.meeting_detection.recording_failed(&app);
+            let detection_enabled = state
+                .config
+                .lock()
+                .map(|config| config.meeting.detection_enabled)
+                .unwrap_or(false);
+            state
+                .meeting_detection
+                .recording_failed(&app, detection_enabled);
             Err(e)
         }
     }
+}
+
+/// Read the runtime meeting/recording app catalog and its editable user path.
+#[tauri::command]
+pub fn get_meeting_app_catalog(
+    state: State<'_, AppState>,
+) -> Result<crate::meeting_apps::MeetingAppCatalogDto, String> {
+    Ok(state.meeting_detection.app_catalog())
+}
+
+/// Validate, atomically persist, and immediately activate a new app catalog.
+#[tauri::command]
+pub fn save_meeting_app_catalog(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    catalog: crate::meeting_apps::MeetingAppCatalog,
+) -> Result<crate::meeting_apps::MeetingAppCatalogDto, String> {
+    let saved = state.meeting_detection.save_app_catalog(catalog)?;
+    let enabled = state
+        .config
+        .lock()
+        .map(|config| config.meeting.detection_enabled)
+        .unwrap_or(false);
+    state
+        .meeting_detection
+        .restart_after_catalog_change(&app, enabled);
+    Ok(saved)
+}
+
+/// Reload edits made directly to the external TOML file.
+#[tauri::command]
+pub fn reload_meeting_app_catalog(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::meeting_apps::MeetingAppCatalogDto, String> {
+    let reloaded = state.meeting_detection.reload_app_catalog()?;
+    let enabled = state
+        .config
+        .lock()
+        .map(|config| config.meeting.detection_enabled)
+        .unwrap_or(false);
+    state
+        .meeting_detection
+        .restart_after_catalog_change(&app, enabled);
+    Ok(reloaded)
 }
 
 /// The user dismissed a detection prompt (arms the per-app cooldown).
@@ -1116,6 +1566,25 @@ pub fn set_meeting_watchdog_config(
         cfg.save()?;
     }
     get_meeting_watchdog_config(state)
+}
+
+/// The user confirmed that a silence warning is a real pause rather than an
+/// abandoned meeting. Re-arm the watchdog from the current captured-silence
+/// position, giving the recording a fresh full threshold before it can warn
+/// again. The worker emits `meeting-silence-cleared` on its next tick.
+#[tauri::command]
+pub fn continue_meeting_after_silence(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<(), String> {
+    let guard = state
+        .meeting_watchdog
+        .lock()
+        .map_err(|_| "meeting watchdog lock poisoned".to_string())?;
+    let watchdog = guard
+        .as_ref()
+        .ok_or_else(|| "meeting silence watchdog is not active".to_string())?;
+    watchdog.request_continue(&meeting_id)
 }
 
 fn meeting_detection_capability() -> bool {
@@ -1783,48 +2252,222 @@ pub fn rename_meeting(
     })
 }
 
+struct PreparedMeetingTrim {
+    mic: PathBuf,
+    system: Option<PathBuf>,
+    duration_seconds: f64,
+}
+
+fn prepare_meeting_trim(
+    id: Uuid,
+    mic_source: PathBuf,
+    system_source: Option<PathBuf>,
+    start_seconds: f64,
+    end_seconds: f64,
+) -> Result<PreparedMeetingTrim, String> {
+    let directory = mic_source
+        .parent()
+        .ok_or_else(|| "会议音频目录无效".to_string())?;
+    let token = Uuid::new_v4().simple();
+    let new_mic = directory.join(format!("{id}.trim-{token}.wav"));
+    let new_system = directory.join(format!("{id}.trim-{token}.system.wav"));
+
+    let mic_summary = copy_pcm16_wav_range(&mic_source, &new_mic, start_seconds, end_seconds)
+        .map_err(|error| format!("剪辑麦克风录音失败：{error}"))?;
+
+    let (mic_offset, system_offset) =
+        read_timeline_offsets(&mic_source.with_extension("timeline.json"));
+    let system_skew = system_offset.unwrap_or(mic_offset) - mic_offset;
+    let mut kept_system = None;
+    let mut new_system_skew = None;
+    if let Some(system_source) = system_source.as_deref() {
+        if let Some((local_start, local_end, kept_skew)) =
+            system_trim_range(start_seconds, end_seconds, system_skew)
+        {
+            match copy_pcm16_wav_range(system_source, &new_system, local_start, local_end) {
+                Ok(_) => {
+                    kept_system = Some(new_system.clone());
+                    // Usually both kept WAVs now begin together. When the
+                    // selected range starts before the system capture did,
+                    // preserve the remaining positive start skew.
+                    new_system_skew = Some(kept_skew);
+                }
+                Err(WavRangeError::InvalidRange { .. }) => {
+                    // The optional system track has no overlap with the kept
+                    // interval; the mic track remains authoritative.
+                }
+                Err(error) => {
+                    remove_mic_audio_artifacts(&new_mic);
+                    remove_audio_file(&new_system);
+                    return Err(format!("剪辑系统音频失败：{error}"));
+                }
+            }
+        }
+    }
+
+    write_timeline_sidecar(
+        &new_mic.with_extension("timeline.json"),
+        &MeetingTimeline {
+            mic_offset_seconds: 0.0,
+            system_offset_seconds: new_system_skew,
+            t0_wall_clock: chrono::Utc::now().to_rfc3339(),
+        },
+    );
+    Ok(PreparedMeetingTrim {
+        mic: new_mic,
+        system: kept_system,
+        duration_seconds: mic_summary.duration_seconds,
+    })
+}
+
+/// Destructively keep one continuous range of a finished meeting and discard
+/// everything before/after it. New WAVs are fully prepared first; only then is
+/// the database atomically switched to the new sources and its time-aligned
+/// derived data cleared. The old files are removed after that commit and the
+/// normal offline pipeline regenerates the transcript and minutes.
+#[tauri::command]
+pub async fn trim_meeting_audio(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: String,
+    start_seconds: f64,
+    end_seconds: f64,
+) -> Result<f64, String> {
+    const MIN_KEEP_SECONDS: f64 = 1.0;
+    const RANGE_EPSILON_SECONDS: f64 = 0.25;
+
+    let id = parse_id(&meeting_id, "meeting")?;
+    let _audio_edit = state.meeting_audio_edit.lock().await;
+    let meeting = with_store(&state, |store| {
+        store
+            .get_meeting(id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "会议不存在".to_string())
+    })?;
+    if meeting.status != MeetingStatus::Ready {
+        return Err("只能剪辑已经处理完成的会议".to_string());
+    }
+    let duration = meeting
+        .duration_seconds
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "会议没有可剪辑的有效时长".to_string())?;
+    if !start_seconds.is_finite()
+        || !end_seconds.is_finite()
+        || start_seconds < 0.0
+        || end_seconds - start_seconds < MIN_KEEP_SECONDS
+        || end_seconds > duration + RANGE_EPSILON_SECONDS
+    {
+        return Err("请选择至少 1 秒、且位于录音时长内的保留区间".to_string());
+    }
+    if start_seconds <= RANGE_EPSILON_SECONDS && duration - end_seconds <= RANGE_EPSILON_SECONDS {
+        return Err("当前选择包含整段录音，没有需要剪掉的内容".to_string());
+    }
+
+    let old_mic = owned_meeting_wav(
+        meeting
+            .audio_path
+            .as_deref()
+            .ok_or_else(|| "会议没有录音文件".to_string())?,
+    )?;
+    let old_system = match meeting.system_audio_path.as_deref() {
+        Some(path) if Path::new(path).exists() => Some(owned_meeting_wav(path)?),
+        _ => None,
+    };
+    let mic_for_copy = old_mic.clone();
+    let system_for_copy = old_system.clone();
+
+    let prepared = tauri::async_runtime::spawn_blocking(move || {
+        prepare_meeting_trim(
+            id,
+            mic_for_copy,
+            system_for_copy,
+            start_seconds,
+            end_seconds,
+        )
+    })
+    .await
+    .map_err(|error| format!("剪辑任务异常结束：{error}"))??;
+
+    let new_mic_string = prepared.mic.to_string_lossy().to_string();
+    let new_system_string = prepared
+        .system
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let replaced = with_store(&state, |store| {
+        store
+            .replace_meeting_audio_after_trim(
+                id,
+                &new_mic_string,
+                new_system_string.as_deref(),
+                prepared.duration_seconds,
+            )
+            .map_err(|error| error.to_string())
+    });
+    match replaced {
+        Ok(true) => {}
+        Ok(false) => {
+            remove_mic_audio_artifacts(&prepared.mic);
+            if let Some(system) = prepared.system.as_deref() {
+                remove_audio_file(system);
+            }
+            return Err("会议状态已经变化，请刷新后重试".to_string());
+        }
+        Err(error) => {
+            remove_mic_audio_artifacts(&prepared.mic);
+            if let Some(system) = prepared.system.as_deref() {
+                remove_audio_file(system);
+            }
+            return Err(error);
+        }
+    }
+
+    remove_mic_audio_artifacts(&old_mic);
+    if let Some(system) = old_system.as_deref() {
+        remove_audio_file(system);
+    }
+    spawn_meeting_processing(app, id, prepared.mic, prepared.system);
+    Ok(prepared.duration_seconds)
+}
+
 /// Delete a meeting and everything attached to it. The store cascade removes the
 /// segments, speakers, and summaries; this command additionally deletes the
 /// meeting's recorded WAV from disk (best-effort — a missing file is fine, and a
 /// remove error is logged but does not fail the delete, since the row is already
 /// gone). Returns `true` if a meeting row was deleted.
 #[tauri::command]
-pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<bool, String> {
+pub async fn delete_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<bool, String> {
     let id = parse_id(&meeting_id, "meeting")?;
-    // Read the audio paths (mic + optional system track) before deleting the
-    // row so we know which WAVs to remove.
-    let (audio_path, system_audio_path) = with_store(&state, |s| {
-        let meeting = s.get_meeting(id).map_err(|e| e.to_string())?;
-        Ok((
-            meeting.as_ref().and_then(|m| m.audio_path.clone()),
-            meeting.and_then(|m| m.system_audio_path),
-        ))
+    let _audio_edit = state.meeting_audio_edit.lock().await;
+    // Fetch both source paths and delete the row in one SQLite transaction.
+    // The outer operation lock keeps trim's file preparation/DB swap/cleanup
+    // from interleaving with the subsequent best-effort file removal.
+    let deleted_paths = with_store(&state, |s| {
+        s.delete_meeting_with_audio_paths(id)
+            .map_err(|e| e.to_string())
     })?;
-    let deleted = with_store(&state, |s| s.delete_meeting(id).map_err(|e| e.to_string()))?;
-    if deleted {
-        // The timeline sidecar sits next to the mic WAV; sweep it with the
-        // audio (best-effort, missing is fine).
-        if let Some(mic) = audio_path.as_deref() {
-            let sidecar = Path::new(mic).with_extension("timeline.json");
-            if sidecar.exists() {
-                let _ = std::fs::remove_file(&sidecar);
-            }
-        }
-        for path in [audio_path, system_audio_path].into_iter().flatten() {
-            let wav = Path::new(&path);
-            if wav.exists() {
-                if let Err(e) = std::fs::remove_file(wav) {
-                    tracing::warn!(
-                        meeting_id = %id,
-                        path = %wav.display(),
-                        error = %e,
-                        "could not delete meeting audio file"
-                    );
-                }
+    let Some((audio_path, system_audio_path)) = deleted_paths else {
+        return Ok(false);
+    };
+    if let Some(mic) = audio_path.as_deref() {
+        match owned_meeting_wav(mic) {
+            Ok(owned) => remove_mic_audio_artifacts(&owned),
+            Err(error) => {
+                tracing::warn!(path = %mic, %error, "skipping unowned meeting audio on delete")
             }
         }
     }
-    Ok(deleted)
+    if let Some(system) = system_audio_path.as_deref() {
+        match owned_meeting_wav(system) {
+            Ok(owned) => remove_audio_file(&owned),
+            Err(error) => {
+                tracing::warn!(path = %system, %error, "skipping unowned system audio on delete")
+            }
+        }
+    }
+    Ok(true)
 }
 
 // ----- live speaker annotations (L2) -------------------------------------
@@ -2777,7 +3420,234 @@ pub fn export_meeting(
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_attendees_into_notes, write_timeline_sidecar, MeetingTimeline};
+    use super::{
+        combine_track_silence_seconds, merge_attendees_into_notes, owned_meeting_wav_in,
+        prepare_meeting_trim, read_timeline_offsets, remove_mic_audio_artifacts, system_trim_range,
+        write_timeline_sidecar, MeetingRecordingDto, MeetingRecordingOwner, MeetingTimeline,
+        SilenceWatchdogAction, SilenceWatchdogState,
+    };
+
+    fn write_test_wav(path: &std::path::Path, sample_rate: u32, samples: usize) {
+        let mut sink = lumen_asr::WavSink::create(path, sample_rate).unwrap();
+        sink.write_samples(&vec![0.2; samples]).unwrap();
+        sink.finalize().unwrap();
+    }
+
+    fn recording_result(id: uuid::Uuid) -> MeetingRecordingDto {
+        MeetingRecordingDto {
+            id: id.to_string(),
+            audio_path: format!("/meetings/{id}.wav"),
+            duration_seconds: 12.0,
+            sample_rate: 16_000,
+            status: "processing".into(),
+        }
+    }
+
+    #[test]
+    fn stale_stop_cannot_take_ownership_from_a_new_recording() {
+        let old = uuid::Uuid::new_v4();
+        let new = uuid::Uuid::new_v4();
+        let mut owner = MeetingRecordingOwner::default();
+        owner.started(old);
+        owner.completed(old, recording_result(old));
+        owner.ensure_startable().unwrap();
+        owner.started(new);
+
+        let replay = owner.authorize_stop(old).unwrap().unwrap();
+        assert_eq!(replay.id, old.to_string());
+        assert_eq!(owner.active_id, Some(new));
+        assert!(owner.authorize_stop(new).unwrap().is_none());
+    }
+
+    #[test]
+    fn unrelated_stop_is_rejected_without_changing_the_active_owner() {
+        let active = uuid::Uuid::new_v4();
+        let unrelated = uuid::Uuid::new_v4();
+        let mut owner = MeetingRecordingOwner::default();
+        owner.started(active);
+
+        assert!(owner.authorize_stop(unrelated).is_err());
+        assert_eq!(owner.active_id, Some(active));
+    }
+
+    #[test]
+    fn system_trim_range_preserves_or_removes_capture_start_skew() {
+        let assert_range = |actual: Option<(f64, f64, f64)>, expected: (f64, f64, f64)| {
+            let actual = actual.expect("system range");
+            assert!((actual.0 - expected.0).abs() < 1e-9);
+            assert!((actual.1 - expected.1).abs() < 1e-9);
+            assert!((actual.2 - expected.2).abs() < 1e-9);
+        };
+        assert_range(system_trim_range(10.0, 20.0, 0.4), (9.6, 19.6, 0.0));
+        assert_range(system_trim_range(0.1, 1.0, 0.4), (0.0, 0.6, 0.3));
+        assert_eq!(system_trim_range(0.0, 0.2, 0.4), None);
+        assert_range(system_trim_range(0.0, 1.0, -0.2), (0.2, 1.2, 0.0));
+    }
+
+    #[test]
+    fn removing_mic_audio_also_removes_every_derived_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let mic = directory.path().join("meeting.wav");
+        let timeline = mic.with_extension("timeline.json");
+        let echo = directory.path().join("meeting.echo_suppression.json");
+        for path in [&mic, &timeline, &echo] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+
+        remove_mic_audio_artifacts(&mic);
+        assert!(!mic.exists());
+        assert!(!timeline.exists());
+        assert!(!echo.exists());
+    }
+
+    #[test]
+    fn owned_meeting_wav_rejects_files_outside_or_below_the_meetings_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let meetings = directory.path().join("meetings");
+        let nested = meetings.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let owned = meetings.join("owned.wav");
+        let outside = directory.path().join("outside.wav");
+        let nested_wav = nested.join("nested.wav");
+        for path in [&owned, &outside, &nested_wav] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+
+        assert_eq!(
+            owned_meeting_wav_in(&meetings, &owned).unwrap(),
+            owned.canonicalize().unwrap()
+        );
+        assert!(owned_meeting_wav_in(&meetings, &outside).is_err());
+        assert!(owned_meeting_wav_in(&meetings, &nested_wav).is_err());
+    }
+
+    #[test]
+    fn preparing_dual_track_trim_keeps_old_sources_and_writes_aligned_new_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let mic = directory.path().join("meeting.wav");
+        let system = directory.path().join("meeting.system.wav");
+        write_test_wav(&mic, 10, 30);
+        write_test_wav(&system, 10, 30);
+        write_timeline_sidecar(
+            &mic.with_extension("timeline.json"),
+            &MeetingTimeline {
+                mic_offset_seconds: 0.0,
+                system_offset_seconds: Some(0.2),
+                t0_wall_clock: "2026-01-01T00:00:00+00:00".into(),
+            },
+        );
+
+        let prepared = prepare_meeting_trim(
+            uuid::Uuid::new_v4(),
+            mic.clone(),
+            Some(system.clone()),
+            0.5,
+            2.5,
+        )
+        .unwrap();
+        assert!((prepared.duration_seconds - 2.0).abs() < 1e-9);
+        assert!(prepared.mic.exists());
+        assert!(prepared.system.as_ref().is_some_and(|path| path.exists()));
+        assert!(
+            mic.exists(),
+            "the coordinator owns old-file deletion after DB commit"
+        );
+        assert!(system.exists());
+        assert_eq!(
+            read_timeline_offsets(&prepared.mic.with_extension("timeline.json")),
+            (0.0, Some(0.0))
+        );
+    }
+
+    #[test]
+    fn failed_system_trim_removes_every_prepared_file_but_keeps_old_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let mic = directory.path().join("meeting.wav");
+        let system = directory.path().join("meeting.system.wav");
+        write_test_wav(&mic, 10, 30);
+        std::fs::write(&system, b"not a wav").unwrap();
+
+        assert!(prepare_meeting_trim(
+            uuid::Uuid::new_v4(),
+            mic.clone(),
+            Some(system.clone()),
+            0.5,
+            2.5,
+        )
+        .is_err());
+        assert!(mic.exists());
+        assert!(system.exists());
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".trim-")
+        }));
+    }
+
+    #[test]
+    fn silence_watchdog_warns_then_stops_only_after_grace_period() {
+        let mut watchdog = SilenceWatchdogState::new(60.0, 20.0);
+        assert_eq!(watchdog.observe(Some(59.9), 0), SilenceWatchdogAction::None);
+        assert_eq!(watchdog.observe(Some(60.0), 0), SilenceWatchdogAction::Warn);
+        assert_eq!(watchdog.observe(Some(79.9), 0), SilenceWatchdogAction::None);
+        assert_eq!(watchdog.observe(Some(80.0), 0), SilenceWatchdogAction::Stop);
+    }
+
+    #[test]
+    fn meeting_silence_uses_the_most_recent_activity_from_any_available_track() {
+        assert_eq!(
+            combine_track_silence_seconds(Some(90.0), Some(2.0)),
+            Some(2.0)
+        );
+        assert_eq!(
+            combine_track_silence_seconds(Some(90.0), Some(80.0)),
+            Some(80.0)
+        );
+        assert_eq!(combine_track_silence_seconds(Some(12.0), None), Some(12.0));
+        assert_eq!(combine_track_silence_seconds(None, Some(7.0)), Some(7.0));
+        assert_eq!(combine_track_silence_seconds(None, None), None);
+        assert_eq!(
+            combine_track_silence_seconds(Some(f64::NAN), Some(4.0)),
+            Some(4.0)
+        );
+    }
+
+    #[test]
+    fn sound_during_countdown_clears_and_rearms_warning() {
+        let mut watchdog = SilenceWatchdogState::new(60.0, 20.0);
+        assert_eq!(watchdog.observe(Some(60.0), 0), SilenceWatchdogAction::Warn);
+        assert_eq!(watchdog.observe(Some(0.0), 0), SilenceWatchdogAction::Clear);
+        assert_eq!(watchdog.observe(Some(59.0), 0), SilenceWatchdogAction::None);
+        assert_eq!(watchdog.observe(Some(60.0), 0), SilenceWatchdogAction::Warn);
+    }
+
+    #[test]
+    fn continue_acknowledgement_grants_a_fresh_full_silence_interval() {
+        let mut watchdog = SilenceWatchdogState::new(60.0, 20.0);
+        assert_eq!(watchdog.observe(Some(60.0), 0), SilenceWatchdogAction::Warn);
+        assert_eq!(
+            watchdog.observe(Some(65.0), 1),
+            SilenceWatchdogAction::Clear
+        );
+        assert_eq!(
+            watchdog.observe(Some(124.9), 1),
+            SilenceWatchdogAction::None
+        );
+        assert_eq!(
+            watchdog.observe(Some(125.0), 1),
+            SilenceWatchdogAction::Warn
+        );
+    }
+
+    #[test]
+    fn losing_activity_measurement_fails_open_and_clears_warning() {
+        let mut watchdog = SilenceWatchdogState::new(60.0, 20.0);
+        assert_eq!(watchdog.observe(Some(60.0), 0), SilenceWatchdogAction::Warn);
+        assert_eq!(watchdog.observe(None, 0), SilenceWatchdogAction::Clear);
+        assert_eq!(watchdog.observe(None, 0), SilenceWatchdogAction::None);
+    }
 
     #[test]
     fn timeline_sidecar_serializes_offsets_and_wall_clock() {

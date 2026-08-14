@@ -51,7 +51,8 @@ pub struct MeetingConfig {
     /// transcript automatically.
     pub transcript_cleanup: bool,
     /// Opt-in automatic meeting detection: watch for audio-input activity from
-    /// known meeting apps and *prompt* (never auto-record) to start a meeting.
+    /// apps enabled in the external runtime catalog and *prompt* (never
+    /// auto-record) to start a meeting.
     /// Defaults to `false` — the feature ships off so users enable it
     /// deliberately, keeping first-run false positives out of the default
     /// experience. Only runs when this is on AND the OS capability is present.
@@ -76,8 +77,8 @@ pub struct MeetingConfig {
     /// meaningful when the meeting was linked to a calendar event.
     #[serde(default = "default_calendar_end_reminder")]
     pub calendar_end_reminder: bool,
-    /// Record the system audio output (remote participants) as a second,
-    /// synchronized meeting track via a Core Audio process tap. Defaults to
+    /// Record configured meeting-app process audio (remote participants) as a
+    /// second, synchronized meeting track via a Core Audio process tap. Defaults to
     /// `true` but only takes effect when the OS capability (macOS 14.2+) and
     /// the system-audio permission are present — otherwise recording degrades
     /// to mic-only, never fails.

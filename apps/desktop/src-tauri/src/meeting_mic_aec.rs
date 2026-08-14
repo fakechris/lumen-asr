@@ -142,6 +142,16 @@ impl MeetingMicAec {
         false
     }
 
+    /// Seconds since the AEC microphone path last carried physical audio above
+    /// the room-noise threshold. `None` means this backend is not active.
+    pub fn silence_seconds(&self) -> Option<f64> {
+        self.inner.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|session| session.track.silence_seconds())
+        })
+    }
+
     /// Stop the capture and finalize the mic WAV.
     ///
     /// - `None`: no AEC session was running (the recording used the cpal

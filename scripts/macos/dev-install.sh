@@ -24,6 +24,7 @@ APP_DIR="$ROOT/target/release/bundle/macos/Lumen ASR.app"
 BIN_SRC="$ROOT/target/release/lumen-asr-desktop"
 BIN_DST="$APP_DIR/Contents/MacOS/lumen-asr-desktop"
 SRC_PLIST="$ROOT/apps/desktop/src-tauri/Info.plist"
+MEETING_APPS_SEED_SRC="$ROOT/apps/desktop/src-tauri/resources/meeting-apps.toml"
 # Final install location. Building into target/ but launching from /Applications
 # (Spotlight/Dock) is how you end up running a stale copy — so after signing we
 # sync the fresh bundle here and open THIS one. Override with LUMEN_INSTALL_DEST=
@@ -35,6 +36,10 @@ SKIP_FRONTEND=0
 
 if [[ ! -f "$SRC_PLIST" ]]; then
   echo "ERROR: canonical Info.plist not found: $SRC_PLIST" >&2
+  exit 1
+fi
+if [[ ! -f "$MEETING_APPS_SEED_SRC" ]]; then
+  echo "ERROR: meeting-app catalog seed not found: $MEETING_APPS_SEED_SRC" >&2
   exit 1
 fi
 if ! /usr/bin/plutil -lint "$SRC_PLIST" >/dev/null; then
@@ -176,6 +181,15 @@ if [[ -f "$ICON_DST" && -f "$PLIST" ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile icon" "$PLIST" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string icon" "$PLIST"
 fi
+
+# Plain `cargo build` does not run Tauri's bundler, so install the same external
+# seed resource that `tauri.conf.json` places in Contents/Resources. The app
+# copies this file to Application Support only when the user-owned catalog does
+# not exist; rebuilds never overwrite user configuration.
+MEETING_APPS_SEED_DST="$APP_DIR/Contents/Resources/meeting-apps.toml"
+mkdir -p "$(dirname "$MEETING_APPS_SEED_DST")"
+cp -f "$MEETING_APPS_SEED_SRC" "$MEETING_APPS_SEED_DST"
+echo "==> meeting-app catalog seed installed"
 
 # Sync every privacy consent string from the canonical src-tauri/Info.plist into
 # the bundle plist. This is a plain `cargo build` (not `tauri build`), so Tauri

@@ -19,11 +19,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
-
-[dev-dependencies]
-# Standard WAV reader used only to assert that a crash-recovered file is
-# readable by an off-the-shelf decoder (already in the workspace lockfile).
 hound = "3"
+same-file = "1"
 
 [features]
 default = ["sherpa"]

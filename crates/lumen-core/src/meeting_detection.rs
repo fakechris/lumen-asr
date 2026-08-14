@@ -24,14 +24,12 @@
 //! further suggestions for the rest of that recording. Manually started
 //! meetings have no associated candidate and are never suggested on.
 //!
-//! ## Classification & the browser carve-out
-//! A raw candidate carries an [`AppClass`]. Native meeting apps (a small bundle
-//! id allow-list) are promptable on input activity alone. Browsers are *not*
-//! promptable on microphone alone — a page holding the mic is far too weak a
-//! signal (voice messages, mic tests, dictation, permission pre-grants all
-//! trip it). Browser candidates are tracked-but-never-prompted here, leaving a
-//! clean extension point for a future additional signal. `Other` apps are
-//! likewise not prompted.
+//! ## Classification
+//! A raw candidate carries an [`AppClass`] supplied by the host's runtime
+//! application catalog. Native meeting apps and configured browsers are
+//! promptable after the stability window; browsers receive a stricter UI
+//! explanation because process-level capture includes every tab. `Other` apps
+//! are never prompted.
 
 use std::collections::HashMap;
 
@@ -41,7 +39,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppClass {
-    /// A known native meeting/conferencing app (allow-listed bundle id).
+    /// A native meeting/conferencing app enabled in the runtime catalog.
     NativeMeeting,
     /// A web browser (or one of its helper/renderer processes).
     Browser,
@@ -50,12 +48,11 @@ pub enum AppClass {
 }
 
 impl AppClass {
-    /// Whether input activity from this class is, on its own, strong enough
-    /// evidence to prompt. Only native meeting apps qualify today; browsers and
-    /// everything else need an additional signal that this policy does not yet
-    /// have, so they are tracked but never prompted.
+    /// Whether input activity from this configured class is strong enough to
+    /// prompt. The host only assigns these two classes to catalog entries whose
+    /// `detect` flag is enabled; unknown applications arrive as `Other`.
     pub fn promptable_on_input_alone(self) -> bool {
-        matches!(self, AppClass::NativeMeeting)
+        matches!(self, AppClass::NativeMeeting | AppClass::Browser)
     }
 }
 
@@ -348,16 +345,12 @@ impl MeetingDetectionPolicy {
                 "ignored_self",
             ))];
         }
-        // Browsers / other apps: tracked-but-not-prompted (extension point).
+        // Unknown / disabled apps are never prompted.
         if !cand.app_class.promptable_on_input_alone() {
-            let reason = match cand.app_class {
-                AppClass::Browser => "browser_needs_additional_signal",
-                _ => "class_not_promptable",
-            };
             return vec![DetectionOutput::Decision(DetectionDecision::new(
                 cand.bundle_id,
                 "input_active",
-                reason,
+                "class_not_promptable",
             ))];
         }
         // While a detection-started recording is live, a re-appearing input of
@@ -691,49 +684,6 @@ pub fn normalize_bundle_id(bundle_id: &str) -> String {
     trimmed.to_string()
 }
 
-/// Bundle ids (normalized, lowercased) of known native meeting/conferencing
-/// apps. Kept intentionally small and specific.
-const NATIVE_MEETING_BUNDLE_IDS: &[&str] = &[
-    "us.zoom.xos",                     // Zoom
-    "com.microsoft.teams",             // Teams (classic)
-    "com.microsoft.teams2",            // Teams (new)
-    "com.tinyspeck.slackmacgap",       // Slack
-    "com.apple.facetime",              // FaceTime
-    "com.cisco.webexmeetingsapp",      // Webex
-    "com.webex.meetingmanager",        // Webex (legacy)
-    "com.hnc.discord",                 // Discord
-    "com.skype.skype",                 // Skype
-    "com.microsoft.skypeforbusiness",  // Skype for Business
-    "com.google.meetings",             // Google Meet (native wrapper)
-    "com.readdle.smartemail-mac.meet", // (defensive; harmless if unused)
-];
-
-/// Bundle ids (normalized, lowercased) of common web browsers.
-const BROWSER_BUNDLE_IDS: &[&str] = &[
-    "com.apple.safari",
-    "com.google.chrome",
-    "com.google.chrome.canary",
-    "com.google.chrome.beta",
-    "com.microsoft.edgemac",
-    "org.mozilla.firefox",
-    "com.brave.browser",
-    "com.operasoftware.opera",
-    "company.thebrowser.browser", // Arc
-    "com.vivaldi.vivaldi",
-];
-
-/// Classify an *already-normalized* bundle id.
-pub fn classify_bundle_id(bundle_id: &str) -> AppClass {
-    let b = bundle_id.to_ascii_lowercase();
-    if NATIVE_MEETING_BUNDLE_IDS.contains(&b.as_str()) {
-        return AppClass::NativeMeeting;
-    }
-    if BROWSER_BUNDLE_IDS.contains(&b.as_str()) {
-        return AppClass::Browser;
-    }
-    AppClass::Other
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,19 +731,7 @@ mod tests {
             .any(|o| matches!(o, DetectionOutput::StartRecording { .. }))
     }
 
-    // --- Classification & normalization -------------------------------------
-
-    #[test]
-    fn classifies_native_browser_and_other() {
-        assert_eq!(classify_bundle_id("us.zoom.xos"), AppClass::NativeMeeting);
-        assert_eq!(
-            classify_bundle_id("com.microsoft.teams2"),
-            AppClass::NativeMeeting
-        );
-        assert_eq!(classify_bundle_id("com.google.chrome"), AppClass::Browser);
-        assert_eq!(classify_bundle_id("com.apple.safari"), AppClass::Browser);
-        assert_eq!(classify_bundle_id("com.acme.notes"), AppClass::Other);
-    }
+    // --- Bundle normalization -----------------------------------------------
 
     #[test]
     fn normalizes_helper_and_webkit_processes_to_parent() {
@@ -810,12 +748,6 @@ mod tests {
             "com.apple.Safari"
         );
         assert_eq!(normalize_bundle_id("us.zoom.xos"), "us.zoom.xos");
-    }
-
-    #[test]
-    fn normalized_then_classified_folds_chrome_renderer_to_browser() {
-        let norm = normalize_bundle_id("com.google.Chrome.helper (Renderer)");
-        assert_eq!(classify_bundle_id(&norm), AppClass::Browser);
     }
 
     // --- Core happy path ----------------------------------------------------
@@ -861,29 +793,25 @@ mod tests {
         assert_eq!(p.phase(), "candidate");
     }
 
-    // --- Browser carve-out --------------------------------------------------
+    // --- Configured browser prompt -----------------------------------------
 
     #[test]
-    fn browser_mic_alone_never_prompts() {
+    fn configured_browser_prompts_after_stability_but_never_auto_records() {
         let mut p = MeetingDetectionPolicy::with_defaults();
-        let outs = p.handle(added(browser("chrome#1"), 0));
-        assert!(!has_show_prompt(&outs));
-        // Even after a long stable period, a browser is never promoted.
-        for t in (1_000..=10_000).step_by(1_000) {
-            assert!(!has_show_prompt(
-                &p.handle(DetectionInput::Tick { now_ms: t })
-            ));
-        }
-        assert_eq!(p.phase(), "idle");
-        // The decision trail records *why* it was skipped.
-        let decisions: Vec<_> = outs
-            .iter()
-            .filter_map(|o| match o {
-                DetectionOutput::Decision(d) => Some(d.reason.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(decisions.contains(&"browser_needs_additional_signal"));
+        assert!(!has_show_prompt(&p.handle(added(browser("chrome#1"), 0))));
+        assert!(!has_show_prompt(
+            &p.handle(DetectionInput::Tick { now_ms: 2_999 })
+        ));
+        let outs = p.handle(DetectionInput::Tick { now_ms: 3_000 });
+        assert!(has_show_prompt(&outs));
+        assert!(
+            !has_start(&outs),
+            "a browser must never start recording on its own"
+        );
+        assert_eq!(p.phase(), "prompted");
+        assert!(has_start(
+            &p.handle(DetectionInput::UserAccepted { now_ms: 3_500 })
+        ));
     }
 
     // --- Signal disappearance cancels an unshown/shown prompt ---------------
