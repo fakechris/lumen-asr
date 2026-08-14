@@ -331,26 +331,25 @@ pub fn repair_wav_header(path: impl AsRef<Path>) -> io::Result<RepairedWav> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VoicedTracker — how long the microphone has been effectively silent.
+// VoicedTracker — how long one captured audio track has been effectively silent.
 //
-// The WAV writer thread already sees every mic chunk, so it doubles as the
+// The WAV writer thread already sees every captured chunk, so it doubles as the
 // silence probe for the unattended-recording watchdog: per chunk it advances a
 // running sample counter and, when the chunk's RMS clears a small threshold,
 // stamps the counter as the last "voiced" position. `silence_seconds` is then
 // `(total - last_voiced) / sample_rate`. Pure arithmetic behind atomics, so it
 // is `Send + Sync`, cheap on the writer thread, and unit-testable without cpal.
 //
-// Only the mic track is measured (the writer is shared with the system track,
-// which passes `None`): remote-participant audio is not evidence the person in
-// the room is still talking.
+// Both mic and system tracks opt into the same tracker. The desktop watchdog
+// combines them so activity on either side of a meeting keeps it alive.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// RMS below which a mic chunk counts as silence. Room tone / fan noise sit well
+/// RMS below which a captured chunk counts as silence. Room tone / fan noise sit well
 /// under this; ordinary speech is far above it. Not correctness-critical — it
 /// only decides when the silence timer advances.
 const SILENCE_RMS_THRESHOLD: f32 = 0.01;
 
-/// Shared, lock-free tracker of mic silence for the watchdog (see the section
+/// Shared, lock-free tracker of one track's silence for the watchdog (see the section
 /// comment above). Cloned behind an `Arc`: the writer thread `observe`s chunks
 /// while the recorder reads `silence_seconds`.
 pub struct VoicedTracker {
@@ -401,7 +400,7 @@ impl VoicedTracker {
         }
     }
 
-    /// Seconds of continuous silence at the mic since the last voiced chunk, or
+    /// Seconds of continuous silence on this track since the last voiced chunk, or
     /// `None` when the rate is unknown (never armed / not recording).
     fn silence_seconds(&self) -> Option<f64> {
         let sample_rate = self.sample_rate.load(Ordering::SeqCst);
@@ -432,9 +431,9 @@ enum WriterMsg {
     Finalize(Sender<io::Result<(u64, Vec<MeetingGap>)>>),
 }
 
-/// Spawn the WAV writer thread. `voiced` is the mic silence tracker: it is
-/// `Some` only for the microphone track (the system track passes `None`, so
-/// remote-participant audio never counts as "someone is still in the room").
+/// Spawn the WAV writer thread. `voiced`, when present, observes only real
+/// captured chunks (never synthetic gap padding), so callers can distinguish
+/// an active meeting from prolonged physical silence without involving ASR.
 fn spawn_writer(
     mut sink: WavSink,
     voiced: Option<Arc<VoicedTracker>>,
@@ -448,8 +447,8 @@ fn spawn_writer(
             while let Ok(msg) = rx.recv() {
                 match msg {
                     WriterMsg::Chunk { samples, arrived_at } => {
-                        // Feed the silence watchdog (mic track only) before any
-                        // gap padding, so it measures the real captured audio.
+                        // Feed the silence watchdog before any gap padding, so
+                        // it measures the real captured audio.
                         if let Some(voiced) = &voiced {
                             voiced.observe(&samples);
                         }
@@ -523,6 +522,7 @@ pub struct SystemTrackRecorder {
     paused: Arc<AtomicBool>,
     out_path: PathBuf,
     sample_rate: u32,
+    voiced: Arc<VoicedTracker>,
 }
 
 /// Cloneable, thread-safe feed handle for a [`SystemTrackRecorder`]. The
@@ -559,14 +559,16 @@ impl SystemTrackRecorder {
     pub fn create(out_path: impl Into<PathBuf>, sample_rate: u32) -> io::Result<Self> {
         let out_path = out_path.into();
         let sink = WavSink::create(&out_path, sample_rate)?;
-        // No silence tracker: only the mic track drives the watchdog.
-        let (writer_tx, writer_handle) = spawn_writer(sink, None);
+        let voiced = Arc::new(VoicedTracker::new());
+        voiced.arm(sample_rate);
+        let (writer_tx, writer_handle) = spawn_writer(sink, Some(Arc::clone(&voiced)));
         Ok(Self {
             writer_tx,
             writer_handle,
             paused: Arc::new(AtomicBool::new(false)),
             out_path,
             sample_rate,
+            voiced,
         })
     }
 
@@ -593,6 +595,13 @@ impl SystemTrackRecorder {
     /// Path of the WAV being written.
     pub fn out_path(&self) -> &Path {
         &self.out_path
+    }
+
+    /// Seconds since this externally-fed track last carried physical audio
+    /// above the room-noise threshold. This is sample-clock based, so pausing
+    /// the track also pauses the silence clock.
+    pub fn silence_seconds(&self) -> Option<f64> {
+        self.voiced.silence_seconds()
     }
 
     /// Finalize the WAV (back-fill the RIFF/`data` sizes) and join the writer.
@@ -1411,6 +1420,33 @@ mod tests {
             "unexpected gaps: {:?}",
             summary.gaps
         );
+    }
+
+    #[test]
+    fn externally_fed_track_reports_physical_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("activity.wav");
+        let track = SystemTrackRecorder::create(&path, 16_000).unwrap();
+        let sender = track.sender();
+        assert!(sender.push(&[0.4f32; 1_600]));
+        assert!(sender.push(&[0.0f32; 1_600]));
+        assert!(sender.push(&[0.0f32; 1_600]));
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if track
+                .silence_seconds()
+                .is_some_and(|seconds| seconds >= 0.2)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "writer did not update activity tracker"
+            );
+            std::thread::yield_now();
+        }
+        track.finalize().unwrap();
     }
 
     fn read_u32_le(bytes: &[u8], off: usize) -> u32 {

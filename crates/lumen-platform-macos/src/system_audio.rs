@@ -3,17 +3,11 @@
 //!
 //! Dual-track meeting recording needs the *other* side of a call — the remote
 //! participants' voices — which never pass through the microphone. On macOS
-//! 14.2+ Core Audio can tap process audio: this module creates a **global**
-//! tap (a mono mixdown of the entire system output, excluding this process),
-//! wraps it in a private aggregate device, and reads the tapped samples with a
-//! device IO proc. Each callback's samples are forwarded to a caller-supplied
-//! sink as mono `f32` at the tap's native sample rate.
-//!
-//! ## Why a global tap (v1 decision)
-//! A per-process tap would need a target PID, but a meeting recording can be
-//! started manually with no detected meeting app. The global mixdown captures
-//! whatever the user hears (minus our own output), which is exactly the
-//! "remote participants" track — simpler and always applicable.
+//! 14.2+ Core Audio can tap selected process objects. This module resolves an
+//! explicit bundle-id allow-list to live process objects, creates a mono
+//! mixdown tap for only those processes, wraps it in a private aggregate
+//! device, and reads the tapped samples with a device IO proc. It never falls
+//! back to a global system mix: an unmatched target degrades to mic-only.
 //!
 //! ## Capability gate (macOS 14.2+ only)
 //! The tap entry points (`AudioHardwareCreateProcessTap`, …) and the
@@ -48,6 +42,10 @@ pub enum SystemAudioError {
     /// A capture is already running.
     #[error("system audio capture already running")]
     AlreadyRunning,
+    /// None of the configured bundle ids currently has a Core Audio process
+    /// object, so there is no safe per-process target to capture.
+    #[error("no running audio process matched configured targets: {bundle_ids:?}")]
+    NoMatchingProcesses { bundle_ids: Vec<String> },
     /// A Core Audio call failed (includes a denied TCC permission surfacing as
     /// a tap/aggregate creation error).
     #[error("core audio error in {stage}: status {status}")]
@@ -61,6 +59,42 @@ pub enum SystemAudioError {
 /// native tap sample rate. Runs on a Core Audio dispatch queue — keep it fast
 /// (the meeting recorder's sink only forwards to a writer thread).
 pub type SystemAudioSink = Arc<dyn Fn(&[f32]) + Send + Sync>;
+
+/// Explicit process-level selection for a system-audio tap. Bundle ids are
+/// normalized and deduplicated; they come from the runtime app catalog rather
+/// than a compiled application list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemAudioTarget {
+    bundle_ids: Vec<String>,
+}
+
+impl SystemAudioTarget {
+    pub fn new(bundle_ids: impl IntoIterator<Item = String>) -> Self {
+        let mut normalized = Vec::new();
+        for bundle_id in bundle_ids {
+            let bundle_id = lumen_core::normalize_bundle_id(&bundle_id);
+            if bundle_id.is_empty()
+                || normalized
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(&bundle_id))
+            {
+                continue;
+            }
+            normalized.push(bundle_id);
+        }
+        Self {
+            bundle_ids: normalized,
+        }
+    }
+
+    pub fn bundle_ids(&self) -> &[String] {
+        &self.bundle_ids
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bundle_ids.is_empty()
+    }
+}
 
 /// Whether this build/host exposes the Core Audio process-tap API
 /// (macOS 14.2+). `false` on non-macOS and on older macOS.
@@ -111,10 +145,14 @@ impl SystemAudioCapture {
         }
     }
 
-    /// Create the global tap (excluding this process), wrap it in a private
-    /// aggregate device, and start delivering mono `f32` chunks to `sink`.
-    /// Returns the native sample rate of the tap stream.
-    pub fn start(&mut self, sink: SystemAudioSink) -> Result<u32, SystemAudioError> {
+    /// Create a process tap for `target`, wrap it in a private aggregate
+    /// device, and start delivering mono `f32` chunks to `sink`. Returns the
+    /// native sample rate of the tap stream.
+    pub fn start(
+        &mut self,
+        target: &SystemAudioTarget,
+        sink: SystemAudioSink,
+    ) -> Result<u32, SystemAudioError> {
         #[cfg(target_os = "macos")]
         {
             if self.session.is_some() {
@@ -123,14 +161,14 @@ impl SystemAudioCapture {
             if !imp::tap_api_available() {
                 return Err(SystemAudioError::Unsupported);
             }
-            let session = imp::TapSession::start(sink)?;
+            let session = imp::TapSession::start(target, sink)?;
             let sample_rate = session.sample_rate();
             self.session = Some(session);
             Ok(sample_rate)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = sink;
+            let _ = (target, sink);
             Err(SystemAudioError::Unsupported)
         }
     }
@@ -155,7 +193,7 @@ impl Drop for SystemAudioCapture {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{SystemAudioError, SystemAudioSink};
+    use super::{SystemAudioError, SystemAudioSink, SystemAudioTarget};
     use std::ffi::{c_char, c_void};
 
     use block2::{Block, RcBlock};
@@ -163,10 +201,10 @@ mod imp {
     use core_foundation::base::{CFType, TCFType};
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::number::CFNumber;
-    use core_foundation::string::CFString;
+    use core_foundation::string::{CFString, CFStringRef};
     use objc2::msg_send;
     use objc2::rc::Retained;
-    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
     use objc2_foundation::{NSArray, NSNumber, NSString};
 
     type AudioObjectID = u32;
@@ -219,6 +257,8 @@ mod imp {
     const SCOPE_GLOBAL: u32 = fourcc(b"glob"); // kAudioObjectPropertyScopeGlobal
     const ELEMENT_MAIN: u32 = 0; // kAudioObjectPropertyElementMain
     const TRANSLATE_PID_TO_PROCESS_OBJECT: u32 = fourcc(b"id2p"); // kAudioHardwarePropertyTranslatePIDToProcessObject
+    const PROCESS_OBJECT_LIST: u32 = fourcc(b"prs#"); // kAudioHardwarePropertyProcessObjectList
+    const PROCESS_BUNDLE_ID: u32 = fourcc(b"pbid"); // kAudioProcessPropertyBundleID
     const TAP_PROPERTY_FORMAT: u32 = fourcc(b"tfmt"); // kAudioTapPropertyFormat
     const FORMAT_FLAG_IS_FLOAT: u32 = 1; // kAudioFormatFlagIsFloat
 
@@ -227,6 +267,13 @@ mod imp {
     // `tap_fns` instead, so this library loads on older macOS too).
     #[link(name = "CoreAudio", kind = "framework")]
     extern "C" {
+        fn AudioObjectGetPropertyDataSize(
+            in_object: AudioObjectID,
+            in_address: *const AudioObjectPropertyAddress,
+            in_qualifier_data_size: u32,
+            in_qualifier_data: *const c_void,
+            out_data_size: *mut u32,
+        ) -> OSStatus;
         fn AudioObjectGetPropertyData(
             in_object: AudioObjectID,
             in_address: *const AudioObjectPropertyAddress,
@@ -321,6 +368,76 @@ mod imp {
         (status == 0 && object != 0).then_some(object)
     }
 
+    fn process_object_ids() -> Vec<AudioObjectID> {
+        let a = addr(PROCESS_OBJECT_LIST);
+        let mut size = 0u32;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(SYSTEM_OBJECT, &a, 0, std::ptr::null(), &mut size)
+        };
+        if status != 0 || size == 0 {
+            return Vec::new();
+        }
+        let count = size as usize / std::mem::size_of::<AudioObjectID>();
+        let mut objects = vec![0; count];
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                SYSTEM_OBJECT,
+                &a,
+                0,
+                std::ptr::null(),
+                &mut size,
+                objects.as_mut_ptr() as *mut c_void,
+            )
+        };
+        if status != 0 {
+            Vec::new()
+        } else {
+            objects
+        }
+    }
+
+    fn process_bundle_id(object: AudioObjectID) -> Option<String> {
+        let a = addr(PROCESS_BUNDLE_ID);
+        let mut value: CFStringRef = std::ptr::null();
+        let mut size = std::mem::size_of::<CFStringRef>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                object,
+                &a,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut value as *mut CFStringRef as *mut c_void,
+            )
+        };
+        if status != 0 || value.is_null() {
+            return None;
+        }
+        let value = unsafe { CFString::wrap_under_create_rule(value) };
+        Some(value.to_string())
+    }
+
+    fn matching_process_objects(target: &SystemAudioTarget) -> Vec<AudioObjectID> {
+        let own_process = process_object_for_pid(std::process::id() as i32);
+        let wanted: Vec<String> = target
+            .bundle_ids()
+            .iter()
+            .map(|bundle_id| bundle_id.to_ascii_lowercase())
+            .collect();
+        process_object_ids()
+            .into_iter()
+            .filter(|object| Some(*object) != own_process)
+            .filter(|object| {
+                process_bundle_id(*object).is_some_and(|bundle_id| {
+                    let bundle_id = lumen_core::normalize_bundle_id(&bundle_id);
+                    wanted
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(&bundle_id))
+                })
+            })
+            .collect()
+    }
+
     /// Stream format of the tap (mono mixdown → 1 channel Float32 at the
     /// system output rate).
     fn tap_stream_format(tap: AudioObjectID) -> Option<AudioStreamBasicDescription> {
@@ -341,34 +458,45 @@ mod imp {
         (status == 0 && asbd.m_sample_rate > 0.0).then_some(asbd)
     }
 
-    /// Build a `CATapDescription` for a mono global mixdown that excludes this
-    /// process, and return it together with its tap UUID string (needed to
-    /// reference the tap from the aggregate device's tap list).
-    fn build_tap_description() -> Result<(Retained<AnyObject>, String), SystemAudioError> {
+    /// Build a `CATapDescription` for a mono mixdown of the selected processes,
+    /// and return it together with its tap UUID string (needed to reference the
+    /// tap from the aggregate device's tap list).
+    fn build_tap_description(
+        target: &SystemAudioTarget,
+    ) -> Result<(Retained<AnyObject>, String), SystemAudioError> {
         let class = tap_description_class().ok_or(SystemAudioError::Unsupported)?;
 
-        // Exclude our own process object (when the HAL knows it) so Lumen can
-        // never feed its own output back into the meeting track.
-        let excluded: Vec<Retained<NSNumber>> = process_object_for_pid(std::process::id() as i32)
-            .map(|object| vec![NSNumber::new_u32(object)])
-            .unwrap_or_default();
-        let exclude_array = NSArray::from_retained_slice(&excluded);
+        let matched = matching_process_objects(target);
+        if matched.is_empty() {
+            return Err(SystemAudioError::NoMatchingProcesses {
+                bundle_ids: target.bundle_ids().to_vec(),
+            });
+        }
+        let included: Vec<Retained<NSNumber>> = matched
+            .iter()
+            .map(|object| NSNumber::new_u32(*object))
+            .collect();
+        let include_array = NSArray::from_retained_slice(&included);
 
         // SAFETY: alloc + the documented CATapDescription initializer
-        // `initMonoGlobalTapButExcludeProcesses:` (macOS 14.2+; existence of
-        // the class was checked above). The init consumes the alloc.
+        // `initMonoMixdownOfProcesses:` (macOS 14.2+; existence of the class
+        // was checked above). The init consumes the alloc.
         let desc: Retained<AnyObject> = unsafe {
             let allocated: *mut AnyObject = msg_send![class, alloc];
             let initialized: *mut AnyObject = msg_send![
                 allocated,
-                initMonoGlobalTapButExcludeProcesses: &*exclude_array
+                initMonoMixdownOfProcesses: &*include_array
             ];
             Retained::from_raw(initialized).ok_or_else(|| {
-                SystemAudioError::TapDescription(
-                    "initMonoGlobalTapButExcludeProcesses returned nil".into(),
-                )
+                SystemAudioError::TapDescription("initMonoMixdownOfProcesses returned nil".into())
             })?
         };
+        // Track a configured bundle through process restarts when Core Audio
+        // can restore it; this avoids silently losing remote audio after an app
+        // update/relaunch during a long recording.
+        unsafe {
+            let _: () = msg_send![&*desc, setProcessRestoreEnabled: Bool::YES];
+        }
 
         // SAFETY: `UUID` / `UUIDString` are documented properties.
         let uuid_string: String = unsafe {
@@ -411,9 +539,12 @@ mod imp {
             self.sample_rate
         }
 
-        pub(super) fn start(sink: SystemAudioSink) -> Result<Self, SystemAudioError> {
+        pub(super) fn start(
+            target: &SystemAudioTarget,
+            sink: SystemAudioSink,
+        ) -> Result<Self, SystemAudioError> {
             let (create_tap, destroy_tap) = tap_fns().ok_or(SystemAudioError::Unsupported)?;
-            let (desc, tap_uuid) = build_tap_description()?;
+            let (desc, tap_uuid) = build_tap_description(target)?;
 
             // 1. The process tap itself. This is the step that trips the TCC
             //    system-audio prompt; a denial surfaces as a non-zero status.
@@ -588,6 +719,7 @@ mod imp {
                 sample_rate,
                 channels,
                 tap_uuid = %tap_uuid,
+                targets = ?target.bundle_ids(),
                 "system audio tap capture started"
             );
             Ok(Self {
@@ -645,12 +777,23 @@ mod tests {
         assert!(!capture.is_running());
         if !capability_available() {
             let sink: SystemAudioSink = Arc::new(|_samples: &[f32]| {});
-            let err = capture.start(sink).unwrap_err();
+            let target = SystemAudioTarget::new(["com.example.meeting".to_string()]);
+            let err = capture.start(&target, sink).unwrap_err();
             assert!(matches!(err, SystemAudioError::Unsupported));
         }
         // stop() with nothing running is a no-op, twice.
         capture.stop();
         capture.stop();
         assert!(!capture.is_running());
+    }
+
+    #[test]
+    fn target_normalizes_deduplicates_and_drops_empty_ids() {
+        let target = SystemAudioTarget::new([
+            " com.google.Chrome.helper.Renderer ".to_string(),
+            "com.google.chrome".to_string(),
+            " ".to_string(),
+        ]);
+        assert_eq!(target.bundle_ids(), &["com.google.Chrome"]);
     }
 }

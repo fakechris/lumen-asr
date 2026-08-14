@@ -14,8 +14,8 @@ pub use meeting::{
     SegmentChannel, Speaker, SummaryKind, TranscriptSegment,
 };
 pub use meeting_detection::{
-    classify_bundle_id, normalize_bundle_id, AppClass, Candidate, DetectionConfig,
-    DetectionDecision, DetectionInput, DetectionOutput, MeetingDetectionPolicy,
+    normalize_bundle_id, AppClass, Candidate, DetectionConfig, DetectionDecision, DetectionInput,
+    DetectionOutput, MeetingDetectionPolicy,
 };
 pub use session::{Session, SessionCommand, SessionEvent, SessionState};
 pub use types::{

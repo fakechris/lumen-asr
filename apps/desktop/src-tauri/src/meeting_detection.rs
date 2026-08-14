@@ -27,12 +27,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use lumen_core::{DetectionConfig, DetectionInput, DetectionOutput, MeetingDetectionPolicy};
+use lumen_core::{
+    AppClass, DetectionConfig, DetectionInput, DetectionOutput, MeetingDetectionPolicy,
+};
 use lumen_platform::default_data_dir;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::detection_stats::{DetectionStats, DetectionStatsCounters, StatCounter};
+use crate::meeting_apps::{MeetingAppCatalog, MeetingAppCatalogDto, MeetingAppRegistry};
 
 /// Payload of the `meeting-detected` event the front-end listens for.
 #[derive(Debug, Clone, Serialize)]
@@ -40,8 +43,16 @@ use crate::detection_stats::{DetectionStats, DetectionStatsCounters, StatCounter
 struct MeetingDetectedEvent {
     /// Normalized bundle id of the app that looks like a meeting.
     bundle_id: String,
-    /// Class token (`native_meeting` today) for labelling.
+    /// Class token used to select the native-app or whole-browser warning.
     app_class: String,
+    /// Display name from the external runtime catalog.
+    display_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcceptedMeetingApp {
+    pub bundle_id: String,
+    pub app_class: AppClass,
 }
 
 /// Payload of the `meeting-detection-stop-suggested` event: the candidate that
@@ -56,11 +67,14 @@ struct MeetingStopSuggestedEvent {
     meeting_id: Option<String>,
     /// Normalized bundle id of the app whose input disappeared (for labelling).
     bundle_id: String,
+    /// Display name from the same external catalog used by the start prompt.
+    display_name: String,
 }
 
 /// State shared between the service handle and the detector callback thread.
 struct DetectionShared {
     policy: Mutex<MeetingDetectionPolicy>,
+    apps: MeetingAppRegistry,
     /// Local prompt/suggestion counters (JSON file + tracing; never uploaded).
     stats: DetectionStats,
     /// Meeting id of the recording started from a detection prompt; `None`
@@ -77,6 +91,7 @@ pub struct MeetingDetectionService {
     /// Monotonic origin; policy timestamps are ms since this instant.
     origin: Instant,
     active: AtomicBool,
+    catalog_restart_pending: AtomicBool,
 }
 
 impl Default for MeetingDetectionService {
@@ -87,9 +102,14 @@ impl Default for MeetingDetectionService {
 
 impl MeetingDetectionService {
     pub fn new() -> Self {
+        Self::with_registry(MeetingAppRegistry::default())
+    }
+
+    fn with_registry(apps: MeetingAppRegistry) -> Self {
         Self {
             shared: Arc::new(DetectionShared {
                 policy: Mutex::new(MeetingDetectionPolicy::new(DetectionConfig::default())),
+                apps,
                 stats: DetectionStats::load(default_data_dir().join("detection_stats.json")),
                 active_meeting: Mutex::new(None),
             }),
@@ -97,7 +117,56 @@ impl MeetingDetectionService {
             detector: Mutex::new(lumen_platform_macos::MeetingActivityDetector::new()),
             origin: Instant::now(),
             active: AtomicBool::new(false),
+            catalog_restart_pending: AtomicBool::new(false),
         }
+    }
+
+    pub fn install_and_load_app_catalog(&self, app: &AppHandle) -> Result<(), String> {
+        self.shared.apps.install_and_load(app)
+    }
+
+    pub fn app_catalog(&self) -> MeetingAppCatalogDto {
+        self.shared.apps.snapshot()
+    }
+
+    pub fn save_app_catalog(
+        &self,
+        catalog: MeetingAppCatalog,
+    ) -> Result<MeetingAppCatalogDto, String> {
+        self.shared.apps.save(catalog)
+    }
+
+    pub fn reload_app_catalog(&self) -> Result<MeetingAppCatalogDto, String> {
+        self.shared.apps.reload()?;
+        Ok(self.shared.apps.snapshot())
+    }
+
+    /// Re-evaluate every live input session against a newly saved catalog.
+    /// Restarting the poller clears its previous-session cache, so configured
+    /// apps that are already using the microphone are emitted again instead of
+    /// waiting for their next mute/rejoin cycle.
+    pub fn restart_after_catalog_change(&self, app: &AppHandle, enabled: bool) {
+        // Do not discard the candidate that owns an in-progress
+        // detection-started recording; it is still needed for the eventual
+        // end-of-meeting suggestion. Queue a restart for the finish path so
+        // every currently active input is re-emitted against the new catalog.
+        if self.active_meeting_id().is_some() {
+            self.catalog_restart_pending.store(true, Ordering::SeqCst);
+            return;
+        }
+        self.catalog_restart_pending.store(false, Ordering::SeqCst);
+        self.stop_and_reset(app);
+        if enabled {
+            self.start(app.clone());
+        }
+    }
+
+    pub fn manual_capture_bundle_ids(&self) -> Vec<String> {
+        self.shared.apps.manual_capture_bundle_ids()
+    }
+
+    pub fn capture_enabled(&self, bundle_id: &str) -> bool {
+        self.shared.apps.capture_enabled(bundle_id)
     }
 
     fn now_ms(&self) -> u64 {
@@ -178,30 +247,33 @@ impl MeetingDetectionService {
     /// The user accepted the prompt. Advances the policy (arming cooldown and
     /// moving to `recording`) and reports whether a recording should now begin.
     /// The caller performs the actual `start_meeting_recording`.
-    pub fn accept(&self) -> bool {
+    pub fn accept(&self) -> Option<AcceptedMeetingApp> {
         let now = self.now_ms();
         let outputs = {
             let mut policy = match self.shared.policy.lock() {
                 Ok(p) => p,
-                Err(_) => return false,
+                Err(_) => return None,
             };
             policy.handle(DetectionInput::UserAccepted { now_ms: now })
         };
-        let mut should_start = false;
+        let mut accepted = None;
         for out in &outputs {
             match out {
                 DetectionOutput::StartRecording { bundle_id } => {
                     tracing::info!(bundle_id = %bundle_id, "meeting detection accepted → start");
-                    should_start = true;
+                    accepted = Some(AcceptedMeetingApp {
+                        bundle_id: bundle_id.clone(),
+                        app_class: self.shared.apps.classify(bundle_id),
+                    });
                 }
                 DetectionOutput::Decision(d) => log_decision(d),
                 _ => {}
             }
         }
-        if should_start {
+        if accepted.is_some() {
             self.shared.stats.increment(StatCounter::PromptAccepted);
         }
-        should_start
+        accepted
     }
 
     /// Record which meeting the accepted prompt actually started, so the
@@ -267,7 +339,7 @@ impl MeetingDetectionService {
     /// can return to idle. Safe to call regardless of how the recording started
     /// (a manual meeting no-ops). Also clears the tracked meeting id and
     /// retracts a still-visible stop suggestion.
-    pub fn recording_finished(&self, app: &AppHandle) {
+    pub fn recording_finished(&self, app: &AppHandle, detection_enabled: bool) {
         let now = self.now_ms();
         if let Ok(mut active) = self.shared.active_meeting.lock() {
             *active = None;
@@ -280,13 +352,14 @@ impl MeetingDetectionService {
             policy.handle(DetectionInput::RecordingFinished { now_ms: now })
         };
         apply_outputs(app, &self.shared, &outputs);
+        self.apply_pending_catalog_restart(app, detection_enabled);
     }
 
     /// The accepted recording failed to start (or died on an error path that
     /// never reached a successful stop). Returns the policy to idle so future
     /// candidates are not rejected as busy forever; the per-app cooldown armed
     /// at accept stays in effect (see the policy for the rationale).
-    pub fn recording_failed(&self, app: &AppHandle) {
+    pub fn recording_failed(&self, app: &AppHandle, detection_enabled: bool) {
         let now = self.now_ms();
         if let Ok(mut active) = self.shared.active_meeting.lock() {
             *active = None;
@@ -299,6 +372,17 @@ impl MeetingDetectionService {
             policy.handle(DetectionInput::RecordingFailed { now_ms: now })
         };
         apply_outputs(app, &self.shared, &outputs);
+        self.apply_pending_catalog_restart(app, detection_enabled);
+    }
+
+    fn apply_pending_catalog_restart(&self, app: &AppHandle, detection_enabled: bool) {
+        if !self.catalog_restart_pending.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.stop_and_reset(app);
+        if detection_enabled {
+            self.start(app.clone());
+        }
     }
 
     /// Current local counter values (for `get_meeting_detection_stats`).
@@ -320,7 +404,7 @@ fn handle_signal(
     let input = match signal {
         S::Added(input) => DetectionInput::CandidateAdded {
             candidate: lumen_core::Candidate {
-                app_class: input.app_class,
+                app_class: shared.apps.classify(&input.bundle_id),
                 bundle_id: input.bundle_id,
                 session_key: input.session_key,
             },
@@ -358,7 +442,13 @@ fn apply_outputs(app: &AppHandle, shared: &DetectionShared, outputs: &[Detection
                     "meeting-detected",
                     MeetingDetectedEvent {
                         bundle_id: bundle_id.clone(),
-                        app_class: format!("{app_class:?}").to_ascii_lowercase(),
+                        app_class: match app_class {
+                            AppClass::NativeMeeting => "native_meeting",
+                            AppClass::Browser => "browser",
+                            AppClass::Other => "other",
+                        }
+                        .to_string(),
+                        display_name: shared.apps.label(bundle_id),
                     },
                 );
             }
@@ -377,6 +467,7 @@ fn apply_outputs(app: &AppHandle, shared: &DetectionShared, outputs: &[Detection
                     MeetingStopSuggestedEvent {
                         meeting_id,
                         bundle_id: bundle_id.clone(),
+                        display_name: shared.apps.label(bundle_id),
                     },
                 );
             }

@@ -2215,6 +2215,10 @@ mod attempt_metric_tests {
             meeting_power_guard: std::sync::Mutex::new(None),
             meeting_battery_poll: std::sync::Mutex::new(None),
             meeting_watchdog: std::sync::Mutex::new(None),
+            meeting_recording_owner: std::sync::Mutex::new(
+                crate::meeting_cmd::MeetingRecordingOwner::default(),
+            ),
+            meeting_audio_edit: tokio::sync::Mutex::new(()),
             meeting_recovery_notices: std::sync::Mutex::new(Vec::new()),
             meeting_live: crate::meeting_live::MeetingLive::default(),
             meeting_system_audio: crate::meeting_system_audio::MeetingSystemAudio::default(),
@@ -2398,6 +2402,10 @@ mod attempt_metric_tests {
             meeting_power_guard: std::sync::Mutex::new(None),
             meeting_battery_poll: std::sync::Mutex::new(None),
             meeting_watchdog: std::sync::Mutex::new(None),
+            meeting_recording_owner: std::sync::Mutex::new(
+                crate::meeting_cmd::MeetingRecordingOwner::default(),
+            ),
+            meeting_audio_edit: tokio::sync::Mutex::new(()),
             meeting_recovery_notices: std::sync::Mutex::new(Vec::new()),
             meeting_live: crate::meeting_live::MeetingLive::default(),
             meeting_system_audio: crate::meeting_system_audio::MeetingSystemAudio::default(),

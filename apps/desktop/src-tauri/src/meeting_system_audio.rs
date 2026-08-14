@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use lumen_asr::{LiveTapSender, RecordingSummary, SystemTrackRecorder, SystemTrackSender};
-use lumen_platform_macos::{SystemAudioCapture, SystemAudioSink};
+use lumen_platform_macos::{SystemAudioCapture, SystemAudioSink, SystemAudioTarget};
 
 /// One live tap→WAV session for the active meeting recording.
 struct Session {
@@ -50,7 +50,12 @@ impl MeetingSystemAudio {
     /// native sample rate, which the WAV header needs), so the capture sink
     /// forwards through a late-bound slot; the handful of callbacks that can
     /// fire before the slot is filled are dropped (a few ms at session start).
-    pub fn start(&self, out_path: PathBuf, live: Option<LiveTapSender>) -> Option<u32> {
+    pub fn start(
+        &self,
+        out_path: PathBuf,
+        bundle_ids: Vec<String>,
+        live: Option<LiveTapSender>,
+    ) -> Option<u32> {
         let mut guard = match self.inner.lock() {
             Ok(guard) => guard,
             Err(_) => {
@@ -80,8 +85,14 @@ impl MeetingSystemAudio {
             }
         });
 
+        let target = SystemAudioTarget::new(bundle_ids);
+        if target.is_empty() {
+            tracing::info!("no configured system-audio target; recording mic-only");
+            return None;
+        }
+
         let mut capture = SystemAudioCapture::new();
-        let sample_rate = match capture.start(sink) {
+        let sample_rate = match capture.start(&target, sink) {
             Ok(rate) => rate,
             Err(e) => {
                 // Capability absent, permission denied, or a HAL failure —
@@ -111,6 +122,7 @@ impl MeetingSystemAudio {
         tracing::info!(
             sample_rate,
             path = %out_path.display(),
+            targets = ?target.bundle_ids(),
             "system audio track recording started"
         );
         *guard = Some(Session { capture, track });
@@ -125,6 +137,17 @@ impl MeetingSystemAudio {
                 session.track.set_paused(paused);
             }
         }
+    }
+
+    /// Seconds since the captured system-output track last carried physical
+    /// audio above the room-noise threshold. Remote speech therefore keeps an
+    /// attended meeting alive even while the local microphone is quiet.
+    pub fn silence_seconds(&self) -> Option<f64> {
+        self.inner.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|session| session.track.silence_seconds())
+        })
     }
 
     /// Stop the tap and finalize the system WAV. Returns the finalized track

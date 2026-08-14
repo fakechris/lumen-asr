@@ -18,6 +18,7 @@ mod hotkey;
 mod hotkey_validate;
 mod inject_cmd;
 mod learning;
+mod meeting_apps;
 mod meeting_cmd;
 mod meeting_detection;
 mod meeting_live;
@@ -276,12 +277,15 @@ pub struct AppState {
     /// join handle, so `stop_meeting_recording` can signal + join it. `None`
     /// when no recording is active (or the silence auto-stop is disabled). All
     /// `Send`/`Sync` — never holds an objc2 object.
-    pub meeting_watchdog: std::sync::Mutex<
-        Option<(
-            std::sync::Arc<std::sync::atomic::AtomicBool>,
-            std::thread::JoinHandle<()>,
-        )>,
-    >,
+    pub meeting_watchdog: std::sync::Mutex<Option<meeting_cmd::MeetingWatchdogHandle>>,
+    /// Serializes meeting start/stop and binds the global capture engines to
+    /// the meeting id that owns them. A delayed stop event from an older
+    /// meeting must never finalize a newer recording.
+    pub meeting_recording_owner: std::sync::Mutex<meeting_cmd::MeetingRecordingOwner>,
+    /// Serializes destructive source-audio operations. In particular, delete
+    /// cannot interleave with trim's prepare/DB-swap/file-cleanup sequence and
+    /// leave an unowned WAV behind.
+    pub meeting_audio_edit: tokio::sync::Mutex<()>,
     /// Interrupted-recording recovery outcomes buffered at startup until the
     /// front-end drains them (it can miss the live event if recovery runs before
     /// its listener is ready). See `meeting_cmd::take_recovery_notices`.
@@ -538,6 +542,8 @@ pub fn run() {
             meeting_power_guard: Mutex::new(None),
             meeting_battery_poll: Mutex::new(None),
             meeting_watchdog: Mutex::new(None),
+            meeting_recording_owner: Mutex::new(meeting_cmd::MeetingRecordingOwner::default()),
+            meeting_audio_edit: tokio::sync::Mutex::new(()),
             meeting_recovery_notices: Mutex::new(Vec::new()),
             meeting_live: meeting_live::MeetingLive::default(),
             meeting_system_audio: meeting_system_audio::MeetingSystemAudio::default(),
@@ -612,6 +618,9 @@ pub fn run() {
             meeting_cmd::resume_meeting_recording,
             meeting_cmd::get_meeting_detection,
             meeting_cmd::set_meeting_detection_enabled,
+            meeting_cmd::get_meeting_app_catalog,
+            meeting_cmd::save_meeting_app_catalog,
+            meeting_cmd::reload_meeting_app_catalog,
             meeting_cmd::accept_meeting_detection,
             meeting_cmd::dismiss_meeting_detection,
             meeting_cmd::accept_meeting_detection_stop,
@@ -619,11 +628,13 @@ pub fn run() {
             meeting_cmd::get_meeting_detection_stats,
             meeting_cmd::get_meeting_watchdog_config,
             meeting_cmd::set_meeting_watchdog_config,
+            meeting_cmd::continue_meeting_after_silence,
             meeting_cmd::process_meeting_now,
             meeting_cmd::list_meetings,
             meeting_cmd::get_meeting_detail,
             meeting_cmd::save_meeting_notes,
             meeting_cmd::rename_meeting,
+            meeting_cmd::trim_meeting_audio,
             meeting_cmd::delete_meeting,
             meeting_cmd::edit_meeting_segment,
             meeting_cmd::annotate_live_segment,
@@ -689,6 +700,14 @@ pub fn run() {
             app.state::<AppState>()
                 .edit_learning
                 .attach_app_handle(app.handle().clone());
+
+            if let Err(error) = app
+                .state::<AppState>()
+                .meeting_detection
+                .install_and_load_app_catalog(app.handle())
+            {
+                tracing::error!(%error, "meeting-app catalog unavailable; app detection and system-audio targeting disabled");
+            }
 
             // Log AX status only — wizard/settings open System Settings on demand.
             permissions_cmd::bootstrap_permissions();

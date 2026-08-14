@@ -40,6 +40,9 @@
   "bundle": {
     "active": true,
     "targets": ["dmg"],
+    "resources": {
+      "resources/meeting-apps.toml": "meeting-apps.toml"
+    },
     "icon": [
       "icons/icon.png",
       "icons/icon.ico",

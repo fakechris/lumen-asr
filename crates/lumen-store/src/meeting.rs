@@ -158,6 +158,53 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Replace a finished meeting's source audio after the user keeps a
+    /// smaller time range. The audio pointers and lifecycle reset happen in
+    /// the same transaction as deleting every time-aligned derived row, so a
+    /// reader can never observe new audio with an old transcript.
+    ///
+    /// Free-form meeting notes and the title are deliberately preserved. Live
+    /// annotations are removed because their timestamps refer to the original
+    /// recording; speaker conflicts disappear when the speaker rows cascade.
+    /// Returns `false` when the meeting does not exist.
+    pub fn replace_meeting_audio_after_trim(
+        &self,
+        id: Uuid,
+        audio_path: &str,
+        system_audio_path: Option<&str>,
+        duration_seconds: f64,
+    ) -> Result<bool> {
+        let id = id.to_string();
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE meetings \
+             SET audio_path=?2, system_audio_path=?3, duration_seconds=?4, \
+                 status='processing', failure_reason=NULL \
+             WHERE id=?1 AND status IN ('ready', 'failed')",
+            params![&id, audio_path, system_audio_path, duration_seconds],
+        )?;
+        if changed == 0 {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+
+        transaction.execute(
+            "DELETE FROM transcript_segments WHERE meeting_id=?1",
+            params![&id],
+        )?;
+        transaction.execute("DELETE FROM speakers WHERE meeting_id=?1", params![&id])?;
+        transaction.execute(
+            "DELETE FROM meeting_summaries WHERE meeting_id=?1",
+            params![&id],
+        )?;
+        transaction.execute(
+            "DELETE FROM live_annotations WHERE meeting_id=?1",
+            params![&id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     /// Record (or clear, with `None`) the path of the meeting's second,
     /// synchronized system-audio WAV. Written at recording start so crash
     /// recovery can find the file, and cleared at stop when the system track
@@ -310,6 +357,31 @@ impl Store {
             .conn
             .execute("DELETE FROM meetings WHERE id=?1", params![id.to_string()])?;
         Ok(changed > 0)
+    }
+
+    /// Atomically take a meeting's source-audio paths and delete its row.
+    /// Callers can remove the returned files after commit without a trim
+    /// transaction changing the paths between an independent read and delete.
+    pub fn delete_meeting_with_audio_paths(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let id = id.to_string();
+        let transaction = self.conn.unchecked_transaction()?;
+        let paths = transaction
+            .query_row(
+                "SELECT audio_path, system_audio_path FROM meetings WHERE id=?1",
+                params![&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some(paths) = paths else {
+            transaction.rollback()?;
+            return Ok(None);
+        };
+        transaction.execute("DELETE FROM meetings WHERE id=?1", params![&id])?;
+        transaction.commit()?;
+        Ok(Some(paths))
     }
 
     // ----- transcript segments ---------------------------------------------
@@ -1007,7 +1079,8 @@ fn map_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<MeetingSummary> {
 mod tests {
     use lumen_core::transcript::Word;
     use lumen_core::{
-        Meeting, MeetingStatus, MeetingSummary, Speaker, SummaryKind, TranscriptSegment,
+        LiveAnnotation, Meeting, MeetingStatus, MeetingSummary, SegmentChannel, Speaker,
+        SummaryKind, TranscriptSegment,
     };
     use uuid::Uuid;
 
@@ -1652,6 +1725,152 @@ mod tests {
             .is_none());
         // Deleting a missing meeting is a no-op.
         assert!(!store.delete_meeting(Uuid::new_v4()).unwrap());
+    }
+
+    #[test]
+    fn delete_meeting_atomically_returns_the_paths_it_removed() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        store
+            .set_meeting_audio_path(meeting.id, "/meetings/mic.wav")
+            .unwrap();
+        store
+            .set_meeting_system_audio_path(meeting.id, Some("/meetings/system.wav"))
+            .unwrap();
+
+        let paths = store
+            .delete_meeting_with_audio_paths(meeting.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(paths.0.as_deref(), Some("/meetings/mic.wav"));
+        assert_eq!(paths.1.as_deref(), Some("/meetings/system.wav"));
+        assert!(store.get_meeting(meeting.id).unwrap().is_none());
+        assert!(store
+            .delete_meeting_with_audio_paths(meeting.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn trim_and_atomic_delete_have_safe_commit_orders() {
+        let (_dir, store) = open_store();
+
+        // Trim commits first: delete must return the replacement paths, never
+        // the obsolete files that trim is about to clean up.
+        let first = Meeting::new();
+        store.create_meeting(&first).unwrap();
+        store
+            .update_meeting_status(first.id, MeetingStatus::Ready)
+            .unwrap();
+        assert!(store
+            .replace_meeting_audio_after_trim(
+                first.id,
+                "/meetings/new.wav",
+                Some("/meetings/new.system.wav"),
+                5.0,
+            )
+            .unwrap());
+        assert_eq!(
+            store.delete_meeting_with_audio_paths(first.id).unwrap(),
+            Some((
+                Some("/meetings/new.wav".into()),
+                Some("/meetings/new.system.wav".into())
+            ))
+        );
+
+        // Delete commits first: trim's conditional swap must fail and its
+        // caller remains responsible for removing prepared files.
+        let second = Meeting::new();
+        store.create_meeting(&second).unwrap();
+        store
+            .update_meeting_status(second.id, MeetingStatus::Ready)
+            .unwrap();
+        assert!(store
+            .delete_meeting_with_audio_paths(second.id)
+            .unwrap()
+            .is_some());
+        assert!(!store
+            .replace_meeting_audio_after_trim(second.id, "/meetings/orphan.wav", None, 5.0)
+            .unwrap());
+    }
+
+    #[test]
+    fn trimmed_audio_replaces_sources_and_clears_time_aligned_data_atomically() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        store
+            .update_meeting_status(meeting.id, MeetingStatus::Ready)
+            .unwrap();
+        store.set_meeting_title(meeting.id, "周会").unwrap();
+        store
+            .set_meeting_notes(meeting.id, "保留这些手写笔记")
+            .unwrap();
+
+        let speaker = Speaker::new(meeting.id, "S1");
+        store.upsert_speaker(&speaker).unwrap();
+        let mut segment = TranscriptSegment::new(meeting.id, 0, 3.0, 5.0, "旧逐字稿");
+        segment.speaker_id = Some(speaker.id);
+        store.add_segment(&segment).unwrap();
+        store
+            .save_summary(&MeetingSummary::new(
+                meeting.id,
+                SummaryKind::Summary,
+                "旧纪要",
+            ))
+            .unwrap();
+        store
+            .add_live_annotation(&LiveAnnotation::new(
+                meeting.id,
+                3.0,
+                None,
+                SegmentChannel::Mic,
+                None,
+                "张三",
+            ))
+            .unwrap();
+
+        assert!(store
+            .replace_meeting_audio_after_trim(
+                meeting.id,
+                "/tmp/trimmed.wav",
+                Some("/tmp/trimmed.system.wav"),
+                42.5,
+            )
+            .unwrap());
+
+        let saved = store.get_meeting(meeting.id).unwrap().unwrap();
+        assert_eq!(saved.audio_path.as_deref(), Some("/tmp/trimmed.wav"));
+        assert_eq!(
+            saved.system_audio_path.as_deref(),
+            Some("/tmp/trimmed.system.wav")
+        );
+        assert_eq!(saved.duration_seconds, Some(42.5));
+        assert_eq!(saved.status, MeetingStatus::Processing);
+        assert_eq!(saved.title.as_deref(), Some("周会"));
+        assert_eq!(saved.notes, "保留这些手写笔记");
+
+        let detail = store.get_meeting_detail(meeting.id).unwrap().unwrap();
+        assert!(detail.segments.is_empty());
+        assert!(detail.speakers.is_empty());
+        assert!(detail.summaries.is_empty());
+        assert!(store.list_live_annotations(meeting.id).unwrap().is_empty());
+        assert!(!store
+            .replace_meeting_audio_after_trim(meeting.id, "/tmp/racing.wav", None, 1.0,)
+            .unwrap());
+        assert_eq!(
+            store
+                .get_meeting(meeting.id)
+                .unwrap()
+                .unwrap()
+                .audio_path
+                .as_deref(),
+            Some("/tmp/trimmed.wav")
+        );
+        assert!(!store
+            .replace_meeting_audio_after_trim(Uuid::new_v4(), "/tmp/missing.wav", None, 1.0,)
+            .unwrap());
     }
 
     #[test]
