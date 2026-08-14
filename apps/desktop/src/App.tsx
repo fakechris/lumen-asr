@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api, type AsrModelStatus } from "./api";
+import { api, type AsrModelStatus, type MeetingAppCatalog } from "./api";
 import { HotkeyRecorder } from "./HotkeyRecorder";
 import { OnboardingWizard } from "./OnboardingWizard";
 import { formatHotkeyLabel } from "./hotkeyFormat";
@@ -206,6 +206,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [powerWarning, setPowerWarning] = useState<string | null>(null);
+  // Prolonged-silence grace period. The backend owns the authoritative sample
+  // clock; the deadline here is presentation-only for the visible countdown.
+  const [silenceWarning, setSilenceWarning] = useState<{
+    meetingId: string;
+    deadlineMs: number;
+  } | null>(null);
   // Info banner shown after the watchdog auto-stopped a silent recording.
   const [autoStopNotice, setAutoStopNotice] = useState<string | null>(null);
   // Calendar-linked meeting whose end time passed while still recording. A
@@ -241,12 +247,14 @@ export default function App() {
   const [detected, setDetected] = useState<{
     bundleId: string;
     appClass: string;
+    displayName: string;
   } | null>(null);
   // End-of-meeting stop suggestion for a detection-started recording. The
   // backend asks; nothing is ever stopped without an explicit user click.
   const [stopSuggested, setStopSuggested] = useState<{
     bundleId: string;
     meetingId: string | null;
+    displayName: string;
   } | null>(null);
 
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
@@ -467,9 +475,12 @@ export default function App() {
   useEffect(() => {
     let unDetected: (() => void) | undefined;
     let unCancelled: (() => void) | undefined;
-    listen<{ bundleId: string; appClass: string }>("meeting-detected", (e) => {
-      setDetected(e.payload);
-    }).then((fn) => {
+    listen<{ bundleId: string; appClass: string; displayName: string }>(
+      "meeting-detected",
+      (e) => {
+        setDetected(e.payload);
+      },
+    ).then((fn) => {
       unDetected = fn;
     });
     listen("meeting-detection-cancelled", () => setDetected(null)).then((fn) => {
@@ -512,10 +523,48 @@ export default function App() {
     };
   }, []);
 
-  // Silence auto-stop: the backend watchdog emits `meeting-auto-stop` when a
-  // recording has been silent past the configured threshold (a meeting nobody
-  // stopped). The FRONT-END owns the real stop path, so we call it here (guarded
-  // against a duplicate stop) and show a dismissible info banner.
+  // The backend starts a grace-period countdown only after every available
+  // physical audio track has remained quiet for the configured threshold.
+  // Sound resuming (or a Keep action acknowledged by the backend) retracts it.
+  useEffect(() => {
+    let unWarning: (() => void) | undefined;
+    let unCleared: (() => void) | undefined;
+    let cancelled = false;
+    Promise.all([
+      listen<{ meetingId: string; countdownSeconds: number }>(
+        "meeting-silence-warning",
+        (e) => {
+          if (stoppedMeetingsRef.current.has(e.payload.meetingId)) return;
+          setSilenceWarning({
+            meetingId: e.payload.meetingId,
+            deadlineMs: Date.now() + Math.max(0, e.payload.countdownSeconds) * 1000,
+          });
+        },
+      ),
+      listen<{ meetingId: string }>("meeting-silence-cleared", (e) => {
+        setSilenceWarning((current) =>
+          current?.meetingId === e.payload.meetingId ? null : current,
+        );
+      }),
+    ]).then(([warning, cleared]) => {
+      if (cancelled) {
+        warning();
+        cleared();
+      } else {
+        unWarning = warning;
+        unCleared = cleared;
+      }
+    });
+    return () => {
+      cancelled = true;
+      unWarning?.();
+      unCleared?.();
+    };
+  }, []);
+
+  // Silence auto-stop: after the warning countdown expires with no new sound,
+  // the FRONT-END owns the real stop path. Guard duplicate events/clicks and
+  // show a dismissible completion banner.
   useEffect(() => {
     let un: (() => void) | undefined;
     let cancelled = false;
@@ -523,8 +572,14 @@ export default function App() {
       const { meetingId } = e.payload;
       if (stoppedMeetingsRef.current.has(meetingId)) return;
       stoppedMeetingsRef.current.add(meetingId);
-      void api.stopMeetingRecording(meetingId).catch(() => {});
-      setAutoStopNotice("录音已因长时间无声自动停止。");
+      setSilenceWarning(null);
+      void api
+        .stopMeetingRecording(meetingId)
+        .then(() => setAutoStopNotice("录音已因长时间无声自动停止。"))
+        .catch((error) => {
+          stoppedMeetingsRef.current.delete(meetingId);
+          setError(`自动结束会议失败：${String(error)}`);
+        });
     }).then((fn) => {
       if (cancelled) fn();
       else un = fn;
@@ -626,7 +681,7 @@ export default function App() {
   useEffect(() => {
     let unSuggested: (() => void) | undefined;
     let unStopCancelled: (() => void) | undefined;
-    listen<{ bundleId: string; meetingId: string | null }>(
+    listen<{ bundleId: string; meetingId: string | null; displayName: string }>(
       "meeting-detection-stop-suggested",
       (e) => {
         setStopSuggested(e.payload);
@@ -733,11 +788,13 @@ export default function App() {
       {detected && (
         <DetectionPrompt
           bundleId={detected.bundleId}
-          onStart={() =>
+          appClass={detected.appClass}
+          displayName={detected.displayName}
+          onStart={(captureSystemAudio) =>
             void (async () => {
               setDetected(null);
               try {
-                await api.acceptMeetingDetection();
+                await api.acceptMeetingDetection(captureSystemAudio);
                 setTab("meeting");
               } catch (e) {
                 setError(String(e));
@@ -759,6 +816,7 @@ export default function App() {
       {stopSuggested && (
         <StopSuggestPrompt
           bundleId={stopSuggested.bundleId}
+          displayName={stopSuggested.displayName}
           onStop={() =>
             void (async () => {
               setStopSuggested(null);
@@ -779,6 +837,27 @@ export default function App() {
               }
             })()
           }
+        />
+      )}
+      {silenceWarning && (
+        <SilenceStopPrompt
+          deadlineMs={silenceWarning.deadlineMs}
+          onKeep={() => {
+            const { meetingId } = silenceWarning;
+            void api.continueMeetingAfterSilence(meetingId).catch((e) =>
+              setError(String(e)),
+            );
+          }}
+          onStop={() => {
+            const { meetingId } = silenceWarning;
+            setSilenceWarning(null);
+            if (stoppedMeetingsRef.current.has(meetingId)) return;
+            stoppedMeetingsRef.current.add(meetingId);
+            void api.stopMeetingRecording(meetingId).catch((e) => {
+              stoppedMeetingsRef.current.delete(meetingId);
+              setError(String(e));
+            });
+          }}
         />
       )}
       {/* System titlebar (Visible) — native macOS drag / traffic lights */}
@@ -1212,41 +1291,24 @@ export default function App() {
   );
 }
 
-// Friendly display name for a detected meeting app's bundle id. Falls back to
-// the raw id so an unmapped-but-allow-listed app still reads sensibly. Keys are
-// lowercase and the lookup lowercases too: the backend passes the OS-reported
-// bundle id, whose casing varies (e.g. `com.apple.FaceTime`).
-const MEETING_APP_LABELS: Record<string, string> = {
-  "us.zoom.xos": "Zoom",
-  "com.microsoft.teams": "Microsoft Teams",
-  "com.microsoft.teams2": "Microsoft Teams",
-  "com.tinyspeck.slackmacgap": "Slack",
-  "com.apple.facetime": "FaceTime",
-  "com.cisco.webexmeetingsapp": "Webex",
-  "com.webex.meetingmanager": "Webex",
-  "com.hnc.discord": "Discord",
-  "com.skype.skype": "Skype",
-  "com.microsoft.skypeforbusiness": "Skype for Business",
-  "com.google.meetings": "Google Meet",
-};
-
-function meetingAppLabel(bundleId: string): string {
-  return MEETING_APP_LABELS[bundleId.toLowerCase()] || bundleId;
-}
-
 // App-level, non-blocking prompt shown when the backend detects likely meeting
 // audio activity. It never records on its own — the user must click "开始记录".
 // Accessibility: labelled by its title, focus moves to the primary action on
 // open, and Esc dismisses (same as clicking 忽略).
 function DetectionPrompt({
   bundleId,
+  appClass,
+  displayName,
   onStart,
   onDismiss,
 }: {
   bundleId: string;
-  onStart: () => void;
+  appClass: string;
+  displayName: string;
+  onStart: (captureSystemAudio: boolean) => void;
   onDismiss: () => void;
 }) {
+  const isBrowser = appClass === "browser";
   const startRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
     startRef.current?.focus();
@@ -1269,13 +1331,36 @@ function DetectionPrompt({
           检测到可能的会议
         </span>
         <span id="detection-prompt-sub" className="detection-prompt-sub">
-          {meetingAppLabel(bundleId)} 正在使用麦克风。是否开始记录本次会议？
+          {isBrowser
+            ? `${displayName || bundleId} 正在使用麦克风。macOS 只能按整个浏览器录音，无法区分标签页；其他标签页的音乐或视频也会被录入。`
+            : `${displayName || bundleId} 正在使用麦克风。是否开始记录本次会议？`}
         </span>
       </div>
       <div className="detection-prompt-actions">
-        <button type="button" className="btn" ref={startRef} onClick={onStart}>
-          开始记录
-        </button>
+        {isBrowser ? (
+          <>
+            <button
+              type="button"
+              className="btn"
+              ref={startRef}
+              onClick={() => onStart(true)}
+            >
+              录制整个浏览器声音
+            </button>
+            <button type="button" className="btn ghost" onClick={() => onStart(false)}>
+              只录麦克风
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            className="btn"
+            ref={startRef}
+            onClick={() => onStart(true)}
+          >
+            开始记录
+          </button>
+        )}
         <button type="button" className="btn ghost" onClick={onDismiss}>
           忽略
         </button>
@@ -1292,10 +1377,12 @@ function DetectionPrompt({
 // never stops a recording the user wanted to keep.
 function StopSuggestPrompt({
   bundleId,
+  displayName,
   onStop,
   onKeep,
 }: {
   bundleId: string;
+  displayName: string;
   onStop: () => void;
   onKeep: () => void;
 }) {
@@ -1321,7 +1408,7 @@ function StopSuggestPrompt({
           会议似乎已结束
         </span>
         <span id="stop-suggest-sub" className="detection-prompt-sub">
-          {meetingAppLabel(bundleId)} 已不再使用麦克风。是否停止录音？
+          {displayName || bundleId} 已不再使用麦克风。是否停止录音？
         </span>
       </div>
       <div className="detection-prompt-actions">
@@ -1329,6 +1416,57 @@ function StopSuggestPrompt({
           停止录音
         </button>
         <button type="button" className="btn ghost" ref={keepRef} onClick={onKeep}>
+          继续录制
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Non-modal right-side notice for the unattended-recording watchdog. It never
+// steals keyboard focus from the user's meeting app; the backend sample clock,
+// not this display timer, decides whether the recording actually stops.
+function SilenceStopPrompt({
+  deadlineMs,
+  onStop,
+  onKeep,
+}: {
+  deadlineMs: number;
+  onStop: () => void;
+  onKeep: () => void;
+}) {
+  const remainingNow = () => Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1000));
+  const [remaining, setRemaining] = useState(remainingNow);
+  useEffect(() => {
+    setRemaining(remainingNow());
+    const timer = window.setInterval(() => setRemaining(remainingNow()), 250);
+    return () => window.clearInterval(timer);
+  }, [deadlineMs]);
+
+  return (
+    <div
+      className="detection-prompt meeting-silence-prompt"
+      role="alert"
+      aria-live="assertive"
+      aria-atomic="true"
+      aria-labelledby="meeting-silence-title"
+      aria-describedby="meeting-silence-sub"
+    >
+      <div className="detection-prompt-body">
+        <span id="meeting-silence-title" className="detection-prompt-title">
+          持续检测不到声音
+        </span>
+        <span id="meeting-silence-sub" className="detection-prompt-sub">
+          {remaining > 0
+            ? `${remaining} 秒后将自动结束会议录音。`
+            : "正在结束会议录音…"}
+        </span>
+      </div>
+      <div className="detection-prompt-actions">
+        <button type="button" className="btn danger" onClick={onStop}>
+          立即结束
+        </button>
+        <button type="button" className="btn ghost" onClick={onKeep}>
           继续录制
         </button>
       </div>
@@ -2109,6 +2247,8 @@ function SettingsPanel({
   const [persistEditEvidenceText, setPersistEditEvidenceText] = useState(false);
   const [detectionEnabled, setDetectionEnabled] = useState(false);
   const [detectionCapable, setDetectionCapable] = useState(false);
+  const [meetingApps, setMeetingApps] = useState<MeetingAppCatalog | null>(null);
+  const [meetingAppsSaving, setMeetingAppsSaving] = useState(false);
   // Meeting watchdog settings (silence auto-stop minutes, calendar-end reminder).
   const [silenceAutoStopMinutes, setSilenceAutoStopMinutes] = useState(15);
   const [calendarEndReminder, setCalendarEndReminder] = useState(true);
@@ -2202,6 +2342,11 @@ function SettingsPanel({
           /* detection status is best-effort */
         }
         try {
+          setMeetingApps(await api.getMeetingAppCatalog());
+        } catch {
+          /* catalog errors are surfaced when the user explicitly reloads/saves */
+        }
+        try {
           const wd = await api.getMeetingWatchdogConfig();
           setSilenceAutoStopMinutes(wd.silenceAutoStopMinutes);
           setCalendarEndReminder(wd.calendarEndReminder);
@@ -2224,6 +2369,27 @@ function SettingsPanel({
     setCleanup(
       cleanupDrafts.current[activeProfile] || activeCorrector.cleanup || "medium",
     );
+  }
+
+  async function saveMeetingApps() {
+    if (!meetingApps) return;
+    setMeetingAppsSaving(true);
+    onError(null);
+    try {
+      const sanitized: MeetingAppCatalog = {
+        ...meetingApps,
+        applications: meetingApps.applications.map((entry) => ({
+          ...entry,
+          name: entry.name.trim(),
+          bundle_ids: entry.bundle_ids.map((id) => id.trim()).filter(Boolean),
+        })),
+      };
+      setMeetingApps(await api.saveMeetingAppCatalog(sanitized));
+    } catch (error) {
+      onError(`保存会议应用配置失败：${String(error)}`);
+    } finally {
+      setMeetingAppsSaving(false);
+    }
   }
 
   async function save() {
@@ -2872,8 +3038,7 @@ function SettingsPanel({
       <section className="card settings-section">
         <h2>会议自动检测</h2>
         <p className="muted-text">
-          开启后，Lumen 会留意 Zoom、Teams、Slack、FaceTime
-          等会议 App 的麦克风活动，并在检测到时<strong>弹窗提示</strong>——
+          开启后，Lumen 会按下方的外置应用目录留意会议 App 与浏览器的麦克风活动，并在检测到时<strong>弹窗提示</strong>——
           仅在你点击「开始记录」后才会录音，绝不自动录制。默认关闭。
         </p>
         <div className="form-row">
@@ -2908,12 +3073,217 @@ function SettingsPanel({
         )}
 
         <hr className="settings-divider" />
+        <h3>会议 / 录制应用目录</h3>
         <p className="muted-text">
-          看护正在进行的录音：长时间无人说话时自动停止，或在关联日历会议结束时提醒你停止。
+          这份列表来自用户数据目录中的独立 TOML 文件，不编译进客户端。检测和系统声音录制都会立即使用保存后的列表；浏览器即使允许检测，仍会在每次录制前提示“整个浏览器”范围。
+        </p>
+        {meetingApps ? (
+          <>
+            <p className="muted-text meeting-app-config-path">
+              配置文件：<code>{meetingApps.path}</code>
+            </p>
+            {meetingApps.loadError && (
+              <p className="banner error" role="alert">
+                外置配置载入失败：{meetingApps.loadError}。请修正 TOML 后点击“从文件重新载入”。
+              </p>
+            )}
+            <div className="meeting-app-config-list">
+              {meetingApps.applications.map((entry, index) => (
+                <div className="meeting-app-config-row" key={index}>
+                  <input
+                    className="input"
+                    aria-label={`应用 ${index + 1} 名称`}
+                    value={entry.name}
+                    disabled={meetingAppsSaving}
+                    onChange={(event) =>
+                      setMeetingApps((current) =>
+                        current
+                          ? {
+                              ...current,
+                              applications: current.applications.map((item, itemIndex) =>
+                                itemIndex === index
+                                  ? { ...item, name: event.target.value }
+                                  : item,
+                              ),
+                            }
+                          : current,
+                      )
+                    }
+                  />
+                  <select
+                    className="select"
+                    aria-label={`应用 ${index + 1} 类型`}
+                    value={entry.kind}
+                    disabled={meetingAppsSaving}
+                    onChange={(event) => {
+                      const kind = event.target.value === "browser" ? "browser" : "meeting";
+                      setMeetingApps((current) =>
+                        current
+                          ? {
+                              ...current,
+                              applications: current.applications.map((item, itemIndex) =>
+                                itemIndex === index ? { ...item, kind } : item,
+                              ),
+                            }
+                          : current,
+                      );
+                    }}
+                  >
+                    <option value="meeting">会议 App</option>
+                    <option value="browser">浏览器</option>
+                  </select>
+                  <textarea
+                    className="input meeting-app-bundle-ids"
+                    aria-label={`应用 ${index + 1} Bundle IDs`}
+                    rows={Math.max(1, Math.min(3, entry.bundle_ids.length))}
+                    value={entry.bundle_ids.join("\n")}
+                    disabled={meetingAppsSaving}
+                    placeholder="每行一个 bundle ID"
+                    onChange={(event) => {
+                      const bundle_ids = event.target.value.split("\n");
+                      setMeetingApps((current) =>
+                        current
+                          ? {
+                              ...current,
+                              applications: current.applications.map((item, itemIndex) =>
+                                itemIndex === index ? { ...item, bundle_ids } : item,
+                              ),
+                            }
+                          : current,
+                      );
+                    }}
+                  />
+                  <label className="muted-text meeting-app-config-toggle">
+                    <input
+                      type="checkbox"
+                      checked={entry.detect}
+                      disabled={meetingAppsSaving}
+                      onChange={(event) =>
+                        setMeetingApps((current) =>
+                          current
+                            ? {
+                                ...current,
+                                applications: current.applications.map((item, itemIndex) =>
+                                  itemIndex === index
+                                    ? { ...item, detect: event.target.checked }
+                                    : item,
+                                ),
+                              }
+                            : current,
+                        )
+                      }
+                    />
+                    检测
+                  </label>
+                  {entry.kind === "browser" ? (
+                    <span className="muted-text meeting-app-config-toggle">录制时询问</span>
+                  ) : (
+                    <label className="muted-text meeting-app-config-toggle">
+                      <input
+                        type="checkbox"
+                        checked={entry.capture}
+                        disabled={meetingAppsSaving}
+                        onChange={(event) =>
+                          setMeetingApps((current) =>
+                            current
+                              ? {
+                                  ...current,
+                                  applications: current.applications.map((item, itemIndex) =>
+                                    itemIndex === index
+                                      ? { ...item, capture: event.target.checked }
+                                      : item,
+                                  ),
+                                }
+                              : current,
+                          )
+                        }
+                      />
+                      录制声音
+                    </label>
+                  )}
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={meetingAppsSaving}
+                    onClick={() =>
+                      setMeetingApps((current) =>
+                        current
+                          ? {
+                              ...current,
+                              applications: current.applications.filter(
+                                (_, itemIndex) => itemIndex !== index,
+                              ),
+                            }
+                          : current,
+                      )
+                    }
+                  >
+                    删除
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="actions meeting-app-config-actions">
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={meetingAppsSaving}
+                onClick={() =>
+                  setMeetingApps((current) =>
+                    current
+                      ? {
+                          ...current,
+                          applications: [
+                            ...current.applications,
+                            {
+                              name: "新会议应用",
+                              kind: "meeting",
+                              bundle_ids: [""],
+                              detect: true,
+                              capture: true,
+                            },
+                          ],
+                        }
+                      : current,
+                  )
+                }
+              >
+                新增应用
+              </button>
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={meetingAppsSaving}
+                onClick={() =>
+                  void api
+                    .reloadMeetingAppCatalog()
+                    .then(setMeetingApps)
+                    .catch((error) => onError(`重新载入会议应用配置失败：${String(error)}`))
+                }
+              >
+                从文件重新载入
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={meetingAppsSaving}
+                onClick={() => void saveMeetingApps()}
+              >
+                {meetingAppsSaving ? "保存中…" : "保存应用目录"}
+              </button>
+            </div>
+          </>
+        ) : (
+          <p className="muted-text">会议应用目录尚未载入。</p>
+        )}
+
+        <hr className="settings-divider" />
+        <p className="muted-text">
+          看护正在进行的录音：持续检测不到会议声音时先提醒，20 秒后自动停止；关联日历会议结束时也会提醒你。
         </p>
         <div className="form-row">
           <label className="form-label" htmlFor="silence-auto-stop">
-            无声自动停止（分钟），0 关闭
+            无声提醒阈值（分钟），0 关闭
           </label>
           <input
             id="silence-auto-stop"

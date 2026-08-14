@@ -11,6 +11,7 @@ import {
 } from "./meetingModels";
 import { Icon } from "./Icons";
 import { diarGuidance, isNoLlmMarker } from "./meetingGuidance";
+import { isMeaningfulMeetingTrim } from "./meetingTrim";
 import { buildSpeakerColorMap, colorForSpeaker } from "./speakerColors";
 import type {
   ActionItem,
@@ -1883,6 +1884,285 @@ function ConfirmDialog({
   );
 }
 
+/** A deliberately small editor for the common failure mode: recording starts
+ * too early or is left running too long. It keeps one continuous interval and
+ * makes the destructive consequence explicit; playback remains the source of
+ * truth for choosing the two boundaries. */
+function MeetingTrimDialog({
+  duration,
+  currentTime,
+  audioRef,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  duration: number;
+  currentTime: number;
+  audioRef: MutableRefObject<HTMLAudioElement | null>;
+  busy: boolean;
+  onConfirm: (start: number, end: number) => void;
+  onCancel: () => void;
+}) {
+  const total = Math.max(0, duration);
+  const [start, setStart] = useState(0);
+  const [end, setEnd] = useState(total);
+  const [playhead, setPlayhead] = useState(currentTime);
+  const [playing, setPlaying] = useState(false);
+  const previewingRef = useRef(false);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const cancelRef = useRef<HTMLButtonElement | null>(null);
+  const kept = Math.max(0, end - start);
+  const discarded = Math.max(0, start) + Math.max(0, total - end);
+  const changed = isMeaningfulMeetingTrim(start, end, total);
+  const valid = kept >= 1 && changed;
+
+  const stopPreview = useCallback(() => {
+    if (!previewingRef.current) return;
+    previewingRef.current = false;
+    audioRef.current?.pause();
+  }, [audioRef]);
+
+  useEffect(() => {
+    const previousFocus =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frame = window.requestAnimationFrame(() => cancelRef.current?.focus());
+    return () => {
+      window.cancelAnimationFrame(frame);
+      previousFocus?.focus();
+    };
+  }, []);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const stopAtBoundary = () => {
+      setPlayhead(audio.currentTime);
+      if (previewingRef.current && audio.currentTime >= end) stopPreview();
+    };
+    const markPlaying = () => setPlaying(true);
+    const markPaused = () => setPlaying(false);
+    audio.addEventListener("timeupdate", stopAtBoundary);
+    audio.addEventListener("play", markPlaying);
+    audio.addEventListener("pause", markPaused);
+    audio.addEventListener("ended", markPaused);
+    setPlayhead(audio.currentTime);
+    setPlaying(!audio.paused);
+    return () => {
+      audio.removeEventListener("timeupdate", stopAtBoundary);
+      audio.removeEventListener("play", markPlaying);
+      audio.removeEventListener("pause", markPaused);
+      audio.removeEventListener("ended", markPaused);
+      stopPreview();
+    };
+  }, [audioRef, end, stopPreview]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [busy, onCancel]);
+
+  const preview = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio || kept < 1) return;
+    audio.currentTime = start;
+    setPlayhead(start);
+    previewingRef.current = true;
+    void audio.play().catch(() => {
+      previewingRef.current = false;
+    });
+  }, [audioRef, kept, start]);
+
+  const togglePlayback = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    previewingRef.current = false;
+    if (audio.paused) void audio.play().catch(() => {});
+    else audio.pause();
+  }, [audioRef]);
+
+  const usePlayheadForStart = () => {
+    setStart(Math.min(Math.max(0, playhead), Math.max(0, end - 1)));
+  };
+  const usePlayheadForEnd = () => {
+    setEnd(Math.max(Math.min(total, playhead), Math.min(total, start + 1)));
+  };
+
+  return (
+    <div
+      className="meeting-modal-overlay"
+      role="presentation"
+      onClick={() => {
+        if (!busy) onCancel();
+      }}
+    >
+      <div
+        ref={dialogRef}
+        className="card meeting-trim"
+        role="dialog"
+        aria-modal="true"
+        aria-label="剪辑会议音频"
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          if (event.key !== "Tab") return;
+          const focusable = Array.from(
+            dialogRef.current?.querySelectorAll<HTMLElement>(
+              'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+            ) ?? [],
+          );
+          if (focusable.length === 0) {
+            event.preventDefault();
+            return;
+          }
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        }}
+      >
+        <div className="meeting-modal-head">
+          <div>
+            <h3 className="meeting-modal-title">保留会议有效片段</h3>
+            <p className="meeting-trim-intro muted-text">
+              选择一段连续内容。范围外的音频会被永久删除，逐字稿和纪要随后重新生成。
+            </p>
+          </div>
+          <button
+            type="button"
+            className="icon-btn meeting-modal-close"
+            aria-label="关闭"
+            disabled={busy}
+            onClick={onCancel}
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="meeting-trim-summary">
+          <span>
+            保留 <strong>{formatDuration(kept)}</strong>
+          </span>
+          <span className="muted-text">
+            删除 {formatClock(discarded)} · 原始 {formatDuration(total)}
+          </span>
+        </div>
+
+        <div className="meeting-trim-playback">
+          <button
+            type="button"
+            className="btn ghost small"
+            disabled={busy}
+            onClick={togglePlayback}
+          >
+            {playing ? "暂停" : "播放"}
+          </button>
+          <span className="meeting-audio-time">{formatClock(playhead)}</span>
+          <input
+            type="range"
+            min={0}
+            max={total}
+            step={0.1}
+            value={Math.min(total, Math.max(0, playhead))}
+            disabled={busy}
+            aria-label="剪辑播放位置"
+            onChange={(event) => {
+              const next = Number(event.currentTarget.value);
+              setPlayhead(next);
+              previewingRef.current = false;
+              if (audioRef.current) audioRef.current.currentTime = next;
+            }}
+          />
+          <span className="meeting-audio-time">{formatClock(total)}</span>
+        </div>
+
+        <label className="meeting-trim-boundary">
+          <span>
+            开头 <strong>{formatClock(start)}</strong>
+          </span>
+          <button
+            type="button"
+            className="btn ghost small"
+            disabled={busy}
+            onClick={usePlayheadForStart}
+          >
+            设为当前播放位置
+          </button>
+          <input
+            type="range"
+            min={0}
+            max={Math.max(0, end - 1)}
+            step={0.1}
+            value={Math.min(start, Math.max(0, end - 1))}
+            disabled={busy}
+            aria-label="保留片段开头"
+            onChange={(event) => setStart(Number(event.currentTarget.value))}
+          />
+        </label>
+
+        <label className="meeting-trim-boundary">
+          <span>
+            结尾 <strong>{formatClock(end)}</strong>
+          </span>
+          <button
+            type="button"
+            className="btn ghost small"
+            disabled={busy}
+            onClick={usePlayheadForEnd}
+          >
+            设为当前播放位置
+          </button>
+          <input
+            type="range"
+            min={Math.min(total, start + 1)}
+            max={total}
+            step={0.1}
+            value={Math.max(end, Math.min(total, start + 1))}
+            disabled={busy}
+            aria-label="保留片段结尾"
+            onChange={(event) => setEnd(Number(event.currentTarget.value))}
+          />
+        </label>
+
+        <div className="meeting-trim-actions">
+          <button
+            type="button"
+            className="btn ghost small"
+            disabled={kept < 1 || busy}
+            onClick={preview}
+          >
+            试听保留片段
+          </button>
+          <span className="meeting-trim-spacer" />
+          <button
+            ref={cancelRef}
+            type="button"
+            className="btn ghost small"
+            disabled={busy}
+            onClick={onCancel}
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            className="btn danger small"
+            disabled={!valid || busy}
+            onClick={() => onConfirm(start, end)}
+          >
+            {busy ? "正在剪辑…" : "删除范围外内容"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---- detail (transcript-first; minutes as a left index) -----------------
 // dogfood revision (docs/MEETING_M4_UX.md, 2026-07-29): the transcript is the
 // default, always-visible main area; the structured minutes collapse into a
@@ -1906,6 +2186,8 @@ function MeetingDetailView({
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [trimOpen, setTrimOpen] = useState(false);
+  const [trimming, setTrimming] = useState(false);
   // Whether the full-minutes reading overlay is open.
   const [fullOpen, setFullOpen] = useState(false);
   // A jump request from a minutes index item → transcript. The token forces the
@@ -2107,6 +2389,21 @@ function MeetingDetailView({
     }
   }
 
+  async function doTrim(startSeconds: number, endSeconds: number) {
+    setTrimming(true);
+    onError(null);
+    audioRef.current?.pause();
+    try {
+      await api.trimMeetingAudio(meetingId, startSeconds, endSeconds);
+      setTrimOpen(false);
+      await load();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setTrimming(false);
+    }
+  }
+
   const meeting = detail?.meeting;
   const speakerCount = detail?.speakers.length ?? 0;
 
@@ -2184,6 +2481,16 @@ function MeetingDetailView({
           )}
         </div>
         <div className="meeting-detail-actions">
+          {audioSrc && (
+            <button
+              type="button"
+              className="btn ghost small"
+              disabled={trimming}
+              onClick={() => setTrimOpen(true)}
+            >
+              剪辑音频
+            </button>
+          )}
           <div className="meeting-export">
             <button
               type="button"
@@ -2284,6 +2591,16 @@ function MeetingDetailView({
             jumpToSource(src);
           }}
           onClose={() => setFullOpen(false)}
+        />
+      )}
+      {trimOpen && detail?.meeting.duration_seconds && audioSrc && (
+        <MeetingTrimDialog
+          duration={detail.meeting.duration_seconds}
+          currentTime={currentTime}
+          audioRef={audioRef}
+          busy={trimming}
+          onConfirm={(start, end) => void doTrim(start, end)}
+          onCancel={() => setTrimOpen(false)}
         />
       )}
     </div>

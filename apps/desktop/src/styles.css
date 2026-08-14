@@ -1646,6 +1646,56 @@ select.input:focus {
   margin-top: 0;
 }
 
+.meeting-app-config-path code {
+  overflow-wrap: anywhere;
+}
+
+.meeting-app-config-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.meeting-app-config-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(110px, 0.55fr) minmax(190px, 1.5fr) auto auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card-soft);
+}
+
+.meeting-app-bundle-ids {
+  min-height: 38px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+}
+
+.meeting-app-config-toggle {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.meeting-app-config-actions {
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+@media (max-width: 980px) {
+  .meeting-app-config-row {
+    grid-template-columns: 1fr 140px;
+  }
+
+  .meeting-app-bundle-ids {
+    grid-column: 1 / -1;
+  }
+}
+
 /* ── Onboarding wizard ─────────────────────────────────── */
 /* Quiet-utility modal: solid dark scrim (no frosted glass) + bordered card. */
 
@@ -2764,6 +2814,87 @@ button.meeting-index-item:hover {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+/* Post-meeting destructive head/tail trim. The editor intentionally keeps one
+   continuous range: two clear boundaries instead of a full nonlinear editor. */
+.meeting-trim {
+  width: min(620px, 100%);
+  align-self: center;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+
+.meeting-trim-intro {
+  margin: 6px 0 0;
+  max-width: 52ch;
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+.meeting-trim-summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 16px 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--card-soft);
+  font-size: 0.86rem;
+}
+
+.meeting-trim-playback {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0 4px;
+}
+
+.meeting-trim-playback input[type="range"] {
+  flex: 1;
+  min-width: 80px;
+  accent-color: var(--accent);
+}
+
+.meeting-trim-boundary {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 14px;
+  font-size: 0.86rem;
+}
+
+.meeting-trim-boundary input[type="range"] {
+  grid-column: 1 / -1;
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.meeting-trim-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.meeting-trim-spacer {
+  flex: 1;
+}
+
+@media (max-width: 560px) {
+  .meeting-trim-summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .meeting-trim-actions {
+    flex-wrap: wrap;
+  }
+
+  .meeting-trim-spacer {
+    display: none;
+  }
 }
 
 /* Detail-header title editing. */
@@ -3902,6 +4033,23 @@ button.meeting-seg-text.seekable:hover {
   display: flex;
   gap: 8px;
   flex-shrink: 0;
+}
+
+/* Prolonged-silence countdown behaves like a macOS notification: visible from
+   every app tab, anchored at the upper right, and never steals keyboard focus. */
+.meeting-silence-prompt {
+  left: auto;
+  right: 16px;
+  transform: none;
+  max-width: min(460px, calc(100vw - 32px));
+}
+
+@media (max-width: 620px) {
+  .meeting-silence-prompt {
+    left: 16px;
+    right: 16px;
+    max-width: none;
+  }
 }
 
 /* ---- Voiceprint / identity manager (声纹管理) ------------------------- */
