@@ -13,6 +13,7 @@ export type IconName =
   | "overview"
   | "play"
   | "stop"
+  | "check"
   | "copy"
   | "copy-check"
   | "refresh"
@@ -91,6 +92,7 @@ const PATHS: Record<IconName, ReactNode> = {
   ),
   play: <path d="M8 5.5v13l11-6.5z" />,
   stop: <rect x="7.5" y="7.5" width="9" height="9" rx="2" />,
+  check: <path d="M4.5 12.5l5 5L19.5 7" />,
   copy: (
     <>
       <rect x="9" y="9" width="11" height="11" rx="2.4" />

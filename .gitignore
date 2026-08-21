@@ -112,3 +112,4 @@ Thumbs.db
 # Fetched at build time by apps/desktop/scripts/fetch-plex-fonts.mjs (not committed — repo forbids binaries)
 apps/desktop/public/fonts/
 apps/desktop/src/assets/fonts/
+apps/desktop/src/assets/sounds/

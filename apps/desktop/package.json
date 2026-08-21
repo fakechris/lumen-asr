@@ -6,9 +6,9 @@
   "type": "module",
   "scripts": {
     "fonts": "node scripts/fetch-plex-fonts.mjs",
-    "predev": "node scripts/fetch-plex-fonts.mjs",
+    "predev": "node scripts/fetch-plex-fonts.mjs && node scripts/gen-sounds.mjs",
     "dev": "vite",
-    "prebuild": "node scripts/fetch-plex-fonts.mjs",
+    "prebuild": "node scripts/fetch-plex-fonts.mjs && node scripts/gen-sounds.mjs",
     "build": "tsc -b && vite build",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "preview": "vite preview",

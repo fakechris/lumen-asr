@@ -933,7 +933,7 @@ pub async fn stop_and_transcribe_inner(
         corrector_projection: captured_context,
         late_archive: mut late_context_archive,
     } = attach_frozen_context(state, active_context.as_ref(), &mut attempt).await;
-    let capture = match capture_result {
+    let mut capture = match capture_result {
         Ok(capture) => capture,
         Err(error) => {
             let error = error.to_string();
@@ -953,6 +953,24 @@ pub async fn stop_and_transcribe_inner(
             return Err(error);
         }
     };
+    // VAD: drop the silent tail so ASR does not scan dead air (300ms padding
+    // kept so the last syllable is never clipped).
+    if cfg.vad.enabled && cfg.vad.trim_trailing {
+        let cut = lumen_asr::trim_trailing_silence(
+            &capture.samples,
+            capture.sample_rate,
+            cfg.vad.end_threshold,
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        );
+        if cut < capture.samples.len() {
+            tracing::info!(
+                dropped_samples = capture.samples.len() - cut,
+                "vad trimmed trailing silence"
+            );
+            capture.samples.truncate(cut);
+        }
+    }
     let num_samples = capture.samples.len();
     let sample_rate = capture.sample_rate;
     let duration_ms = if sample_rate > 0 {
@@ -2146,6 +2164,48 @@ fn finish_with_transient_fallback(app: &AppHandle, outcome: TranscribeOutcome) {
 }
 
 /// Start recording if idle (push-to-talk press / toggle start).
+/// When `[vad] enabled`, end the dictation after a sustained silent stretch.
+/// Uses the same stop path as a hotkey release — `dictation_stop` is
+/// phase-guarded, so a racing manual stop wins cleanly.
+fn spawn_vad_autostop(app: &AppHandle) {
+    let vad = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .ok()
+        .map(|config| config.vad.clone());
+    let Some(vad) = vad else { return };
+    if !vad.enabled {
+        return;
+    }
+    if vad.mode != "rms" {
+        tracing::warn!(mode = %vad.mode, "vad mode not implemented, falling back to rms");
+    }
+    let mut watcher = lumen_asr::SilenceAutoStop::new(
+        vad.start_threshold,
+        vad.end_threshold,
+        Duration::from_millis(vad.silence_timeout_ms.clamp(300, 30_000)),
+    );
+    let app = app.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            let state = app.state::<AppState>();
+            let Some(rms) = state.audio.latest_rms() else {
+                break; // recording already ended (hotkey release, error, …)
+            };
+            if watcher.update(rms, Instant::now()) == lumen_asr::VadAction::AutoStop {
+                tracing::info!("vad silence timeout — auto-stopping dictation");
+                if let Err(error) = dictation_stop(app.clone()).await {
+                    tracing::warn!(error = %error, "vad auto-stop failed");
+                }
+                break;
+            }
+        }
+    });
+}
+
 pub async fn dictation_start(app: AppHandle) -> Result<(), String> {
     dictation_start_with_intent(app, IntentSpec::Default).await
 }
@@ -2221,6 +2281,7 @@ pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> 
                     target_language: target_lang,
                 },
             );
+            spawn_vad_autostop(&app);
             Ok(())
         }
         Err(e) => {

@@ -25,6 +25,7 @@ import {
   formatAsrEngineLabel,
 } from "./fallbackPresentation";
 import lumenMark from "./assets/product-icons/lumen-asr.svg";
+import { initSoundFeedback, setSoundsEnabled } from "./sound";
 import type {
   AsrStatus,
   AudioDevice,
@@ -443,6 +444,11 @@ export default function App() {
 
   // Global hotkey / capsule events
   useEffect(() => {
+    initSoundFeedback();
+    void api
+      .getUiConfig()
+      .then((c) => setSoundsEnabled(c.sounds))
+      .catch(() => {});
     let un: (() => void) | undefined;
     listen<{
       phase: string;
@@ -2280,6 +2286,8 @@ function SettingsPanel({
   const [postPaste, setPostPaste] = useState(true);
   const [postPasteSecs, setPostPasteSecs] = useState(20);
   const [persistEditEvidenceText, setPersistEditEvidenceText] = useState(false);
+  const [soundsEnabledUi, setSoundsEnabledUi] = useState(true);
+  const [savingSounds, setSavingSounds] = useState(false);
   const [detectionEnabled, setDetectionEnabled] = useState(false);
   const [detectionCapable, setDetectionCapable] = useState(false);
   const [meetingApps, setMeetingApps] = useState<MeetingAppCatalog | null>(null);
@@ -2369,6 +2377,13 @@ function SettingsPanel({
         setPostPaste(ln.postPasteCapture);
         setPostPasteSecs(ln.postPasteSeconds);
         setPersistEditEvidenceText(ln.persistEditEvidenceText);
+        try {
+          const ui = await api.getUiConfig();
+          setSoundsEnabledUi(ui.sounds);
+          setSoundsEnabled(ui.sounds);
+        } catch {
+          /* ui config is best-effort */
+        }
         try {
           const det = await api.getMeetingDetection();
           setDetectionEnabled(det.enabled);
@@ -2787,6 +2802,38 @@ function SettingsPanel({
         }}
         onSaved={onSaved}
       />
+
+      <section className="card settings-section">
+        <h2>声音反馈</h2>
+        <div className="form-row">
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={soundsEnabledUi}
+              disabled={busy || savingSounds}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setSoundsEnabledUi(next);
+                void (async () => {
+                  setSavingSounds(true);
+                  try {
+                    const saved = await api.saveUiConfig({ sounds: next });
+                    setSoundsEnabledUi(saved.sounds);
+                    setSoundsEnabled(saved.sounds);
+                    onSaved();
+                  } catch (err) {
+                    setSoundsEnabledUi(!next);
+                    onError(String(err));
+                  } finally {
+                    setSavingSounds(false);
+                  }
+                })();
+              }}
+            />{" "}
+            听写开始 / 完成 / 出错时播放提示音
+          </label>
+        </div>
+      </section>
 
       <section className="card settings-section">
         <h2>翻译快捷键</h2>
