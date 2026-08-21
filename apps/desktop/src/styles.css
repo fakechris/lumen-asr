@@ -2045,6 +2045,21 @@ select.input:focus {
   border-color: color-mix(in srgb, var(--ok) 55%, transparent);
 }
 
+.onboard-perm-why {
+  margin: 0 0 10px;
+  font-size: 0.86rem;
+}
+
+.onboard-tech-details {
+  margin-top: 10px;
+  font-size: 0.82rem;
+}
+
+.onboard-tech-details summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
 .onboard-perm-title {
   display: flex;
   align-items: center;
@@ -3457,6 +3472,11 @@ button.meeting-seg-text.seekable:hover {
 
 .meeting-start-btn {
   flex-shrink: 0;
+}
+
+.meeting-list-pane.drop-target {
+  outline: 2px dashed color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: -4px;
 }
 
 .meeting-recording {

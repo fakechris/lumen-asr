@@ -53,7 +53,8 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 - **Auditable pipeline records** — immutable attempts, context provenance, and edit-observation outcomes alongside session history
 - **Independent local model selections** — switch SenseVoice, Qwen3-ASR, and Whisper without overwriting each other’s paths or cleanup profile
 - **Offline file CLI** — diarize + per-turn ASR on whole recordings (m4a/mp3/wav), with Metal **Qwen** / **mlx-whisper**, short-turn merge, and optional bilingual LLM translation; see [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)
-- **First-run onboarding** for Microphone + Accessibility  
+- **Meeting file import** — choose or drop wav/mp3/m4a/mp4 in the meeting library; same transcript + structured minutes pipeline as a live recording
+- **First-run onboarding** — Microphone, then Accessibility on macOS (drag the current app into System Settings instead of hunting with “+”)  
 
 ### Offline file transcription (CLI)
 
@@ -73,8 +74,9 @@ Engines: `sensevoice` (CJK dictation), `qwen` (MLX multi-lingual), `mlx-whisper`
 - **Microphone** — to record
 - **Accessibility on macOS** — to paste into other apps (without it, Lumen
   copies to the clipboard)
-- Windows currently uses copy-only mode and does not capture application
-  context
+- **Windows insertion** — Unicode typing and Ctrl+V paste into the focused
+  window. Copy-only is the fallback when the target refuses input (for
+  example an elevated app). Application context capture is not available yet
 - Optional: [Ollama](https://ollama.com) or any OpenAI-compatible API key for AI cleanup  
 
 ### Install & run (from source)
@@ -126,17 +128,14 @@ If the system says the app is blocked, use **right-click → Open** once (local 
 
 #### 2. Complete onboarding
 
-The wizard walks you through:
+The wizard is four steps (about a minute). The dictation model downloads in the background.
 
 | Step | What to do | Why |
 |------|------------|-----|
-| Welcome | Continue | Product overview |
-| Microphone | Click request / allow in System Settings | Recording |
-| Accessibility | Open Settings → enable **Lumen ASR** | Paste into other apps |
-| Try voice | Hold the hotkey and say a short sentence | End-to-end check |
-| Models | Confirm local ASR model is ready | Offline recognition |
-| AI cleanup (optional) | Leave local Ollama or set a cloud provider later | Polish / translate |
-| Finish | Start using Lumen | — |
+| Welcome | Continue | What Lumen does |
+| Permissions | Allow microphone. On macOS, open Accessibility and **drag the floating Lumen icon into the list**, then flip the switch | Recording + paste into other apps |
+| Hotkey | Keep the default, or change it | Hold to speak |
+| Ready | Optional try-dictation, then start | First success |
 
 You can re-open onboarding later from Settings if permissions were skipped.
 
@@ -283,6 +282,7 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 - **终端 pane 观察**：直接跟踪 Herdr、tmux、Zellij 中的修改，不只依赖辅助功能文本
 - **可审计流水线记录**：在会话历史之外保存不可变尝试、上下文来源与编辑观察结果
 - **整段录音 CLI**：对 m4a/mp3/wav 做说话人分段 + 逐段 ASR（Metal **Qwen** / **mlx-whisper**）、短段合并、可选双语 LLM 翻译；详见 [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)
+- **会议文件导入**：在会议库选择或拖入 wav/mp3/m4a/mp4，走与现场录音相同的转写与纪要流程
 
 ### 整段录音离线转写（CLI）
 
@@ -296,14 +296,14 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 
 引擎：`sensevoice`（听写/CJK）、`qwen`（MLX 多语）、`mlx-whisper`（Metal Whisper）、`whisper`（sherpa CPU）。完整参数与模型目录见 [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)。
 - **本地模型独立配置**：切换 SenseVoice、Qwen3-ASR、Whisper 时保留各自路径与整理配置
-- 首次启动 **引导**：麦克风 + 辅助功能  
+- 首次启动 **引导**：麦克风，然后（macOS）把当前应用拖进系统设置的辅助功能列表  
 
 ### 环境要求
 
 - Apple Silicon 上的 macOS 12+，或 Windows 10/11 x64
 - **麦克风**：录音
 - **macOS 辅助功能**：向其他 App 粘贴（未授权时仅复制到剪贴板）
-- Windows 当前采用仅复制模式，不采集应用上下文
+- **Windows 插入**：用 Unicode 输入和 Ctrl+V 写入当前窗口；目标拒绝输入时复制到剪贴板。暂不采集应用上下文
 - 可选：Ollama 或任意 OpenAI 兼容 API，用于 AI 整理  
 
 ### 安装与启动（源码）
@@ -354,13 +354,10 @@ npm run tauri dev
 
 | 步骤 | 操作 | 目的 |
 |------|------|------|
-| 欢迎 | 继续 | 了解产品 |
-| 麦克风 | 允许访问 | 录音 |
-| 辅助功能 | 在系统设置中打开 Lumen ASR | 粘贴到其他 App |
-| 试音 | 按住快捷键说一句话 | 端到端验证 |
-| 模型 | 确认本地识别模型就绪 | 离线 ASR |
-| AI 整理（可选） | 先本地，或稍后配置云端 | 改写 / 翻译 |
-| 完成 | 开始使用 | — |
+| 欢迎 | 继续 | 一句话说明 |
+| 权限 | 允许麦克风。macOS 打开辅助功能后，把浮层图标拖进列表并打开开关 | 录音 + 插入其它应用 |
+| 热键 | 保持默认，或改成你习惯的组合 | 按住说话 |
+| 就绪 | 可选试听，然后开始使用 | 第一次成功 |
 
 跳过引导后可在设置中再次打开。
 
@@ -369,7 +366,7 @@ npm run tauri dev
 **系统设置 → 隐私与安全性**
 
 - **麦克风** → 勾选 **Lumen ASR**  
-- **辅助功能** → 勾选 **Lumen ASR**  
+- **辅助功能** → 把浮层里的 Lumen 图标拖进列表并打开开关（不必点「+」去找应用）  
 
 修改辅助功能后请完全退出再打开 Lumen。
 

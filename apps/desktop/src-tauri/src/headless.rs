@@ -12,13 +12,13 @@
 //!   --lang Spanish|es|zh|auto|…
 //!   --format text|json|transcript-v1|bilingual
 //!   --translate zh              # add Chinese translations per segment
+//!   [--minutes]                 # optional structured minutes (needs LLM; no user library write)
 //!   [--max-speakers N]
 //!   [--min-turn-seconds 1.5]    # absorb short false-speaker fragments
 //! ```
 //! Non-WAV inputs (m4a/mp3/…) are converted via `ffmpeg` to 16 kHz mono PCM.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use lumen_asr::{
@@ -76,6 +76,7 @@ fn print_help() {
            --lang <hint>                     e.g. Spanish, es, zh, auto\n    \
            --format text|json|transcript-v1|bilingual\n    \
            --translate zh[,en,…]             LLM translate each segment (needs corrector)\n    \
+           --minutes                         write <audio>.minutes.md (needs LLM; throwaway DB)\n    \
            --json                            alias for --format json\n    \
            --max-speakers N                  diar clustering cap (default: 6)\n    \
            --min-turn-seconds SEC            absorb shorter diar fragments (default: 1.5)\n  \
@@ -233,6 +234,8 @@ struct MeetingProcessCli {
     /// Target languages for per-segment LLM translation (e.g. ["zh"]).
     translate_langs: Vec<String>,
     mlx_whisper_model: String,
+    /// Optional structured minutes next to the input file (does not write the GUI library).
+    minutes: bool,
 }
 
 fn parse_meeting_process_args(args: &[String]) -> Result<MeetingProcessCli, String> {
@@ -244,6 +247,7 @@ fn parse_meeting_process_args(args: &[String]) -> Result<MeetingProcessCli, Stri
     let mut min_turn_seconds: f64 = lumen_meeting::DEFAULT_MIN_TURN_SECONDS;
     let mut translate_langs: Vec<String> = Vec::new();
     let mut mlx_whisper_model = DEFAULT_MLX_WHISPER_MODEL.to_string();
+    let mut minutes = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -342,6 +346,7 @@ fn parse_meeting_process_args(args: &[String]) -> Result<MeetingProcessCli, Stri
             flag if flag.starts_with("--mlx-whisper-model=") => {
                 mlx_whisper_model = flag["--mlx-whisper-model=".len()..].to_string();
             }
+            "--minutes" => minutes = true,
             other if other.starts_with('-') => {
                 return Err(format!("unexpected argument `{other}`"));
             }
@@ -367,6 +372,7 @@ fn parse_meeting_process_args(args: &[String]) -> Result<MeetingProcessCli, Stri
         min_turn_seconds,
         translate_langs,
         mlx_whisper_model,
+        minutes,
     })
 }
 
@@ -381,58 +387,14 @@ fn split_langs(raw: &str) -> Vec<String> {
 /// Convert compressed audio to 16 kHz mono PCM WAV via ffmpeg when needed.
 /// Returns `(wav_path, temp_dir_to_cleanup)`.
 fn ensure_wav(path: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if matches!(ext.as_str(), "wav" | "wave") {
-        return Ok((path.to_path_buf(), None));
-    }
-    if !path.is_file() {
-        return Err(format!("no such file: {}", path.display()));
-    }
-    let tmp = std::env::temp_dir().join(format!(
-        "lumen-headless-audio-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&tmp).map_err(|e| format!("create temp dir: {e}"))?;
-    let out = tmp.join("input.16k.wav");
-    let status = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            &path.display().to_string(),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-        ])
-        .arg(&out)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| {
-            format!("ffmpeg failed to start ({e}). Install ffmpeg to process m4a/mp3/…")
-        })?;
-    if !status.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(format!(
-            "ffmpeg failed converting {} (exit {status})",
+    let result = crate::audio_convert::ensure_wav(path)?;
+    if result.1.is_some() {
+        eprintln!(
+            "meeting process: converted {} → 16 kHz mono wav",
             path.display()
-        ));
+        );
     }
-    eprintln!(
-        "meeting process: converted {} → 16 kHz mono wav",
-        path.display()
-    );
-    Ok((out, Some(tmp)))
+    Ok(result)
 }
 
 fn normalize_lang_hint(raw: &str, engine: EngineChoice) -> Option<String> {
@@ -655,6 +617,11 @@ fn run_meeting_process(args: &[String]) -> i32 {
         ));
         match outcome {
             Ok(meeting_id) => {
+                if cli.minutes {
+                    if let Err(error) = write_cli_minutes(&store, meeting_id, &cli.audio) {
+                        eprintln!("meeting process: minutes skipped: {error}");
+                    }
+                }
                 // Optional per-segment LLM translation (e.g. --translate zh).
                 // Keep all error paths as `i32` values so temp dirs still clean up.
                 match if cli.translate_langs.is_empty() {
@@ -799,6 +766,62 @@ fn print_segments(segments: &[lumen_core::TranscriptSegment], json: bool) -> i32
         if labels.len() == 1 { "" } else { "s" }
     );
     0
+}
+
+fn minutes_output_path(audio: &Path) -> PathBuf {
+    let stem = audio
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "meeting".into());
+    let name = format!("{stem}.minutes.md");
+    match audio.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// Structured minutes for `--minutes`. Uses the user's corrector config, writes
+/// next to the input file, and never touches the GUI meeting library.
+fn write_cli_minutes(
+    store: &lumen_store::Store,
+    meeting_id: uuid::Uuid,
+    audio: &Path,
+) -> Result<(), String> {
+    let cfg = crate::config::AppConfig::load();
+    if !cfg.corrector.enabled || cfg.corrector.provider == "none" {
+        return Err("no LLM configured (Settings → AI cleanup)".into());
+    }
+    let corrector = crate::corrector_svc::build_corrector(&cfg.corrector)?;
+    let segments = store.list_segments(meeting_id).map_err(|e| e.to_string())?;
+    let speakers = store.list_speakers(meeting_id).map_err(|e| e.to_string())?;
+    let transcript =
+        lumen_meeting::minutes::render_transcript_for_minutes(&segments, &speakers);
+    let minutes = tauri::async_runtime::block_on(lumen_meeting::minutes::generate_minutes(
+        corrector.as_ref(),
+        &transcript,
+        None,
+        None,
+    ))
+    .map_err(|e| e.to_string())?;
+    let model = cfg.corrector.model.trim();
+    let rows = lumen_meeting::minutes::minutes_summaries(
+        meeting_id,
+        &minutes,
+        (!model.is_empty()).then_some(model),
+    )
+    .map_err(|e| e.to_string())?;
+    for row in rows {
+        store.save_summary(&row).map_err(|e| e.to_string())?;
+    }
+    let detail = store
+        .get_meeting_detail(meeting_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "meeting missing after minutes".to_string())?;
+    let out = export_meeting(&detail, ExportPreset::MinutesMd).map_err(|e| e.to_string())?;
+    let dest = minutes_output_path(audio);
+    std::fs::write(&dest, &out.content).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    eprintln!("meeting process: wrote {}", dest.display());
+    Ok(())
 }
 
 fn speaker_labels(
@@ -1197,5 +1220,12 @@ mod tests {
         assert_eq!(cli.engine, EngineChoice::Qwen);
         assert!((cli.min_turn_seconds - 0.0).abs() < 1e-9);
         assert_eq!(cli.lang.as_deref(), Some("Spanish"));
+        assert!(!cli.minutes);
+    }
+
+    #[test]
+    fn parse_minutes_flag() {
+        let cli = parse_meeting_process_args(&args(&["talk.wav", "--minutes"])).unwrap();
+        assert!(cli.minutes);
     }
 }

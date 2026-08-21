@@ -2,8 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   api,
-  type AsrModelStatus,
-  type CorrectorProbeResult,
   type PermissionStatus,
 } from "./api";
 import { HotkeyRecorder } from "./HotkeyRecorder";
@@ -21,7 +19,8 @@ type Props = {
   onDone: () => void;
 };
 
-const STEPS = ["欢迎", "权限", "麦克风", "模型", "修正", "热键", "试听"] as const;
+const STEPS = ["欢迎", "权限", "热键", "就绪"] as const;
+const LAST_STEP = STEPS.length - 1;
 const PEAK_THRESHOLD = 0.04;
 const IS_WINDOWS = navigator.userAgent.includes("Windows");
 
@@ -45,16 +44,7 @@ export function OnboardingWizard({ onDone }: Props) {
   const monitoring = useRef(false);
 
   const models = useMeetingModels();
-  const [asr, setAsr] = useState<AsrModelStatus | null>(null);
-  const [engineChoice, setEngineChoice] = useState<"sensevoice" | "whisper" | "qwen">(
-    "sensevoice",
-  );
-  const [customPath, setCustomPath] = useState("");
   const autoQueuedRef = useRef(false);
-
-  const [probe, setProbe] = useState<CorrectorProbeResult | null>(null);
-  const [pullMsg, setPullMsg] = useState("");
-  const [corrModel, setCorrModel] = useState("qwen2.5:7b");
 
   const [hkEnabled, setHkEnabled] = useState(true);
   const [hkToggle, setHkToggle] = useState(IS_WINDOWS ? "Ctrl+Shift+Space" : "Alt+Space");
@@ -75,37 +65,11 @@ export function OnboardingWizard({ onDone }: Props) {
     }
   }, []);
 
-  const refreshAsr = useCallback(async () => {
-    try {
-      const status = await api.checkAsrModelStatus();
-      setAsr(status);
-      setEngineChoice(
-        status.activeEngine === "qwen" && status.qwenRuntimeSupported
-          ? "qwen"
-          : status.activeEngine === "whisper"
-            ? "whisper"
-            : "sensevoice",
-      );
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
-
-  const refreshProbe = useCallback(async () => {
-    try {
-      const p = await api.probeCorrector();
-      setProbe(p);
-      setCorrModel(p.suggestedModel);
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
-
   useEffect(() => {
     void (async () => {
       try {
         const s = await api.getOnboardingState();
-        setStep(Math.min(s.step, 6));
+        setStep(Math.min(s.step, LAST_STEP));
         const [list, preferred] = await Promise.all([
           api.listAudioDevices(),
           api.getAudioDevice(),
@@ -130,12 +94,15 @@ export function OnboardingWizard({ onDone }: Props) {
   useEffect(() => {
     if (step !== 1) return;
     void refreshPerm();
-    const id = window.setInterval(() => void refreshPerm(), 1000);
+    const id = window.setInterval(() => void refreshPerm(), 800);
     return () => window.clearInterval(id);
   }, [step, refreshPerm]);
 
+  const micOk = perm?.canRecord ?? false;
+
   useEffect(() => {
-    if (step !== 2) {
+    const shouldListen = step === 1 && micOk;
+    if (!shouldListen) {
       if (monitoring.current) {
         monitoring.current = false;
         void api.stopVolumeMonitoring();
@@ -174,25 +141,14 @@ export function OnboardingWizard({ onDone }: Props) {
         void api.stopVolumeMonitoring();
       }
     };
-  }, [step, device]);
+  }, [step, device, micOk]);
 
   useEffect(() => {
-    if (step === 3) void refreshAsr();
-    if (step === 4) void refreshProbe();
-  }, [step, refreshAsr, refreshProbe]);
-
-  // Model status is owned by the app-level coordinator; keep the wizard's
-  // local snapshot (engine pickers, ready pills) in sync as queued downloads
-  // finish in the background.
-  useEffect(() => {
-    if (models.status) setAsr(models.status);
+    if (models.status) {
+      void api.setAsrEngine("sensevoice").catch(() => undefined);
+    }
   }, [models.status]);
 
-  // Kick off the core dictation-model download as soon as the wizard opens:
-  // the user walks the other steps while it installs in the background. Only
-  // SenseVoice auto-starts — the Paraformer meeting models (~1GB each) are
-  // optional and download only when explicitly requested (model step or the
-  // meeting page). An explicit user cancel is never auto-restarted.
   useEffect(() => {
     const s = models.status;
     if (!s || autoQueuedRef.current) return;
@@ -205,18 +161,7 @@ export function OnboardingWizard({ onDone }: Props) {
   }, [models]);
 
   useEffect(() => {
-    if (step !== 4) return;
-    let un: (() => void) | undefined;
-    listen<{ phase: string; message: string }>("ollama-pull-progress", (e) => {
-      setPullMsg(e.payload.message);
-    }).then((fn) => {
-      un = fn;
-    });
-    return () => un?.();
-  }, [step]);
-
-  useEffect(() => {
-    if (step !== 5) return;
+    if (step !== 2) return;
     void (async () => {
       try {
         const v = await api.validateHotkey(hkToggle);
@@ -228,7 +173,7 @@ export function OnboardingWizard({ onDone }: Props) {
   }, [step, hkToggle]);
 
   useEffect(() => {
-    if (step !== 6) return;
+    if (step !== 3) return;
     let un: (() => void) | undefined;
     listen<{
       phase: string;
@@ -254,11 +199,12 @@ export function OnboardingWizard({ onDone }: Props) {
     setError(null);
     setBusy(true);
     try {
-      if (step === 2) {
-        await api.stopVolumeMonitoring();
+      if (step === 1) {
+        await api.stopVolumeMonitoring().catch(() => undefined);
       }
-      await api.setOnboardingStep(next);
-      setStep(next);
+      const clamped = Math.max(0, Math.min(LAST_STEP, next));
+      await api.setOnboardingStep(clamped);
+      setStep(clamped);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -267,7 +213,6 @@ export function OnboardingWizard({ onDone }: Props) {
   }
 
   async function skipAll() {
-    // Always allow mid-wizard exit (even during long downloads / probes).
     if (dismissing.current) return;
     dismissing.current = true;
     setBusy(true);
@@ -277,6 +222,7 @@ export function OnboardingWizard({ onDone }: Props) {
       } catch {
         /* ignore if not monitoring */
       }
+      void api.dismissAccessibilityDragOverlay().catch(() => undefined);
       await api.skipOnboarding();
       onDone();
     } catch (e) {
@@ -290,7 +236,8 @@ export function OnboardingWizard({ onDone }: Props) {
   async function finish() {
     setBusy(true);
     try {
-      await api.stopVolumeMonitoring();
+      await api.stopVolumeMonitoring().catch(() => undefined);
+      void api.dismissAccessibilityDragOverlay().catch(() => undefined);
       await api.completeOnboarding(true);
       onDone();
     } catch (e) {
@@ -300,7 +247,6 @@ export function OnboardingWizard({ onDone }: Props) {
     }
   }
 
-  // Escape / anytime dismiss — standard wizard exit, not only step 0.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -314,16 +260,10 @@ export function OnboardingWizard({ onDone }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [busy]);
 
-  const micOk = perm?.canRecord ?? false;
   const axOk = perm?.accessibilityTrusted ?? false;
   const canLeavePerms = micOk;
   const meterPct = Math.min(100, Math.round(Math.max(peak, rms * 2) * 200));
-  const asrReady =
-    engineChoice === "qwen"
-      ? ((asr?.qwenRuntimeSupported && asr?.qwenReady) ?? false)
-      : engineChoice === "whisper"
-      ? (asr?.whisperReady ?? false)
-      : (asr?.sensevoiceReady ?? false);
+  const asrReady = models.status?.sensevoiceReady ?? false;
 
   return (
     <div
@@ -332,10 +272,11 @@ export function OnboardingWizard({ onDone }: Props) {
       aria-modal="true"
       aria-label="首次设置"
     >
-      {/* Overlay is non-dismissive: only × / 稍后再说 / Esc close the wizard. */}
       <div className="onboard-card onboard-card-wide">
         <div className="onboard-topbar">
-          <span className="onboard-topbar-title">首次设置 · {step + 1}/{STEPS.length}</span>
+          <span className="onboard-topbar-title">
+            首次设置 · {step + 1}/{STEPS.length} · 大约一分钟
+          </span>
           <div className="onboard-topbar-actions">
             <DownloadBadge models={models} />
             <button
@@ -374,28 +315,28 @@ export function OnboardingWizard({ onDone }: Props) {
 
         {step === 0 && (
           <section className="onboard-step">
-            <h1>欢迎使用 Lumen ASR</h1>
+            <h1>按住热键说话</h1>
             <p className="muted-text">
-              在本地把语音转成文字，并插入到你正在输入的应用光标处。随时可点右上角关闭，稍后从侧栏继续。
+              文字会出现在你正在写的地方。听写模型会在后台下载，你先完成权限即可。
             </p>
             <ul className="onboard-feature-list">
               <li>
                 <span className="onboard-feature-icon accent">
                   <Icon name="mic" size={14} />
                 </span>
-                本地转写（SenseVoice）
+                本地转写，不经过云端
               </li>
               <li>
                 <span className="onboard-feature-icon accent">
-                  <Icon name="hotkey" size={14} />
+                  <Icon name="insert" size={14} />
                 </span>
-                按住热键说话，松手插入
+                松手后插入当前输入框
               </li>
               <li>
                 <span className="onboard-feature-icon warm">
                   <Icon name="sparkle-ai" size={14} />
                 </span>
-                可选 AI 修正（Ollama / OpenAI 兼容）
+                AI 修正可稍后在设置里打开
               </li>
             </ul>
             <div className="onboard-actions">
@@ -411,17 +352,19 @@ export function OnboardingWizard({ onDone }: Props) {
 
         {step === 1 && (
           <section className="onboard-step">
-            <h1>核心权限</h1>
+            <h1>需要两件事</h1>
             <p className="muted-text">
               {IS_WINDOWS
-                ? "Windows 会在首次录音时检查麦克风隐私权限。当前 Alpha 使用安全的复制到剪贴板模式，不要求管理员权限。"
-                : "麦克风会弹系统对话框。辅助功能不会弹窗，必须在系统设置里打开当前这份进程。列表里若出现两个 Lumen，是不同签名/路径，只开对应当前路径的那一项。"}
+                ? "点卡片授权麦克风。转写完成后会写入当前窗口；失败时复制到剪贴板。"
+                : "点卡片授权。麦克风会弹系统对话框；辅助功能打开系统设置后，把图标拖进列表并打开开关。"}
             </p>
             <div className="onboard-perm-grid">
-              <div className={`onboard-perm-card ${micOk ? "ok" : ""}`}>
+              <div className={`onboard-perm-card ${micOk ? "ok" : "actionable"}`}>
                 <div className="onboard-perm-title">
-                  麦克风 <span className="onboard-pill">{micOk ? "已就绪" : "需要授权"}</span>
+                  麦克风{" "}
+                  <span className="onboard-pill">{micOk ? "已就绪" : "点一下授权"}</span>
                 </div>
+                <p className="muted-text onboard-perm-why">听写需要它听到你说话。</p>
                 <div className="actions">
                   <button
                     type="button"
@@ -440,82 +383,91 @@ export function OnboardingWizard({ onDone }: Props) {
                       })()
                     }
                   >
-                    请求麦克风
-                  </button>
-                  <button
-                    type="button"
-                    className="btn ghost"
-                    disabled={busy}
-                    onClick={() => void api.openMicrophoneSettings()}
-                  >
-                    打开设置
+                    {micOk ? "已授权" : "允许麦克风"}
                   </button>
                 </div>
+                {micOk && (
+                  <div className="onboard-meter-wrap">
+                    <div className="onboard-meter-label">
+                      {heardVoice ? "已听到声音" : "对着电脑说一句，确认有声"}
+                    </div>
+                    <div className="onboard-meter" aria-hidden>
+                      <div
+                        className={`onboard-meter-fill ${heardVoice ? "ok" : ""}`}
+                        style={{ width: `${meterPct}%` }}
+                      />
+                    </div>
+                    {devices.length > 1 && (
+                      <select
+                        className="input"
+                        style={{ marginTop: 10 }}
+                        value={device}
+                        disabled={busy}
+                        onChange={(e) => setDevice(e.target.value)}
+                      >
+                        {devices.map((d) => (
+                          <option key={d.name} value={d.name}>
+                            {d.name}
+                            {d.is_default ? "（默认）" : ""}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+                )}
               </div>
+
               {IS_WINDOWS ? (
                 <div className="onboard-perm-card ok">
                   <div className="onboard-perm-title">
-                    Windows 输出模式 <span className="onboard-pill">复制到剪贴板</span>
+                    写入当前窗口 <span className="onboard-pill">自动插入</span>
                   </div>
-                  <p className="muted-text">
-                    转写完成后会复制 UTF-16 文本。自动粘贴和跨权限级别注入暂未启用，因此无需
-                    macOS“辅助功能”授权，也不会要求以管理员身份运行。
+                  <p className="muted-text onboard-perm-why">
+                    用键盘/粘贴写入光标处。注入失败会复制到剪贴板，并在胶囊说明原因。不要以管理员身份运行目标程序。
                   </p>
                 </div>
               ) : (
-                <div className={`onboard-perm-card ${axOk ? "ok" : ""}`}>
-                <div className="onboard-perm-title">
-                  辅助功能 <span className="onboard-pill">{axOk ? "已开启" : "需要开启"}</span>
-                </div>
-                {perm && (
-                  <dl className="onboard-path-meta">
-                    <dt>系统列表名称</dt>
-                    <dd>
-                      <code>{perm.settingsListName || perm.processHint}</code>
-                    </dd>
-                    <dt>可执行文件</dt>
-                    <dd>
-                      <code>{perm.processHint}</code>
-                    </dd>
-                    <dt>路径</dt>
-                    <dd className="onboard-path">
-                      <code>{perm.processPath}</code>
-                    </dd>
-                    {perm.codesignKind ? (
-                      <>
-                        <dt>签名</dt>
-                        <dd>
-                          <code>{perm.codesignKind}</code>
-                          {perm.codesignAdhoc ? " · 重新编译后常需重开开关" : ""}
-                        </dd>
-                      </>
-                    ) : null}
-                  </dl>
-                )}
-                <div className="actions">
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={busy}
-                    onClick={() =>
-                      void (async () => {
-                        setBusy(true);
-                        try {
-                          setPerm(await api.requestAccessibilityAccess());
-                        } catch (e) {
-                          setError(String(e));
-                        } finally {
-                          setBusy(false);
-                        }
-                      })()
-                    }
-                  >
-                    打开辅助功能设置
-                  </button>
-                  <button type="button" className="btn ghost" disabled={busy} onClick={() => void refreshPerm()}>
-                    刷新
-                  </button>
-                </div>
+                <div className={`onboard-perm-card ${axOk ? "ok" : "actionable"}`}>
+                  <div className="onboard-perm-title">
+                    辅助功能{" "}
+                    <span className="onboard-pill">{axOk ? "已开启" : "拖入系统设置"}</span>
+                  </div>
+                  <p className="muted-text onboard-perm-why">
+                    {axOk
+                      ? "可以直接把文字插入其它应用。"
+                      : "点下面按钮会打开系统设置，并把 Lumen 图标浮在窗口下方。把它拖进列表，打开开关即可——不用点 + 去找应用。"}
+                  </p>
+                  <div className="actions">
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busy}
+                      onClick={() =>
+                        void (async () => {
+                          setBusy(true);
+                          try {
+                            setPerm(await api.requestAccessibilityAccess());
+                          } catch (e) {
+                            setError(String(e));
+                          } finally {
+                            setBusy(false);
+                          }
+                        })()
+                      }
+                    >
+                      {axOk ? "已开启" : "打开并拖入"}
+                    </button>
+                  </div>
+                  {perm && !axOk && (
+                    <details className="onboard-tech-details">
+                      <summary>列表里找不到？</summary>
+                      <p className="muted-text">
+                        把浮层里的图标拖进「辅助功能」列表。若仍无效，只打开名称是{" "}
+                        <code>{perm.settingsListName || perm.processHint}</code>{" "}
+                        的那一项。
+                      </p>
+                    </details>
+                  )}
                 </div>
               )}
             </div>
@@ -537,466 +489,11 @@ export function OnboardingWizard({ onDone }: Props) {
 
         {step === 2 && (
           <section className="onboard-step">
-            <h1>选择麦克风</h1>
-            <p className="muted-text">选择输入设备，然后说一句话。</p>
-            <div className="form-row" style={{ marginBottom: 16 }}>
-              <label className="form-label">
-                设备
-              </label>
-              <select
-                className="input"
-                value={device}
-                disabled={busy}
-                onChange={(e) => setDevice(e.target.value)}
-              >
-                {devices.map((d) => (
-                  <option key={d.name} value={d.name}>
-                    {d.name}
-                    {d.is_default ? "（默认）" : ""}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="onboard-meter-wrap">
-              <div className="onboard-meter-label">
-                {heardVoice ? "已检测到声音 ✓" : "请对着麦克风说一句话…"}
-              </div>
-              <div className="onboard-meter" aria-hidden>
-                <div
-                  className={`onboard-meter-fill ${heardVoice ? "ok" : ""}`}
-                  style={{ width: `${meterPct}%` }}
-                />
-              </div>
-            </div>
-            <div className="onboard-actions">
-              <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(1)}>
-                上一步
-              </button>
-              <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(3)}>
-                跳过
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={busy || !heardVoice}
-                onClick={() => void goStep(3)}
-              >
-                下一步
-              </button>
-            </div>
-          </section>
-        )}
-
-        {step === 3 && (
-          <section className="onboard-step">
-            <h1>本地 ASR 模型</h1>
+            <h1>按住说话</h1>
             <p className="muted-text">
-              默认 SenseVoice，适合无独显和低内存机器。Qwen3-ASR 本地 runtime 当前基于 Apple
-              MLX；Windows 会自动降级到 SenseVoice。缺失的听写模型已在后台自动下载（见右上角进度），无需停留等待。
-            </p>
-            {asr?.qwenFallbackReason && (
-              <div className="onboard-perm-card" style={{ marginBottom: 12 }}>
-                <div className="onboard-perm-title">
-                  资源检测 <span className="onboard-pill">SenseVoice fallback</span>
-                </div>
-                <p className="muted-text">{asr.qwenFallbackReason}</p>
-                {asr.totalMemoryMb ? (
-                  <p className="muted-text">
-                    系统内存：{(asr.totalMemoryMb / 1024).toFixed(1)} GB
-                  </p>
-                ) : null}
-              </div>
-            )}
-            <div className="form-row" style={{ marginBottom: 10 }}>
-              <label className="form-label">
-                引擎
-              </label>
-              <select
-                className="input"
-                value={engineChoice}
-                disabled={busy}
-                onChange={(event) => {
-                  const next = event.target.value as "sensevoice" | "whisper" | "qwen";
-                  setEngineChoice(next);
-                  void api.setAsrEngine(next).catch((error) => setError(String(error)));
-                }}
-              >
-                <option value="sensevoice">SenseVoice（推荐，可下载）</option>
-                <option value="qwen" disabled={!asr?.qwenRuntimeSupported}>
-                  Qwen3-ASR（需 Apple MLX；Windows 自动 fallback）
-                </option>
-                <option value="whisper">Whisper（使用已有模型）</option>
-              </select>
-            </div>
-            {asr && (
-              <div className={`onboard-perm-card ${asrReady ? "ok" : ""}`} style={{ marginBottom: 12 }}>
-                <div className="onboard-perm-title">
-                  {engineChoice === "qwen"
-                    ? "Qwen3-ASR"
-                    : engineChoice === "whisper"
-                      ? "Whisper"
-                      : "SenseVoice"}{" "}
-                  <span className="onboard-pill">{asrReady ? "就绪" : "未就绪"}</span>
-                </div>
-                <p className="muted-text" style={{ wordBreak: "break-all" }}>
-                  <code>
-                    {engineChoice === "qwen"
-                      ? asr.qwenDir
-                      : engineChoice === "whisper"
-                        ? asr.whisperDir
-                        : asr.sensevoiceDir}
-                  </code>
-                </p>
-              </div>
-            )}
-            {asr && asr.candidates.filter((c) => c.ready && c.engine === engineChoice).length > 0 && (
-              <div style={{ marginBottom: 12 }}>
-                <div className="muted-text" style={{ marginBottom: 6 }}>
-                  检测到的本地模型
-                </div>
-                {asr.candidates
-                  .filter((c) => c.ready && c.engine === engineChoice)
-                  .map((c) => (
-                    <div key={c.path} className="onboard-candidate">
-                      <span>{c.label}</span>
-                      <button
-                        type="button"
-                        className="btn ghost"
-                        disabled={busy}
-                        onClick={() =>
-                          void (async () => {
-                            setBusy(true);
-                            try {
-                              setAsr(await api.useExistingAsrModel(c.path, engineChoice));
-                              // Keep the app-level coordinator's snapshot fresh
-                              // so the queue skips now-ready targets.
-                              void models.refresh();
-                            } catch (e) {
-                              setError(String(e));
-                            } finally {
-                              setBusy(false);
-                            }
-                          })()
-                        }
-                      >
-                        使用
-                      </button>
-                    </div>
-                  ))}
-              </div>
-            )}
-            <div className="form-row" style={{ marginBottom: 10 }}>
-              <input
-                className="input"
-                style={{ flex: 1 }}
-                placeholder="或粘贴本地模型目录路径…"
-                value={customPath}
-                disabled={busy}
-                onChange={(e) => setCustomPath(e.target.value)}
-              />
-              <button
-                type="button"
-                className="btn ghost"
-                disabled={busy || !customPath.trim()}
-                onClick={() =>
-                  void (async () => {
-                    setBusy(true);
-                    try {
-                      setAsr(await api.useExistingAsrModel(customPath.trim(), engineChoice));
-                      void models.refresh();
-                    } catch (e) {
-                      setError(String(e));
-                    } finally {
-                      setBusy(false);
-                    }
-                  })()
-                }
-              >
-                验证并使用
-              </button>
-            </div>
-            {engineChoice === "whisper" && !asrReady && (
-              <p className="muted-text">
-                Whisper 暂无内置下载，请从检测列表选择已有模型或粘贴模型目录。
-              </p>
-            )}
-            <div className="actions" style={{ marginBottom: 8 }}>
-              <button
-                type="button"
-                className="btn"
-                disabled={
-                  asrReady ||
-                  engineChoice !== "sensevoice" ||
-                  models.active === "sensevoice" ||
-                  models.queued.includes("sensevoice")
-                }
-                onClick={() =>
-                  models.failed.includes("sensevoice")
-                    ? models.retry()
-                    : models.enqueue(["sensevoice"])
-                }
-              >
-                {asrReady
-                  ? "已就绪"
-                  : models.active === "sensevoice"
-                    ? "下载中…"
-                    : models.queued.includes("sensevoice")
-                      ? "排队中…"
-                      : models.failed.includes("sensevoice")
-                        ? "重试下载"
-                        : "下载 SenseVoice"}
-              </button>
-              <button
-                type="button"
-                className="btn ghost"
-                disabled={models.active !== "sensevoice"}
-                onClick={() => void models.cancel()}
-              >
-                取消下载
-              </button>
-              <button type="button" className="btn ghost" disabled={busy} onClick={() => void refreshAsr()}>
-                刷新
-              </button>
-            </div>
-            {models.active === "sensevoice" && models.progress && (
-              <p className="muted-text">
-                {models.progress.message}
-                {models.progress.percent != null
-                  ? ` · ${models.progress.percent.toFixed(0)}%`
-                  : ""}
-                {" · 下载在后台进行，可先继续下一步"}
-              </p>
-            )}
-            {models.error && models.failed.includes("sensevoice") && (
-              <p className="muted-text">
-                下载失败：{models.error}{" "}
-                <button type="button" className="btn ghost small" onClick={() => models.retry()}>
-                  重试
-                </button>
-              </p>
-            )}
-            {asr && (
-              <div className="onboard-perm-card" style={{ marginBottom: 12 }}>
-                <div className="onboard-perm-title">
-                  会议模型 · Paraformer <span className="onboard-pill">可选</span>
-                </div>
-                <p className="muted-text">
-                  用于会议记录（实时转写 + 词级时间戳）。会议功能可选，日常听写无需安装，因此不会自动下载；点「安装」加入后台下载队列，也可稍后在会议页安装。
-                </p>
-                <ParaformerRow
-                  label="Paraformer 离线（会议转写）"
-                  target="offline"
-                  ready={asr.paraformerOfflineReady}
-                  models={models}
-                />
-                <ParaformerRow
-                  label="Paraformer 流式（会议实时）"
-                  target="streaming"
-                  ready={asr.paraformerStreamingReady}
-                  models={models}
-                />
-                <p className="muted-text" style={{ wordBreak: "break-all" }}>
-                  <code>{asr.paraformerOfflineDir}</code>
-                </p>
-              </div>
-            )}
-            <div className="onboard-actions">
-              <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(2)}>
-                上一步
-              </button>
-              <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(4)}>
-                {models.active !== null ? "跳过（后台继续下载）" : "跳过（稍后配置）"}
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={busy || !asrReady}
-                onClick={() => void goStep(4)}
-              >
-                下一步
-              </button>
-            </div>
-          </section>
-        )}
-
-        {step === 4 && (
-          <section className="onboard-step">
-            <h1>AI 修正（可选）</h1>
-            <p className="muted-text">
-              优先 Ollama 本地模型；也可使用环境变量中的 OpenAI 兼容接口。
-            </p>
-            {probe && (
-              <div className={`onboard-perm-card ${probe.ollamaRunning ? "ok" : ""}`}>
-                <div className="onboard-perm-title">
-                  检测结果 <span className="onboard-pill">{probe.suggestedProvider}</span>
-                </div>
-                <p className="muted-text">{probe.message}</p>
-                {probe.ollamaRunning && (
-                  <p className="muted-text">
-                    模型：{probe.ollamaModels.slice(0, 8).join(", ") || "（空）"}
-                    {probe.ollamaModels.length > 8 ? "…" : ""}
-                  </p>
-                )}
-                {probe.envOpenaiBase && (
-                  <p className="muted-text">
-                    Env base: <code>{probe.envOpenaiBase}</code>
-                    {probe.envOpenaiKeySet ? " · key 已设置" : " · 无 key"}
-                  </p>
-                )}
-              </div>
-            )}
-            {probe?.ollamaRunning && (
-              <div className="form-row" style={{ margin: "12px 0" }}>
-                <label className="form-label">
-                  模型
-                </label>
-                <select
-                  className="input"
-                  value={corrModel}
-                  disabled={busy}
-                  onChange={(e) => setCorrModel(e.target.value)}
-                >
-                  {!probe.ollamaModels.includes(corrModel) && (
-                    <option value={corrModel}>{corrModel}</option>
-                  )}
-                  {probe.ollamaModels.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                  {!probe.hasQwen257b && <option value="qwen2.5:7b">qwen2.5:7b（需拉取）</option>}
-                </select>
-              </div>
-            )}
-            {pullMsg && <p className="muted-text">{pullMsg}</p>}
-            <div className="actions" style={{ marginTop: 10 }}>
-              <button type="button" className="btn ghost" disabled={busy} onClick={() => void refreshProbe()}>
-                重新检测
-              </button>
-              {probe?.ollamaRunning && (
-                <button
-                  type="button"
-                  className="btn"
-                  disabled={busy}
-                  onClick={() =>
-                    void (async () => {
-                      setBusy(true);
-                      try {
-                        await api.applyCorrectorSuggestion({
-                          provider: "ollama",
-                          baseUrl: probe.suggestedBaseUrl,
-                          model: corrModel,
-                          enabled: true,
-                        });
-                      } catch (e) {
-                        setError(String(e));
-                      } finally {
-                        setBusy(false);
-                      }
-                    })()
-                  }
-                >
-                  使用 Ollama
-                </button>
-              )}
-              {probe?.ollamaRunning && !probe.hasQwen257b && (
-                <button
-                  type="button"
-                  className="btn ghost"
-                  disabled={busy}
-                  onClick={() =>
-                    void (async () => {
-                      setBusy(true);
-                      setPullMsg("拉取中…");
-                      try {
-                        const p = await api.ollamaPullModel("qwen2.5:7b");
-                        setProbe(p);
-                        setCorrModel("qwen2.5:7b");
-                        await api.applyCorrectorSuggestion({
-                          provider: "ollama",
-                          baseUrl: p.suggestedBaseUrl,
-                          model: "qwen2.5:7b",
-                          enabled: true,
-                        });
-                      } catch (e) {
-                        setError(String(e));
-                      } finally {
-                        setBusy(false);
-                      }
-                    })()
-                  }
-                >
-                  拉取 qwen2.5:7b
-                </button>
-              )}
-              {probe?.envOpenaiBase && (
-                <button
-                  type="button"
-                  className="btn"
-                  disabled={busy}
-                  onClick={() =>
-                    void (async () => {
-                      setBusy(true);
-                      try {
-                        await api.applyCorrectorSuggestion({
-                          provider: "openai_compatible",
-                          baseUrl: probe.envOpenaiBase!,
-                          model: probe.envLumenModel || probe.suggestedModel,
-                          enabled: true,
-                        });
-                      } catch (e) {
-                        setError(String(e));
-                      } finally {
-                        setBusy(false);
-                      }
-                    })()
-                  }
-                >
-                  使用 Env OpenAI 兼容
-                </button>
-              )}
-              <button
-                type="button"
-                className="btn ghost"
-                disabled={busy}
-                onClick={() =>
-                  void (async () => {
-                    setBusy(true);
-                    try {
-                      await api.applyCorrectorSuggestion({
-                        provider: "none",
-                        baseUrl: "http://127.0.0.1:11434/v1",
-                        model: "none",
-                        enabled: false,
-                      });
-                    } catch (e) {
-                      setError(String(e));
-                    } finally {
-                      setBusy(false);
-                    }
-                  })()
-                }
-              >
-                跳过修正
-              </button>
-            </div>
-            <div className="onboard-actions">
-              <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(3)}>
-                上一步
-              </button>
-              <button type="button" className="btn" disabled={busy} onClick={() => void goStep(5)}>
-                下一步
-              </button>
-            </div>
-          </section>
-        )}
-
-        {step === 5 && (
-          <section className="onboard-step">
-            <h1>全局热键</h1>
-            <p className="muted-text">
-              默认按住说话。避免 ⌘Space（Spotlight）。当前：{" "}
-              <span className="kbd">{formatHotkeyLabel(hkToggle)}</span>
+              默认按住{" "}
+              <span className="kbd">{formatHotkeyLabel(hkToggle)}</span>{" "}
+              录音，松手插入。大多数人不用改。
             </p>
             {hkWarn.length > 0 && (
               <ul className="onboard-bullets" style={{ color: "var(--muted)" }}>
@@ -1024,38 +521,43 @@ export function OnboardingWizard({ onDone }: Props) {
               }}
             />
             <div className="onboard-actions">
-              <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(4)}>
+              <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(1)}>
                 上一步
               </button>
-              <button type="button" className="btn" disabled={busy} onClick={() => void goStep(6)}>
-                下一步 · 试听
+              <button type="button" className="btn" disabled={busy} onClick={() => void goStep(3)}>
+                下一步
               </button>
             </div>
           </section>
         )}
 
-        {step === 6 && (
+        {step === 3 && (
           <section className="onboard-step">
-            <h1>端到端试听</h1>
+            <h1>可以开始了</h1>
             <p className="muted-text">
-              按住 <span className="kbd">{formatHotkeyLabel(hkToggle)}</span>{" "}
-              说话，松手等待结果出现在下方（也可点按钮）。
+              到任意输入框，按住{" "}
+              <span className="kbd">{formatHotkeyLabel(hkToggle)}</span>{" "}
+              说话，松手等文字出现。也可以在这里试一次。
             </p>
+            {!asrReady && (
+              <p className="muted-text">
+                听写模型还在后台下载，完成后即可使用。可先结束设置。
+              </p>
+            )}
             <textarea
               className="input onboard-practice"
-              rows={5}
+              rows={4}
               value={practice}
               onChange={(e) => setPractice(e.target.value)}
               placeholder="转写结果会出现在这里…"
             />
             <p className="muted-text">
-              状态：{e2ePhase}
-              {e2eOk ? " · 已收到结果 ✓" : ""}
+              {e2eOk ? "已收到结果" : e2ePhase === "idle" ? "可选：按住热键，或点按钮试听" : `状态：${e2ePhase}`}
             </p>
             <div className="actions">
               <button
                 type="button"
-                className="btn"
+                className="btn ghost"
                 disabled={busy}
                 onClick={() =>
                   void (async () => {
@@ -1076,7 +578,7 @@ export function OnboardingWizard({ onDone }: Props) {
               </button>
               <button
                 type="button"
-                className="btn"
+                className="btn ghost"
                 disabled={busy}
                 onClick={() =>
                   void (async () => {
@@ -1098,14 +600,11 @@ export function OnboardingWizard({ onDone }: Props) {
               </button>
             </div>
             <div className="onboard-actions">
-              <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(5)}>
+              <button type="button" className="btn ghost" disabled={busy} onClick={() => void goStep(2)}>
                 上一步
               </button>
-              <button type="button" className="btn ghost" disabled={busy} onClick={() => void finish()}>
-                跳过完成
-              </button>
               <button type="button" className="btn" disabled={busy} onClick={() => void finish()}>
-                {e2eOk ? "完成设置" : "完成设置"}
+                开始使用
               </button>
             </div>
           </section>
@@ -1115,10 +614,6 @@ export function OnboardingWizard({ onDone }: Props) {
   );
 }
 
-/** Lightweight always-visible download indicator in the wizard topbar. Shows
- * "模型下载中 42%" while the queue runs; click to expand details (current item,
- * queued items, cancel) or, after a failure/cancel, to retry. Hidden when the
- * queue is idle with nothing to report. */
 function DownloadBadge({ models }: { models: MeetingModels }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -1129,9 +624,6 @@ function DownloadBadge({ models }: { models: MeetingModels }) {
   useEffect(() => {
     if (!show) setOpen(false);
   }, [show]);
-  // Close the popover on Escape or a click outside it. Escape stops
-  // propagation so the wizard's own window-level Escape (exit wizard)
-  // doesn't fire from the same keypress.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -1227,7 +719,7 @@ function DownloadBadge({ models }: { models: MeetingModels }) {
           {!downloading && !error && cancelled && failed.length > 0 && (
             <>
               <p className="muted-text onboard-dl-msg">
-                已取消，未完成的模型可稍后在模型步或会议页安装。
+                已取消，未完成的模型可稍后在设置或会议页安装。
               </p>
               <div className="actions">
                 <button
@@ -1241,55 +733,6 @@ function DownloadBadge({ models }: { models: MeetingModels }) {
             </>
           )}
         </div>
-      )}
-    </div>
-  );
-}
-
-/** One optional meeting-model row on the model step. Installs go through the
- * app-level queue (single-flight backend), so the row never blocks the wizard:
- * it just reflects queue state and offers install/cancel. */
-function ParaformerRow({
-  label,
-  target,
-  ready,
-  models,
-}: {
-  label: string;
-  target: ModelTarget;
-  ready: boolean;
-  models: MeetingModels;
-}) {
-  const activeRow = models.active === target;
-  const queuedRow = models.queued.includes(target);
-  const pct = activeRow ? models.progress?.percent ?? null : null;
-  return (
-    <div className="onboard-candidate">
-      <span>
-        {label}{" "}
-        <span className="onboard-pill">
-          {ready
-            ? "已安装"
-            : activeRow
-              ? `下载中${pct != null ? ` ${pct.toFixed(0)}%` : ""}`
-              : queuedRow
-                ? "排队中"
-                : "未安装"}
-        </span>
-      </span>
-      {activeRow ? (
-        <button type="button" className="btn ghost" onClick={() => void models.cancel()}>
-          取消
-        </button>
-      ) : (
-        <button
-          type="button"
-          className="btn ghost"
-          disabled={ready || queuedRow}
-          onClick={() => models.enqueue([target])}
-        >
-          {ready ? "已安装" : queuedRow ? "排队中" : "安装"}
-        </button>
       )}
     </div>
   );

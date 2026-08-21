@@ -48,6 +48,7 @@ time windows; ASR owns text**.
 | `--lang` | (engine default) | Language hint, e.g. `Spanish`, `es`, `zh`, `auto` |
 | `--format` | `text` | `text` \| `json` \| `transcript-v1` \| `bilingual` |
 | `--translate` | (none) | Comma-separated target langs for LLM translation (e.g. `zh`) |
+| `--minutes` | off | Generate structured minutes with the configured LLM and write `<audio>.minutes.md` next to the input. Does not write the GUI meeting library. Skipped (stderr) if no LLM is configured. |
 | `--json` | | Alias for `--format json` |
 | `--max-speakers` | `6` | Diar AHC speaker cap |
 | `--min-turn-seconds` | `1.5` | Absorb shorter diar turns into a neighbour (`0` = off) |

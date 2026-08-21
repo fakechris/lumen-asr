@@ -12,7 +12,7 @@ Hold a hotkey, speak, get polished text into the focused app — **local-first**
 - Agent / chat / Total Recall screenshots
 - Billing / membership
 - Team dictionary sync
-- Windows delivery (architecture only)
+- Windows application context capture
 - Auto-silent dictionary writes without user control
 
 ## 3. Core user loop
@@ -32,7 +32,9 @@ Hotkey down → record → ASR → normalize → model correct (dict injected)
 | Screen Recording | — | Not in MVP |
 | Automation | Optional launch-at-login later | Skip |
 
-Onboarding order: Mic → Accessibility → try dictation playground.
+Onboarding order: Welcome → Microphone + Accessibility (macOS: drag the app
+icon into System Settings) → hotkey → optional try-dictation. Optional AI
+cleanup and extra ASR models stay in Settings.
 
 ## 5. ASR
 

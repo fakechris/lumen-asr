@@ -2579,10 +2579,10 @@ function SettingsPanel({
                     <span className="perm-status-text">
                       <span className="perm-name">
                         Windows 输出模式
-                        <span className="perm-badge">复制到剪贴板</span>
+                        <span className="perm-badge">自动插入</span>
                       </span>
                       <span className="perm-state">
-                        Windows 版当前不需要 macOS“辅助功能”权限；转写结果会安全地复制到剪贴板。
+                        转写完成后会写入当前窗口。失败时复制到剪贴板，并在胶囊说明原因。
                       </span>
                     </span>
                   </span>
@@ -2626,7 +2626,7 @@ function SettingsPanel({
                     })()
                   }
                 >
-                  {perm.accessibilityTrusted ? "重新检查" : "打开辅助功能设置"}
+                  {perm.accessibilityTrusted ? "重新检查" : "打开并拖入"}
                 </button>
               </div>
               )}

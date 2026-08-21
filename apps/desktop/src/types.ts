@@ -83,6 +83,7 @@ export type TranscribeOutcome = {
   session: SessionRecord;
   watchPostPaste?: boolean;
   postPasteSeconds?: number;
+  insertNotice?: string | null;
 };
 
 export type ProcessEditResult = {

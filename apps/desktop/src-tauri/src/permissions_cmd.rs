@@ -4,7 +4,10 @@ use lumen_platform::PermissionStatus;
 #[cfg(target_os = "macos")]
 use lumen_platform::Permissions;
 #[cfg(target_os = "macos")]
-use lumen_platform_macos::{is_accessibility_trusted, prompt_accessibility, MacPermissions};
+use lumen_platform_macos::{
+    dismiss_accessibility_drag_overlay, is_accessibility_trusted, present_accessibility_drag_overlay,
+    prompt_accessibility, MacPermissions,
+};
 use serde::Serialize;
 use tauri::State;
 
@@ -344,7 +347,7 @@ pub async fn open_accessibility_settings() -> Result<(), String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Err("Accessibility settings are macOS-only; Windows currently uses copy-only mode".into())
+        Err("辅助功能设置仅适用于 macOS。Windows 使用键盘/粘贴插入，无需该权限。".into())
     }
 }
 
@@ -361,12 +364,19 @@ pub async fn request_accessibility_access() -> Result<PermissionDto, String> {
         }
         let _ = MacPermissions.open_accessibility_settings().await;
         let after = is_accessibility_trusted();
+        if !after {
+            // Settings is open; float a draggable app icon instead of sending
+            // the user hunting through Finder with the “+” button.
+            present_accessibility_drag_overlay();
+        } else {
+            dismiss_accessibility_drag_overlay();
+        }
         tracing::info!(
             before,
             after,
             process = %process_hint(),
             path = %process_path(),
-            "accessibility request (open Settings; user must enable toggle)"
+            "accessibility request (open Settings; drag overlay if still untrusted)"
         );
         get_permission_status().await
     }
@@ -374,6 +384,13 @@ pub async fn request_accessibility_access() -> Result<PermissionDto, String> {
     {
         get_permission_status().await
     }
+}
+
+#[tauri::command]
+pub async fn dismiss_accessibility_drag_overlay_cmd() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    dismiss_accessibility_drag_overlay();
+    Ok(())
 }
 
 #[tauri::command]
@@ -433,7 +450,7 @@ pub fn bootstrap_permissions() {
         tracing::info!(
             path = %process_path(),
             ?microphone,
-            "Windows permission bootstrap: package capability checked; capture probe remains available; text output is copy-only"
+            "Windows permission bootstrap: package capability checked; capture probe remains available; text insertion uses SendInput"
         );
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

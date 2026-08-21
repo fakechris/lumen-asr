@@ -30,5 +30,15 @@ export function correctorFallbackReasonLabel(reason?: string | null): string {
 }
 
 export function correctorFallbackNotice(reason?: string | null): string {
-  return `AI 修订未采用，已使用基础整理文本：${correctorFallbackReasonLabel(reason)}`;
+  return `识别完成，校对未应用：${correctorFallbackReasonLabel(reason)}`;
+}
+
+export function dictationDoneNotice(opts: {
+  fallbackReason?: string | null;
+  insertNotice?: string | null;
+}): string | null {
+  const parts: string[] = [];
+  if (opts.fallbackReason) parts.push(correctorFallbackNotice(opts.fallbackReason));
+  if (opts.insertNotice?.trim()) parts.push(opts.insertNotice.trim());
+  return parts.length > 0 ? parts.join(" ") : null;
 }

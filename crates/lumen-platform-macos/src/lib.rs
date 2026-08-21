@@ -1,5 +1,6 @@
 //! macOS platform adapters: permissions, text injection, frontmost app, hotkeys.
 
+mod ax_drag;
 mod calendar;
 mod edit_surface;
 mod focused_field;
@@ -27,6 +28,9 @@ pub use inject::MacTextInjectorBackend;
 pub use meeting_activity::{
     capability_available as meeting_detection_capability_available, ActiveInput, DetectorSignal,
     MeetingActivityDetector, DEFAULT_POLL as MEETING_DETECTION_DEFAULT_POLL,
+};
+pub use ax_drag::{
+    dismiss_accessibility_drag_overlay, drag_payload_path, present_accessibility_drag_overlay,
 };
 pub use permissions::{
     ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,
@@ -302,7 +306,7 @@ pub fn is_self_target(t: &FrontmostTarget) -> bool {
 /// libdispatch directly — the closure is boxed and consumed by a C trampoline,
 /// so no extra crates are needed.
 #[cfg(target_os = "macos")]
-fn run_on_main(f: impl FnOnce() + Send + 'static) {
+pub(crate) fn run_on_main(f: impl FnOnce() + Send + 'static) {
     use std::ffi::c_void;
     extern "C" fn trampoline(ctx: *mut c_void) {
         // SAFETY: `ctx` was created just below via `Box::into_raw` and is

@@ -5,10 +5,11 @@ use crate::AppState;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-// Version 2 is the first Windows onboarding that verifies the real microphone
-// capture result and explains the copy-only output mode. Keep macOS on its
-// existing version so this Windows migration never re-prompts Mac users.
-const CURRENT_ONBOARDING_VERSION: u32 = if cfg!(target_os = "windows") { 2 } else { 1 };
+// Version 4 (Windows) / 2 (macOS): four-step wizard (welcome → permissions →
+// hotkey → ready). Completed users of an older version stay completed; an
+// unfinished older wizard restarts at Welcome because the step map changed.
+const CURRENT_ONBOARDING_VERSION: u32 = if cfg!(target_os = "windows") { 4 } else { 2 };
+const LAST_STEP: u32 = 3;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,18 +31,22 @@ pub struct OnboardingStepInput {
 
 fn dto_from(cfg: &OnboardingConfig) -> OnboardingStateDto {
     let current = cfg.version >= CURRENT_ONBOARDING_VERSION;
-    let completed = current && cfg.completed;
-    let skipped = current && cfg.skipped;
+    // Finished users keep their completion across copy/step-map bumps.
+    let completed = cfg.completed;
+    let skipped = !completed && cfg.skipped;
     let show_wizard = !completed && !skipped;
     OnboardingStateDto {
         completed,
         skipped,
         version: CURRENT_ONBOARDING_VERSION,
-        // An older completed wizard must restart at Welcome, not reopen on its
-        // old final step.
-        step: if current { cfg.step } else { 0 },
+        // Unfinished older wizards restart at Welcome (step indices changed).
+        step: if current {
+            cfg.step.min(LAST_STEP)
+        } else {
+            0
+        },
         show_wizard,
-        max_step_stage_b: 6, // full wizard: 0…6
+        max_step_stage_b: LAST_STEP,
     }
 }
 
@@ -66,7 +71,7 @@ pub fn set_onboarding_step(
     guard.onboarding.version = CURRENT_ONBOARDING_VERSION;
     guard.onboarding.completed = false;
     guard.onboarding.skipped = false;
-    guard.onboarding.step = input.step.min(6);
+    guard.onboarding.step = input.step.min(LAST_STEP);
     guard.save()?;
     Ok(dto_from(&guard.onboarding))
 }
@@ -99,7 +104,7 @@ pub fn complete_onboarding(
     guard.onboarding.completed = true;
     guard.onboarding.skipped = false;
     guard.onboarding.version = CURRENT_ONBOARDING_VERSION;
-    guard.onboarding.step = 6;
+    guard.onboarding.step = LAST_STEP;
     guard.onboarding.completed_at = Some(chrono::Utc::now().to_rfc3339());
     guard.save()?;
     tracing::info!("onboarding completed");
@@ -130,6 +135,21 @@ mod tests {
         let cfg = OnboardingConfig {
             completed: true,
             version: CURRENT_ONBOARDING_VERSION,
+            step: LAST_STEP,
+            ..OnboardingConfig::default()
+        };
+
+        let dto = dto_from(&cfg);
+        assert!(dto.completed);
+        assert!(!dto.show_wizard);
+        assert_eq!(dto.step, LAST_STEP);
+    }
+
+    #[test]
+    fn completed_older_onboarding_stays_closed() {
+        let cfg = OnboardingConfig {
+            completed: true,
+            version: CURRENT_ONBOARDING_VERSION.saturating_sub(1),
             step: 6,
             ..OnboardingConfig::default()
         };
@@ -137,15 +157,16 @@ mod tests {
         let dto = dto_from(&cfg);
         assert!(dto.completed);
         assert!(!dto.show_wizard);
-        assert_eq!(dto.step, 6);
+        assert_eq!(dto.step, 0);
     }
 
     #[test]
-    fn older_onboarding_restarts_at_welcome() {
+    fn unfinished_older_onboarding_restarts_at_welcome() {
         let cfg = OnboardingConfig {
-            completed: true,
-            version: CURRENT_ONBOARDING_VERSION - 1,
-            step: 6,
+            completed: false,
+            skipped: false,
+            version: CURRENT_ONBOARDING_VERSION.saturating_sub(1),
+            step: 5,
             ..OnboardingConfig::default()
         };
 
