@@ -37,8 +37,29 @@ export function dictationDoneNotice(opts: {
   fallbackReason?: string | null;
   insertNotice?: string | null;
 }): string | null {
+  const insert = opts.insertNotice?.trim() ?? "";
+  const fallback = opts.fallbackReason
+    ? correctorFallbackNotice(opts.fallbackReason)
+    : "";
+  if (insert.startsWith("已复制")) {
+    return fallback ? `${insert} · ${fallback}` : insert;
+  }
   const parts: string[] = [];
-  if (opts.fallbackReason) parts.push(correctorFallbackNotice(opts.fallbackReason));
-  if (opts.insertNotice?.trim()) parts.push(opts.insertNotice.trim());
+  if (fallback) parts.push(fallback);
+  if (insert) parts.push(insert);
   return parts.length > 0 ? parts.join(" ") : null;
+}
+
+/** Floating overlay copy confirmation. Longer insert help stays on the capsule. */
+export function copyToastLabel(insertNotice?: string | null): string | null {
+  if (!insertNotice?.includes("已复制")) return null;
+  return "已复制";
+}
+
+/** History label for the engine that actually produced the transcript. */
+export function formatAsrEngineLabel(engine?: string | null): string {
+  if (!engine) return "";
+  const sep = engine.indexOf("→");
+  if (sep < 0) return engine;
+  return `${engine.slice(sep + 1)}（在线超时，改用本地）`;
 }

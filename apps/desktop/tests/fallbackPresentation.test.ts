@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  copyToastLabel,
   correctorFallbackNotice,
   correctorFallbackReasonLabel,
   dictationDoneNotice,
+  formatAsrEngineLabel,
 } from "../src/fallbackPresentation.ts";
 
 test("explains granular context-integrity fallback reasons", () => {
@@ -27,17 +29,33 @@ test("fallback notice says that the model revision was not used", () => {
 
 test("done notice keeps insert failure separate from ASR failure", () => {
   assert.equal(dictationDoneNotice({}), null);
-  assert.equal(
-    dictationDoneNotice({
-      insertNotice: "未能插入到当前窗口，已复制到剪贴板，请手动粘贴。",
-    }),
-    "未能插入到当前窗口，已复制到剪贴板，请手动粘贴。",
-  );
+  assert.equal(dictationDoneNotice({ insertNotice: "已复制" }), "已复制");
   assert.equal(
     dictationDoneNotice({
       fallbackReason: "timeout",
-      insertNotice: "未能插入到当前窗口，已复制到剪贴板，请手动粘贴。",
+      insertNotice: "已复制",
     }),
-    "识别完成，校对未应用：AI 服务响应超时 未能插入到当前窗口，已复制到剪贴板，请手动粘贴。",
+    "已复制 · 识别完成，校对未应用：AI 服务响应超时",
+  );
+  assert.equal(
+    dictationDoneNotice({
+      insertNotice: "未能插入，也无法写入剪贴板。请从历史记录复制结果。",
+    }),
+    "未能插入，也无法写入剪贴板。请从历史记录复制结果。",
+  );
+});
+
+test("copy toast is the short confirmation, not the full insert help", () => {
+  assert.equal(copyToastLabel(null), null);
+  assert.equal(copyToastLabel("已复制"), "已复制");
+  assert.equal(copyToastLabel("已复制 · 请开启辅助功能后可自动插入"), "已复制");
+  assert.equal(copyToastLabel("未能插入，也无法写入剪贴板。请从历史记录复制结果。"), null);
+});
+
+test("history labels the local engine when cloud ASR timed out", () => {
+  assert.equal(formatAsrEngineLabel("sensevoice"), "sensevoice");
+  assert.equal(
+    formatAsrEngineLabel("openai_audio→sensevoice"),
+    "sensevoice（在线超时，改用本地）",
   );
 });

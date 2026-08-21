@@ -238,6 +238,38 @@ body {
   flex-direction: column;
   height: 100%;
   min-height: 0;
+  position: relative;
+}
+
+.copy-toast {
+  position: fixed;
+  top: 28px;
+  left: 50%;
+  z-index: 40;
+  transform: translateX(-50%);
+  padding: 8px 16px;
+  border-radius: var(--radius-pill);
+  background: #17120d;
+  color: #fff4cf;
+  border: 1.5px solid rgba(240, 190, 72, 0.9);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  font-family: var(--font-sans);
+  font-size: 0.88rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+  animation: copy-toast-in 0.16s ease-out;
+}
+
+@keyframes copy-toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
 }
 
 .app-body {
