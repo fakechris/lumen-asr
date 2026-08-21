@@ -372,6 +372,9 @@ export const api = {
     postPasteSeconds?: number;
     persistEditEvidenceText?: boolean;
   }) => invoke<import("./types").LearningConfig>("save_learning_config", { input }),
+  getUiConfig: () => invoke<{ sounds: boolean }>("get_ui_config"),
+  saveUiConfig: (input: { sounds?: boolean }) =>
+    invoke<{ sounds: boolean }>("save_ui_config", { input }),
   processEdit: (input: {
     beforeText: string;
     afterText: string;

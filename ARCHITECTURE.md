@@ -73,6 +73,18 @@ policy.mode:
 Clipboard restore delay: ~300–500ms.  
 Always log which strategy succeeded for history/`debug_info`.
 
+## 4.5 Context capture → corrector
+
+At hotkey press the desktop app freezes a sealed, encrypted context snapshot
+(`context_capture.rs` + `lumen-context`): frontmost app, AX editor field
+(cursor/selection/nearby text), browser metadata, visible text. A bounded
+`CorrectorContextProjection` (per-field char limits, secure-focus and
+browser-policy fail-closed) is offered to the corrector as `context_json` —
+**only** when `corrector.use_captured_context = true` (default `false`;
+settings UI: “用当前应用和光标附近文字辅助纠错”). Every stage’s exact payload
+is persisted with provenance (`context_stage_usage`) before any provider can
+receive it; integrity guards reject model output that replays context text.
+
 ## 5. Data model (SQLite)
 
 ```sql
@@ -138,6 +150,14 @@ toggle = false
 [dictionary]
 auto_promote = false
 auto_promote_threshold = 3
+
+[vad]
+enabled = false             # silence auto-stop for dictation (opt-in)
+mode = "rms"                # only rms implemented; other values fall back to rms
+start_threshold = 0.02      # RMS marking speech onset
+end_threshold = 0.005       # RMS below which input counts as silence
+silence_timeout_ms = 1500   # sustained silence that ends the dictation
+trim_trailing = true        # drop the silent tail before ASR (300ms padding kept)
 
 [paths]
 # default: ~/Library/Application Support/LumenAsr

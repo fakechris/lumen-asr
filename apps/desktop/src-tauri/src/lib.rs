@@ -33,6 +33,7 @@ mod permissions_cmd;
 mod pipeline_attempt;
 mod provider_presets;
 mod session_debug;
+mod ui_cmd;
 mod volume_mon;
 
 pub use headless::maybe_run_cli;
@@ -665,6 +666,8 @@ pub fn run() {
             meeting_cmd::export_meeting,
             learning::get_learning_config,
             learning::save_learning_config,
+            ui_cmd::get_ui_config,
+            ui_cmd::save_ui_config,
             learning::process_edit,
             edit_learning_runtime::get_edit_learning_observability,
             edit_learning_runtime::list_edit_learning_feedback,

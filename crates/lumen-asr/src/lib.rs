@@ -10,6 +10,7 @@
 mod audio;
 mod meeting_recorder;
 mod mlx_whisper;
+mod vad;
 mod wav_edit;
 
 pub use audio::{AudioCapture, AudioDeviceInfo, AudioError, CaptureResult};
@@ -22,6 +23,7 @@ pub use mlx_whisper::{
     MlxWhisperAsr, MlxWhisperConfig, DEFAULT_MLX_WHISPER_MODEL,
     PRODUCT_WORKER as MLX_WHISPER_WORKER,
 };
+pub use vad::{trim_trailing_silence, SilenceAutoStop, VadAction};
 pub use wav_edit::{copy_pcm16_wav_range, WavRangeError, WavRangeSummary};
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).

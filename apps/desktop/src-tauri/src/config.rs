@@ -15,6 +15,10 @@ pub struct AppConfig {
     pub learning: LearningConfig,
     pub onboarding: OnboardingConfig,
     pub audio: AudioConfig,
+    /// Desktop UI preferences (sound cues, …).
+    pub ui: UiConfig,
+    /// Voice-activity detection (silence auto-stop / trailing trim).
+    pub vad: VadConfig,
     /// Speech recognition backend (local or cloud).
     pub asr: AsrServiceConfig,
     /// Local, encrypted context capture used for replay and pipeline provenance.
@@ -33,6 +37,8 @@ impl Default for AppConfig {
             learning: LearningConfig::default(),
             onboarding: OnboardingConfig::default(),
             audio: AudioConfig::default(),
+            ui: UiConfig::default(),
+            vad: VadConfig::default(),
             asr: AsrServiceConfig::default(),
             context: ContextCaptureConfig::default(),
             meeting: MeetingConfig::default(),
@@ -634,6 +640,51 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self { device_name: None }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Short start/done/error cues on dictation phase transitions.
+    pub sounds: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { sounds: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VadConfig {
+    /// Silence auto-stop for dictation. Off by default: a wrong threshold
+    /// cutting a session mid-thought is worse than holding the key longer.
+    pub enabled: bool,
+    /// rms (built-in); unknown modes fall back to rms with a warning.
+    pub mode: String,
+    /// RMS marking speech onset (≈ clear speech at the mic).
+    pub start_threshold: f32,
+    /// RMS below which input counts as silence once speaking. Matches the
+    /// 0.005 (≈ −46 dBFS) gate used by meeting preflight / diar-rs.
+    pub end_threshold: f32,
+    /// Sustained silence that ends the current dictation.
+    pub silence_timeout_ms: u64,
+    /// Drop the silent tail before ASR (keeps a 300ms padding).
+    pub trim_trailing: bool,
+}
+
+impl Default for VadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "rms".into(),
+            start_threshold: 0.02,
+            end_threshold: 0.005,
+            silence_timeout_ms: 1500,
+            trim_trailing: true,
+        }
     }
 }
 

@@ -65,6 +65,9 @@ pub struct AudioCapture {
     recording: Arc<AtomicBool>,
     preferred_device: Arc<Mutex<Option<String>>>,
     cmd_tx: Mutex<Option<Sender<AudioCmd>>>,
+    /// Latest callback chunk RMS (f32 bits); 0 when idle. Lets a VAD watcher
+    /// observe the live session without locking the sample buffer.
+    latest_rms: Arc<AtomicU32>,
 }
 
 impl Default for AudioCapture {
@@ -84,9 +87,11 @@ impl AudioCapture {
         let samples_slot: Arc<Mutex<Option<Arc<Mutex<Vec<f32>>>>>> = Arc::new(Mutex::new(None));
         let sample_rate = Arc::new(AtomicU32::new(0));
         let epoch = Arc::new(AtomicU64::new(0));
+        let latest_rms = Arc::new(AtomicU32::new(0));
         let rate_flag = Arc::clone(&sample_rate);
         let samples_for_thread = Arc::clone(&samples_slot);
         let epoch_for_thread = Arc::clone(&epoch);
+        let rms_for_thread = Arc::clone(&latest_rms);
 
         thread::Builder::new()
             .name("lumen-audio".into())
@@ -103,6 +108,7 @@ impl AudioCapture {
                                 &rate_flag,
                                 &epoch_for_thread,
                                 &samples_for_thread,
+                                &rms_for_thread,
                                 &mut stream_slot,
                             );
                             if res.is_ok() {
@@ -121,6 +127,7 @@ impl AudioCapture {
                             // also gives in-flight callbacks a moment to exit.
                             thread::sleep(std::time::Duration::from_millis(60));
                             rec_flag.store(false, Ordering::SeqCst);
+                            rms_for_thread.store(0, Ordering::SeqCst);
                             let sample_rate = rate_flag.load(Ordering::SeqCst);
                             let samples = samples_for_thread
                                 .lock()
@@ -174,11 +181,18 @@ impl AudioCapture {
             recording,
             preferred_device,
             cmd_tx: Mutex::new(Some(tx)),
+            latest_rms,
         }
     }
 
     pub fn is_recording(&self) -> bool {
         self.recording.load(Ordering::SeqCst)
+    }
+
+    /// RMS of the most recent callback chunk while recording; `None` when idle.
+    pub fn latest_rms(&self) -> Option<f32> {
+        self.is_recording()
+            .then(|| f32::from_bits(self.latest_rms.load(Ordering::SeqCst)))
     }
 
     pub fn set_device(&self, name: Option<String>) {
@@ -250,6 +264,7 @@ fn start_on_thread(
     sample_rate_atom: &AtomicU32,
     epoch: &Arc<AtomicU64>,
     samples_slot: &Arc<Mutex<Option<Arc<Mutex<Vec<f32>>>>>>,
+    latest_rms: &Arc<AtomicU32>,
     stream_slot: &mut Option<cpal::Stream>,
 ) -> Result<(), AudioError> {
     if recording.swap(true, Ordering::SeqCst) {
@@ -289,6 +304,7 @@ fn start_on_thread(
 
     let samples_cb = Arc::clone(&samples_buf);
     let epoch_cb = Arc::clone(epoch);
+    latest_rms.store(0, Ordering::SeqCst);
     let stream_config: StreamConfig = config.clone().into();
     let err_fn = |e| tracing::error!(error = %e, "audio stream error");
 
@@ -300,6 +316,7 @@ fn start_on_thread(
             samples_cb,
             epoch_cb,
             session_epoch,
+            Arc::clone(latest_rms),
             err_fn,
         ),
         SampleFormat::I16 => build_stream::<i16>(
@@ -309,6 +326,7 @@ fn start_on_thread(
             samples_cb,
             epoch_cb,
             session_epoch,
+            Arc::clone(latest_rms),
             err_fn,
         ),
         SampleFormat::U16 => build_stream::<u16>(
@@ -318,6 +336,7 @@ fn start_on_thread(
             samples_cb,
             epoch_cb,
             session_epoch,
+            Arc::clone(latest_rms),
             err_fn,
         ),
         other => {
@@ -372,6 +391,7 @@ fn build_stream<T>(
     samples: Arc<Mutex<Vec<f32>>>,
     epoch: Arc<AtomicU64>,
     session_epoch: u64,
+    latest_rms: Arc<AtomicU32>,
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, AudioError>
 where
@@ -387,9 +407,14 @@ where
                     return;
                 }
                 let mut buf = samples.lock();
+                let mut sum_sq = 0.0f64;
+                let mut n = 0u64;
                 if channels <= 1 {
                     for &s in data {
-                        buf.push(s.to_sample::<f32>());
+                        let v = s.to_sample::<f32>();
+                        sum_sq += f64::from(v) * f64::from(v);
+                        n += 1;
+                        buf.push(v);
                     }
                 } else {
                     for frame in data.chunks(channels) {
@@ -397,8 +422,17 @@ where
                         for &s in frame {
                             sum += s.to_sample::<f32>();
                         }
-                        buf.push(sum / channels as f32);
+                        let v = sum / channels as f32;
+                        sum_sq += f64::from(v) * f64::from(v);
+                        n += 1;
+                        buf.push(v);
                     }
+                }
+                if n > 0 {
+                    latest_rms.store(
+                        ((sum_sq / n as f64).sqrt() as f32).to_bits(),
+                        Ordering::SeqCst,
+                    );
                 }
             },
             err_fn,

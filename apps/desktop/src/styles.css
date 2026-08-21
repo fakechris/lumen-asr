@@ -1943,6 +1943,33 @@ select.input:focus {
   margin-bottom: 20px;
 }
 
+.onboard-progress-item {
+  flex: 1;
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  min-width: 0;
+}
+
+/* Connector between step dots: done → ok green, current → accent, pending → faint */
+.onboard-line {
+  flex-shrink: 0;
+  width: 14px;
+  height: 2px;
+  margin-top: 1px;
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  transition: background var(--dur-normal) var(--ease);
+}
+
+.onboard-line.done {
+  background: var(--ok);
+}
+
+.onboard-line.current {
+  background: var(--accent);
+}
+
 /* Design system: 7 segment bars (not heavy numbered circles) */
 .onboard-dot {
   flex: 1;
@@ -2049,14 +2076,38 @@ select.input:focus {
   margin-top: 22px;
 }
 
-.onboard-error {
+.onboard-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
   margin-bottom: 12px;
   padding: 10px 12px;
   border-radius: 10px;
-  background: color-mix(in srgb, var(--error) 12%, var(--card));
-  border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
-  color: var(--text);
-  font-size: 0.9rem;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.onboard-notice-title {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.onboard-notice.warn {
+  background: var(--warn-soft);
+  border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+}
+
+.onboard-notice.warn .onboard-notice-title {
+  color: var(--warn);
+}
+
+.onboard-notice.error {
+  background: var(--danger-soft);
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+}
+
+.onboard-notice.error .onboard-notice-title {
+  color: var(--danger);
 }
 
 .onboard-perm-grid {
@@ -2167,6 +2218,206 @@ select.input:focus {
   margin-top: 6px;
   font-size: 0.78rem;
   font-variant-numeric: tabular-nums;
+}
+
+/* ── Onboarding v2: wide dual-column, step transition, mock settings ── */
+
+/* Wide variant for the first/last steps (two-column layout) */
+.onboard-card.wide {
+  width: min(760px, 100%);
+}
+
+/* Step body remounts per step (key={step}) and fades/slides in */
+.onboard-step-body {
+  animation: onboard-step-in var(--dur-normal) var(--ease);
+}
+
+@keyframes onboard-step-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.onboard-cols {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  gap: 20px;
+  margin-top: 6px;
+  align-items: start;
+}
+
+/* Left-rail demo / status panel in wide steps */
+.onboard-demo {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg) 55%, var(--card));
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 200px;
+}
+
+.demo-kicker {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--muted-2);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.demo-raw {
+  font-size: 0.85rem;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.demo-arrow {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.demo-clean {
+  font-size: 0.9rem;
+  line-height: 1.55;
+  border-left: 2px solid var(--accent);
+  padding-left: 10px;
+}
+
+.demo-note {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+/* Status-summary pills on the ready step */
+.onboard-sum-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.onboard-sum-pill {
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 18%, transparent);
+}
+
+.onboard-sum-pill.ok {
+  background: var(--success-soft);
+  color: var(--ok);
+}
+
+.onboard-sum-pill.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* Mock System Settings list: mirrors the real permission toggle state */
+.mock-settings {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: color-mix(in srgb, var(--bg) 55%, var(--card));
+  margin-top: 14px;
+}
+
+.mock-settings .ms-head {
+  padding: 7px 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 78%, var(--card));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mock-settings .ms-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.mock-settings .ms-row:last-child {
+  border-bottom: 0;
+}
+
+.mock-settings .ms-row.highlight {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.mock-toggle {
+  width: 30px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--border-strong);
+  position: relative;
+  flex-shrink: 0;
+  transition: background var(--dur-normal) var(--ease);
+}
+
+.mock-toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--card);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: left var(--dur-normal) var(--ease);
+}
+
+.mock-toggle.on {
+  background: var(--ok);
+}
+
+.mock-toggle.on::after {
+  left: 14px;
+}
+
+/* Completion flash on the ready step */
+.onboard-success {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ok);
+  font-weight: 600;
+  margin-top: 12px;
+  animation: onboard-pop 400ms var(--ease);
+}
+
+@keyframes onboard-pop {
+  0% {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.08);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
 }
 
 /* ── Capsule window ────────────────────────────────────── */
