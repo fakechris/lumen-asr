@@ -12,8 +12,8 @@ use crate::session_debug;
 use crate::AppState;
 use lumen_asr::{
     lumen_models_dir, paraformer_offline_ready, prepare_for_asr, probe_status, sensevoice_ready,
-    AsrEngine, AsrRequest, AsrResult, AudioDeviceInfo, EngineKind, EngineStatus, OpenAiAudioAsr,
-    OpenAiAudioConfig, ParaformerAsr, QwenShadowRequest, QwenShadowTerm,
+    whisper_ready, AsrEngine, AsrRequest, AsrResult, AudioDeviceInfo, EngineKind, EngineStatus,
+    OpenAiAudioAsr, OpenAiAudioConfig, ParaformerAsr, QwenShadowRequest, QwenShadowTerm,
 };
 use lumen_core::{DictEntryKind, FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use lumen_dictionary::DictionaryEntry;
@@ -307,12 +307,16 @@ fn insertion_outcome_for_strategy(strategy: InsertStrategy) -> InsertionOutcome 
     }
 }
 
+/// Capsule / overlay copy confirmation. Keep this short — the HUD is a pill.
+fn copied_toast_notice() -> String {
+    "已复制".into()
+}
+
 fn copy_only_fallback_notice(clipboard_copied: bool) -> String {
     #[cfg(target_os = "macos")]
     {
         if clipboard_copied {
-            "需要「辅助功能」权限才能插入到其他 App。请到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop），然后重试。文字已复制到剪贴板。"
-                .into()
+            "已复制 · 请开启辅助功能后可自动插入".into()
         } else {
             "需要「辅助功能」权限才能插入到其他 App，并且复制到剪贴板也失败了。请先从历史记录复制结果，并到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop）后重试。"
                 .into()
@@ -321,7 +325,7 @@ fn copy_only_fallback_notice(clipboard_copied: bool) -> String {
     #[cfg(not(target_os = "macos"))]
     {
         if clipboard_copied {
-            "未能自动插入，已复制到剪贴板，请手动粘贴。".into()
+            copied_toast_notice()
         } else {
             "未能插入，也无法写入剪贴板。请从历史记录复制结果。".into()
         }
@@ -331,17 +335,53 @@ fn copy_only_fallback_notice(clipboard_copied: bool) -> String {
 fn insert_failure_notice(error: &str, copied: bool) -> String {
     let elevated = error.to_ascii_lowercase().contains("elevated");
     match (copied, elevated) {
-        (true, true) => {
-            "目标窗口拒绝输入。若该程序以管理员身份运行，Lumen 无法注入。已复制到剪贴板，请手动粘贴。"
-                .into()
-        }
-        (true, false) => "未能插入到当前窗口，已复制到剪贴板，请手动粘贴。".into(),
+        (true, true) => "已复制 · 目标窗口可能以管理员运行".into(),
+        (true, false) => copied_toast_notice(),
         (false, true) => {
             "目标窗口拒绝输入（可能正在以管理员身份运行）。也无法写入剪贴板，请从历史记录复制结果。"
                 .into()
         }
         (false, false) => "未能插入，也无法写入剪贴板。请从历史记录复制结果。".into(),
     }
+}
+
+fn capsule_notice_hold(outcome: &TranscribeOutcome) -> Duration {
+    let copy_only = outcome
+        .insert_notice
+        .as_deref()
+        .is_some_and(|notice| notice.starts_with("已复制"));
+    if copy_only && outcome.fallback_reason.is_none() {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(4)
+    }
+}
+
+/// When cloud ASR is selected and a local engine is ready, do not wait out the
+/// full HTTP timeout before giving the user text.
+const CLOUD_ASR_HEDGE: Duration = Duration::from_secs(8);
+
+fn cloud_asr_hedge_deadline(configured: Duration, local_ready: bool) -> Duration {
+    if local_ready {
+        configured.min(CLOUD_ASR_HEDGE)
+    } else {
+        configured
+    }
+}
+
+fn cloud_asr_error_is_hedgeable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("timeout")
+        || error.contains("timed out")
+        || error.contains("error sending request")
+        || error.contains("connection")
+        || error.contains("connect error")
+        || error.contains("dns error")
+        || error.contains("network")
+}
+
+fn asr_engine_hedge_label(selected_provider: &str, local_engine: EngineKind) -> String {
+    format!("{selected_provider}→{}", local_engine.as_str())
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1014,14 +1054,14 @@ pub async fn stop_and_transcribe_inner(
     schedule_late_context_archive(late_context_archive.take(), app);
 
     let asr_started = Instant::now();
-    let result = match run_asr(state, engine_kind, &asr_cfg, samples_16k, &mut attempt).await {
-        Ok(result) => result,
+    let asr_run = match run_asr(state, engine_kind, &asr_cfg, samples_16k, &mut attempt).await {
+        Ok(run) => run,
         Err(error) => {
             attempt.pipeline_metrics.asr_ms = elapsed_ms(asr_started);
             attempt.pipeline_metrics.set_asr_rtf();
             mark_attempt_failed(&mut attempt, PipelineStage::Asr, &error, pipeline_started);
             rec.status = SessionStatus::Failed;
-            rec.asr_engine = Some(engine_kind.as_str().into());
+            rec.asr_engine = Some(asr_engine_str.clone());
             write_attempt_debug(
                 &mut rec,
                 &attempt,
@@ -1043,11 +1083,13 @@ pub async fn stop_and_transcribe_inner(
             return Err(error);
         }
     };
-    let (asr_text, enhanced_text) = apply_asr_result(&mut attempt, &result, asr_started);
+    let asr_engine_label = asr_run.engine_label;
+    attempt.pipeline_identity.asr_engine = asr_engine_label.clone();
+    let (asr_text, enhanced_text) = apply_asr_result(&mut attempt, &asr_run.result, asr_started);
     tracing::info!(
         attempt_id = %attempt.id,
         asr_chars = asr_text.chars().count(),
-        engine = %asr_engine_str,
+        engine = %asr_engine_label,
         "ASR result"
     );
 
@@ -1197,6 +1239,9 @@ pub async fn stop_and_transcribe_inner(
                     insert_strategy = out.strategy;
                     insertion_outcome = insertion_outcome_for_strategy(insert_strategy);
                     did_insert = insertion_outcome == InsertionOutcome::Inserted;
+                    if insertion_outcome == InsertionOutcome::Copied {
+                        insert_notice = Some(copied_toast_notice());
+                    }
                     tracing::info!(
                         ?insert_strategy,
                         observation_started,
@@ -1254,7 +1299,7 @@ pub async fn stop_and_transcribe_inner(
     rec.asr_raw = Some(asr_text.clone());
     rec.corrected = Some(corrected_text.clone());
     rec.pasted = Some(corrected_text.clone());
-    rec.asr_engine = Some(engine_kind.as_str().into());
+    rec.asr_engine = Some(asr_engine_label.clone());
     rec.corrector_engine = Some(corrector_engine.clone());
     write_attempt_debug(
         &mut rec,
@@ -1278,7 +1323,7 @@ pub async fn stop_and_transcribe_inner(
         corrected_text,
         model_applied: correction.model_applied,
         fallback_reason,
-        asr_engine: engine_kind.as_str().into(),
+        asr_engine: asr_engine_label,
         corrector_engine,
         sample_rate,
         num_samples,
@@ -1517,8 +1562,8 @@ pub async fn retry_session_transcription(
     );
 
     let asr_started = Instant::now();
-    let result = match run_asr(&state, engine_kind, &cfg.asr, samples_16k, &mut attempt).await {
-        Ok(result) => result,
+    let asr_run = match run_asr(&state, engine_kind, &cfg.asr, samples_16k, &mut attempt).await {
+        Ok(run) => run,
         Err(error) => {
             attempt.pipeline_metrics.asr_ms = elapsed_ms(asr_started);
             attempt.pipeline_metrics.set_asr_rtf();
@@ -1529,7 +1574,9 @@ pub async fn retry_session_transcription(
             return Err(error);
         }
     };
-    let (asr_text, enhanced_text) = apply_asr_result(&mut attempt, &result, asr_started);
+    let asr_engine_label = asr_run.engine_label;
+    attempt.pipeline_identity.asr_engine = asr_engine_label.clone();
+    let (asr_text, enhanced_text) = apply_asr_result(&mut attempt, &asr_run.result, asr_started);
     let correction = run_corrector_stage(
         &state,
         &cfg,
@@ -1548,7 +1595,7 @@ pub async fn retry_session_transcription(
     rec.asr_raw = Some(asr_text.clone());
     rec.corrected = Some(corrected_text.clone());
     rec.pasted = Some(corrected_text.clone());
-    rec.asr_engine = Some(engine_kind.as_str().into());
+    rec.asr_engine = Some(asr_engine_label.clone());
     rec.corrector_engine = Some(corrector_engine.clone());
     rec.status = SessionStatus::Completed;
 
@@ -1566,7 +1613,7 @@ pub async fn retry_session_transcription(
         session: rec,
         asr_text,
         corrected_text,
-        asr_engine: engine_kind.as_str().into(),
+        asr_engine: asr_engine_label,
         corrector_engine,
         model_applied: correction.model_applied,
         fallback_reason,
@@ -1650,13 +1697,18 @@ pub(crate) fn build_meeting_asr_engine(state: &AppState) -> Result<Box<dyn AsrEn
     )
 }
 
+struct AsrRun {
+    result: AsrResult,
+    engine_label: String,
+}
+
 async fn run_asr(
     state: &AppState,
     engine_kind: EngineKind,
     asr_cfg: &AsrServiceConfig,
     samples_16k: Vec<f32>,
     attempt: &mut DictationAttemptRecord,
-) -> Result<AsrResult, String> {
+) -> Result<AsrRun, String> {
     let provider = canonical_asr_provider(&asr_cfg.provider);
     let provider = provider.as_str();
 
@@ -1670,39 +1722,133 @@ async fn run_asr(
     }
 
     if matches!(provider, "openai_audio" | "custom") {
-        let base = if asr_cfg.base_url.trim().is_empty() {
-            "https://api.openai.com/v1".into()
-        } else {
-            asr_cfg.base_url.clone()
-        };
-        let model = if asr_cfg.model.trim().is_empty() {
-            "whisper-1".into()
-        } else {
-            asr_cfg.model.clone()
-        };
-        let eng = OpenAiAudioAsr::new(OpenAiAudioConfig {
-            base_url: base,
-            api_key: asr_cfg.api_key.clone(),
-            model,
-            timeout: std::time::Duration::from_secs(asr_cfg.timeout_secs.max(30)),
-            language: if asr_cfg.language.trim().is_empty() {
-                None
-            } else {
-                Some(asr_cfg.language.clone())
-            },
-            // Keep the shared engine's defaults for the new knobs
-            // (8 MiB request cap, "openai_audio" transcript label).
-            ..OpenAiAudioConfig::default()
-        })
-        .map_err(|e| e.to_string())?;
-        return eng
-            .transcribe(AsrRequest::new(samples_16k, 16_000))
-            .await
-            .map_err(|e| e.to_string());
+        return run_cloud_asr_with_local_hedge(state, provider, asr_cfg, samples_16k, attempt)
+            .await;
     }
 
     let selected_local_engine = engine_kind_for_provider(provider).unwrap_or(engine_kind);
-    if selected_local_engine == EngineKind::Whisper {
+    let result = run_local_asr(state, selected_local_engine, asr_cfg, samples_16k, attempt).await?;
+    Ok(AsrRun {
+        result,
+        engine_label: selected_local_engine.as_str().into(),
+    })
+}
+
+async fn run_cloud_asr_with_local_hedge(
+    state: &AppState,
+    provider: &str,
+    asr_cfg: &AsrServiceConfig,
+    samples_16k: Vec<f32>,
+    attempt: &mut DictationAttemptRecord,
+) -> Result<AsrRun, String> {
+    let local_kind = local_hedge_engine_kind(state);
+    let configured = Duration::from_secs(asr_cfg.timeout_secs.max(30));
+    let deadline = cloud_asr_hedge_deadline(configured, local_kind.is_some());
+    let cloud = transcribe_openai_audio(asr_cfg, samples_16k.clone());
+    let cloud_outcome = match tokio::time::timeout(deadline, cloud).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err("timeout".into()),
+    };
+    match cloud_outcome {
+        Ok(result) => Ok(AsrRun {
+            result,
+            engine_label: provider.to_owned(),
+        }),
+        Err(error) => {
+            let Some(local_kind) = local_kind.filter(|_| cloud_asr_error_is_hedgeable(&error))
+            else {
+                return Err(if error == "timeout" {
+                    "在线 ASR 超时".into()
+                } else {
+                    error
+                });
+            };
+            tracing::warn!(
+                %provider,
+                hedge = %local_kind.as_str(),
+                error = %error,
+                "cloud ASR timed out or dropped; falling back to local engine"
+            );
+            match run_local_asr(state, local_kind, asr_cfg, samples_16k, attempt).await {
+                Ok(result) => {
+                    attempt
+                        .pipeline_metrics
+                        .stage_issues
+                        .push(PipelineStageIssue {
+                            stage: PipelineStage::Asr,
+                            kind: PipelineIssueKind::Fallback,
+                            message: format!("{provider} timeout; used {}", local_kind.as_str()),
+                        });
+                    Ok(AsrRun {
+                        result,
+                        engine_label: asr_engine_hedge_label(provider, local_kind),
+                    })
+                }
+                Err(local_error) => Err(format!(
+                    "在线 ASR 超时，本地 {} 也失败：{local_error}",
+                    local_kind.as_str()
+                )),
+            }
+        }
+    }
+}
+
+fn local_hedge_engine_kind(state: &AppState) -> Option<EngineKind> {
+    if let Ok(engine) = state.sensevoice.lock() {
+        if sensevoice_ready(&engine.model_dir()) {
+            return Some(EngineKind::SenseVoice);
+        }
+    }
+    if let Ok(engine) = state.whisper.lock() {
+        if whisper_ready(&engine.model_dir()) {
+            return Some(EngineKind::Whisper);
+        }
+    }
+    None
+}
+
+async fn transcribe_openai_audio(
+    asr_cfg: &AsrServiceConfig,
+    samples_16k: Vec<f32>,
+) -> Result<AsrResult, String> {
+    let base = if asr_cfg.base_url.trim().is_empty() {
+        "https://api.openai.com/v1".into()
+    } else {
+        asr_cfg.base_url.clone()
+    };
+    let model = if asr_cfg.model.trim().is_empty() {
+        "whisper-1".into()
+    } else {
+        asr_cfg.model.clone()
+    };
+    let eng = OpenAiAudioAsr::new(OpenAiAudioConfig {
+        base_url: base,
+        api_key: asr_cfg.api_key.clone(),
+        model,
+        timeout: Duration::from_secs(asr_cfg.timeout_secs.max(30)),
+        language: if asr_cfg.language.trim().is_empty() {
+            None
+        } else {
+            Some(asr_cfg.language.clone())
+        },
+        // Keep the shared engine's defaults for the new knobs
+        // (8 MiB request cap, "openai_audio" transcript label).
+        ..OpenAiAudioConfig::default()
+    })
+    .map_err(|e| e.to_string())?;
+    eng.transcribe(AsrRequest::new(samples_16k, 16_000))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn run_local_asr(
+    state: &AppState,
+    engine_kind: EngineKind,
+    asr_cfg: &AsrServiceConfig,
+    samples_16k: Vec<f32>,
+    attempt: &mut DictationAttemptRecord,
+) -> Result<AsrResult, String> {
+    if engine_kind == EngineKind::Whisper {
         let eng = state
             .whisper
             .lock()
@@ -1714,7 +1860,7 @@ async fn run_asr(
             .map_err(|e| e.to_string());
     }
 
-    if selected_local_engine == EngineKind::Qwen {
+    if engine_kind == EngineKind::Qwen {
         let eng = state
             .qwen
             .lock()
@@ -1972,6 +2118,7 @@ fn finish_with_transient_error(app: &AppHandle, message: String) {
 }
 
 fn finish_with_transient_fallback(app: &AppHandle, outcome: TranscribeOutcome) {
+    let hold = capsule_notice_hold(&outcome);
     let notice_epoch = {
         let _transition = UI_TRANSITION
             .lock()
@@ -1985,7 +2132,7 @@ fn finish_with_transient_fallback(app: &AppHandle, outcome: TranscribeOutcome) {
 
     let app_for_notice = app.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        tokio::time::sleep(hold).await;
         let _transition = UI_TRANSITION
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2312,10 +2459,10 @@ mod attempt_metric_tests {
 
     #[test]
     fn copy_only_feedback_matches_platform_contract() {
+        let copied = copy_only_fallback_notice(true);
+        assert!(copied.starts_with("已复制"));
         #[cfg(target_os = "windows")]
         {
-            let copied = copy_only_fallback_notice(true);
-            assert!(copied.contains("剪贴板"));
             assert!(!copied.contains("辅助功能"));
             let failure = copy_only_fallback_notice(false);
             assert!(failure.contains("剪贴板"));
@@ -2323,7 +2470,7 @@ mod attempt_metric_tests {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(copy_only_fallback_notice(true).contains("辅助功能"));
+            assert!(copied.contains("辅助功能"));
         }
     }
 
@@ -2333,13 +2480,71 @@ mod attempt_metric_tests {
             "Windows blocked simulated keyboard input; elevated apps cannot receive input from a non-elevated Lumen process",
             true,
         );
+        assert!(elevated.starts_with("已复制"));
         assert!(elevated.contains("管理员"));
-        assert!(elevated.contains("剪贴板"));
         let generic = insert_failure_notice("paste failed", true);
-        assert!(generic.contains("剪贴板"));
-        assert!(!generic.contains("管理员"));
+        assert_eq!(generic, "已复制");
         let both_failed = insert_failure_notice("paste failed", false);
         assert!(both_failed.contains("历史记录"));
+    }
+
+    #[test]
+    fn cloud_asr_hedge_prefers_a_short_deadline_when_local_is_ready() {
+        let configured = Duration::from_secs(120);
+        assert_eq!(
+            cloud_asr_hedge_deadline(configured, true),
+            Duration::from_secs(8)
+        );
+        assert_eq!(cloud_asr_hedge_deadline(configured, false), configured);
+        assert_eq!(
+            cloud_asr_hedge_deadline(Duration::from_secs(5), true),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn cloud_asr_timeouts_are_hedgeable_but_auth_rejects_are_not() {
+        assert!(cloud_asr_error_is_hedgeable("timeout"));
+        assert!(cloud_asr_error_is_hedgeable("http: error sending request"));
+        assert!(cloud_asr_error_is_hedgeable("timed out"));
+        assert!(!cloud_asr_error_is_hedgeable(
+            "provider rejected request with status 401 Unauthorized"
+        ));
+        assert!(!cloud_asr_error_is_hedgeable(
+            "provider rejected request with status 400: bad request"
+        ));
+    }
+
+    #[test]
+    fn asr_engine_hedge_label_records_the_path_that_actually_ran() {
+        assert_eq!(
+            asr_engine_hedge_label("openai_audio", EngineKind::SenseVoice),
+            "openai_audio→sensevoice"
+        );
+    }
+
+    #[test]
+    fn copy_toast_holds_the_capsule_briefly() {
+        let outcome = TranscribeOutcome {
+            text: "你好".into(),
+            asr_text: "你好".into(),
+            corrected_text: "你好".into(),
+            model_applied: true,
+            fallback_reason: None,
+            asr_engine: "sensevoice".into(),
+            corrector_engine: "none".into(),
+            sample_rate: 16_000,
+            num_samples: 0,
+            duration_ms: 0,
+            session: SessionRecord::new(),
+            watch_post_paste: false,
+            post_paste_seconds: 0,
+            insert_notice: Some("已复制".into()),
+        };
+        assert_eq!(capsule_notice_hold(&outcome), Duration::from_secs(2));
+        let mut with_fallback = outcome.clone();
+        with_fallback.fallback_reason = Some("timeout".into());
+        assert_eq!(capsule_notice_hold(&with_fallback), Duration::from_secs(4));
     }
 
     #[test]

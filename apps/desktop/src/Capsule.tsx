@@ -136,7 +136,10 @@ export default function Capsule() {
     badge = "!";
     label = message;
   } else if (phase === "notice") {
-    badge = message.includes("插入") || message.includes("剪贴板") ? "贴" : "回";
+    badge =
+      message.includes("复制") || message.includes("插入") || message.includes("剪贴板")
+        ? "贴"
+        : "回";
     label = message;
   } else {
     badge = "·";

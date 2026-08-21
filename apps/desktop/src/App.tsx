@@ -19,8 +19,10 @@ import {
   hasAcknowledgedWindowsMicrophoneNotice,
 } from "./microphoneConsent";
 import {
+  copyToastLabel,
   correctorFallbackNotice,
   correctorFallbackReasonLabel,
+  formatAsrEngineLabel,
 } from "./fallbackPresentation";
 import lumenMark from "./assets/product-icons/lumen-asr.svg";
 import type {
@@ -205,6 +207,18 @@ export default function App() {
   const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [copyToast, setCopyToast] = useState<string | null>(null);
+  const copyToastTimerRef = useRef<number | null>(null);
+  const showCopyToast = useCallback((text: string) => {
+    setCopyToast(text);
+    if (copyToastTimerRef.current != null) {
+      window.clearTimeout(copyToastTimerRef.current);
+    }
+    copyToastTimerRef.current = window.setTimeout(() => {
+      setCopyToast(null);
+      copyToastTimerRef.current = null;
+    }, 2200);
+  }, []);
   const [powerWarning, setPowerWarning] = useState<string | null>(null);
   // Prolonged-silence grace period. The backend owns the authoritative sample
   // clock; the deadline here is presentation-only for the visible countdown.
@@ -439,6 +453,7 @@ export default function App() {
         asrEngine?: string;
         correctorEngine?: string;
         fallbackReason?: string | null;
+        insertNotice?: string | null;
         session?: SessionRecord;
       };
     }>("dictation", (e) => {
@@ -453,6 +468,8 @@ export default function App() {
         // Update history quietly — do not force-activate or jump UI aggressively.
         void refreshHealth();
         void refreshSessions();
+        const copied = copyToastLabel(p.outcome.insertNotice);
+        if (copied) showCopyToast(copied);
         // Stash for Record tab if user opens it; hotkey path must not steal OS focus.
         window.dispatchEvent(
           new CustomEvent("lumen-dictation-done", { detail: p.outcome })
@@ -467,7 +484,7 @@ export default function App() {
       un = fn;
     });
     return () => un?.();
-  }, [refreshHealth, refreshSessions]);
+  }, [refreshHealth, refreshSessions, showCopyToast]);
 
   // Meeting-detection prompt lifecycle: the backend emits `meeting-detected`
   // when a stable meeting-app input is seen, and `meeting-detection-cancelled`
@@ -773,9 +790,22 @@ export default function App() {
 
   const nav = NAV.find((n) => n.id === tab) ?? NAV[0];
 
+  useEffect(() => {
+    return () => {
+      if (copyToastTimerRef.current != null) {
+        window.clearTimeout(copyToastTimerRef.current);
+      }
+    };
+  }, []);
+
   return (
     <MeetingModelsProvider>
     <div className="app-frame">
+      {copyToast && (
+        <div className="copy-toast" role="status" aria-live="polite">
+          {copyToast}
+        </div>
+      )}
       {showOnboarding && (
         <OnboardingWizard
           onDone={() => {
@@ -1064,6 +1094,7 @@ export default function App() {
                 busy={busy}
                 onError={setError}
                 onBusy={setBusy}
+                onCopyToast={showCopyToast}
                 hotkeyLabel={hotkeyLabel}
                 onSaved={async () => {
                   await refreshSessions();
@@ -1567,12 +1598,14 @@ function RecordPanel({
   onBusy,
   onSaved,
   onLearnCandidates,
+  onCopyToast,
   hotkeyLabel,
 }: {
   busy: boolean;
   onError: (e: string | null) => void;
   onBusy: (b: boolean) => void;
   onSaved: () => Promise<void>;
+  onCopyToast: (text: string) => void;
   hotkeyLabel: string;
   onLearnCandidates: (
     sessionId: string,
@@ -1679,8 +1712,8 @@ function RecordPanel({
       setLiveCandidates([]);
       setMeta(
         detail.fallbackReason
-          ? `hotkey · ASR ${detail.asrEngine || "?"} · ${correctorFallbackNotice(detail.fallbackReason)}`
-          : `hotkey · ASR ${detail.asrEngine || "?"} · ${detail.correctorEngine || ""}`
+          ? `hotkey · ASR ${formatAsrEngineLabel(detail.asrEngine) || "?"} · ${correctorFallbackNotice(detail.fallbackReason)}`
+          : `hotkey · ASR ${formatAsrEngineLabel(detail.asrEngine) || "?"} · ${detail.correctorEngine || ""}`
       );
     };
     window.addEventListener("lumen-dictation-done", handler);
@@ -1788,11 +1821,13 @@ function RecordPanel({
       setBaseline(out.text);
       setSessionId(out.session?.id ?? null);
       setLiveCandidates([]);
+      const copied = copyToastLabel(out.insertNotice);
+      if (copied) onCopyToast(copied);
       const corr = out.modelApplied
         ? `corrector ${out.correctorEngine}`
         : `${correctorFallbackNotice(out.fallbackReason)} (${out.correctorEngine})`;
       setMeta(
-        `ASR ${out.asrEngine} · ${corr} · ${(out.durationMs / 1000).toFixed(1)}s · ${out.numSamples} samples`
+        `ASR ${formatAsrEngineLabel(out.asrEngine) || out.asrEngine} · ${corr} · ${(out.durationMs / 1000).toFixed(1)}s · ${out.numSamples} samples`
       );
       await onSaved();
       await refreshStatus();
@@ -4503,7 +4538,7 @@ function HistoryPanel({
                 <div className="history-detail-meta muted-text">
                   {[
                     selected.focus?.app_name,
-                    selected.asr_engine,
+                    formatAsrEngineLabel(selected.asr_engine),
                     selected.corrector_engine && selected.corrector_engine !== "none"
                       ? `修正 ${selected.corrector_engine}`
                       : null,
