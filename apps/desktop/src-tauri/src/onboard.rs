@@ -40,11 +40,7 @@ fn dto_from(cfg: &OnboardingConfig) -> OnboardingStateDto {
         skipped,
         version: CURRENT_ONBOARDING_VERSION,
         // Unfinished older wizards restart at Welcome (step indices changed).
-        step: if current {
-            cfg.step.min(LAST_STEP)
-        } else {
-            0
-        },
+        step: if current { cfg.step.min(LAST_STEP) } else { 0 },
         show_wizard,
         max_step_stage_b: LAST_STEP,
     }

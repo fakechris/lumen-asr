@@ -5,8 +5,8 @@ use lumen_platform::PermissionStatus;
 use lumen_platform::Permissions;
 #[cfg(target_os = "macos")]
 use lumen_platform_macos::{
-    dismiss_accessibility_drag_overlay, is_accessibility_trusted, present_accessibility_drag_overlay,
-    prompt_accessibility, MacPermissions,
+    dismiss_accessibility_drag_overlay, is_accessibility_trusted,
+    present_accessibility_drag_overlay, prompt_accessibility, MacPermissions,
 };
 use serde::Serialize;
 use tauri::State;

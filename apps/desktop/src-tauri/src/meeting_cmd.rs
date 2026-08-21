@@ -1708,10 +1708,7 @@ fn prepare_imported_meeting_audio(
     let dest = meetings_dir.join(format!("{}.wav", meeting.id));
     crate::audio_convert::copy_or_convert_to_wav(source, &dest)?;
     meeting.audio_path = Some(dest.to_string_lossy().into_owned());
-    Ok(PreparedImport {
-        meeting,
-        wav: dest,
-    })
+    Ok(PreparedImport { meeting, wav: dest })
 }
 
 fn pick_meeting_audio_path(app: &AppHandle) -> Result<PathBuf, String> {

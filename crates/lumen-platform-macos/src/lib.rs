@@ -13,6 +13,9 @@ pub mod power_monitor;
 mod system_audio;
 mod voice_processing;
 
+pub use ax_drag::{
+    dismiss_accessibility_drag_overlay, drag_payload_path, present_accessibility_drag_overlay,
+};
 pub use calendar::{
     current_or_upcoming_event as calendar_current_or_upcoming_event,
     request_access as calendar_request_access, select_event_in_window, CalendarCandidate,
@@ -28,9 +31,6 @@ pub use inject::MacTextInjectorBackend;
 pub use meeting_activity::{
     capability_available as meeting_detection_capability_available, ActiveInput, DetectorSignal,
     MeetingActivityDetector, DEFAULT_POLL as MEETING_DETECTION_DEFAULT_POLL,
-};
-pub use ax_drag::{
-    dismiss_accessibility_drag_overlay, drag_payload_path, present_accessibility_drag_overlay,
 };
 pub use permissions::{
     ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,

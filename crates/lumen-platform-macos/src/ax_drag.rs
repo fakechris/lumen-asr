@@ -71,10 +71,7 @@ pub fn pick_settings_window(windows: &[OverlayWindow]) -> Option<&OverlayWindow>
 
 /// Panel frame in CG/AppKit screen coords (origin bottom-left), docked near
 /// the bottom of the Settings window.
-pub fn overlay_frame_in(
-    settings: (f64, f64, f64, f64),
-    panel: (f64, f64),
-) -> (f64, f64, f64, f64) {
+pub fn overlay_frame_in(settings: (f64, f64, f64, f64), panel: (f64, f64)) -> (f64, f64, f64, f64) {
     let (sx, sy, sw, _sh) = settings;
     let (pw, ph) = panel;
     let width = pw.min(sw - 24.0).max(320.0);
@@ -95,9 +92,7 @@ pub fn dismiss_accessibility_drag_overlay() {
 
 #[cfg(target_os = "macos")]
 mod native {
-    use super::{
-        drag_payload_path, overlay_frame_in, pick_settings_window, OverlayWindow,
-    };
+    use super::{drag_payload_path, overlay_frame_in, pick_settings_window, OverlayWindow};
     use crate::permissions::is_accessibility_trusted;
     use crate::run_on_main;
     use core_foundation::base::{TCFType, ToVoid};
@@ -112,9 +107,9 @@ mod native {
     use objc2::runtime::{AnyObject, Sel};
     use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
     use objc2_app_kit::{
-        NSBackingStoreType, NSButton, NSColor, NSEvent, NSFont, NSImage, NSImageView, NSPanel,
-        NSScreen, NSTextField, NSView, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
-        NSFloatingWindowLevel,
+        NSBackingStoreType, NSButton, NSColor, NSEvent, NSFloatingWindowLevel, NSFont, NSImage,
+        NSImageView, NSPanel, NSScreen, NSTextField, NSView, NSWindowCollectionBehavior,
+        NSWindowStyleMask, NSWorkspace,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
     use std::cell::RefCell;
@@ -453,7 +448,10 @@ mod native {
         pick_settings_window(&windows).cloned()
     }
 
-    fn dict_string(dict: &CFDictionary, key: core_foundation::string::CFStringRef) -> Option<String> {
+    fn dict_string(
+        dict: &CFDictionary,
+        key: core_foundation::string::CFStringRef,
+    ) -> Option<String> {
         let key = unsafe { CFString::wrap_under_get_rule(key) };
         let value = dict.find(key.to_void())?;
         if (*value).is_null() {

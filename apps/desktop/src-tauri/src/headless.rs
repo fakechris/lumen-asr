@@ -794,8 +794,7 @@ fn write_cli_minutes(
     let corrector = crate::corrector_svc::build_corrector(&cfg.corrector)?;
     let segments = store.list_segments(meeting_id).map_err(|e| e.to_string())?;
     let speakers = store.list_speakers(meeting_id).map_err(|e| e.to_string())?;
-    let transcript =
-        lumen_meeting::minutes::render_transcript_for_minutes(&segments, &speakers);
+    let transcript = lumen_meeting::minutes::render_transcript_for_minutes(&segments, &speakers);
     let minutes = tauri::async_runtime::block_on(lumen_meeting::minutes::generate_minutes(
         corrector.as_ref(),
         &transcript,

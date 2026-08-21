@@ -40,9 +40,7 @@ pub fn convert_to_wav_16k(src: &Path, dest: &Path) -> Result<(), String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|e| {
-            format!("无法启动 ffmpeg（{e}）。请安装 ffmpeg 后再导入 m4a/mp3/mp4。")
-        })?;
+        .map_err(|e| format!("无法启动 ffmpeg（{e}）。请安装 ffmpeg 后再导入 m4a/mp3/mp4。"))?;
     if !status.success() {
         return Err(format!("ffmpeg 转换失败：{}", src.display()));
     }
