@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { correctorFallbackNotice } from "./fallbackPresentation";
+import { dictationDoneNotice } from "./fallbackPresentation";
 
 type Phase = "idle" | "listening" | "processing" | "notice" | "error";
 
@@ -21,7 +21,11 @@ type DictationEvent =
     }
   | {
       phase: "done";
-      outcome: { text: string; fallbackReason?: string | null };
+      outcome: {
+        text: string;
+        fallbackReason?: string | null;
+        insertNotice?: string | null;
+      };
     }
   | { phase: "notice"; message: string }
   | { phase: "error"; message: string }
@@ -57,9 +61,13 @@ export default function Capsule() {
         setPhase("notice");
         setMessage(p.message);
       } else if (p.phase === "done") {
-        if (p.outcome.fallbackReason) {
+        const notice = dictationDoneNotice({
+          fallbackReason: p.outcome.fallbackReason,
+          insertNotice: p.outcome.insertNotice,
+        });
+        if (notice) {
           setPhase("notice");
-          setMessage(correctorFallbackNotice(p.outcome.fallbackReason));
+          setMessage(notice);
         } else {
           setPhase("idle");
           setMessage("完成");
@@ -128,7 +136,7 @@ export default function Capsule() {
     badge = "!";
     label = message;
   } else if (phase === "notice") {
-    badge = "回";
+    badge = message.includes("插入") || message.includes("剪贴板") ? "贴" : "回";
     label = message;
   } else {
     badge = "·";

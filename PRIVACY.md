@@ -54,7 +54,8 @@ privacy policy and retention terms. Lumen ASR does not control those providers.
   capture, and inserting text into another application. Without it, Lumen ASR
   can fall back to the clipboard.
 - **Clipboard and input APIs** are used to deliver the resulting text. Windows
-  currently uses copy-only mode and does not perform OS context capture.
+  inserts via simulated keyboard / paste and falls back to the clipboard when
+  the target refuses input. Windows does not perform OS context capture.
 
 ## Retention and deletion
 

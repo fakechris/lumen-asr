@@ -266,6 +266,8 @@ export const api = {
   openAccessibilitySettings: () => invoke<void>("open_accessibility_settings"),
   requestAccessibilityAccess: () =>
     invoke<PermissionStatus>("request_accessibility_access"),
+  dismissAccessibilityDragOverlay: () =>
+    invoke<void>("dismiss_accessibility_drag_overlay_cmd"),
   requestMicrophoneAccess: () =>
     invoke<PermissionStatus>("request_microphone_access"),
 
@@ -484,6 +486,11 @@ export const api = {
    * `processing → … → ready`/`failed` in the background (poll the list/detail). */
   stopMeetingRecording: (meetingId: string) =>
     invoke<MeetingRecordingResult>("stop_meeting_recording", { meetingId }),
+
+  /** Import wav/mp3/m4a/mp4 into the meeting library and start processing.
+   * Omit `path` to open a native file picker; drag-and-drop passes the dropped path. */
+  importMeetingFile: (path?: string) =>
+    invoke<string>("import_meeting_file", { path: path ?? null }),
 
   // Pause/resume are backend-ready but intentionally NOT surfaced by the minimal
   // inline recording bar (which is reconstructed from backend state on remount

@@ -1,6 +1,6 @@
 # Windows port status
 
-Updated: 2026-07-27
+Updated: 2026-08-20
 
 This document tracks deliberate compatibility choices made by the
 `port/windows` branch.
@@ -24,6 +24,9 @@ At this point, no intentional macOS behavior break has been introduced.
 - Application data uses `%LOCALAPPDATA%\LumenAsr`.
 - Windows copy-only output now writes UTF-16 text through the Win32 clipboard
   API, including retrying briefly when another process owns the clipboard.
+- Automatic insertion is implemented: Unicode `SendInput` typing and Ctrl+V
+  paste into the focused window. Copy-only is the fallback when insertion is
+  blocked.
 - The microphone settings action opens `ms-settings:privacy-microphone`.
 - A Windows Tauri overlay selects an NSIS current-user installer and the
   WebView2 download bootstrapper.
@@ -39,8 +42,7 @@ At this point, no intentional macOS behavior break has been introduced.
   backend on GitHub-hosted `windows-latest` runners.
 - Windows CI creates an unsigned MSIX for Microsoft Store ingestion. The
   manifest declares only `runFullTrust` (required for the Tauri Win32 process)
-  and `microphone`; Windows context capture and automatic insertion remain
-  disabled.
+  and `microphone`. Windows context capture remains disabled.
 - Store submission builds read the Partner Center identity from the
   `WINDOWS_STORE_IDENTITY_NAME`, `WINDOWS_STORE_PUBLISHER`, and
   `WINDOWS_STORE_PUBLISHER_DISPLAY_NAME` repository variables. Pull requests
@@ -51,9 +53,10 @@ At this point, no intentional macOS behavior break has been introduced.
 
 - The desktop backend still contains direct calls to `lumen-platform-macos`.
   Several have non-macOS stubs, but they do not provide Windows foreground
-  target capture, text injection, or permission diagnostics.
-- Automatic insertion is not yet supported. Windows deliberately returns a
-  `copy_only` outcome instead of calling the macOS injector.
+  target capture or permission diagnostics.
+- Elevated (administrator) windows cannot receive simulated keyboard input from
+  a non-elevated Lumen process. Insertion then copies to the clipboard and the
+  capsule shows a human-readable notice.
 - Context capture is not yet implemented with UI Automation, Windows Graphics
   Capture, DPAPI, or Named Pipes.
 - The installer is unsigned, so SmartScreen warnings are expected.

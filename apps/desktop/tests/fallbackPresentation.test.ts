@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   correctorFallbackNotice,
   correctorFallbackReasonLabel,
+  dictationDoneNotice,
 } from "../src/fallbackPresentation.ts";
 
 test("explains granular context-integrity fallback reasons", () => {
@@ -20,6 +21,23 @@ test("explains granular context-integrity fallback reasons", () => {
 test("fallback notice says that the model revision was not used", () => {
   assert.equal(
     correctorFallbackNotice("timeout"),
-    "AI 修订未采用，已使用基础整理文本：AI 服务响应超时",
+    "识别完成，校对未应用：AI 服务响应超时",
+  );
+});
+
+test("done notice keeps insert failure separate from ASR failure", () => {
+  assert.equal(dictationDoneNotice({}), null);
+  assert.equal(
+    dictationDoneNotice({
+      insertNotice: "未能插入到当前窗口，已复制到剪贴板，请手动粘贴。",
+    }),
+    "未能插入到当前窗口，已复制到剪贴板，请手动粘贴。",
+  );
+  assert.equal(
+    dictationDoneNotice({
+      fallbackReason: "timeout",
+      insertNotice: "未能插入到当前窗口，已复制到剪贴板，请手动粘贴。",
+    }),
+    "识别完成，校对未应用：AI 服务响应超时 未能插入到当前窗口，已复制到剪贴板，请手动粘贴。",
   );
 });

@@ -307,26 +307,40 @@ fn insertion_outcome_for_strategy(strategy: InsertStrategy) -> InsertionOutcome 
     }
 }
 
-fn copy_only_error_message(clipboard_copied: bool) -> Option<&'static str> {
-    #[cfg(target_os = "windows")]
+fn copy_only_fallback_notice(clipboard_copied: bool) -> String {
+    #[cfg(target_os = "macos")]
     {
         if clipboard_copied {
-            None
+            "需要「辅助功能」权限才能插入到其他 App。请到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop），然后重试。文字已复制到剪贴板。"
+                .into()
         } else {
-            Some("Windows 复制模式未能把文字写入剪贴板，请先从历史记录手动复制结果。")
+            "需要「辅助功能」权限才能插入到其他 App，并且复制到剪贴板也失败了。请先从历史记录复制结果，并到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop）后重试。"
+                .into()
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(target_os = "macos"))]
     {
         if clipboard_copied {
-            Some(
-                "需要「辅助功能」权限才能插入到其他 App。请到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop），然后重试。文字已复制到剪贴板。",
-            )
+            "未能自动插入，已复制到剪贴板，请手动粘贴。".into()
         } else {
-            Some(
-                "需要「辅助功能」权限才能插入到其他 App，并且复制到剪贴板也失败了。请先手动复制结果，并到 系统设置 → 隐私与安全性 → 辅助功能 打开 Lumen（或 lumen-asr-desktop）后重试。",
-            )
+            "未能插入，也无法写入剪贴板。请从历史记录复制结果。".into()
         }
+    }
+}
+
+fn insert_failure_notice(error: &str, copied: bool) -> String {
+    let elevated = error.to_ascii_lowercase().contains("elevated");
+    match (copied, elevated) {
+        (true, true) => {
+            "目标窗口拒绝输入。若该程序以管理员身份运行，Lumen 无法注入。已复制到剪贴板，请手动粘贴。"
+                .into()
+        }
+        (true, false) => "未能插入到当前窗口，已复制到剪贴板，请手动粘贴。".into(),
+        (false, true) => {
+            "目标窗口拒绝输入（可能正在以管理员身份运行）。也无法写入剪贴板，请从历史记录复制结果。"
+                .into()
+        }
+        (false, false) => "未能插入，也无法写入剪贴板。请从历史记录复制结果。".into(),
     }
 }
 
@@ -712,6 +726,8 @@ pub struct TranscribeOutcome {
     /// True when the backend successfully anchored and started post-paste edit watch.
     pub watch_post_paste: bool,
     pub post_paste_seconds: u64,
+    /// Human-readable insert fallback. Distinct from ASR failure and corrector fallback.
+    pub insert_notice: Option<String>,
 }
 
 #[tauri::command]
@@ -1092,6 +1108,7 @@ pub async fn stop_and_transcribe_inner(
     let mut did_insert = false;
     let mut observation_started = false;
     let mut insertion_outcome = InsertionOutcome::NotRequested;
+    let mut insert_notice: Option<String> = None;
     let mut frontmost_before_insert = None;
     let insert_started = Instant::now();
     if cfg.inject.auto_insert && !corrected_text.is_empty() {
@@ -1139,14 +1156,7 @@ pub async fn stop_and_transcribe_inner(
                     false
                 }
             };
-            if let (Some(app), Some(message)) = (app, copy_only_error_message(clipboard_copied)) {
-                emit_dictation(
-                    app,
-                    DictationUiEvent::Error {
-                        message: message.into(),
-                    },
-                );
-            }
+            insert_notice = Some(copy_only_fallback_notice(clipboard_copied));
         } else {
             frontmost_before_insert = restore_target_app_before_insert(app);
             // Let focus settle after capsule hide; modifiers clear inside inject.
@@ -1195,7 +1205,6 @@ pub async fn stop_and_transcribe_inner(
                     );
                 }
                 Err(e) => {
-                    insertion_outcome = InsertionOutcome::Failed;
                     notes.push(format!("insert error: {e}"));
                     attempt
                         .pipeline_metrics
@@ -1206,6 +1215,27 @@ pub async fn stop_and_transcribe_inner(
                             message: e.to_string(),
                         });
                     tracing::warn!(error = %e, "auto-insert failed");
+                    match crate::inject_cmd::copy_only(&corrected_text).await {
+                        Ok(()) => {
+                            insert_strategy = InsertStrategy::CopyOnly;
+                            insertion_outcome = InsertionOutcome::Copied;
+                            insert_notice = Some(insert_failure_notice(&e, true));
+                            tracing::info!("copied result to clipboard after insert failure");
+                        }
+                        Err(copy_err) => {
+                            insertion_outcome = InsertionOutcome::Failed;
+                            notes.push(format!("clipboard copy failed: {copy_err}"));
+                            attempt
+                                .pipeline_metrics
+                                .stage_issues
+                                .push(PipelineStageIssue {
+                                    stage: PipelineStage::Insert,
+                                    kind: PipelineIssueKind::ClipboardFailure,
+                                    message: copy_err,
+                                });
+                            insert_notice = Some(insert_failure_notice(&e, false));
+                        }
+                    }
                 }
             }
         }
@@ -1256,6 +1286,7 @@ pub async fn stop_and_transcribe_inner(
         session: rec,
         watch_post_paste,
         post_paste_seconds: cfg.learning.post_paste_seconds,
+        insert_notice,
     })
 }
 
@@ -2137,7 +2168,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
     clear_ui_intent();
     match result {
         Ok(outcome) => {
-            if outcome.fallback_reason.is_some() {
+            if outcome.fallback_reason.is_some() || outcome.insert_notice.is_some() {
                 finish_with_transient_fallback(&app, outcome);
             } else {
                 crate::capsule::set_capsule_visible(&app, false, "idle");
@@ -2283,15 +2314,32 @@ mod attempt_metric_tests {
     fn copy_only_feedback_matches_platform_contract() {
         #[cfg(target_os = "windows")]
         {
-            assert_eq!(copy_only_error_message(true), None);
-            let failure = copy_only_error_message(false).unwrap();
+            let copied = copy_only_fallback_notice(true);
+            assert!(copied.contains("剪贴板"));
+            assert!(!copied.contains("辅助功能"));
+            let failure = copy_only_fallback_notice(false);
             assert!(failure.contains("剪贴板"));
             assert!(!failure.contains("辅助功能"));
         }
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(copy_only_error_message(true).unwrap().contains("辅助功能"));
+            assert!(copy_only_fallback_notice(true).contains("辅助功能"));
         }
+    }
+
+    #[test]
+    fn insert_failure_notice_separates_elevated_targets_from_generic_failures() {
+        let elevated = insert_failure_notice(
+            "Windows blocked simulated keyboard input; elevated apps cannot receive input from a non-elevated Lumen process",
+            true,
+        );
+        assert!(elevated.contains("管理员"));
+        assert!(elevated.contains("剪贴板"));
+        let generic = insert_failure_notice("paste failed", true);
+        assert!(generic.contains("剪贴板"));
+        assert!(!generic.contains("管理员"));
+        let both_failed = insert_failure_notice("paste failed", false);
+        assert!(both_failed.contains("历史记录"));
     }
 
     #[test]

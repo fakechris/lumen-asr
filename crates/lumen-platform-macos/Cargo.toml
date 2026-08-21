@@ -19,7 +19,30 @@ chrono = { workspace = true }
 core-foundation = "0.10"
 core-graphics = "0.24"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSValue", "NSNotification", "NSOperation", "block2"] }
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSWorkspace", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSValue", "NSNotification", "NSOperation", "NSURL", "block2"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSPasteboard",
+    "NSWorkspace",
+    "NSRunningApplication",
+    "NSApplication",
+    "NSPanel",
+    "NSWindow",
+    "NSResponder",
+    "NSView",
+    "NSControl",
+    "NSDragging",
+    "NSDraggingItem",
+    "NSDraggingSession",
+    "NSImage",
+    "NSImageView",
+    "NSTextField",
+    "NSButton",
+    "NSColor",
+    "NSFont",
+    "NSScreen",
+    "NSEvent",
+    "NSGraphics",
+    "NSCell",
+] }
 block2 = "0.6"
 tokio = { workspace = true }

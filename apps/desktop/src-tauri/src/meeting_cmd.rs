@@ -1649,6 +1649,83 @@ pub fn process_meeting_now(
     Ok(())
 }
 
+/// Import an existing audio/video file into the meeting library and run the
+/// same offline pipeline as a recorded meeting. `path` is used for drag-and-drop;
+/// omit it to open a native file picker.
+#[tauri::command]
+pub async fn import_meeting_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: Option<String>,
+) -> Result<String, String> {
+    let source = match path.filter(|p| !p.trim().is_empty()) {
+        Some(p) => PathBuf::from(p),
+        None => pick_meeting_audio_path(&app)?,
+    };
+    let meetings_dir = default_data_dir().join("meetings");
+    let source_for_io = source.clone();
+    let meetings_dir_for_io = meetings_dir.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_imported_meeting_audio(&source_for_io, &meetings_dir_for_io)
+    })
+    .await
+    .map_err(|e| format!("导入中断：{e}"))??;
+
+    let persist_error = with_store(&state, |s| {
+        s.create_meeting(&prepared.meeting)
+            .map_err(|e| format!("无法写入会议库：{e}"))
+    });
+    if let Err(error) = persist_error {
+        let _ = std::fs::remove_file(&prepared.wav);
+        return Err(error);
+    }
+    spawn_meeting_processing(app, prepared.meeting.id, prepared.wav, None);
+    Ok(prepared.meeting.id.to_string())
+}
+
+#[derive(Debug)]
+struct PreparedImport {
+    meeting: Meeting,
+    wav: PathBuf,
+}
+
+fn prepare_imported_meeting_audio(
+    source: &Path,
+    meetings_dir: &Path,
+) -> Result<PreparedImport, String> {
+    if !source.is_file() {
+        return Err(format!("找不到音频文件：{}", source.display()));
+    }
+    if !crate::audio_convert::is_importable_meeting_audio(source) {
+        return Err("仅支持 wav / mp3 / m4a / mp4".into());
+    }
+    let mut meeting = Meeting::new();
+    meeting.status = MeetingStatus::Processing;
+    meeting.title = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty());
+    let dest = meetings_dir.join(format!("{}.wav", meeting.id));
+    crate::audio_convert::copy_or_convert_to_wav(source, &dest)?;
+    meeting.audio_path = Some(dest.to_string_lossy().into_owned());
+    Ok(PreparedImport { meeting, wav: dest })
+}
+
+fn pick_meeting_audio_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let picked = rfd::FileDialog::new()
+            .add_filter("音视频", &["wav", "wave", "mp3", "m4a", "mp4"])
+            .set_title("导入会议录音")
+            .pick_file();
+        let _ = tx.send(picked);
+    })
+    .map_err(|e| format!("无法打开文件对话框：{e}"))?;
+    rx.recv()
+        .map_err(|e| format!("文件对话框中断：{e}"))?
+        .ok_or_else(|| "已取消导入".to_string())
+}
+
 /// Spawn the offline meeting pipeline off the IPC path so the caller returns
 /// immediately. Transcription is slow (diarize + per-turn ASR + minutes LLM), so
 /// it must never block the stop command.
@@ -3422,10 +3499,11 @@ pub fn export_meeting(
 mod tests {
     use super::{
         combine_track_silence_seconds, merge_attendees_into_notes, owned_meeting_wav_in,
-        prepare_meeting_trim, read_timeline_offsets, remove_mic_audio_artifacts, system_trim_range,
-        write_timeline_sidecar, MeetingRecordingDto, MeetingRecordingOwner, MeetingTimeline,
-        SilenceWatchdogAction, SilenceWatchdogState,
+        prepare_imported_meeting_audio, prepare_meeting_trim, read_timeline_offsets,
+        remove_mic_audio_artifacts, system_trim_range, write_timeline_sidecar, MeetingRecordingDto,
+        MeetingRecordingOwner, MeetingTimeline, SilenceWatchdogAction, SilenceWatchdogState,
     };
+    use lumen_core::MeetingStatus;
 
     fn write_test_wav(path: &std::path::Path, sample_rate: u32, samples: usize) {
         let mut sink = lumen_asr::WavSink::create(path, sample_rate).unwrap();
@@ -3519,6 +3597,32 @@ mod tests {
         );
         assert!(owned_meeting_wav_in(&meetings, &outside).is_err());
         assert!(owned_meeting_wav_in(&meetings, &nested_wav).is_err());
+    }
+
+    #[test]
+    fn imported_wav_copies_into_the_meetings_dir_as_processing() {
+        let directory = tempfile::tempdir().unwrap();
+        let meetings = directory.path().join("meetings");
+        let source = directory.path().join("standup.wav");
+        std::fs::write(&source, b"RIFF....WAVEfmt ").unwrap();
+
+        let prepared = prepare_imported_meeting_audio(&source, &meetings).unwrap();
+        assert_eq!(prepared.meeting.status, MeetingStatus::Processing);
+        assert_eq!(prepared.meeting.title.as_deref(), Some("standup"));
+        assert_eq!(
+            prepared.wav,
+            meetings.join(format!("{}.wav", prepared.meeting.id))
+        );
+        assert_eq!(std::fs::read(&prepared.wav).unwrap(), b"RIFF....WAVEfmt ");
+    }
+
+    #[test]
+    fn imported_unsupported_extension_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("notes.txt");
+        std::fs::write(&source, b"not audio").unwrap();
+        let error = prepare_imported_meeting_audio(&source, directory.path()).unwrap_err();
+        assert!(error.contains("wav"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ import type { ChangeEvent, MutableRefObject, ReactNode } from "react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { api } from "./api";
 import {
   useMeetingModels,
@@ -242,6 +243,8 @@ function MeetingLibrary({
   );
   const [titleDraft, setTitleDraft] = useState("");
   const [starting, setStarting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [dropActive, setDropActive] = useState(false);
 
   const refresh = useCallback(
     async (q: string) => {
@@ -322,6 +325,51 @@ function MeetingLibrary({
       setStarting(false);
     }
   }, [titleDraft, refresh, query, onError, onOpen]);
+
+  const importFile = useCallback(
+    async (path?: string) => {
+      if (recording || starting || importing) return;
+      setImporting(true);
+      onError(null);
+      try {
+        const id = await api.importMeetingFile(path);
+        await refresh(query);
+        onOpen(id);
+      } catch (e) {
+        const message = String(e);
+        if (!message.includes("已取消")) onError(message);
+      } finally {
+        setImporting(false);
+      }
+    },
+    [recording, starting, importing, refresh, query, onError, onOpen],
+  );
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          setDropActive(true);
+        } else if (event.payload.type === "leave") {
+          setDropActive(false);
+        } else if (event.payload.type === "drop") {
+          setDropActive(false);
+          const path = event.payload.paths.find((p) =>
+            /\.(wav|wave|mp3|m4a|mp4)$/i.test(p),
+          );
+          if (path) {
+            void importFile(path);
+          } else if (event.payload.paths.length > 0) {
+            onError("仅支持 wav / mp3 / m4a / mp4");
+          }
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      });
+    return () => unlisten?.();
+  }, [importFile, onError]);
 
   const onStopped = useCallback(() => {
     setActive(null);
@@ -415,7 +463,7 @@ function MeetingLibrary({
         </p>
       </aside>
 
-      <section className="card meeting-list-pane">
+      <section className={`card meeting-list-pane${dropActive ? " drop-target" : ""}`}>
         <div className="meeting-start-bar">
           {recording ? (
             <RecordingBar
@@ -438,16 +486,25 @@ function MeetingLibrary({
                 type="text"
                 value={titleDraft}
                 placeholder="会议标题（可选）"
-                disabled={starting}
+                disabled={starting || importing}
                 onChange={(e) => setTitleDraft(e.target.value)}
               />
               <button
                 type="submit"
                 className="btn meeting-start-btn"
-                disabled={starting}
+                disabled={starting || importing}
               >
                 <Icon name="mic" size={16} />
                 {starting ? "正在开始…" : "开始会议"}
+              </button>
+              <button
+                type="button"
+                className="btn ghost meeting-start-btn"
+                disabled={starting || importing}
+                onClick={() => void importFile()}
+              >
+                <Icon name="add" size={16} />
+                {importing ? "正在导入…" : "导入文件"}
               </button>
             </form>
           )}
@@ -461,7 +518,7 @@ function MeetingLibrary({
             <p className="muted-text">
               {query.trim()
                 ? "没有匹配的会议标题。"
-                : "点上方“开始会议”录一场会议，停止后它会按时间出现在这里。"}
+                : "点上方“开始会议”录一场，或“导入文件”选择 wav / mp3 / m4a / mp4。也可把文件拖到这里。"}
             </p>
           </div>
         ) : (
@@ -2782,11 +2839,11 @@ function IndexItem({
   );
 }
 
-function actionSub(item: ActionItem): string | null {
-  const parts: string[] = [];
-  if (item.owner?.trim()) parts.push(`负责人：${item.owner.trim()}`);
+function actionSub(item: ActionItem): string {
+  const owner = item.owner?.trim() ? item.owner.trim() : "原文未明确";
+  const parts = [`负责人：${owner}`];
   if (item.due?.trim()) parts.push(`截止：${item.due.trim()}`);
-  return parts.length > 0 ? parts.join(" · ") : null;
+  return parts.join(" · ");
 }
 
 /** The narrow left column: structured minutes rendered as a compact, clickable
@@ -2848,6 +2905,12 @@ function MinutesIndex({
             </button>
           )}
         </div>
+      );
+    } else if (status === "ready") {
+      guide = (
+        <p className="muted-text meeting-index-note">
+          逐字稿已生成，纪要未生成。稿仍可复制或导出。
+        </p>
       );
     } else {
       guide = (
@@ -3444,11 +3507,7 @@ function minutesEmpty(m: Minutes): boolean {
 }
 
 function ActionMeta({ item }: { item: ActionItem }) {
-  const parts: string[] = [];
-  if (item.owner?.trim()) parts.push(`负责人：${item.owner.trim()}`);
-  if (item.due?.trim()) parts.push(`截止：${item.due.trim()}`);
-  if (parts.length === 0) return null;
-  return <span className="meeting-item-sub muted-text">{parts.join(" · ")}</span>;
+  return <span className="meeting-item-sub muted-text">{actionSub(item)}</span>;
 }
 
 // ---- transcript view (segment-level: seek + highlight + inline edit) -----

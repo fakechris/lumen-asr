@@ -1,4 +1,5 @@
 mod asr_models;
+mod audio_convert;
 mod capsule;
 mod commands;
 mod config;
@@ -602,6 +603,7 @@ pub fn run() {
             permissions_cmd::open_microphone_settings,
             permissions_cmd::open_accessibility_settings,
             permissions_cmd::request_accessibility_access,
+            permissions_cmd::dismiss_accessibility_drag_overlay_cmd,
             permissions_cmd::request_microphone_access,
             inject_cmd::get_inject_config,
             inject_cmd::save_inject_config,
@@ -630,6 +632,7 @@ pub fn run() {
             meeting_cmd::set_meeting_watchdog_config,
             meeting_cmd::continue_meeting_after_silence,
             meeting_cmd::process_meeting_now,
+            meeting_cmd::import_meeting_file,
             meeting_cmd::list_meetings,
             meeting_cmd::get_meeting_detail,
             meeting_cmd::save_meeting_notes,
@@ -789,7 +792,7 @@ pub fn run() {
                 name = app.package_info().name,
                 debug = %debug_dir.display(),
                 log = %log_path.display(),
-                "Lumen ASR desktop starting (copy-only platform mode)"
+                "Lumen ASR desktop starting (Windows insert + clipboard fallback)"
             );
             Ok(())
         })
