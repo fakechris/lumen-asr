@@ -7,24 +7,23 @@
 //! Model path resolution / readiness / install locking / downloads live in
 //! `lumen-models`.
 
-mod audio;
-mod meeting_recorder;
 mod mlx_whisper;
-mod vad;
-mod wav_edit;
 
-pub use audio::{AudioCapture, AudioDeviceInfo, AudioError, CaptureResult};
-pub use meeting_recorder::{
-    live_tap_channel, repair_wav_header, LiveAudioPacket, LiveTapSender, MeetingRecorder,
-    MeetingRecorderError, RecordingSummary, RepairedWav, SampleSink, SystemTrackRecorder,
-    SystemTrackSender, WavSink, LIVE_TAP_CAPACITY,
-};
 pub use mlx_whisper::{
     MlxWhisperAsr, MlxWhisperConfig, DEFAULT_MLX_WHISPER_MODEL,
     PRODUCT_WORKER as MLX_WHISPER_WORKER,
 };
-pub use vad::{trim_trailing_silence, SilenceAutoStop, VadAction};
-pub use wav_edit::{copy_pcm16_wav_range, WavRangeError, WavRangeSummary};
+
+// Audio capture / VAD / WAV editing / dual-track recording now live in the
+// shared lumen-suite `lumen-audio` crate; re-exported so every existing
+// `lumen_asr::` call site is unchanged.
+pub use lumen_audio::{
+    AudioCapture, AudioDeviceInfo, AudioError, CaptureResult, live_tap_channel, repair_wav_header,
+    LiveAudioPacket, LiveTapSender, MeetingRecorder, MeetingRecorderError, RecordingSummary,
+    RepairedWav, SampleSink, SystemTrackRecorder, SystemTrackSender, WavSink, LIVE_TAP_CAPACITY,
+    trim_trailing_silence, SilenceAutoStop, VadAction, copy_pcm16_wav_range, WavRangeError,
+    WavRangeSummary,
+};
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).
 pub use lumen_asr_engine::{

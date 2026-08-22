@@ -75,7 +75,8 @@ lumen-transcript = { git = "https://github.com/fakechris/lumen-suite.git", rev =
 # Suite platform crates (promoted from navi + asr mac modules). The macos
 # crate is aliased because asr still ships a product-local crate of the same
 # name hosting its trait-shaped adapters.
-lumen_platform_suite_macos = { git = "https://github.com/fakechris/lumen-suite.git", rev = "2ee4ba28e840bcfb3ed69bd37d5a8b628c68b645", package = "lumen-platform-macos" }
+lumen_platform_suite_macos = { git = "https://github.com/fakechris/lumen-suite.git", rev = "47bf81de4c7cd253931c457ca319509c143f7d94", package = "lumen-platform-macos" }
+lumen-audio = { git = "https://github.com/fakechris/lumen-suite.git", rev = "47bf81de4c7cd253931c457ca319509c143f7d94" }
 parking_lot = "0.12"
 cpal = "0.15"
 blake3 = "1"
