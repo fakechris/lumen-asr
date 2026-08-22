@@ -20,7 +20,7 @@ pub fn default_data_dir() -> std::path::PathBuf {
         {
             std::path::PathBuf::from(local_app_data).join("LumenAsr")
         } else {
-            std::path::temp_dir().join("LumenAsr")
+            std::env::temp_dir().join("LumenAsr")
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
