@@ -93,7 +93,6 @@ pub fn dismiss_accessibility_drag_overlay() {
 #[cfg(target_os = "macos")]
 mod native {
     use super::{drag_payload_path, overlay_frame_in, pick_settings_window, OverlayWindow};
-    use crate::permissions::is_accessibility_trusted;
     use crate::run_on_main;
     use core_foundation::base::{TCFType, ToVoid};
     use core_foundation::dictionary::CFDictionary;
@@ -103,6 +102,7 @@ mod native {
         copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer,
         kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly, kCGWindowOwnerName,
     };
+    use lumen_platform_suite_macos::is_accessibility_trusted;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Sel};
     use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};

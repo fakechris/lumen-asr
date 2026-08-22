@@ -3,10 +3,7 @@ name = "lumen-platform"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cross-platform capability traits (permissions, hotkey, frontmost app)"
+description = "Product facade over the shared lumen-suite platform types + LumenAsr data paths"
 
 [dependencies]
-async-trait = { workspace = true }
-lumen-core = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
+lumen_platform_suite = { workspace = true }
