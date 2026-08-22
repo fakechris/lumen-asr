@@ -1,8 +1,5 @@
-//! Platform facade — the generic capability types (permission state/status,
-//! the interactive `Permissions` trait, `PlatformError`) now live in the
-//! shared lumen-suite `lumen-platform` crate and are re-exported here so
-//! existing `lumen_platform::` call sites are unchanged. Only the product's
-//! LumenAsr data paths remain local.
+//! Platform capability types (permission state/status, the `Permissions`
+//! trait, `PlatformError`) and LumenAsr data paths.
 
 pub use lumen_platform_suite::{PermissionState, PermissionStatus, Permissions, PlatformError};
 

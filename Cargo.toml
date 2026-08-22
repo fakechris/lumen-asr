@@ -70,9 +70,6 @@ lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "64
 lumen-asr-engine = { git = "https://github.com/fakechris/lumen-suite.git", rev = "64f970d530c2c88d61b02925ed28b6f660f81e14", default-features = false }
 # Shared serde types for the lumen-transcript.v1 interchange format.
 lumen-transcript = { git = "https://github.com/fakechris/lumen-suite.git", rev = "64f970d530c2c88d61b02925ed28b6f660f81e14" }
-# Suite platform crates (promoted from navi + asr mac modules). The macos
-# crate is aliased because asr still ships a product-local crate of the same
-# name hosting its trait-shaped adapters.
 lumen_platform_suite_macos = { git = "https://github.com/fakechris/lumen-suite.git", rev = "64f970d530c2c88d61b02925ed28b6f660f81e14", package = "lumen-platform-macos" }
 lumen-audio = { git = "https://github.com/fakechris/lumen-suite.git", rev = "64f970d530c2c88d61b02925ed28b6f660f81e14" }
 lumen_platform_suite = { git = "https://github.com/fakechris/lumen-suite.git", rev = "64f970d530c2c88d61b02925ed28b6f660f81e14", package = "lumen-platform" }
