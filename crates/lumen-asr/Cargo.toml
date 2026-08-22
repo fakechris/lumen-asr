@@ -9,6 +9,7 @@ description = "Mic capture + product glue over the shared lumen-suite ASR crates
 # Shared cluster crates (engines + model management). `cloud` enables the
 # OpenAI-compatible HTTP engine that this product always offered.
 lumen-asr-engine = { workspace = true, features = ["cloud"] }
+lumen-audio = { workspace = true }
 lumen-models = { workspace = true }
 async-trait = { workspace = true }
 cpal = { workspace = true }

@@ -11,6 +11,7 @@ lumen-core = { workspace = true }
 lumen-edit-learning = { workspace = true }
 lumen-inject = { workspace = true }
 lumen-platform = { workspace = true }
+lumen_platform_suite_macos = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
