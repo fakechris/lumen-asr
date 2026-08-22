@@ -24,15 +24,25 @@ pub enum SessionState {
 pub enum SessionCommand {
     Start,
     PermissionsOk,
-    PermissionsDenied { copy_only: bool },
+    PermissionsDenied {
+        copy_only: bool,
+    },
     AudioFinished,
-    TranscriptReady { text: String },
-    Corrected { text: String },
+    TranscriptReady {
+        text: String,
+    },
+    Corrected {
+        text: String,
+    },
     CorrectFailed,
     /// User confirmed text (possibly edited) for insert.
-    Accept { text: String },
+    Accept {
+        text: String,
+    },
     SkipReview,
-    InsertDone { strategy: InsertStrategy },
+    InsertDone {
+        strategy: InsertStrategy,
+    },
     InsertFailed,
     VerifyDone,
     EditsFlushed,
@@ -43,18 +53,31 @@ pub enum SessionCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
-    StateChanged { from: SessionState, to: SessionState },
+    StateChanged {
+        from: SessionState,
+        to: SessionState,
+    },
     NeedPermissions,
     StartRecording,
     StopRecording,
     RunAsr,
-    RunCorrector { text: String },
-    ShowReview { text: String },
-    Insert { text: String },
+    RunCorrector {
+        text: String,
+    },
+    ShowReview {
+        text: String,
+    },
+    Insert {
+        text: String,
+    },
     Verify,
     CaptureEdits,
-    Completed { record: SessionRecord },
-    Failed { message: String },
+    Completed {
+        record: SessionRecord,
+    },
+    Failed {
+        message: String,
+    },
     Cancelled,
 }
 
@@ -122,12 +145,13 @@ impl Session {
         let from = self.state;
 
         let transition = match (self.state, &cmd) {
-            (S::Idle, C::Start) => Some((S::CheckingPermissions, vec![SessionEvent::NeedPermissions])),
+            (S::Idle, C::Start) => {
+                Some((S::CheckingPermissions, vec![SessionEvent::NeedPermissions]))
+            }
 
-            (S::CheckingPermissions, C::PermissionsOk) => Some((
-                S::Listening,
-                vec![SessionEvent::StartRecording],
-            )),
+            (S::CheckingPermissions, C::PermissionsOk) => {
+                Some((S::Listening, vec![SessionEvent::StartRecording]))
+            }
             (S::CheckingPermissions, C::PermissionsDenied { copy_only }) => {
                 self.copy_only = *copy_only;
                 if *copy_only {
@@ -145,10 +169,7 @@ impl Session {
 
             (S::Listening, C::AudioFinished) => Some((
                 S::Transcribing,
-                vec![
-                    SessionEvent::StopRecording,
-                    SessionEvent::RunAsr,
-                ],
+                vec![SessionEvent::StopRecording, SessionEvent::RunAsr],
             )),
             (S::Listening, C::Cancel) => {
                 self.record.status = SessionStatus::Cancelled;
@@ -180,10 +201,7 @@ impl Session {
                 // Fail soft: use ASR (or preprocess) text.
                 let text = self.working_text.clone();
                 self.record.corrected = Some(text.clone());
-                Some((
-                    S::Review,
-                    vec![SessionEvent::ShowReview { text }],
-                ))
+                Some((S::Review, vec![SessionEvent::ShowReview { text }]))
             }
 
             (S::Review, C::Accept { text }) => {
@@ -218,10 +236,7 @@ impl Session {
             (S::Inserting, C::InsertDone { strategy }) => {
                 self.record.insert_strategy = *strategy;
                 self.record.pasted = Some(self.working_text.clone());
-                Some((
-                    S::Verifying,
-                    vec![SessionEvent::Verify],
-                ))
+                Some((S::Verifying, vec![SessionEvent::Verify]))
             }
             (S::Inserting, C::InsertFailed) => {
                 // Still save text; mark copy-only-ish failure path.
@@ -306,7 +321,9 @@ mod tests {
         s.handle(SessionCommand::VerifyDone).unwrap();
         let ev = s.handle(SessionCommand::EditsFlushed).unwrap();
         assert_eq!(s.state(), SessionState::Idle);
-        assert!(ev.iter().any(|e| matches!(e, SessionEvent::Completed { .. })));
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Completed { .. })));
         assert_eq!(s.record().asr_raw.as_deref(), Some("你好 世界"));
         assert_eq!(s.record().pasted.as_deref(), Some("你好，世界。"));
     }
@@ -317,10 +334,8 @@ mod tests {
         s.handle(SessionCommand::Start).unwrap();
         s.handle(SessionCommand::PermissionsOk).unwrap();
         s.handle(SessionCommand::AudioFinished).unwrap();
-        s.handle(SessionCommand::TranscriptReady {
-            text: "raw".into(),
-        })
-        .unwrap();
+        s.handle(SessionCommand::TranscriptReady { text: "raw".into() })
+            .unwrap();
         s.handle(SessionCommand::CorrectFailed).unwrap();
         assert_eq!(s.state(), SessionState::Review);
         assert_eq!(s.working_text(), "raw");
@@ -329,9 +344,7 @@ mod tests {
     #[test]
     fn invalid_transition_errors() {
         let mut s = Session::new();
-        let err = s
-            .handle(SessionCommand::AudioFinished)
-            .unwrap_err();
+        let err = s.handle(SessionCommand::AudioFinished).unwrap_err();
         assert!(matches!(err, SessionError::InvalidTransition { .. }));
     }
 }

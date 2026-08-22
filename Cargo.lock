@@ -2329,7 +2329,7 @@ dependencies = [
 [[package]]
 name = "lumen-audio"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=47bf81de4c7cd253931c457ca319509c143f7d94#47bf81de4c7cd253931c457ca319509c143f7d94"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=5e53011ed53dd28a13c1e06a309a88bdb88a8630#5e53011ed53dd28a13c1e06a309a88bdb88a8630"
 dependencies = [
  "cpal",
  "hound",
@@ -2503,7 +2503,7 @@ dependencies = [
 [[package]]
 name = "lumen-platform"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=47bf81de4c7cd253931c457ca319509c143f7d94#47bf81de4c7cd253931c457ca319509c143f7d94"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=5e53011ed53dd28a13c1e06a309a88bdb88a8630#5e53011ed53dd28a13c1e06a309a88bdb88a8630"
 dependencies = [
  "async-trait",
  "serde",
@@ -2513,10 +2513,10 @@ dependencies = [
 [[package]]
 name = "lumen-platform-cpal"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=47bf81de4c7cd253931c457ca319509c143f7d94#47bf81de4c7cd253931c457ca319509c143f7d94"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=5e53011ed53dd28a13c1e06a309a88bdb88a8630#5e53011ed53dd28a13c1e06a309a88bdb88a8630"
 dependencies = [
  "cpal",
- "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=47bf81de4c7cd253931c457ca319509c143f7d94)",
+ "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=5e53011ed53dd28a13c1e06a309a88bdb88a8630)",
  "tracing",
 ]
 
@@ -2533,7 +2533,7 @@ dependencies = [
  "lumen-edit-learning",
  "lumen-inject",
  "lumen-platform 0.1.0",
- "lumen-platform-macos 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=47bf81de4c7cd253931c457ca319509c143f7d94)",
+ "lumen-platform-macos 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=5e53011ed53dd28a13c1e06a309a88bdb88a8630)",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -2545,7 +2545,7 @@ dependencies = [
 [[package]]
 name = "lumen-platform-macos"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=47bf81de4c7cd253931c457ca319509c143f7d94#47bf81de4c7cd253931c457ca319509c143f7d94"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=5e53011ed53dd28a13c1e06a309a88bdb88a8630#5e53011ed53dd28a13c1e06a309a88bdb88a8630"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2557,7 +2557,7 @@ dependencies = [
  "core-graphics 0.24.0",
  "foreign-types 0.5.0",
  "image",
- "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=47bf81de4c7cd253931c457ca319509c143f7d94)",
+ "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=5e53011ed53dd28a13c1e06a309a88bdb88a8630)",
  "lumen-platform-cpal",
  "objc2",
  "objc2-app-kit",

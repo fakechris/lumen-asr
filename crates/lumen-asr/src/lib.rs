@@ -18,11 +18,11 @@ pub use mlx_whisper::{
 // shared lumen-suite `lumen-audio` crate; re-exported so every existing
 // `lumen_asr::` call site is unchanged.
 pub use lumen_audio::{
-    AudioCapture, AudioDeviceInfo, AudioError, CaptureResult, live_tap_channel, repair_wav_header,
-    LiveAudioPacket, LiveTapSender, MeetingRecorder, MeetingRecorderError, RecordingSummary,
-    RepairedWav, SampleSink, SystemTrackRecorder, SystemTrackSender, WavSink, LIVE_TAP_CAPACITY,
-    trim_trailing_silence, SilenceAutoStop, VadAction, copy_pcm16_wav_range, WavRangeError,
-    WavRangeSummary,
+    copy_pcm16_wav_range, live_tap_channel, repair_wav_header, trim_trailing_silence, AudioCapture,
+    AudioDeviceInfo, AudioError, CaptureResult, LiveAudioPacket, LiveTapSender, MeetingRecorder,
+    MeetingRecorderError, RecordingSummary, RepairedWav, SampleSink, SilenceAutoStop,
+    SystemTrackRecorder, SystemTrackSender, VadAction, WavRangeError, WavRangeSummary, WavSink,
+    LIVE_TAP_CAPACITY,
 };
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).

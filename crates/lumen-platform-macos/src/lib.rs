@@ -33,11 +33,11 @@ pub use permissions::{
 };
 
 pub use lumen_platform_suite_macos::{
-    physical_fn_down, start_monitor, start_multi_monitor, stop_monitor, HotkeyBinding, HotkeyEdge,
-    HotkeyMode, HotkeySpec, MeetingPowerGuard, battery_status, install_will_sleep_observer,
-    BatteryStatus, system_audio_capability_available, SystemAudioCapture, SystemAudioError,
-    SystemAudioSink, SystemAudioTarget, voice_processing_supported, VoiceInputSink,
-    VoiceProcessingError, VoiceProcessingInput,
+    battery_status, install_will_sleep_observer, physical_fn_down, start_monitor,
+    start_multi_monitor, stop_monitor, system_audio_capability_available,
+    voice_processing_supported, BatteryStatus, HotkeyBinding, HotkeyEdge, HotkeyMode, HotkeySpec,
+    MeetingPowerGuard, SystemAudioCapture, SystemAudioError, SystemAudioSink, SystemAudioTarget,
+    VoiceInputSink, VoiceProcessingError, VoiceProcessingInput,
 };
 
 use async_trait::async_trait;
