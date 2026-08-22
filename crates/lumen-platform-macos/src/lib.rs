@@ -11,7 +11,6 @@ mod edit_surface;
 mod focused_field;
 mod inject;
 mod meeting_activity;
-mod permissions;
 
 pub use ax_drag::{
     dismiss_accessibility_drag_overlay, drag_payload_path, present_accessibility_drag_overlay,
@@ -28,23 +27,17 @@ pub use meeting_activity::{
     capability_available as meeting_detection_capability_available, ActiveInput, DetectorSignal,
     MeetingActivityDetector, DEFAULT_POLL as MEETING_DETECTION_DEFAULT_POLL,
 };
-pub use permissions::{
-    ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,
-};
 
 pub use lumen_platform_suite_macos::{
-    battery_status, install_will_sleep_observer, physical_fn_down, start_monitor,
+    battery_status, ensure_accessibility_onboarding, install_will_sleep_observer,
+    is_accessibility_trusted, open_url, physical_fn_down, prompt_accessibility, start_monitor,
     start_multi_monitor, stop_monitor, system_audio_capability_available,
     voice_processing_supported, BatteryStatus, HotkeyBinding, HotkeyEdge, HotkeyMode, HotkeySpec,
-    MeetingPowerGuard, SystemAudioCapture, SystemAudioError, SystemAudioSink, SystemAudioTarget,
-    VoiceInputSink, VoiceProcessingError, VoiceProcessingInput,
+    MacTccPermissions as MacPermissions, MeetingPowerGuard, SystemAudioCapture, SystemAudioError,
+    SystemAudioSink, SystemAudioTarget, VoiceInputSink, VoiceProcessingError, VoiceProcessingInput,
 };
 
-use async_trait::async_trait;
 use lumen_core::FocusInfo;
-use lumen_platform::{FrontmostApp, PlatformError};
-
-pub struct MacFrontmost;
 
 #[cfg(test)]
 mod edit_surface_contract_tests {
@@ -67,30 +60,7 @@ mod edit_surface_contract_tests {
     }
 }
 
-#[async_trait]
-impl FrontmostApp for MacFrontmost {
-    async fn focus_info(&self) -> Result<FocusInfo, PlatformError> {
-        Ok(frontmost_focus_info().unwrap_or_default())
-    }
-}
-
-/// Open System Settings privacy panes.
-pub fn open_url(url: &str) -> Result<(), PlatformError> {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| PlatformError::Message(e.to_string()))?;
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = url;
-        Err(PlatformError::Message("not macOS".into()))
-    }
-}
-
+/// Best-effort frontmost process name + bundle id.
 #[derive(Debug, Clone, Default)]
 pub struct FrontmostTarget {
     pub name: Option<String>,

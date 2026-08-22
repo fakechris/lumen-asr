@@ -295,6 +295,7 @@ pub async fn get_permission_status() -> Result<PermissionDto, String> {
             // the fallback for unpackaged builds.
             microphone: windows_microphone_state(),
             accessibility: PermissionState::Restricted,
+            screen_recording: PermissionState::NotDetermined,
         }))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -303,6 +304,7 @@ pub async fn get_permission_status() -> Result<PermissionDto, String> {
         Ok(map_status(PermissionStatus {
             microphone: PermissionState::NotDetermined,
             accessibility: PermissionState::Restricted,
+            screen_recording: PermissionState::NotDetermined,
         }))
     }
 }
@@ -466,6 +468,7 @@ mod tests {
         PermissionStatus {
             microphone,
             accessibility: PermissionState::Restricted,
+            screen_recording: PermissionState::NotDetermined,
         }
     }
 

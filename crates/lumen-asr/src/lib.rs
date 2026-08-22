@@ -7,11 +7,8 @@
 //! Model path resolution / readiness / install locking / downloads live in
 //! `lumen-models`.
 
-mod mlx_whisper;
-
-pub use mlx_whisper::{
-    MlxWhisperAsr, MlxWhisperConfig, DEFAULT_MLX_WHISPER_MODEL,
-    PRODUCT_WORKER as MLX_WHISPER_WORKER,
+pub use lumen_asr_engine::{
+    MlxWhisperAsr, MlxWhisperConfig, DEFAULT_MLX_WHISPER_MODEL, MLX_WHISPER_WORKER,
 };
 
 // Audio capture / VAD / WAV editing / dual-track recording now live in the
