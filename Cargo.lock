@@ -2281,8 +2281,8 @@ dependencies = [
  "lumen-identity",
  "lumen-inject",
  "lumen-meeting",
- "lumen-platform",
- "lumen-platform-macos",
+ "lumen-platform 0.1.0",
+ "lumen-platform-macos 0.1.0",
  "lumen-prompts",
  "lumen-store",
  "lumen-transcript",
@@ -2486,6 +2486,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-platform"
+version = "0.1.0"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=2ee4ba28e840bcfb3ed69bd37d5a8b628c68b645#2ee4ba28e840bcfb3ed69bd37d5a8b628c68b645"
+dependencies = [
+ "async-trait",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lumen-platform-cpal"
+version = "0.1.0"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=2ee4ba28e840bcfb3ed69bd37d5a8b628c68b645#2ee4ba28e840bcfb3ed69bd37d5a8b628c68b645"
+dependencies = [
+ "cpal",
+ "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=2ee4ba28e840bcfb3ed69bd37d5a8b628c68b645)",
+ "tracing",
+]
+
+[[package]]
 name = "lumen-platform-macos"
 version = "0.1.0"
 dependencies = [
@@ -2497,10 +2517,38 @@ dependencies = [
  "lumen-core",
  "lumen-edit-learning",
  "lumen-inject",
- "lumen-platform",
+ "lumen-platform 0.1.0",
+ "lumen-platform-macos 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=2ee4ba28e840bcfb3ed69bd37d5a8b628c68b645)",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "lumen-platform-macos"
+version = "0.1.0"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=2ee4ba28e840bcfb3ed69bd37d5a8b628c68b645#2ee4ba28e840bcfb3ed69bd37d5a8b628c68b645"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "block2",
+ "cc",
+ "chrono",
+ "core-foundation",
+ "core-foundation-sys",
+ "core-graphics 0.24.0",
+ "foreign-types 0.5.0",
+ "image",
+ "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=2ee4ba28e840bcfb3ed69bd37d5a8b628c68b645)",
+ "lumen-platform-cpal",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

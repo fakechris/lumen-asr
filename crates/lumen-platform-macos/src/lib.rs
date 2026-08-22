@@ -1,17 +1,17 @@
 //! macOS platform adapters: permissions, text injection, frontmost app, hotkeys.
+//!
+//! The generic capability modules (system audio process tap, hotkey CGEvent
+//! tap, AUVoiceIO, power monitor/assertion) now live in the shared
+//! lumen-suite `lumen-platform-macos` crate and are re-exported here so
+//! existing `lumen_platform_macos::` call sites keep working.
 
 mod ax_drag;
 mod calendar;
 mod edit_surface;
 mod focused_field;
-mod hotkey_tap;
 mod inject;
 mod meeting_activity;
 mod permissions;
-pub mod power_assertion;
-pub mod power_monitor;
-mod system_audio;
-mod voice_processing;
 
 pub use ax_drag::{
     dismiss_accessibility_drag_overlay, drag_payload_path, present_accessibility_drag_overlay,
@@ -23,10 +23,6 @@ pub use calendar::{
 };
 pub use edit_surface::MacAccessibilitySurfaceAdapter;
 pub use focused_field::{focused_text_field_snapshot, FocusedTextFieldSnapshot};
-pub use hotkey_tap::{
-    physical_fn_down, start_monitor, start_multi_monitor, stop_monitor, HotkeyBinding, HotkeyEdge,
-    HotkeyMode, HotkeySpec,
-};
 pub use inject::MacTextInjectorBackend;
 pub use meeting_activity::{
     capability_available as meeting_detection_capability_available, ActiveInput, DetectorSignal,
@@ -35,14 +31,13 @@ pub use meeting_activity::{
 pub use permissions::{
     ensure_accessibility_onboarding, is_accessibility_trusted, prompt_accessibility, MacPermissions,
 };
-pub use power_assertion::MeetingPowerGuard;
-pub use power_monitor::{battery_status, install_will_sleep_observer, BatteryStatus};
-pub use system_audio::{
-    capability_available as system_audio_capability_available, SystemAudioCapture,
-    SystemAudioError, SystemAudioSink, SystemAudioTarget,
-};
-pub use voice_processing::{
-    voice_processing_supported, VoiceInputSink, VoiceProcessingError, VoiceProcessingInput,
+
+pub use lumen_platform_suite_macos::{
+    physical_fn_down, start_monitor, start_multi_monitor, stop_monitor, HotkeyBinding, HotkeyEdge,
+    HotkeyMode, HotkeySpec, MeetingPowerGuard, battery_status, install_will_sleep_observer,
+    BatteryStatus, system_audio_capability_available, SystemAudioCapture, SystemAudioError,
+    SystemAudioSink, SystemAudioTarget, voice_processing_supported, VoiceInputSink,
+    VoiceProcessingError, VoiceProcessingInput,
 };
 
 use async_trait::async_trait;
