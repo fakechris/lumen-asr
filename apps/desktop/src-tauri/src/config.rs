@@ -118,17 +118,6 @@ pub struct MeetingConfig {
     /// user's name; withholds only on a confident different-name voiceprint
     /// conflict. The library is local-only (never uploaded). Defaults to `true`.
     pub auto_enroll_speakers: bool,
-    /// Capture the meeting microphone through the macOS system voice
-    /// processor (VoiceProcessingIO — the FaceTime chain) so the OS cancels
-    /// acoustic echo at the source: on speakerphone meetings the far-end
-    /// voice is no longer picked back up by the mic. Defaults to `true`;
-    /// trade-off: the bundled noise suppression can attenuate quiet far-field
-    /// speakers in a conference room, so turn this off for multi-person
-    /// room recordings if远场人声 sounds thin. When off — or whenever the
-    /// unit fails to initialize — the mic records through the plain cpal
-    /// path exactly as before (recording never fails because of AEC).
-    /// Dictation is unaffected either way. macOS-only (a no-op elsewhere).
-    pub mic_aec: bool,
     /// The enrolled voiceprint identity that is *the user themself* ("这是我").
     /// Purely a rendering hint: when live/offline attribution matches this
     /// identity, the UI shows "我" instead of the enrolled name. `None` until
@@ -149,7 +138,6 @@ impl Default for MeetingConfig {
             echo_suppression: true,
             annotation_voiceprint_spread: true,
             auto_enroll_speakers: true,
-            mic_aec: true,
             self_identity_id: None,
         }
     }
@@ -1233,29 +1221,18 @@ echo_suppression = false
     }
 
     #[test]
-    fn meeting_mic_aec_defaults_on_and_can_opt_out() {
-        // Defaults on (runtime-gated: VPIO support probed at recording start)…
-        assert!(MeetingConfig::default().mic_aec);
-        assert!(AppConfig::default().meeting.mic_aec);
-        // …absent from an existing config → still on…
-        let existing: AppConfig = toml::from_str(
+    fn legacy_meeting_mic_aec_setting_is_ignored() {
+        // The old hidden setting was default-on and did not express user
+        // intent. It must not reactivate VoiceProcessingIO after upgrading.
+        let legacy: AppConfig = toml::from_str(
             r#"
 [meeting]
-transcript_cleanup = true
+mic_aec = true
 "#,
         )
         .unwrap();
-        assert!(existing.meeting.mic_aec);
-        // …and an explicit opt-out (e.g. conference-room far-field recording)
-        // is honored.
-        let off: AppConfig = toml::from_str(
-            r#"
-[meeting]
-mic_aec = false
-"#,
-        )
-        .unwrap();
-        assert!(!off.meeting.mic_aec);
+        let serialized = toml::to_string(&legacy).unwrap();
+        assert!(!serialized.contains("mic_aec"));
     }
 
     #[test]

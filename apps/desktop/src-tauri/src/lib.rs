@@ -299,10 +299,10 @@ pub struct AppState {
     /// meeting recording. Capability-gated (macOS 14.2+ process tap);
     /// best-effort — idle everywhere else.
     pub meeting_system_audio: meeting_system_audio::MeetingSystemAudio,
-    /// System-AEC (VoiceProcessingIO) mic capture for the active meeting
-    /// recording. Opt-out via `meeting.mic_aec`; on any init failure the
-    /// meeting falls back to `meeting_recorder` (plain cpal). macOS-only —
-    /// idle everywhere else. Dictation never touches this.
+    /// System-AEC (VoiceProcessingIO) mic capture support. The production
+    /// meeting path is safety-gated to plain cpal because there is no safe
+    /// mid-session handoff between the two WAV writers. Dictation never
+    /// touches this holder.
     pub meeting_mic_aec: meeting_mic_aec::MeetingMicAec,
     /// Mutual-exclusion arbiter between dictation and meeting recording.
     pub capture: CaptureArbiter,
