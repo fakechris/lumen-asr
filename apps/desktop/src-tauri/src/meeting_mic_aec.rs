@@ -12,22 +12,52 @@
 //!
 //! **Best-effort by contract**: any failure to start returns `None` and the
 //! caller records through the existing cpal path — a meeting recording never
-//! fails because AEC could not engage. The trade-off motivating the config
-//! opt-out (`meeting.mic_aec`): VPIO's bundled noise suppression may attenuate
-//! quiet far-field speakers in a conference room (see the platform module docs).
+//! fails because AEC could not engage.
 //!
 //! Dictation is untouched: this type is only ever driven by the meeting
 //! commands.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use lumen_asr::{LiveTapSender, RecordingSummary, SystemTrackRecorder, SystemTrackSender};
-use lumen_platform_macos::{VoiceInputSink, VoiceProcessingInput};
+use lumen_platform_macos::{VoiceInputSink, VoiceProcessingError, VoiceProcessingInput};
+
+const STARTUP_AUDIO_TIMEOUT: Duration = Duration::from_millis(1_500);
+const READY_AUDIO_MILLIS: u32 = 100;
+const READY_CALLBACKS: u32 = 3;
+const STARTUP_PROBING: u8 = 0;
+const STARTUP_ACCEPTED: u8 = 1;
+const STARTUP_REJECTED: u8 = 2;
+
+/// Narrow system-boundary interface for the Core Audio capture lifecycle.
+trait VoiceCaptureBackend: Send {
+    fn start(
+        &mut self,
+        preferred_device: Option<&str>,
+        sink: VoiceInputSink,
+    ) -> Result<u32, VoiceProcessingError>;
+    fn stop(&mut self);
+}
+
+impl VoiceCaptureBackend for VoiceProcessingInput {
+    fn start(
+        &mut self,
+        preferred_device: Option<&str>,
+        sink: VoiceInputSink,
+    ) -> Result<u32, VoiceProcessingError> {
+        VoiceProcessingInput::start(self, preferred_device, sink)
+    }
+
+    fn stop(&mut self) {
+        VoiceProcessingInput::stop(self);
+    }
+}
 
 /// One live VPIO→WAV session for the active meeting's mic track.
 struct Session {
-    capture: VoiceProcessingInput,
+    capture: Box<dyn VoiceCaptureBackend>,
     track: SystemTrackRecorder,
 }
 
@@ -63,6 +93,23 @@ impl MeetingMicAec {
         out_path: PathBuf,
         live: Option<LiveTapSender>,
     ) -> Option<u32> {
+        self.start_with_capture(
+            device,
+            out_path,
+            live,
+            Box::new(VoiceProcessingInput::new()),
+            STARTUP_AUDIO_TIMEOUT,
+        )
+    }
+
+    fn start_with_capture(
+        &self,
+        device: Option<String>,
+        out_path: PathBuf,
+        live: Option<LiveTapSender>,
+        mut capture: Box<dyn VoiceCaptureBackend>,
+        first_audio_timeout: Duration,
+    ) -> Option<u32> {
         let mut guard = match self.inner.lock() {
             Ok(guard) => guard,
             Err(_) => {
@@ -77,21 +124,47 @@ impl MeetingMicAec {
 
         let slot: Arc<Mutex<Option<SystemTrackSender>>> = Arc::new(Mutex::new(None));
         let sink_slot = Arc::clone(&slot);
+        let startup_state = Arc::new(std::sync::atomic::AtomicU8::new(STARTUP_PROBING));
+        let sink_startup_state = Arc::clone(&startup_state);
+        let accepted_samples = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink_accepted_samples = Arc::clone(&accepted_samples);
+        let accepted_callbacks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let sink_accepted_callbacks = Arc::clone(&accepted_callbacks);
+        let (readiness_tx, readiness_rx) = std::sync::mpsc::sync_channel(1);
         let sink: VoiceInputSink = Arc::new(move |samples: &[f32]| {
             if let Ok(sender) = sink_slot.lock() {
                 if let Some(sender) = sender.as_ref() {
                     // WAV first (authoritative). Its `push` returns `false`
                     // while paused/finalized, which also gates the live copy.
                     if sender.push(samples) {
-                        if let Some(live) = live.as_ref() {
-                            live.push(samples);
+                        // Probe only until startup is proven healthy. Requiring
+                        // several callbacks plus a minimum amount of audio
+                        // rejects a unit that emits one startup buffer and then
+                        // stalls, while keeping the steady-state callback free
+                        // of readiness-channel work.
+                        let state = sink_startup_state.load(std::sync::atomic::Ordering::Acquire);
+                        if state == STARTUP_PROBING {
+                            sink_accepted_samples.fetch_add(
+                                samples.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            sink_accepted_callbacks
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = readiness_tx.try_send(());
+                        }
+                        // Probe audio belongs to a backend that may still be
+                        // rejected. Do not let it enter the live transcript
+                        // until AEC is committed as the authoritative mic path.
+                        if state == STARTUP_ACCEPTED {
+                            if let Some(live) = live.as_ref() {
+                                live.push(samples);
+                            }
                         }
                     }
                 }
             }
         });
 
-        let mut capture = VoiceProcessingInput::new();
         let sample_rate = match capture.start(device.as_deref(), sink) {
             Ok(rate) => rate,
             Err(e) => {
@@ -118,6 +191,48 @@ impl MeetingMicAec {
         if let Ok(mut sender) = slot.lock() {
             *sender = Some(track.sender());
         }
+
+        let ready_samples =
+            u64::from(sample_rate).saturating_mul(u64::from(READY_AUDIO_MILLIS)) / 1_000;
+        let deadline = Instant::now() + first_audio_timeout;
+        let ready = loop {
+            let samples = accepted_samples.load(std::sync::atomic::Ordering::Relaxed);
+            let callbacks = accepted_callbacks.load(std::sync::atomic::Ordering::Relaxed);
+            if samples >= ready_samples && callbacks >= READY_CALLBACKS {
+                break true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break false;
+            };
+            if readiness_rx.recv_timeout(remaining).is_err() {
+                break false;
+            }
+        };
+        if !ready {
+            startup_state.store(STARTUP_REJECTED, std::sync::atomic::Ordering::Release);
+            // Tear both resources down before the caller opens the same path
+            // through cpal. This covers the observed field failure where
+            // AudioOutputUnitStart succeeded but no sustained callback stream
+            // ever arrived.
+            capture.stop();
+            if let Err(error) = track.finalize() {
+                tracing::warn!(%error, "could not finalize silent AEC probe track");
+            }
+            if let Err(error) = std::fs::remove_file(&out_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%error, path = %out_path.display(), "could not remove rejected AEC probe track");
+                }
+            }
+            tracing::warn!(
+                timeout_ms = first_audio_timeout.as_millis(),
+                callbacks = accepted_callbacks.load(std::sync::atomic::Ordering::Relaxed),
+                samples = accepted_samples.load(std::sync::atomic::Ordering::Relaxed),
+                "voice-processing mic started without sustained audio callbacks; falling back to cpal"
+            );
+            return None;
+        }
+
+        startup_state.store(STARTUP_ACCEPTED, std::sync::atomic::Ordering::Release);
 
         tracing::info!(
             sample_rate,
@@ -190,6 +305,134 @@ impl MeetingMicAec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen_asr::live_tap_channel;
+    use lumen_platform_macos::VoiceProcessingError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    struct SilentCapture {
+        stopped: Arc<AtomicBool>,
+        sink: Option<VoiceInputSink>,
+    }
+
+    #[derive(Default)]
+    struct ActiveCapture {
+        stopped: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    struct OneShotCapture {
+        stopped: Arc<AtomicBool>,
+        sink: Option<VoiceInputSink>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    struct FailingCapture;
+
+    struct StartTrackingCapture {
+        started: Arc<AtomicBool>,
+    }
+
+    impl VoiceCaptureBackend for SilentCapture {
+        fn start(
+            &mut self,
+            _preferred_device: Option<&str>,
+            sink: VoiceInputSink,
+        ) -> Result<u32, VoiceProcessingError> {
+            // Retain the callback without invoking it. This models the field
+            // failure: Core Audio reported a successful start and kept the
+            // unit alive, but no input callback ever arrived.
+            self.sink = Some(sink);
+            Ok(44_100)
+        }
+
+        fn stop(&mut self) {
+            self.sink = None;
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl VoiceCaptureBackend for ActiveCapture {
+        fn start(
+            &mut self,
+            _preferred_device: Option<&str>,
+            sink: VoiceInputSink,
+        ) -> Result<u32, VoiceProcessingError> {
+            let stopped = Arc::clone(&self.stopped);
+            self.worker = Some(std::thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    sink(&vec![0.25; 441]);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }));
+            Ok(44_100)
+        }
+
+        fn stop(&mut self) {
+            self.stopped.store(true, Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    impl VoiceCaptureBackend for OneShotCapture {
+        fn start(
+            &mut self,
+            _preferred_device: Option<&str>,
+            sink: VoiceInputSink,
+        ) -> Result<u32, VoiceProcessingError> {
+            self.sink = Some(Arc::clone(&sink));
+            self.worker = Some(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(2));
+                sink(&vec![0.25; 441]);
+            }));
+            Ok(44_100)
+        }
+
+        fn stop(&mut self) {
+            self.sink = None;
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl VoiceCaptureBackend for FailingCapture {
+        fn start(
+            &mut self,
+            _preferred_device: Option<&str>,
+            _sink: VoiceInputSink,
+        ) -> Result<u32, VoiceProcessingError> {
+            Err(VoiceProcessingError::Unsupported)
+        }
+
+        fn stop(&mut self) {
+            panic!("a backend that never started must not be stopped");
+        }
+    }
+
+    impl VoiceCaptureBackend for StartTrackingCapture {
+        fn start(
+            &mut self,
+            _preferred_device: Option<&str>,
+            _sink: VoiceInputSink,
+        ) -> Result<u32, VoiceProcessingError> {
+            self.started.store(true, Ordering::SeqCst);
+            Ok(44_100)
+        }
+
+        fn stop(&mut self) {}
+    }
+
+    fn temp_wav(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("lumen-{name}-{nonce}.wav"))
+    }
 
     #[test]
     fn is_supported_probe_never_panics() {
@@ -206,5 +449,175 @@ mod tests {
         assert!(!aec.set_paused(false));
         // Idempotent.
         assert!(aec.stop().is_none());
+    }
+
+    #[test]
+    fn start_fails_when_voice_processor_delivers_no_audio() {
+        let path = temp_wav("silent-aec");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let aec = MeetingMicAec::default();
+
+        let result = aec.start_with_capture(
+            None,
+            path.clone(),
+            None,
+            Box::new(SilentCapture {
+                stopped: Arc::clone(&stopped),
+                sink: None,
+            }),
+            Duration::from_millis(25),
+        );
+
+        assert_eq!(result, None);
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(aec.stop().is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn start_succeeds_after_audio_reaches_the_writer() {
+        let path = temp_wav("active-aec");
+        let aec = MeetingMicAec::default();
+        let (live, live_rx) = live_tap_channel("mic", Instant::now(), 2);
+
+        let result = aec.start_with_capture(
+            None,
+            path.clone(),
+            Some(live),
+            Box::new(ActiveCapture::default()),
+            Duration::from_millis(200),
+        );
+
+        assert_eq!(result, Some(44_100));
+        let packet = live_rx.recv_timeout(Duration::from_millis(200)).unwrap();
+        assert_eq!(packet.samples, vec![0.25; 441]);
+        let summary = aec.stop().unwrap().unwrap();
+        assert_eq!(summary.sample_rate, 44_100);
+        assert!(summary.duration_seconds > 0.0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn one_startup_buffer_then_stall_falls_back() {
+        let path = temp_wav("one-shot-aec");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let aec = MeetingMicAec::default();
+        let (live, live_rx) = live_tap_channel("mic", Instant::now(), 2);
+
+        let result = aec.start_with_capture(
+            None,
+            path.clone(),
+            Some(live),
+            Box::new(OneShotCapture {
+                stopped: Arc::clone(&stopped),
+                sink: None,
+                worker: None,
+            }),
+            Duration::from_millis(25),
+        );
+
+        assert_eq!(result, None);
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(aec.stop().is_none());
+        assert!(live_rx.recv_timeout(Duration::from_millis(10)).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn start_error_falls_back_without_creating_a_session() {
+        let path = temp_wav("failed-aec-start");
+        let aec = MeetingMicAec::default();
+
+        let result = aec.start_with_capture(
+            None,
+            path.clone(),
+            None,
+            Box::new(FailingCapture),
+            Duration::from_millis(10),
+        );
+
+        assert_eq!(result, None);
+        assert!(!path.exists());
+        assert!(aec.stop().is_none());
+    }
+
+    #[test]
+    fn wav_creation_error_stops_capture_and_falls_back() {
+        let path = temp_wav("missing-parent").join("mic.wav");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let aec = MeetingMicAec::default();
+
+        let result = aec.start_with_capture(
+            None,
+            path,
+            None,
+            Box::new(SilentCapture {
+                stopped: Arc::clone(&stopped),
+                sink: None,
+            }),
+            Duration::from_millis(10),
+        );
+
+        assert_eq!(result, None);
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(aec.stop().is_none());
+    }
+
+    #[test]
+    fn second_start_is_rejected_before_touching_its_backend() {
+        let path = temp_wav("active-aec-owner");
+        let aec = MeetingMicAec::default();
+        assert_eq!(
+            aec.start_with_capture(
+                None,
+                path.clone(),
+                None,
+                Box::new(ActiveCapture::default()),
+                Duration::from_millis(200),
+            ),
+            Some(44_100)
+        );
+
+        let second_started = Arc::new(AtomicBool::new(false));
+        let second = aec.start_with_capture(
+            None,
+            temp_wav("rejected-second-aec"),
+            None,
+            Box::new(StartTrackingCapture {
+                started: Arc::clone(&second_started),
+            }),
+            Duration::from_millis(10),
+        );
+
+        assert_eq!(second, None);
+        assert!(!second_started.load(Ordering::SeqCst));
+        aec.stop().unwrap().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn poisoned_session_lock_falls_back_before_touching_backend() {
+        let aec = Arc::new(MeetingMicAec::default());
+        let poison_target = Arc::clone(&aec);
+        assert!(std::thread::spawn(move || {
+            let _guard = poison_target.inner.lock().unwrap();
+            panic!("poison AEC session lock for fallback test");
+        })
+        .join()
+        .is_err());
+
+        let started = Arc::new(AtomicBool::new(false));
+        let result = aec.start_with_capture(
+            None,
+            temp_wav("poisoned-aec-lock"),
+            None,
+            Box::new(StartTrackingCapture {
+                started: Arc::clone(&started),
+            }),
+            Duration::from_millis(10),
+        );
+
+        assert_eq!(result, None);
+        assert!(!started.load(Ordering::SeqCst));
     }
 }

@@ -701,22 +701,11 @@ fn start_meeting_recording_with_targets(
     } else {
         (None, None)
     };
-    // Mic capture backend selection: prefer the system voice processor
-    // (VoiceProcessingIO — OS-level echo cancellation, so speakerphone
-    // meetings stop feeding the far-end voice back through the mic) when the
-    // user has not opted out (`meeting.mic_aec`, default on) and the host
-    // supports it. Any AEC start failure falls back to the plain cpal
-    // recorder — the recording itself never fails because of AEC. Both
-    // backends feed the identical WAV/fan-out contracts, so live preview,
-    // pause, sidecars, and the offline pipeline are unaffected by the choice.
-    // (Trade-off behind the opt-out: VPIO's bundled noise suppression may
-    // attenuate quiet far-field speakers in a conference room.)
-    let mic_aec_enabled = state
-        .config
-        .lock()
-        .map(|cfg| cfg.meeting.mic_aec)
-        .unwrap_or(true);
-    let aec_rate = if mic_aec_enabled && crate::meeting_mic_aec::MeetingMicAec::is_supported() {
+    // Production meetings use the plain cpal microphone path.
+    const VOICE_PROCESSING_SAFE_FOR_MEETINGS: bool = false;
+    let aec_rate = if VOICE_PROCESSING_SAFE_FOR_MEETINGS
+        && crate::meeting_mic_aec::MeetingMicAec::is_supported()
+    {
         let rate = state
             .meeting_mic_aec
             .start(device.clone(), out_path.clone(), mic_tap.clone());
@@ -727,10 +716,7 @@ fn start_meeting_recording_with_targets(
         }
         rate
     } else {
-        tracing::info!(
-            mic_aec_enabled,
-            "meeting mic path: cpal (AEC disabled or unsupported on this host)"
-        );
+        tracing::info!("meeting mic path: cpal (VoiceProcessingIO safety gate disabled)");
         None
     };
     let sample_rate = match aec_rate {
