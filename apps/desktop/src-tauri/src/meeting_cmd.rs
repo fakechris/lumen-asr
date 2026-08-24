@@ -701,12 +701,7 @@ fn start_meeting_recording_with_targets(
     } else {
         (None, None)
     };
-    // VoiceProcessingIO is deliberately safety-gated out of the production
-    // path. Its bundled processing attenuates far-field room speakers, and a
-    // unit that stalls after startup cannot yet hand the same authoritative
-    // WAV over to cpal without losing audio. Keep the tested startup/fallback
-    // implementation available, but record production meetings through the
-    // proven cpal path so one backend owns the full timeline.
+    // Production meetings use the plain cpal microphone path.
     const VOICE_PROCESSING_SAFE_FOR_MEETINGS: bool = false;
     let aec_rate = if VOICE_PROCESSING_SAFE_FOR_MEETINGS
         && crate::meeting_mic_aec::MeetingMicAec::is_supported()

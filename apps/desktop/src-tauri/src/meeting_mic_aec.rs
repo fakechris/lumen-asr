@@ -12,10 +12,7 @@
 //!
 //! **Best-effort by contract**: any failure to start returns `None` and the
 //! caller records through the existing cpal path — a meeting recording never
-//! fails because AEC could not engage. The production meeting path currently
-//! safety-gates this backend off: VPIO's bundled noise suppression can
-//! attenuate quiet far-field speakers, and a mid-session callback stall cannot
-//! transfer the same authoritative WAV safely to cpal.
+//! fails because AEC could not engage.
 //!
 //! Dictation is untouched: this type is only ever driven by the meeting
 //! commands.

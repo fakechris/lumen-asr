@@ -1222,8 +1222,6 @@ echo_suppression = false
 
     #[test]
     fn legacy_meeting_mic_aec_setting_is_ignored() {
-        // The old hidden setting was default-on and did not express user
-        // intent. It must not reactivate VoiceProcessingIO after upgrading.
         let legacy: AppConfig = toml::from_str(
             r#"
 [meeting]
