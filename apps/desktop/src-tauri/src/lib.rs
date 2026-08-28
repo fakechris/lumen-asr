@@ -27,6 +27,7 @@ mod meeting_mic_aec;
 mod meeting_system_audio;
 mod mod_chord;
 mod mode_arbiter;
+mod model_integrity;
 mod onboard;
 mod pane_observer;
 mod permissions_cmd;
