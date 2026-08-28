@@ -37,7 +37,7 @@ lumen-asr-engine = { workspace = true }
 # fetch, the C++ toolchain, nor the ONNX Runtime download.
 [target.'cfg(target_os = "macos")'.dependencies]
 # Keep this rev in sync with the other lumen-suite deps in the workspace root Cargo.toml.
-diar-rs = { git = "https://github.com/fakechris/lumen-suite.git", rev = "64f970d530c2c88d61b02925ed28b6f660f81e14", optional = true }
+diar-rs = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ffa41c42ee1c6276f48a143e9d679378c1093bc7", optional = true }
 
 [features]
 default = []

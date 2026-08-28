@@ -1,6 +1,6 @@
 //! Recording + local ASR + model corrector IPC (M2–M5).
 
-use crate::config::AsrServiceConfig;
+use crate::config::{AsrServiceConfig, VadConfig};
 use crate::context_capture::{
     ActiveContextCapture, CorrectorContextProjection, StageUsageInput, TargetHint,
 };
@@ -27,6 +27,7 @@ use lumen_store::{
     InsertionOutcome, PipelineIssueKind, PipelineStage, PipelineStageIssue,
 };
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -685,6 +686,67 @@ pub(crate) fn ensure_active_asr_ready(
     Err(format!("{provider_label} 未就绪。{guidance}"))
 }
 
+/// Arm the configured VAD backend for the upcoming dictation recording.
+///
+/// Must run before `state.audio.start()`: silero mode attaches the silero VAD
+/// (the model loads here, off the audio thread, on first use); rms / disabled
+/// / model-unavailable all detach it so the capture callback does zero extra
+/// work. Fail-open throughout — a silero problem logs and leaves the RMS path
+/// in charge, recording is never affected.
+fn configure_session_vad(state: &AppState) {
+    let vad = state.config.lock().ok().map(|config| config.vad.clone());
+    let Some(vad) = vad else { return };
+    if !vad.enabled || vad.mode != "silero" {
+        let _ = state.audio.set_silero_vad(None);
+        return;
+    }
+    let Some(model_path) = resolve_silero_model_path(&vad) else {
+        tracing::warn!("vad.mode=silero but the model is not installed; using rms this session");
+        let _ = state.audio.set_silero_vad(None);
+        kick_silero_model_download();
+        return;
+    };
+    match state.audio.set_silero_vad(Some(&model_path)) {
+        Ok(()) => tracing::info!(path = %model_path.display(), "silero vad armed"),
+        Err(error) => {
+            tracing::warn!(%error, "silero vad unavailable; using rms this session");
+            let _ = state.audio.set_silero_vad(None);
+        }
+    }
+}
+
+/// Configured silero model path wins; empty config resolves the shared
+/// lumen-models install. Returns `None` when no usable model file exists.
+fn resolve_silero_model_path(vad: &VadConfig) -> Option<PathBuf> {
+    let configured = vad.silero_model_path.trim();
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        return path.is_file().then_some(path);
+    }
+    lumen_asr::silero_vad_model_path(&lumen_asr::default_silero_vad_dir())
+}
+
+/// First silero session downloads the model in the background (~2 MB); the
+/// current session runs RMS, the next one picks silero up. Runs at most once
+/// per process.
+fn kick_silero_model_download() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let cancel = AtomicBool::new(false);
+        match lumen_asr::download_silero_vad_package(
+            &lumen_asr::lumen_models_dir(),
+            &cancel,
+            |p| tracing::debug!(phase = %p.phase, "silero vad model download"),
+        ) {
+            Ok(dir) => tracing::info!(dir = %dir.display(), "silero vad model installed"),
+            Err(error) => tracing::warn!(%error, "silero vad model download failed"),
+        }
+    });
+}
+
 pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     if state.audio.is_recording() {
         return Ok(());
@@ -703,6 +765,7 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
         ..TargetHint::default()
     });
     state.context.begin(hint);
+    configure_session_vad(state);
     state.audio.start().map_err(|error| {
         cancel_pane_target_discovery();
         state.context.clear_active();
@@ -2167,25 +2230,51 @@ fn finish_with_transient_fallback(app: &AppHandle, outcome: TranscribeOutcome) {
 /// When `[vad] enabled`, end the dictation after a sustained silent stretch.
 /// Uses the same stop path as a hotkey release — `dictation_stop` is
 /// phase-guarded, so a racing manual stop wins cleanly.
+///
+/// Two backends, same "stop only after a sustained silent stretch" policy:
+/// silero (`AudioCapture` feeds the VAD from the capture callback; this
+/// watcher reads its last-speech timestamp) or rms (polls `latest_rms` into
+/// `SilenceAutoStop`). silero configured but not active (model missing /
+/// failed to load) falls back to rms with a warning.
 fn spawn_vad_autostop(app: &AppHandle) {
-    let vad = app
-        .state::<AppState>()
-        .config
-        .lock()
-        .ok()
-        .map(|config| config.vad.clone());
+    let state = app.state::<AppState>();
+    let vad = state.config.lock().ok().map(|config| config.vad.clone());
     let Some(vad) = vad else { return };
     if !vad.enabled {
         return;
     }
-    if vad.mode != "rms" {
+    let timeout = Duration::from_millis(vad.silence_timeout_ms.clamp(300, 30_000));
+    let silero_active = state.audio.silero_vad_active();
+    if vad.mode == "silero" && silero_active {
+        let watcher = lumen_asr::TimestampAutoStop::new(timeout);
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                let state = app.state::<AppState>();
+                let Some(elapsed_ms) = state.audio.silero_elapsed_ms() else {
+                    break; // recording already ended (hotkey release, error, …)
+                };
+                let last_speech = state.audio.silero_last_speech_at_ms();
+                if watcher.update(last_speech, elapsed_ms) == lumen_asr::VadAction::AutoStop {
+                    tracing::info!("silero vad silence timeout — auto-stopping dictation");
+                    if let Err(error) = dictation_stop(app.clone()).await {
+                        tracing::warn!(error = %error, "vad auto-stop failed");
+                    }
+                    break;
+                }
+            }
+        });
+        return;
+    }
+    if vad.mode == "silero" {
+        tracing::warn!("vad.mode=silero but the silero backend is not active, falling back to rms");
+    } else if vad.mode != "rms" {
         tracing::warn!(mode = %vad.mode, "vad mode not implemented, falling back to rms");
     }
-    let mut watcher = lumen_asr::SilenceAutoStop::new(
-        vad.start_threshold,
-        vad.end_threshold,
-        Duration::from_millis(vad.silence_timeout_ms.clamp(300, 30_000)),
-    );
+    let mut watcher =
+        lumen_asr::SilenceAutoStop::new(vad.start_threshold, vad.end_threshold, timeout);
     let app = app.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
@@ -2766,5 +2855,28 @@ mod attempt_metric_tests {
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].status, AttemptStatus::Failed);
         assert_eq!(attempts[0].failed_stage, Some(PipelineStage::Capture));
+    }
+
+    #[test]
+    fn silero_model_path_prefers_configured_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("silero_vad.onnx");
+        std::fs::write(&model, b"model").unwrap();
+        let vad = VadConfig {
+            silero_model_path: model.to_string_lossy().into_owned(),
+            ..VadConfig::default()
+        };
+        assert_eq!(resolve_silero_model_path(&vad), Some(model));
+    }
+
+    #[test]
+    fn silero_model_path_rejects_missing_configured_file() {
+        // An explicit but wrong path must not silently fall through to the
+        // shared install — surfacing the typo beats picking another model.
+        let vad = VadConfig {
+            silero_model_path: "/nonexistent/silero_vad.onnx".into(),
+            ..VadConfig::default()
+        };
+        assert_eq!(resolve_silero_model_path(&vad), None);
     }
 }
