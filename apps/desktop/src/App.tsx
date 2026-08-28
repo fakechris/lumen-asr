@@ -227,6 +227,12 @@ export default function App() {
     meetingId: string;
     deadlineMs: number;
   } | null>(null);
+  // Max-duration grace period ("forgot to stop" cap). Same presentation-only
+  // countdown contract as the silence warning above.
+  const [maxDurationWarning, setMaxDurationWarning] = useState<{
+    meetingId: string;
+    deadlineMs: number;
+  } | null>(null);
   // Info banner shown after the watchdog auto-stopped a silent recording.
   const [autoStopNotice, setAutoStopNotice] = useState<string | null>(null);
   // Calendar-linked meeting whose end time passed while still recording. A
@@ -585,6 +591,45 @@ export default function App() {
     };
   }, []);
 
+  // Max-duration cap: the backend starts a grace-period countdown once the
+  // recording's wall-clock age crosses the configured limit. Only an explicit
+  // Keep retracts it (there is no "sound resumed" escape for a duration cap).
+  useEffect(() => {
+    let unWarning: (() => void) | undefined;
+    let unCleared: (() => void) | undefined;
+    let cancelled = false;
+    Promise.all([
+      listen<{ meetingId: string; countdownSeconds: number }>(
+        "meeting-max-duration-warning",
+        (e) => {
+          if (stoppedMeetingsRef.current.has(e.payload.meetingId)) return;
+          setMaxDurationWarning({
+            meetingId: e.payload.meetingId,
+            deadlineMs: Date.now() + Math.max(0, e.payload.countdownSeconds) * 1000,
+          });
+        },
+      ),
+      listen<{ meetingId: string }>("meeting-max-duration-cleared", (e) => {
+        setMaxDurationWarning((current) =>
+          current?.meetingId === e.payload.meetingId ? null : current,
+        );
+      }),
+    ]).then(([warning, cleared]) => {
+      if (cancelled) {
+        warning();
+        cleared();
+      } else {
+        unWarning = warning;
+        unCleared = cleared;
+      }
+    });
+    return () => {
+      cancelled = true;
+      unWarning?.();
+      unCleared?.();
+    };
+  }, []);
+
   // Silence auto-stop: after the warning countdown expires with no new sound,
   // the FRONT-END owns the real stop path. Guard duplicate events/clicks and
   // show a dismissible completion banner.
@@ -592,13 +637,18 @@ export default function App() {
     let un: (() => void) | undefined;
     let cancelled = false;
     listen<{ meetingId: string; reason: string }>("meeting-auto-stop", (e) => {
-      const { meetingId } = e.payload;
+      const { meetingId, reason } = e.payload;
       if (stoppedMeetingsRef.current.has(meetingId)) return;
       stoppedMeetingsRef.current.add(meetingId);
       setSilenceWarning(null);
+      setMaxDurationWarning(null);
+      const doneMessage =
+        reason === "max_duration"
+          ? "录音已达最长时长上限，已自动停止。"
+          : "录音已因长时间无声自动停止。";
       void api
         .stopMeetingRecording(meetingId)
-        .then(() => setAutoStopNotice("录音已因长时间无声自动停止。"))
+        .then(() => setAutoStopNotice(doneMessage))
         .catch((error) => {
           stoppedMeetingsRef.current.delete(meetingId);
           setError(`自动结束会议失败：${String(error)}`);
@@ -876,7 +926,9 @@ export default function App() {
         />
       )}
       {silenceWarning && (
-        <SilenceStopPrompt
+        <AutoStopPrompt
+          title="持续检测不到声音"
+          promptId="silence"
           deadlineMs={silenceWarning.deadlineMs}
           onKeep={() => {
             const { meetingId } = silenceWarning;
@@ -887,6 +939,29 @@ export default function App() {
           onStop={() => {
             const { meetingId } = silenceWarning;
             setSilenceWarning(null);
+            if (stoppedMeetingsRef.current.has(meetingId)) return;
+            stoppedMeetingsRef.current.add(meetingId);
+            void api.stopMeetingRecording(meetingId).catch((e) => {
+              stoppedMeetingsRef.current.delete(meetingId);
+              setError(String(e));
+            });
+          }}
+        />
+      )}
+      {maxDurationWarning && (
+        <AutoStopPrompt
+          title="录音已达最长时长上限"
+          promptId="max-duration"
+          deadlineMs={maxDurationWarning.deadlineMs}
+          onKeep={() => {
+            const { meetingId } = maxDurationWarning;
+            void api.continueMeetingAfterMaxDuration(meetingId).catch((e) =>
+              setError(String(e)),
+            );
+          }}
+          onStop={() => {
+            const { meetingId } = maxDurationWarning;
+            setMaxDurationWarning(null);
             if (stoppedMeetingsRef.current.has(meetingId)) return;
             stoppedMeetingsRef.current.add(meetingId);
             void api.stopMeetingRecording(meetingId).catch((e) => {
@@ -1460,18 +1535,25 @@ function StopSuggestPrompt({
   );
 }
 
-// Non-modal right-side notice for the unattended-recording watchdog. It never
-// steals keyboard focus from the user's meeting app; the backend sample clock,
-// not this display timer, decides whether the recording actually stops.
-function SilenceStopPrompt({
+// Non-modal right-side notice for the auto-stop watchdogs (silence and
+// max-duration). It never steals keyboard focus from the user's meeting app;
+// the backend clock, not this display timer, decides whether the recording
+// actually stops.
+function AutoStopPrompt({
+  title,
+  promptId,
   deadlineMs,
   onStop,
   onKeep,
 }: {
+  title: string;
+  promptId: string;
   deadlineMs: number;
   onStop: () => void;
   onKeep: () => void;
 }) {
+  const titleId = `meeting-auto-stop-title-${promptId}`;
+  const subId = `meeting-auto-stop-sub-${promptId}`;
   const remainingNow = () => Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1000));
   const [remaining, setRemaining] = useState(remainingNow);
   useEffect(() => {
@@ -1486,14 +1568,14 @@ function SilenceStopPrompt({
       role="alert"
       aria-live="assertive"
       aria-atomic="true"
-      aria-labelledby="meeting-silence-title"
-      aria-describedby="meeting-silence-sub"
+      aria-labelledby={titleId}
+      aria-describedby={subId}
     >
       <div className="detection-prompt-body">
-        <span id="meeting-silence-title" className="detection-prompt-title">
-          持续检测不到声音
+        <span id={titleId} className="detection-prompt-title">
+          {title}
         </span>
-        <span id="meeting-silence-sub" className="detection-prompt-sub">
+        <span id={subId} className="detection-prompt-sub">
           {remaining > 0
             ? `${remaining} 秒后将自动结束会议录音。`
             : "正在结束会议录音…"}
@@ -2292,20 +2374,23 @@ function SettingsPanel({
   const [detectionCapable, setDetectionCapable] = useState(false);
   const [meetingApps, setMeetingApps] = useState<MeetingAppCatalog | null>(null);
   const [meetingAppsSaving, setMeetingAppsSaving] = useState(false);
-  // Meeting watchdog settings (silence auto-stop minutes, calendar-end reminder).
+  // Meeting watchdog settings (silence auto-stop minutes, max-duration cap,
+  // calendar-end reminder).
   const [silenceAutoStopMinutes, setSilenceAutoStopMinutes] = useState(15);
+  const [maxDurationMinutes, setMaxDurationMinutes] = useState(480);
   const [calendarEndReminder, setCalendarEndReminder] = useState(true);
   // Debounce + latest-wins so rapid edits to either field don't race as
   // independent writes (each call persists both fields, so an older in-flight
   // write could otherwise clobber the newer one).
   const watchdogSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveWatchdog = useCallback(
-    (minutes: number, reminder: boolean) => {
+    (minutes: number, maxDuration: number, reminder: boolean) => {
       if (watchdogSaveTimer.current) clearTimeout(watchdogSaveTimer.current);
       watchdogSaveTimer.current = setTimeout(() => {
         void api
           .setMeetingWatchdogConfig({
             silenceAutoStopMinutes: minutes,
+            maxDurationMinutes: maxDuration,
             calendarEndReminder: reminder,
           })
           .catch((err) => onError(String(err)));
@@ -2399,6 +2484,7 @@ function SettingsPanel({
         try {
           const wd = await api.getMeetingWatchdogConfig();
           setSilenceAutoStopMinutes(wd.silenceAutoStopMinutes);
+          setMaxDurationMinutes(wd.maxDurationMinutes);
           setCalendarEndReminder(wd.calendarEndReminder);
         } catch {
           /* watchdog settings are best-effort */
@@ -3361,7 +3447,8 @@ function SettingsPanel({
 
         <hr className="settings-divider" />
         <p className="muted-text">
-          看护正在进行的录音：持续检测不到会议声音时先提醒，20 秒后自动停止；关联日历会议结束时也会提醒你。
+          看护正在进行的录音：持续检测不到会议声音时先提醒，20 秒后自动停止；超过最长时长上限会先提醒，60
+          秒后自动停止；关联日历会议结束时也会提醒你。
         </p>
         <div className="form-row">
           <label className="form-label" htmlFor="silence-auto-stop">
@@ -3379,7 +3466,27 @@ function SettingsPanel({
             onChange={(e) => {
               const next = Math.max(0, Math.floor(Number(e.target.value) || 0));
               setSilenceAutoStopMinutes(next);
-              saveWatchdog(next, calendarEndReminder);
+              saveWatchdog(next, maxDurationMinutes, calendarEndReminder);
+            }}
+          />
+        </div>
+        <div className="form-row">
+          <label className="form-label" htmlFor="max-duration">
+            最长录制时长（分钟），0 关闭
+          </label>
+          <input
+            id="max-duration"
+            className="input"
+            type="number"
+            min={0}
+            step={1}
+            value={maxDurationMinutes}
+            disabled={busy}
+            style={{ maxWidth: 120 }}
+            onChange={(e) => {
+              const next = Math.max(0, Math.floor(Number(e.target.value) || 0));
+              setMaxDurationMinutes(next);
+              saveWatchdog(silenceAutoStopMinutes, next, calendarEndReminder);
             }}
           />
         </div>
@@ -3392,7 +3499,7 @@ function SettingsPanel({
               onChange={(e) => {
                 const next = e.target.checked;
                 setCalendarEndReminder(next);
-                saveWatchdog(silenceAutoStopMinutes, next);
+                saveWatchdog(silenceAutoStopMinutes, maxDurationMinutes, next);
               }}
             />{" "}
             日历结束时提醒停止录音

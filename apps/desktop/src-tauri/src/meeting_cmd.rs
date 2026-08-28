@@ -363,7 +363,8 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// cancels it; otherwise the meeting is stopped when this countdown expires.
 const SILENCE_COUNTDOWN_SECONDS: u32 = 20;
 
-/// Handle stored in [`AppState`] for the one active silence watchdog.
+/// Handle stored in [`AppState`] for one active meeting watchdog (the silence
+/// auto-stop or the max-duration cap — both share this stop/continue shape).
 pub struct MeetingWatchdogHandle {
     meeting_id: String,
     stop: Arc<AtomicBool>,
@@ -374,7 +375,7 @@ pub struct MeetingWatchdogHandle {
 impl MeetingWatchdogHandle {
     fn request_continue(&self, meeting_id: &str) -> Result<(), String> {
         if self.meeting_id != meeting_id {
-            return Err("silence warning belongs to a different meeting".to_string());
+            return Err("watchdog warning belongs to a different meeting".to_string());
         }
         self.continue_generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -388,7 +389,8 @@ impl MeetingWatchdogHandle {
 
 /// Payload of the `meeting-auto-stop` event: the front-end owns the real stop
 /// path, so the watchdog only *asks* it to stop (it never calls the stop
-/// command from the background thread). `reason` is `"silence"`.
+/// command from the background thread). `reason` is `"silence"` or
+/// `"max_duration"`.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingAutoStop {
@@ -610,6 +612,179 @@ fn spawn_meeting_watchdog(
                     );
                 }
                 SilenceWatchdogAction::None => {}
+            }
+        }
+    });
+    MeetingWatchdogHandle {
+        meeting_id,
+        stop,
+        continue_generation,
+        handle,
+    }
+}
+
+/// Grace period shown once a recording reaches its configured maximum
+/// duration. Unlike the silence countdown there is no "sound resumes" escape:
+/// only an explicit "continue recording" acknowledgement cancels it.
+const MAX_DURATION_COUNTDOWN_SECONDS: u32 = 60;
+
+/// Payload emitted when a recording crosses its configured maximum duration
+/// and the grace-period countdown begins.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingMaxDurationWarning {
+    pub meeting_id: String,
+    pub countdown_seconds: u32,
+}
+
+/// Payload emitted when the user explicitly chooses to keep recording past the
+/// limit, so every open UI can retract a stale countdown.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingMaxDurationCleared {
+    pub meeting_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaxDurationWatchdogAction {
+    None,
+    Warn,
+    Clear,
+    Stop,
+}
+
+/// Pure state machine behind the max-duration watchdog thread.
+///
+/// Unlike [`SilenceWatchdogState`] — which measures *captured samples* so an
+/// intentional pause also pauses it — this one is fed **wall-clock** elapsed
+/// seconds. That difference is deliberate: the cap protects against a
+/// recording nobody remembered to stop, and pausing must not extend it.
+struct MaxDurationWatchdogState {
+    threshold_seconds: f64,
+    countdown_seconds: f64,
+    /// Elapsed seconds at the last continue acknowledgement: continuing grants
+    /// a fresh full threshold from that point (mirroring the silence
+    /// watchdog's baseline semantics).
+    baseline_seconds: f64,
+    warned_at_seconds: Option<f64>,
+    continue_generation: u64,
+}
+
+impl MaxDurationWatchdogState {
+    fn new(threshold_seconds: f64, countdown_seconds: f64) -> Self {
+        Self {
+            threshold_seconds,
+            countdown_seconds,
+            baseline_seconds: 0.0,
+            warned_at_seconds: None,
+            continue_generation: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        elapsed_seconds: f64,
+        continue_generation: u64,
+    ) -> MaxDurationWatchdogAction {
+        if continue_generation != self.continue_generation {
+            self.continue_generation = continue_generation;
+            self.baseline_seconds = elapsed_seconds;
+            return if self.warned_at_seconds.take().is_some() {
+                MaxDurationWatchdogAction::Clear
+            } else {
+                MaxDurationWatchdogAction::None
+            };
+        }
+
+        let effective = (elapsed_seconds - self.baseline_seconds).max(0.0);
+        match self.warned_at_seconds {
+            Some(warned_at) if effective >= warned_at + self.countdown_seconds => {
+                MaxDurationWatchdogAction::Stop
+            }
+            Some(_) => MaxDurationWatchdogAction::None,
+            None if effective >= self.threshold_seconds => {
+                self.warned_at_seconds = Some(effective);
+                MaxDurationWatchdogAction::Warn
+            }
+            None => MaxDurationWatchdogAction::None,
+        }
+    }
+}
+
+/// Spawn a background thread that watches the recording's wall-clock age.
+/// Past the configured limit it emits `meeting-max-duration-warning`; after a
+/// 60-second grace period with no acknowledgement it emits `meeting-auto-stop`
+/// with `reason = "max_duration"`. The thread only emits events — the
+/// front-end owns the real stop path (see [`MeetingAutoStop`]). `t0` is the
+/// recording's start instant so the measured age matches the recording.
+fn spawn_max_duration_watchdog(
+    app: AppHandle,
+    meeting_id: String,
+    t0: Instant,
+    minutes: u32,
+) -> MeetingWatchdogHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let continue_generation = Arc::new(AtomicU64::new(0));
+    let continue_thread = Arc::clone(&continue_generation);
+    let threshold_seconds = f64::from(minutes) * 60.0;
+    let thread_meeting_id = meeting_id.clone();
+    let handle = std::thread::spawn(move || {
+        let mut watchdog = MaxDurationWatchdogState::new(
+            threshold_seconds,
+            f64::from(MAX_DURATION_COUNTDOWN_SECONDS),
+        );
+        // Sleep in small slices so a stop request is honored promptly.
+        let step = Duration::from_millis(250);
+        while !stop_thread.load(Ordering::SeqCst) {
+            let mut slept = Duration::ZERO;
+            while slept < WATCHDOG_POLL_INTERVAL && !stop_thread.load(Ordering::SeqCst) {
+                std::thread::sleep(step);
+                slept += step;
+            }
+            if stop_thread.load(Ordering::SeqCst) {
+                break;
+            }
+            let elapsed = t0.elapsed().as_secs_f64();
+            let generation = continue_thread.load(Ordering::SeqCst);
+            match watchdog.observe(elapsed, generation) {
+                MaxDurationWatchdogAction::Warn => {
+                    tracing::info!(
+                        meeting_id = %thread_meeting_id,
+                        elapsed_seconds = elapsed,
+                        countdown_seconds = MAX_DURATION_COUNTDOWN_SECONDS,
+                        "meeting reached max duration; starting auto-stop countdown"
+                    );
+                    let _ = app.emit(
+                        "meeting-max-duration-warning",
+                        MeetingMaxDurationWarning {
+                            meeting_id: thread_meeting_id.clone(),
+                            countdown_seconds: MAX_DURATION_COUNTDOWN_SECONDS,
+                        },
+                    );
+                }
+                MaxDurationWatchdogAction::Clear => {
+                    let _ = app.emit(
+                        "meeting-max-duration-cleared",
+                        MeetingMaxDurationCleared {
+                            meeting_id: thread_meeting_id.clone(),
+                        },
+                    );
+                }
+                MaxDurationWatchdogAction::Stop => {
+                    tracing::info!(
+                        meeting_id = %thread_meeting_id,
+                        "meeting stayed at max duration through countdown; asking UI to stop"
+                    );
+                    let _ = app.emit(
+                        "meeting-auto-stop",
+                        MeetingAutoStop {
+                            meeting_id: thread_meeting_id.clone(),
+                            reason: "max_duration",
+                        },
+                    );
+                }
+                MaxDurationWatchdogAction::None => {}
             }
         }
     });
@@ -911,6 +1086,30 @@ fn start_meeting_recording_with_targets(
         }
     }
 
+    // Max-duration cap: warn when the recording's wall-clock age crosses the
+    // configured limit, then auto-stop after a 60-second grace period. Disabled
+    // when `max_duration_minutes` is 0. Same store-or-stop-on-poison handling
+    // as the silence watchdog above.
+    let max_duration_minutes = state
+        .config
+        .lock()
+        .map(|cfg| cfg.meeting.max_duration_minutes)
+        .unwrap_or(0);
+    if max_duration_minutes > 0 {
+        let watchdog = spawn_max_duration_watchdog(
+            app.clone(),
+            meeting_id.to_string(),
+            t0,
+            max_duration_minutes,
+        );
+        if let Ok(mut guard) = state.meeting_max_duration_watchdog.lock() {
+            *guard = Some(watchdog);
+        } else {
+            watchdog.stop_and_join();
+            tracing::warn!("meeting max-duration watchdog lock poisoned; skipping duration cap");
+        }
+    }
+
     recording_owner.started(meeting_id);
     tracing::info!(meeting_id = %meeting_id, "meeting recording started");
     Ok(meeting_id.to_string())
@@ -1122,6 +1321,14 @@ pub fn stop_meeting_recording(
         }
     }
 
+    // Same for the max-duration watchdog: it must not fire its auto-stop while
+    // this command is already finalizing the meeting.
+    if let Ok(mut guard) = state.meeting_max_duration_watchdog.lock() {
+        if let Some(watchdog) = guard.take() {
+            watchdog.stop_and_join();
+        }
+    }
+
     // Try to stop + finalize the recorder, but *keep* the result — the recovery
     // below (restore hotkey + reset arbiter) must run on every path, success or
     // failure. This is finally/defer semantics: whatever happens to the
@@ -1197,6 +1404,13 @@ pub fn stop_meeting_recording(
     let _ = app.emit(
         "meeting-silence-cleared",
         MeetingSilenceCleared {
+            meeting_id: meeting_id.clone(),
+        },
+    );
+    // Retract any still-visible max-duration countdown for the same reason.
+    let _ = app.emit(
+        "meeting-max-duration-cleared",
+        MeetingMaxDurationCleared {
             meeting_id: meeting_id.clone(),
         },
     );
@@ -1513,12 +1727,15 @@ pub struct MeetingWatchdogConfig {
     /// Minutes of continuous mic silence before an unattended recording
     /// auto-stops. `0` disables the auto-stop.
     pub silence_auto_stop_minutes: u32,
+    /// Wall-clock cap on one recording in minutes ("forgot to stop"
+    /// protection). `0` disables the cap.
+    pub max_duration_minutes: u32,
     /// Prompt to stop when a calendar-linked meeting's end time passes.
     pub calendar_end_reminder: bool,
 }
 
-/// Read the meeting watchdog settings (silence auto-stop + calendar-end
-/// reminder) for the settings UI.
+/// Read the meeting watchdog settings (silence auto-stop + max-duration cap +
+/// calendar-end reminder) for the settings UI.
 #[tauri::command]
 pub fn get_meeting_watchdog_config(
     state: State<'_, AppState>,
@@ -1529,6 +1746,7 @@ pub fn get_meeting_watchdog_config(
         .map_err(|_| "config lock poisoned".to_string())?;
     Ok(MeetingWatchdogConfig {
         silence_auto_stop_minutes: cfg.meeting.silence_auto_stop_minutes,
+        max_duration_minutes: cfg.meeting.max_duration_minutes,
         calendar_end_reminder: cfg.meeting.calendar_end_reminder,
     })
 }
@@ -1540,6 +1758,7 @@ pub fn get_meeting_watchdog_config(
 pub fn set_meeting_watchdog_config(
     state: State<'_, AppState>,
     silence_auto_stop_minutes: u32,
+    max_duration_minutes: u32,
     calendar_end_reminder: bool,
 ) -> Result<MeetingWatchdogConfig, String> {
     {
@@ -1548,6 +1767,7 @@ pub fn set_meeting_watchdog_config(
             .lock()
             .map_err(|_| "config lock poisoned".to_string())?;
         cfg.meeting.silence_auto_stop_minutes = silence_auto_stop_minutes;
+        cfg.meeting.max_duration_minutes = max_duration_minutes;
         cfg.meeting.calendar_end_reminder = calendar_end_reminder;
         cfg.save()?;
     }
@@ -1570,6 +1790,25 @@ pub fn continue_meeting_after_silence(
     let watchdog = guard
         .as_ref()
         .ok_or_else(|| "meeting silence watchdog is not active".to_string())?;
+    watchdog.request_continue(&meeting_id)
+}
+
+/// The user confirmed the max-duration warning is a meeting they want to keep
+/// recording. Re-arm the cap from now, granting a fresh full threshold before
+/// it can warn again. The worker emits `meeting-max-duration-cleared` on its
+/// next tick.
+#[tauri::command]
+pub fn continue_meeting_after_max_duration(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<(), String> {
+    let guard = state
+        .meeting_max_duration_watchdog
+        .lock()
+        .map_err(|_| "meeting watchdog lock poisoned".to_string())?;
+    let watchdog = guard
+        .as_ref()
+        .ok_or_else(|| "meeting max-duration watchdog is not active".to_string())?;
     watchdog.request_continue(&meeting_id)
 }
 
@@ -3486,7 +3725,8 @@ mod tests {
     use super::{
         combine_track_silence_seconds, merge_attendees_into_notes, owned_meeting_wav_in,
         prepare_imported_meeting_audio, prepare_meeting_trim, read_timeline_offsets,
-        remove_mic_audio_artifacts, system_trim_range, write_timeline_sidecar, MeetingRecordingDto,
+        remove_mic_audio_artifacts, system_trim_range, write_timeline_sidecar,
+        MaxDurationWatchdogAction, MaxDurationWatchdogState, MeetingRecordingDto,
         MeetingRecordingOwner, MeetingTimeline, SilenceWatchdogAction, SilenceWatchdogState,
     };
     use lumen_core::MeetingStatus;
@@ -3737,6 +3977,50 @@ mod tests {
         assert_eq!(watchdog.observe(Some(60.0), 0), SilenceWatchdogAction::Warn);
         assert_eq!(watchdog.observe(None, 0), SilenceWatchdogAction::Clear);
         assert_eq!(watchdog.observe(None, 0), SilenceWatchdogAction::None);
+    }
+
+    #[test]
+    fn max_duration_warns_then_stops_only_after_grace_period() {
+        let mut watchdog = MaxDurationWatchdogState::new(600.0, 60.0);
+        assert_eq!(watchdog.observe(599.9, 0), MaxDurationWatchdogAction::None);
+        assert_eq!(watchdog.observe(600.0, 0), MaxDurationWatchdogAction::Warn);
+        // During the countdown there is no escape but an explicit continue —
+        // elapsed time alone never retracts the warning.
+        assert_eq!(watchdog.observe(659.9, 0), MaxDurationWatchdogAction::None);
+        assert_eq!(watchdog.observe(660.0, 0), MaxDurationWatchdogAction::Stop);
+    }
+
+    #[test]
+    fn max_duration_continue_grants_a_fresh_full_threshold() {
+        let mut watchdog = MaxDurationWatchdogState::new(600.0, 60.0);
+        assert_eq!(watchdog.observe(600.0, 0), MaxDurationWatchdogAction::Warn);
+        // Acknowledged at 610 s: the warning retracts and the next one cannot
+        // fire before another full threshold has elapsed.
+        assert_eq!(watchdog.observe(610.0, 1), MaxDurationWatchdogAction::Clear);
+        assert_eq!(watchdog.observe(1209.9, 1), MaxDurationWatchdogAction::None);
+        assert_eq!(watchdog.observe(1210.0, 1), MaxDurationWatchdogAction::Warn);
+        assert_eq!(watchdog.observe(1270.0, 1), MaxDurationWatchdogAction::Stop);
+    }
+
+    #[test]
+    fn max_duration_continue_without_a_warning_is_a_noop() {
+        let mut watchdog = MaxDurationWatchdogState::new(600.0, 60.0);
+        assert_eq!(watchdog.observe(100.0, 1), MaxDurationWatchdogAction::None);
+        // The baseline still moved: the warn now needs a full threshold from
+        // the acknowledgement point, not from t0.
+        assert_eq!(watchdog.observe(699.9, 1), MaxDurationWatchdogAction::None);
+        assert_eq!(watchdog.observe(700.0, 1), MaxDurationWatchdogAction::Warn);
+    }
+
+    #[test]
+    fn max_duration_clamps_a_backwards_clock() {
+        let mut watchdog = MaxDurationWatchdogState::new(600.0, 60.0);
+        assert_eq!(watchdog.observe(700.0, 0), MaxDurationWatchdogAction::Warn);
+        assert_eq!(watchdog.observe(750.0, 1), MaxDurationWatchdogAction::Clear);
+        // A backwards jump (NTP step) clamps effective elapsed to 0 rather
+        // than stopping or panicking.
+        assert_eq!(watchdog.observe(100.0, 1), MaxDurationWatchdogAction::None);
+        assert_eq!(watchdog.observe(600.0, 1), MaxDurationWatchdogAction::None);
     }
 
     #[test]

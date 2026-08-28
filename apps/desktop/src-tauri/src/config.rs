@@ -77,6 +77,14 @@ pub struct MeetingConfig {
     /// active) nothing is auto-stopped.
     #[serde(default = "default_silence_auto_stop_minutes")]
     pub silence_auto_stop_minutes: u32,
+    /// Hard cap on a meeting's wall-clock length in minutes (" forgot to stop
+    /// the recording" protection): past this limit the UI warns with a 60-second
+    /// countdown, then asks the front-end to stop. `0` disables the cap.
+    /// Defaults to `480` (8 hours). Unlike the silence watchdog — which measures
+    /// captured samples so a pause pauses it — this cap is wall-clock on
+    /// purpose: pausing must not extend it.
+    #[serde(default = "default_max_duration_minutes")]
+    pub max_duration_minutes: u32,
     /// When a calendar-linked meeting's end time passes, prompt the user to stop
     /// recording (a reminder with a Stop button — never an auto-stop, since a
     /// calendar end is not necessarily the real end). Defaults to `true`; only
@@ -132,6 +140,7 @@ impl Default for MeetingConfig {
             detection_enabled: false,
             calendar_link: true,
             silence_auto_stop_minutes: default_silence_auto_stop_minutes(),
+            max_duration_minutes: default_max_duration_minutes(),
             calendar_end_reminder: default_calendar_end_reminder(),
             system_audio: true,
             system_live_preview: true,
@@ -147,6 +156,12 @@ impl Default for MeetingConfig {
 /// auto-stops. `0` would disable the feature.
 fn default_silence_auto_stop_minutes() -> u32 {
     15
+}
+
+/// Default wall-clock cap on one meeting recording: 8 hours. `0` would
+/// disable the cap.
+fn default_max_duration_minutes() -> u32 {
+    480
 }
 
 /// Default for the calendar-end stop reminder (a prompt, never an auto-stop).
