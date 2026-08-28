@@ -17,9 +17,9 @@ pub use lumen_asr_engine::{
 pub use lumen_audio::{
     copy_pcm16_wav_range, live_tap_channel, repair_wav_header, trim_trailing_silence, AudioCapture,
     AudioDeviceInfo, AudioError, CaptureResult, LiveAudioPacket, LiveTapSender, MeetingRecorder,
-    MeetingRecorderError, RecordingSummary, RepairedWav, SampleSink, SilenceAutoStop,
-    SystemTrackRecorder, SystemTrackSender, VadAction, WavRangeError, WavRangeSummary, WavSink,
-    LIVE_TAP_CAPACITY,
+    MeetingRecorderError, RecordingSummary, RepairedWav, SampleSink, SilenceAutoStop, SileroVad,
+    SileroVadError, SystemTrackRecorder, SystemTrackSender, TimestampAutoStop, VadAction,
+    WavRangeError, WavRangeSummary, WavSink, LIVE_TAP_CAPACITY,
 };
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).
@@ -40,15 +40,17 @@ pub use lumen_models::app_models_dir;
 pub use lumen_models::{
     default_paraformer_offline_dir, default_paraformer_offline_dir_with_root,
     default_paraformer_streaming_dir, default_paraformer_streaming_dir_with_root, default_qwen_dir,
-    default_sensevoice_dir, default_sensevoice_dir_with_root, default_whisper_dir,
-    default_whisper_dir_with_root, download_paraformer_offline_package,
-    download_paraformer_streaming_package, download_sensevoice_package, legacy_model_roots,
-    lumen_models_dir, lumen_models_dir_with_override, paraformer_streaming_ready, qwen_ready,
-    resolve_qwen_asr_dir, resolve_sensevoice_dir, scan_model_candidates,
-    scan_model_candidates_with_root, sensevoice_ready, shared_sensevoice_dir, shared_whisper_dir,
-    user_home_dir, whisper_ready, DownloadError, DownloadProgress, ModelCandidate,
-    ModelInstallLock, ENV_LUMEN_MODELS_DIR, PARAFORMER_OFFLINE_ARCHIVE_URL,
-    PARAFORMER_STREAMING_ARCHIVE_URL, SENSEVOICE_ARCHIVE_NAME, SENSEVOICE_ARCHIVE_URL,
+    default_sensevoice_dir, default_sensevoice_dir_with_root, default_silero_vad_dir,
+    default_whisper_dir, default_whisper_dir_with_root, download_paraformer_offline_package,
+    download_paraformer_streaming_package, download_sensevoice_package,
+    download_silero_vad_package, legacy_model_roots, lumen_models_dir,
+    lumen_models_dir_with_override, paraformer_streaming_ready, qwen_ready, resolve_qwen_asr_dir,
+    resolve_sensevoice_dir, scan_model_candidates, scan_model_candidates_with_root,
+    sensevoice_ready, shared_sensevoice_dir, shared_silero_vad_dir, shared_whisper_dir,
+    silero_vad_model_path, silero_vad_ready, user_home_dir, whisper_ready, DownloadError,
+    DownloadProgress, ModelCandidate, ModelInstallLock, ENV_LUMEN_MODELS_DIR,
+    PARAFORMER_OFFLINE_ARCHIVE_URL, PARAFORMER_STREAMING_ARCHIVE_URL, SENSEVOICE_ARCHIVE_NAME,
+    SENSEVOICE_ARCHIVE_URL,
 };
 
 /// Status of the default SenseVoice install (default dir + readiness probe).

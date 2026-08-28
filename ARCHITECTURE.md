@@ -153,11 +153,13 @@ auto_promote_threshold = 3
 
 [vad]
 enabled = false             # silence auto-stop for dictation (opt-in)
-mode = "rms"                # only rms implemented; other values fall back to rms
+mode = "rms"                # rms | silero; unknown values fall back to rms
 start_threshold = 0.02      # RMS marking speech onset
 end_threshold = 0.005       # RMS below which input counts as silence
 silence_timeout_ms = 1500   # sustained silence that ends the dictation
 trim_trailing = true        # drop the silent tail before ASR (300ms padding kept)
+silero_model_path = ""      # silero mode only; empty = shared lumen-models install
+                            # (downloaded on demand at first silero session)
 
 [paths]
 # default: ~/Library/Application Support/LumenAsr

@@ -665,7 +665,8 @@ pub struct VadConfig {
     /// Silence auto-stop for dictation. Off by default: a wrong threshold
     /// cutting a session mid-thought is worse than holding the key longer.
     pub enabled: bool,
-    /// rms (built-in); unknown modes fall back to rms with a warning.
+    /// rms (built-in) | silero (sherpa-onnx silero VAD, 16 kHz mono); unknown
+    /// modes fall back to rms with a warning.
     pub mode: String,
     /// RMS marking speech onset (≈ clear speech at the mic).
     pub start_threshold: f32,
@@ -676,6 +677,11 @@ pub struct VadConfig {
     pub silence_timeout_ms: u64,
     /// Drop the silent tail before ASR (keeps a 300ms padding).
     pub trim_trailing: bool,
+    /// silero mode only: path to `silero_vad.onnx`. Empty = the shared
+    /// lumen-models install (`<models>/silero-vad/silero_vad.onnx`), downloaded
+    /// on demand the first time silero mode is used. Missing/unloadable model
+    /// falls back to rms for that session.
+    pub silero_model_path: String,
 }
 
 impl Default for VadConfig {
@@ -687,6 +693,7 @@ impl Default for VadConfig {
             end_threshold: 0.005,
             silence_timeout_ms: 1500,
             trim_trailing: true,
+            silero_model_path: String::new(),
         }
     }
 }
