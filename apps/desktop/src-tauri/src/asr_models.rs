@@ -396,8 +396,35 @@ fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
         emit_progress(app, &p.phase, &p.message, p.bytes, p.total)
     })
     .map_err(|error| error.to_string())?;
+    verify_or_remove(
+        app,
+        &installed,
+        crate::model_integrity::SENSEVOICE_FILES,
+        "SenseVoice",
+    )?;
     tracing::info!(dir = %installed.display(), "SenseVoice model installed");
     Ok(installed)
+}
+
+/// Integrity-check the freshly installed package; on mismatch remove the
+/// install dir so a corrupted model can never be loaded.
+fn verify_or_remove(
+    app: &AppHandle,
+    dir: &PathBuf,
+    files: &[crate::model_integrity::PinnedFile],
+    label: &str,
+) -> Result<(), String> {
+    emit_progress(app, "verifying", "校验模型完整性…", 0, None);
+    if let Err(error) = crate::model_integrity::verify_installed_package(dir, files) {
+        tracing::error!(dir = %dir.display(), model = label, %error, "model integrity check failed");
+        if let Err(remove_error) = std::fs::remove_dir_all(dir) {
+            tracing::warn!(error = %remove_error, "failed to remove corrupted model dir");
+        }
+        return Err(format!(
+            "{label} 模型校验失败（已删除损坏文件，请重试下载）：{error}"
+        ));
+    }
+    Ok(())
 }
 
 /// Install the offline Paraformer model (meeting transcription, word-level
@@ -451,18 +478,21 @@ fn download_paraformer(app: &AppHandle, variant: PfVariant) -> Result<PathBuf, S
     let root = lumen_models_dir();
     let on_progress =
         |p: lumen_asr::DownloadProgress| emit_progress(app, &p.phase, &p.message, p.bytes, p.total);
-    let (installed, label) = match variant {
+    let (installed, label, files) = match variant {
         PfVariant::Offline => (
             download_paraformer_offline_package(&root, &DOWNLOAD_CANCEL, on_progress)
                 .map_err(|error| error.to_string())?,
             "Paraformer (offline)",
+            crate::model_integrity::PARAFORMER_OFFLINE_FILES,
         ),
         PfVariant::Streaming => (
             download_paraformer_streaming_package(&root, &DOWNLOAD_CANCEL, on_progress)
                 .map_err(|error| error.to_string())?,
             "Paraformer (streaming)",
+            crate::model_integrity::PARAFORMER_STREAMING_FILES,
         ),
     };
+    verify_or_remove(app, &installed, files, label)?;
     tracing::info!(dir = %installed.display(), model = label, "Paraformer model installed");
     Ok(installed)
 }
