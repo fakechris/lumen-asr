@@ -118,6 +118,165 @@ struct LiveSpeaker {
     provisional: bool,
 }
 
+/// Payload of the `meeting-live-degraded` event: the live worker detected
+/// repeated packet gaps on a track's fan-out (the bounded `LiveTapSender`
+/// channel dropped chunks because this consumer fell behind). Advisory only —
+/// the WAV recording is on a separate, unbounded path and is never affected;
+/// the UI shows a quiet "live preview may be missing words" note.
+/// `estimated_lost_seconds` is the approximated preview audio lost so far in
+/// the current degraded episode.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MeetingLiveDegraded {
+    meeting_id: String,
+    track: &'static str,
+    estimated_lost_seconds: f64,
+}
+
+/// Payload of `meeting-live-degraded-cleared`: gaps stopped, the live preview
+/// is keeping up again and the UI retracts the note.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MeetingLiveDegradedCleared {
+    meeting_id: String,
+    track: &'static str,
+}
+
+/// Sliding window (meeting-timeline seconds) over recent packet gaps: the gaps
+/// inside it decide whether the preview is degraded.
+const LIVE_DROP_WINDOW_SECONDS: f64 = 2.0;
+
+/// Gaps needed inside the window before the preview is called degraded. Two
+/// keeps a single pause/resume transition — which produces exactly one
+/// timestamp gap and zero dropped packets — from ever warning.
+const LIVE_DROP_MIN_GAPS: usize = 2;
+
+/// A warned track recovers after this many seconds without a fresh gap.
+const LIVE_DROP_CLEAR_SECONDS: f64 = 5.0;
+
+/// One emission decision from [`LiveDropMonitor::observe`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LiveDropAction {
+    None,
+    /// Enter the degraded state; carries the estimated lost preview seconds.
+    Warn {
+        lost_seconds: f64,
+    },
+    /// Leave the degraded state (recovery).
+    Clear,
+}
+
+/// Consumer-side detector for fan-out packet drops. The tap
+/// ([`lumen_asr::LiveTapSender`]) counts drops on the producer side, but the
+/// count is not reachable through the channel, so this monitor infers drops
+/// from the received packets' stamps: consecutive `start_seconds` normally
+/// differ by one chunk duration (the stamp is taken at callback-delivery
+/// time), so a gap well past that means packets were dropped in between.
+///
+/// Throttling: one warn per degraded episode (further gaps only extend the
+/// lost-seconds estimate), one clear per recovery. Pure and unit-testable.
+struct LiveDropMonitor {
+    last_start_seconds: Option<f64>,
+    /// Meeting-timeline stamps of the gaps still inside the window.
+    gaps: VecDeque<f64>,
+    /// Accumulated lost-preview estimate for the current episode.
+    lost_seconds: f64,
+    warned: bool,
+}
+
+impl LiveDropMonitor {
+    fn new() -> Self {
+        Self {
+            last_start_seconds: None,
+            gaps: VecDeque::new(),
+            lost_seconds: 0.0,
+            warned: false,
+        }
+    }
+
+    fn observe(&mut self, start_seconds: f64, chunk_seconds: f64) -> LiveDropAction {
+        let gap = self.last_start_seconds.map(|last| start_seconds - last);
+        self.last_start_seconds = Some(start_seconds);
+
+        // Normal spacing is ~one chunk; a single dropped packet already
+        // doubles it. 1.5× + 20 ms absorbs callback jitter without ever
+        // firing on undropped spacing.
+        if let Some(gap) = gap.filter(|gap| *gap > chunk_seconds * 1.5 + 0.02) {
+            while self
+                .gaps
+                .front()
+                .is_some_and(|t| start_seconds - t > LIVE_DROP_WINDOW_SECONDS)
+            {
+                self.gaps.pop_front();
+            }
+            self.gaps.push_back(start_seconds);
+            self.lost_seconds += (gap - chunk_seconds).max(0.0);
+        }
+
+        if self.warned {
+            // Recover only after a quiet stretch with no fresh gap; until then
+            // stay silent (the warn is already on screen).
+            let quiet_for = self
+                .gaps
+                .back()
+                .map_or(f64::INFINITY, |t| start_seconds - t);
+            if quiet_for >= LIVE_DROP_CLEAR_SECONDS {
+                self.warned = false;
+                self.gaps.clear();
+                self.lost_seconds = 0.0;
+                return LiveDropAction::Clear;
+            }
+            return LiveDropAction::None;
+        }
+        if self.gaps.len() >= LIVE_DROP_MIN_GAPS {
+            self.warned = true;
+            return LiveDropAction::Warn {
+                lost_seconds: self.lost_seconds,
+            };
+        }
+        LiveDropAction::None
+    }
+}
+
+/// Emit the UI event for one drop-monitor decision. Best-effort like every
+/// other live event: a failed emit only costs the note, never the recording.
+fn emit_drop_action(
+    app: &AppHandle,
+    meeting_id: &str,
+    track: &'static str,
+    action: LiveDropAction,
+) {
+    match action {
+        LiveDropAction::Warn { lost_seconds } => {
+            tracing::warn!(
+                meeting_id,
+                track,
+                estimated_lost_seconds = lost_seconds,
+                "live preview dropping fan-out packets (recording unaffected)"
+            );
+            let _ = app.emit(
+                "meeting-live-degraded",
+                MeetingLiveDegraded {
+                    meeting_id: meeting_id.to_string(),
+                    track,
+                    estimated_lost_seconds: lost_seconds,
+                },
+            );
+        }
+        LiveDropAction::Clear => {
+            tracing::info!(meeting_id, track, "live preview fan-out recovered");
+            let _ = app.emit(
+                "meeting-live-degraded-cleared",
+                MeetingLiveDegradedCleared {
+                    meeting_id: meeting_id.to_string(),
+                    track,
+                },
+            );
+        }
+        LiveDropAction::None => {}
+    }
+}
+
 /// Return the streaming Paraformer model directory **iff** the real-time layer
 /// should run: macOS and the model is installed. `None` everywhere else, which
 /// the caller treats as "record normally, no live transcript".
@@ -1043,6 +1202,8 @@ struct TrackState {
     stream: StreamingStream,
     /// Sample-anchored unified-timeline clock for this track's packets.
     sample_clock: SampleClock,
+    /// Consumer-side fan-out drop detector (preview-degradation warnings).
+    drop_monitor: LiveDropMonitor,
     /// End (unified timeline) of the audio fed so far. Used as the finalized
     /// segment's `end_seconds`.
     clock: f64,
@@ -1065,6 +1226,7 @@ impl TrackState {
             feed,
             stream,
             sample_clock,
+            drop_monitor: LiveDropMonitor::new(),
             clock: 0.0,
             disconnected: false,
             window: keep_window.then(|| AudioWindow::new(STREAMING_TARGET_RATE)),
@@ -1074,12 +1236,22 @@ impl TrackState {
     /// Drain every pending packet into the recognizer stream (resampling to
     /// the model rate). Returns `true` if any audio arrived. A disconnected
     /// sender (that track's capture stopped) is flagged, never an error.
-    fn drain(&mut self) -> bool {
+    /// Drop-monitor decisions are pushed to `drop_actions` for the caller to
+    /// emit (this method has no `AppHandle`).
+    fn drain(&mut self, drop_actions: &mut Vec<LiveDropAction>) -> bool {
         let mut got_audio = false;
         loop {
             match self.feed.rx.try_recv() {
                 Ok(packet) => {
                     got_audio = true;
+                    let chunk_seconds =
+                        packet.samples.len() as f64 / f64::from(self.feed.capture_rate.max(1));
+                    let action = self
+                        .drop_monitor
+                        .observe(packet.start_seconds, chunk_seconds);
+                    if action != LiveDropAction::None {
+                        drop_actions.push(action);
+                    }
                     let (chunk_start, chunk_end) = self
                         .sample_clock
                         .observe(packet.start_seconds, packet.samples.len());
@@ -1284,7 +1456,11 @@ fn run_worker(
         }
         let mut got_audio = false;
         for track in &mut tracks {
-            got_audio |= track.drain();
+            let mut drop_actions = Vec::new();
+            got_audio |= track.drain(&mut drop_actions);
+            for action in drop_actions {
+                emit_drop_action(&app, &meeting_id, track.tracker.track, action);
+            }
         }
         // Mic sender dropped ⇒ the recording stopped; flush below. A dropped
         // *system* sender only means that track's capture ended (tap failure
@@ -1541,6 +1717,106 @@ mod tests {
             },
         );
         assert!(live.inner.lock().unwrap().is_none());
+    }
+
+    // ---- Live fan-out drop detection -------------------------------------
+
+    /// Feed `monitor` a run of undropped 0.1 s chunks starting at `from`;
+    /// returns the next free timestamp.
+    fn feed_clean(monitor: &mut LiveDropMonitor, from: f64, count: usize) -> f64 {
+        let mut t = from;
+        for _ in 0..count {
+            assert_eq!(monitor.observe(t, 0.1), LiveDropAction::None, "t={t}");
+            t += 0.1;
+        }
+        t
+    }
+
+    #[test]
+    fn clean_packet_spacing_never_warns() {
+        let mut monitor = LiveDropMonitor::new();
+        feed_clean(&mut monitor, 0.0, 200);
+    }
+
+    #[test]
+    fn one_gap_alone_does_not_warn_but_two_inside_the_window_do() {
+        let mut monitor = LiveDropMonitor::new();
+        feed_clean(&mut monitor, 0.0, 10);
+        // One dropped 0.1 s packet at t=1.0: the next stamp is 1.1 → gap 0.2.
+        // A single gap stays silent (a pause/resume transition looks the same).
+        assert_eq!(monitor.observe(1.1, 0.1), LiveDropAction::None);
+        // A second gap inside the 2 s window → degraded, once.
+        match monitor.observe(1.3, 0.1) {
+            LiveDropAction::Warn { lost_seconds } => {
+                assert!((lost_seconds - 0.2).abs() < 1e-9, "{lost_seconds}");
+            }
+            other => panic!("expected warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warn_is_emitted_once_per_episode_and_further_gaps_only_extend_it() {
+        let mut monitor = LiveDropMonitor::new();
+        monitor.observe(0.0, 0.1);
+        monitor.observe(0.3, 0.1); // gap
+        assert!(matches!(
+            monitor.observe(0.5, 0.1), // second gap → warn
+            LiveDropAction::Warn { .. }
+        ));
+        // More gaps while warned: no repeated warn events.
+        assert_eq!(monitor.observe(0.8, 0.1), LiveDropAction::None);
+        assert_eq!(monitor.observe(1.1, 0.1), LiveDropAction::None);
+    }
+
+    #[test]
+    fn warned_state_clears_after_a_quiet_stretch() {
+        let mut monitor = LiveDropMonitor::new();
+        monitor.observe(0.0, 0.1);
+        monitor.observe(0.3, 0.1);
+        assert!(matches!(
+            monitor.observe(0.5, 0.1),
+            LiveDropAction::Warn { .. }
+        ));
+        // Clean packets resume; 5 s without a fresh gap → cleared.
+        let mut t = 0.6;
+        let mut cleared = false;
+        while t < 6.0 {
+            if monitor.observe(t, 0.1) == LiveDropAction::Clear {
+                cleared = true;
+                break;
+            }
+            t += 0.1;
+        }
+        assert!(
+            cleared,
+            "monitor must recover after {LIVE_DROP_CLEAR_SECONDS}s quiet"
+        );
+        // After recovery a new episode can warn again: the big jump to 10.0 is
+        // the first gap, the one at 10.3 the second inside the window.
+        monitor.observe(10.0, 0.1);
+        assert!(matches!(
+            monitor.observe(10.3, 0.1),
+            LiveDropAction::Warn { .. }
+        ));
+    }
+
+    #[test]
+    fn gaps_outside_the_window_do_not_accumulate() {
+        let mut monitor = LiveDropMonitor::new();
+        monitor.observe(0.0, 0.1);
+        monitor.observe(0.3, 0.1); // gap at 0.3
+                                   // Next gap 3 s later: the first one already left the 2 s window.
+        feed_clean_from(&mut monitor, 0.4, 3.4);
+        assert_eq!(monitor.observe(3.6, 0.1), LiveDropAction::None);
+    }
+
+    /// Feed undropped 0.1 s chunks from `from` up to (not including) `until`.
+    fn feed_clean_from(monitor: &mut LiveDropMonitor, from: f64, until: f64) {
+        let mut t = from;
+        while t < until {
+            assert_eq!(monitor.observe(t, 0.1), LiveDropAction::None, "t={t}");
+            t += 0.1;
+        }
     }
 
     // ---- L3: speaker attribution payload ---------------------------------

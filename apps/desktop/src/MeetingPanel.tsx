@@ -1198,6 +1198,56 @@ function LiveTranscript({
     };
   }, [meetingId]);
 
+  // Preview-degradation note: the backend's live worker emits
+  // `meeting-live-degraded` when a track's bounded fan-out drops packets
+  // (consumer fell behind). Advisory only — the WAV recording is unaffected.
+  // Tracked per track: mic and system degrade and recover independently.
+  const [degraded, setDegraded] = useState<
+    Partial<Record<"mic" | "system", { lostSeconds: number }>>
+  >({});
+  useEffect(() => {
+    let unDegraded: (() => void) | undefined;
+    let unCleared: (() => void) | undefined;
+    let disposed = false;
+    Promise.all([
+      listen<{ meetingId: string; track: "mic" | "system"; estimatedLostSeconds: number }>(
+        "meeting-live-degraded",
+        (e) => {
+          if (e.payload.meetingId !== meetingId) return;
+          setDegraded((prev) => ({
+            ...prev,
+            [e.payload.track]: { lostSeconds: e.payload.estimatedLostSeconds },
+          }));
+        },
+      ),
+      listen<{ meetingId: string; track: "mic" | "system" }>(
+        "meeting-live-degraded-cleared",
+        (e) => {
+          if (e.payload.meetingId !== meetingId) return;
+          setDegraded((prev) => {
+            if (!(e.payload.track in prev)) return prev;
+            const next = { ...prev };
+            delete next[e.payload.track];
+            return next;
+          });
+        },
+      ),
+    ]).then(([degraded, cleared]) => {
+      if (disposed) {
+        degraded();
+        cleared();
+      } else {
+        unDegraded = degraded;
+        unCleared = cleared;
+      }
+    });
+    return () => {
+      disposed = true;
+      unDegraded?.();
+      unCleared?.();
+    };
+  }, [meetingId]);
+
   // Unified-timeline order across both tracks (id as a stable tiebreak).
   const ordered = useMemo(
     () =>
@@ -1291,6 +1341,14 @@ function LiveTranscript({
           点行尾「标注」可记录谁在说 · 停止后生成带说话人最终稿
         </span>
       </div>
+      {(Object.entries(degraded) as ["mic" | "system", { lostSeconds: number }][]).map(
+        ([track, info]) => (
+          <p key={track} className="muted-text meeting-live-note" role="status">
+            {LIVE_TRACK_LABEL[track]}轨实时预览可能缺词（已丢约{" "}
+            {Math.max(1, Math.round(info.lostSeconds))} 秒预览音频），录音不受影响。
+          </p>
+        ),
+      )}
       <div
         className="meeting-live-body"
         ref={scrollRef}

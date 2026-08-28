@@ -2454,6 +2454,7 @@ mod attempt_metric_tests {
             meeting_power_guard: std::sync::Mutex::new(None),
             meeting_battery_poll: std::sync::Mutex::new(None),
             meeting_watchdog: std::sync::Mutex::new(None),
+            meeting_max_duration_watchdog: std::sync::Mutex::new(None),
             meeting_recording_owner: std::sync::Mutex::new(
                 crate::meeting_cmd::MeetingRecordingOwner::default(),
             ),
@@ -2716,6 +2717,7 @@ mod attempt_metric_tests {
             meeting_power_guard: std::sync::Mutex::new(None),
             meeting_battery_poll: std::sync::Mutex::new(None),
             meeting_watchdog: std::sync::Mutex::new(None),
+            meeting_max_duration_watchdog: std::sync::Mutex::new(None),
             meeting_recording_owner: std::sync::Mutex::new(
                 crate::meeting_cmd::MeetingRecordingOwner::default(),
             ),

@@ -281,6 +281,10 @@ pub struct AppState {
     /// when no recording is active (or the silence auto-stop is disabled). All
     /// `Send`/`Sync` — never holds an objc2 object.
     pub meeting_watchdog: std::sync::Mutex<Option<meeting_cmd::MeetingWatchdogHandle>>,
+    /// Max-duration watchdog thread for the active recording (the "forgot to
+    /// stop" cap). Same stop/continue shape as the silence watchdog; `None`
+    /// when no recording is active or the cap is disabled.
+    pub meeting_max_duration_watchdog: std::sync::Mutex<Option<meeting_cmd::MeetingWatchdogHandle>>,
     /// Serializes meeting start/stop and binds the global capture engines to
     /// the meeting id that owns them. A delayed stop event from an older
     /// meeting must never finalize a newer recording.
@@ -543,6 +547,7 @@ pub fn run() {
             meeting_power_guard: Mutex::new(None),
             meeting_battery_poll: Mutex::new(None),
             meeting_watchdog: Mutex::new(None),
+            meeting_max_duration_watchdog: Mutex::new(None),
             meeting_recording_owner: Mutex::new(meeting_cmd::MeetingRecordingOwner::default()),
             meeting_audio_edit: tokio::sync::Mutex::new(()),
             meeting_recovery_notices: Mutex::new(Vec::new()),
@@ -631,6 +636,7 @@ pub fn run() {
             meeting_cmd::get_meeting_watchdog_config,
             meeting_cmd::set_meeting_watchdog_config,
             meeting_cmd::continue_meeting_after_silence,
+            meeting_cmd::continue_meeting_after_max_duration,
             meeting_cmd::process_meeting_now,
             meeting_cmd::import_meeting_file,
             meeting_cmd::list_meetings,

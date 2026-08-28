@@ -155,12 +155,16 @@ export type MeetingDetectionStats = {
   stopDeclined: number;
 };
 
-/** Meeting watchdog settings: auto-stop after prolonged mic silence, and a
- * prompt to stop when a calendar-linked meeting's end time passes. */
+/** Meeting watchdog settings: auto-stop after prolonged mic silence, a
+ * wall-clock cap on one recording's length, and a prompt to stop when a
+ * calendar-linked meeting's end time passes. */
 export type MeetingWatchdogConfig = {
   /** Minutes of continuous mic silence before an unattended recording
    * auto-stops. `0` disables the auto-stop. */
   silenceAutoStopMinutes: number;
+  /** Wall-clock cap on one recording in minutes ("forgot to stop"
+   * protection). `0` disables the cap. */
+  maxDurationMinutes: number;
   /** Prompt to stop when a calendar-linked meeting's end time passes. */
   calendarEndReminder: boolean;
 };
@@ -569,7 +573,7 @@ export const api = {
     invoke<MeetingDetectionStats>("get_meeting_detection_stats"),
 
   /** Read the meeting watchdog settings (silence auto-stop minutes +
-   * calendar-end reminder) for the settings UI. */
+   * max-duration cap + calendar-end reminder) for the settings UI. */
   getMeetingWatchdogConfig: () =>
     invoke<MeetingWatchdogConfig>("get_meeting_watchdog_config"),
 
@@ -577,6 +581,7 @@ export const api = {
    * recording. Resolves the stored values. */
   setMeetingWatchdogConfig: (input: {
     silenceAutoStopMinutes: number;
+    maxDurationMinutes: number;
     calendarEndReminder: boolean;
   }) =>
     invoke<MeetingWatchdogConfig>("set_meeting_watchdog_config", input),
@@ -585,6 +590,11 @@ export const api = {
    * configured silence interval from the acknowledgement point. */
   continueMeetingAfterSilence: (meetingId: string) =>
     invoke<void>("continue_meeting_after_silence", { meetingId }),
+
+  /** Keep recording after a max-duration warning and re-arm a fresh full
+   * duration threshold from the acknowledgement point. */
+  continueMeetingAfterMaxDuration: (meetingId: string) =>
+    invoke<void>("continue_meeting_after_max_duration", { meetingId }),
 
   /** Read one meeting with its speakers, seq-ordered segments, and summaries. */
   getMeetingDetail: (meetingId: string) =>
