@@ -26,6 +26,7 @@ const IS_WINDOWS = navigator.userAgent.includes("Windows");
 
 const MODEL_LABELS: Record<ModelTarget, string> = {
   sensevoice: "SenseVoice（听写）",
+  qwen: "Qwen3-ASR（听写，高准确率）",
   offline: "Paraformer 离线（会议）",
   streaming: "Paraformer 流式（会议）",
 };
@@ -157,7 +158,7 @@ export function OnboardingWizard({ onDone }: Props) {
     autoQueuedRef.current = true;
     const dictationReady =
       s.sensevoiceReady ||
-      (s.activeEngine === "qwen" && s.qwenReady && s.qwenRuntimeSupported) ||
+      (s.activeEngine === "qwen" && s.qwenReady) ||
       (s.activeEngine === "whisper" && s.whisperReady);
     if (!dictationReady) models.enqueue(["sensevoice"]);
   }, [models]);

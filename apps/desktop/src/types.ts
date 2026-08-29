@@ -62,9 +62,6 @@ export type AsrStatus = {
   providerLabel?: string;
   sensevoice: { kind: string; ready: boolean; model_dir: string };
   qwen: { kind: string; ready: boolean; model_dir: string };
-  qwenRuntimePath: string;
-  qwenRuntimeReady: boolean;
-  qwenRuntimeChecking: boolean;
   whisper: { kind: string; ready: boolean; model_dir: string };
   activeReady: boolean;
 };
@@ -140,6 +137,8 @@ export type PipelineIdentity = {
   enhancement_mode: EnhancementMode;
 };
 
+/** Legacy value persisted by the removed MLX Qwen shadow pass; new attempts
+ * are always "none". */
 export type EnhancementMode = "none" | "qwen_shadow" | "unknown";
 export type InsertionOutcome =
   | "not_requested"
@@ -164,106 +163,10 @@ export type PipelineIssueKind =
   | "injection_failure"
   | "unknown";
 
-export type QwenDecodeMode =
-  | "greedy_only"
-  | "official_fallback"
-  | "unknown";
-
-export type AsrTokenEvidence = {
-  chunk_index: number;
-  token_index: number;
-  token_id: number;
-  text: string;
-  selected_logprob: number;
-  entropy: number;
-  top1_top2_margin: number;
-};
-
-export type QwenRuntimeMetrics = {
-  schema_version: number;
-  runtime_version?: string | null;
-  decode_mode: QwenDecodeMode;
-  diagnostics_complete: boolean;
-  fallback_reason?: string | null;
-  chunk_count?: number | null;
-  audio_encode_count?: number | null;
-  prompt_prefill_count?: number | null;
-  generated_token_count?: number | null;
-  max_new_tokens?: number | null;
-  finish_reason?: string | null;
-  token_evidence_truncated: boolean;
-  audio_feature_ms?: number | null;
-  prompt_prefill_ms?: number | null;
-  greedy_decode_ms?: number | null;
-  worker_total_ms?: number | null;
-  mlx_peak_memory_bytes?: number | null;
-  mlx_active_memory_bytes_before_cleanup?: number | null;
-  mlx_active_memory_bytes_after_cleanup?: number | null;
-  mlx_cache_memory_bytes_after_cleanup?: number | null;
-  process_max_rss_bytes?: number | null;
-  process_user_cpu_ms?: number | null;
-  process_system_cpu_ms?: number | null;
-};
-
-export type QwenShadowStatus =
-  | "disabled"
-  | "completed"
-  | "no_trigger"
-  | "unavailable"
-  | "failed"
-  | "unknown";
-
-export type QwenShadowScore = {
-  sum_logprob?: number | null;
-  mean_logprob?: number | null;
-  min_token_logprob?: number | null;
-};
-
-export type QwenShadowCandidate = {
-  surface: string;
-  source: string;
-  beam_rank?: number | null;
-  score: QwenShadowScore;
-  candidate_minus_current?: number | null;
-  disposition: string;
-};
-
-export type QwenShadowSpan = {
-  chunk_index: number;
-  token_start: number;
-  token_end: number;
-  current_surface: string;
-  detector_reasons: string[];
-  current_score: QwenShadowScore;
-  candidates: QwenShadowCandidate[];
-};
-
-export type QwenShadowDiagnostics = {
-  schema_version: number;
-  status: QwenShadowStatus;
-  policy_version: string;
-  chunk_count: number;
-  triggered_span_count: number;
-  candidate_count: number;
-  proposal_count: number;
-  cache_clone_count: number;
-  decoder_step_count: number;
-  shadow_total_ms?: number | null;
-  detector_ms?: number | null;
-  beam_ms?: number | null;
-  verifier_ms?: number | null;
-  user_output_changed: boolean;
-  fallback_reason?: string | null;
-  spans: QwenShadowSpan[];
-};
-
 export type AsrRuntimeDiagnostics = {
   worker_reused?: boolean | null;
   model?: string | null;
   model_revision?: string | null;
-  token_evidence: AsrTokenEvidence[];
-  qwen?: QwenRuntimeMetrics | null;
-  qwen_shadow?: QwenShadowDiagnostics | null;
 };
 
 export type PipelineMetrics = {

@@ -80,8 +80,9 @@ pub fn list_asr_presets() -> Vec<crate::provider_presets::AsrProviderPreset> {
 #[serde(rename_all = "camelCase")]
 pub struct AsrServiceStatus {
     pub provider: String,
+    /// Legacy Python path for the mlx-whisper worker (formerly the MLX Qwen
+    /// runtime); the sherpa-onnx Qwen engine does not use it.
     pub runtime_path: String,
-    pub qwen_shadow_enabled: bool,
     pub base_url: String,
     pub model: String,
     pub has_api_key: bool,
@@ -94,7 +95,6 @@ pub struct AsrServiceStatus {
 pub struct AsrServiceInput {
     pub provider: Option<String>,
     pub runtime_path: Option<String>,
-    pub qwen_shadow_enabled: Option<bool>,
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
@@ -111,7 +111,6 @@ pub fn get_asr_service_config(state: State<'_, AppState>) -> Result<AsrServiceSt
     Ok(AsrServiceStatus {
         provider: crate::dictation::canonical_asr_provider(&cfg.asr.provider),
         runtime_path: cfg.asr.runtime_path.clone(),
-        qwen_shadow_enabled: cfg.asr.qwen_shadow_enabled,
         base_url: cfg.asr.base_url.clone(),
         model: cfg.asr.model.clone(),
         has_api_key: !cfg.asr.api_key.is_empty(),
@@ -146,9 +145,6 @@ pub fn save_asr_service_config(
     if let Some(v) = input.runtime_path {
         guard.asr.runtime_path = v;
     }
-    if let Some(v) = input.qwen_shadow_enabled {
-        guard.asr.qwen_shadow_enabled = v;
-    }
     if let Some(v) = input.base_url {
         guard.asr.base_url = v;
     }
@@ -169,7 +165,6 @@ pub fn save_asr_service_config(
     let status = AsrServiceStatus {
         provider: guard.asr.provider.clone(),
         runtime_path: guard.asr.runtime_path.clone(),
-        qwen_shadow_enabled: guard.asr.qwen_shadow_enabled,
         base_url: guard.asr.base_url.clone(),
         model: guard.asr.model.clone(),
         has_api_key: !guard.asr.api_key.is_empty(),
@@ -192,9 +187,7 @@ pub fn save_asr_service_config(
             .lock()
             .map_err(|_| "engine lock poisoned".to_string())? = engine;
     }
-    if selected_local_engine == Some(lumen_asr::EngineKind::Qwen) {
-        crate::schedule_qwen_runtime_refresh(app)?;
-    }
+    let _ = &app;
     Ok(status)
 }
 

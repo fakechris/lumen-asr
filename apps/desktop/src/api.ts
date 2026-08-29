@@ -71,15 +71,13 @@ export type AsrModelStatus = {
   paraformerOfflineDir: string;
   paraformerStreamingReady: boolean;
   paraformerStreamingDir: string;
-  qwenRuntimeSupported: boolean;
-  qwenFallbackReason?: string | null;
   recommendedEngine: string;
-  totalMemoryMb?: number | null;
   modelsRoot: string;
   activeEngine: string;
   activeModelDir: string;
   candidates: AsrModelCandidate[];
   downloadUrl: string;
+  qwenDownloadUrl: string;
   paraformerOfflineDownloadUrl: string;
   paraformerStreamingDownloadUrl: string;
 };
@@ -234,7 +232,6 @@ export const api = {
     invoke<{
       provider: string;
       runtimePath: string;
-      qwenShadowEnabled: boolean;
       baseUrl: string;
       model: string;
       hasApiKey: boolean;
@@ -244,7 +241,6 @@ export const api = {
   saveAsrServiceConfig: (input: {
     provider?: string;
     runtimePath?: string;
-    qwenShadowEnabled?: boolean;
     baseUrl?: string;
     model?: string;
     apiKey?: string;
@@ -254,7 +250,6 @@ export const api = {
     invoke<{
       provider: string;
       runtimePath: string;
-      qwenShadowEnabled: boolean;
       baseUrl: string;
       model: string;
       hasApiKey: boolean;
@@ -294,6 +289,8 @@ export const api = {
       input: { path, engine },
     }),
   startAsrModelDownload: () => invoke<AsrModelStatus>("start_asr_model_download"),
+  downloadQwen3Sherpa: () =>
+    invoke<AsrModelStatus>("start_qwen3_sherpa_download"),
   downloadParaformerOffline: () =>
     invoke<AsrModelStatus>("start_paraformer_offline_download"),
   downloadParaformerStreaming: () =>

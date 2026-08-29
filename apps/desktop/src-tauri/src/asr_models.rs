@@ -1,13 +1,14 @@
-//! Local ASR model discovery + SenseVoice package download (onboarding Stage C).
+//! Local ASR model discovery + package downloads (onboarding Stage C).
 
 use crate::AppState;
 use lumen_asr::{
     default_paraformer_offline_dir, default_paraformer_streaming_dir, default_qwen_dir,
     default_sensevoice_dir, default_whisper_dir, download_paraformer_offline_package,
-    download_paraformer_streaming_package, download_sensevoice_package, lumen_models_dir,
-    paraformer_offline_ready, paraformer_streaming_ready, qwen_ready, scan_model_candidates,
-    sensevoice_ready, whisper_ready, EngineKind, SenseVoiceSherpaAsr, WhisperAsr,
-    PARAFORMER_OFFLINE_ARCHIVE_URL, PARAFORMER_STREAMING_ARCHIVE_URL, SENSEVOICE_ARCHIVE_URL,
+    download_paraformer_streaming_package, download_qwen3_sherpa_package,
+    download_sensevoice_package, lumen_models_dir, paraformer_offline_ready,
+    paraformer_streaming_ready, qwen_ready, scan_model_candidates, sensevoice_ready,
+    whisper_ready, EngineKind, SenseVoiceSherpaAsr, WhisperAsr, PARAFORMER_OFFLINE_ARCHIVE_URL,
+    PARAFORMER_STREAMING_ARCHIVE_URL, QWEN3_SHERPA_ARCHIVE_URL, SENSEVOICE_ARCHIVE_URL,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -42,15 +43,13 @@ pub struct AsrModelStatus {
     /// Streaming Paraformer (meeting real-time transcription).
     pub paraformer_streaming_ready: bool,
     pub paraformer_streaming_dir: String,
-    pub qwen_runtime_supported: bool,
-    pub qwen_fallback_reason: Option<String>,
     pub recommended_engine: String,
-    pub total_memory_mb: Option<u64>,
     pub models_root: String,
     pub active_engine: String,
     pub active_model_dir: String,
     pub candidates: Vec<AsrModelCandidate>,
     pub download_url: String,
+    pub qwen_download_url: String,
     pub paraformer_offline_download_url: String,
     pub paraformer_streaming_download_url: String,
 }
@@ -115,22 +114,9 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
         "whisper" => crate::display_path(&wh_live),
         _ => crate::display_path(&sv_live),
     };
-    let qwen_runtime_supported = cfg!(target_os = "macos");
-    let total_memory_mb = total_memory_mb();
-    let qwen_fallback_reason = if !qwen_runtime_supported {
-        Some(
-            "Qwen3-ASR local runtime currently uses Apple MLX and is unavailable on Windows; SenseVoice was selected."
-                .into(),
-        )
-    } else if total_memory_mb.is_some_and(|memory| memory < 8 * 1024) {
-        Some("Available system memory is below the 8 GB Qwen safety threshold; SenseVoice was selected.".into())
-    } else {
-        None
-    };
-    let recommended_engine = if qwen_runtime_supported
-        && qwen_fallback_reason.is_none()
-        && (qwen_ready(&qw_live) || qwen_ready(&qw))
-    {
+    // sherpa-onnx Qwen3-ASR is native Rust (no Python/MLX gate): when it is
+    // installed it is the recommended dictation engine everywhere.
+    let recommended_engine = if qwen_ready(&qw_live) || qwen_ready(&qw) {
         "qwen"
     } else {
         "sensevoice"
@@ -158,60 +144,16 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
         paraformer_offline_dir: crate::display_path(&pf_offline),
         paraformer_streaming_ready: paraformer_streaming_ready(&pf_streaming),
         paraformer_streaming_dir: crate::display_path(&pf_streaming),
-        qwen_runtime_supported,
-        qwen_fallback_reason,
         recommended_engine: recommended_engine.into(),
-        total_memory_mb,
         models_root: crate::display_path(&lumen_models_dir()),
         active_engine: engine,
         active_model_dir,
         candidates: scan_candidates(),
         download_url: SENSEVOICE_ARCHIVE_URL.into(),
+        qwen_download_url: QWEN3_SHERPA_ARCHIVE_URL.into(),
         paraformer_offline_download_url: PARAFORMER_OFFLINE_ARCHIVE_URL.into(),
         paraformer_streaming_download_url: PARAFORMER_STREAMING_ARCHIVE_URL.into(),
     })
-}
-
-#[cfg(target_os = "windows")]
-fn total_memory_mb() -> Option<u64> {
-    use std::ffi::c_void;
-
-    #[repr(C)]
-    struct MemoryStatusEx {
-        length: u32,
-        memory_load: u32,
-        total_phys: u64,
-        avail_phys: u64,
-        total_page_file: u64,
-        avail_page_file: u64,
-        total_virtual: u64,
-        avail_virtual: u64,
-        avail_extended_virtual: u64,
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GlobalMemoryStatusEx(buffer: *mut c_void) -> i32;
-    }
-
-    let mut status = MemoryStatusEx {
-        length: std::mem::size_of::<MemoryStatusEx>() as u32,
-        memory_load: 0,
-        total_phys: 0,
-        avail_phys: 0,
-        total_page_file: 0,
-        avail_page_file: 0,
-        total_virtual: 0,
-        avail_virtual: 0,
-        avail_extended_virtual: 0,
-    };
-    (unsafe { GlobalMemoryStatusEx((&mut status as *mut MemoryStatusEx).cast()) } != 0)
-        .then_some(status.total_phys / (1024 * 1024))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn total_memory_mb() -> Option<u64> {
-    None
 }
 
 #[tauri::command]
@@ -233,6 +175,7 @@ pub fn use_existing_asr_model(
     state: State<'_, AppState>,
     input: UseAsrModelInput,
 ) -> Result<AsrModelStatus, String> {
+    let _ = &app;
     let path = PathBuf::from(input.path.trim());
     if !path.is_dir() {
         return Err(format!("not a directory: {}", path.display()));
@@ -244,7 +187,7 @@ pub fn use_existing_asr_model(
         "local_qwen" => {
             if !qwen_ready(&path) {
                 return Err(
-                    "folder is not a valid Qwen3-ASR MLX model dir (need config, safetensors and tokenizer assets)"
+                    "folder is not a valid Qwen3-ASR sherpa-onnx model dir (need conv_frontend.onnx, encoder/decoder and tokenizer assets)"
                         .into(),
                 );
             }
@@ -268,7 +211,6 @@ pub fn use_existing_asr_model(
                 .engine
                 .lock()
                 .map_err(|_| "engine lock poisoned".to_string())? = EngineKind::Qwen;
-            crate::schedule_qwen_runtime_refresh(app)?;
         }
         "local_whisper" => {
             if !whisper_ready(&path) {
@@ -404,6 +346,58 @@ fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
     )?;
     tracing::info!(dir = %installed.display(), "SenseVoice model installed");
     Ok(installed)
+}
+
+/// Install the sherpa-onnx Qwen3-ASR package (~838 MiB, sha256-pinned and
+/// verified by lumen-models before extraction) and switch dictation to it —
+/// Qwen is the recommended dictation engine once installed, mirroring the
+/// SenseVoice download flow.
+#[tauri::command]
+pub async fn start_qwen3_sherpa_download(app: AppHandle) -> Result<AsrModelStatus, String> {
+    if DOWNLOAD_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err("download already running".into());
+    }
+    DOWNLOAD_CANCEL.store(false, Ordering::SeqCst);
+
+    let app_for_dl = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        download_qwen3_sherpa_package(&lumen_models_dir(), &DOWNLOAD_CANCEL, |p| {
+            emit_progress(&app_for_dl, &p.phase, &p.message, p.bytes, p.total)
+        })
+        .map_err(|error| error.to_string())
+    })
+    .await;
+    DOWNLOAD_RUNNING.store(false, Ordering::SeqCst);
+
+    match result {
+        Ok(Ok(dir)) => {
+            tracing::info!(dir = %dir.display(), "Qwen3-ASR sherpa model installed");
+            let state = app.state::<AppState>();
+            crate::dictation::unload_qwen(&state);
+            let asr_config = {
+                let mut config = state
+                    .config
+                    .lock()
+                    .map_err(|_| "config lock poisoned".to_string())?;
+                config.asr.set_model_dir_for(EngineKind::Qwen, &dir);
+                config.asr.provider = "local_qwen".into();
+                config.save()?;
+                config.asr.clone()
+            };
+            *state
+                .qwen
+                .lock()
+                .map_err(|_| "qwen lock poisoned".to_string())? =
+                crate::qwen_engine_from_config(&asr_config);
+            *state
+                .engine
+                .lock()
+                .map_err(|_| "engine lock poisoned".to_string())? = EngineKind::Qwen;
+            check_asr_model_status(state)
+        }
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("download task failed: {e}")),
+    }
 }
 
 /// Integrity-check the freshly installed package; on mismatch remove the

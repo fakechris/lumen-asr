@@ -34,7 +34,7 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 | You want… | Use |
 |-----------|-----|
 | Privacy + lightweight offline ASR | Local SenseVoice (default) |
-| Higher-accuracy local ASR on Apple Silicon | Local Qwen3-ASR 0.6B 8-bit |
+| Higher-accuracy local ASR | Local Qwen3-ASR |
 | Another fully local ASR path | Local Whisper |
 | Cloud transcription | OpenAI Audio-compatible API |
 | Light cleanup, no cloud | Local LLM (Ollama / LM Studio) |
@@ -52,7 +52,7 @@ Most “voice typing” stops at raw speech-to-text. Lumen is built for **writin
 - **Terminal pane observation** — follow edits in Herdr, tmux, and Zellij instead of depending only on Accessibility text
 - **Auditable pipeline records** — immutable attempts, context provenance, and edit-observation outcomes alongside session history
 - **Independent local model selections** — switch SenseVoice, Qwen3-ASR, and Whisper without overwriting each other’s paths or cleanup profile
-- **Offline file CLI** — diarize + per-turn ASR on whole recordings (m4a/mp3/wav), with Metal **Qwen** / **mlx-whisper**, short-turn merge, and optional bilingual LLM translation; see [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)
+- **Offline file CLI** — diarize + per-turn ASR on whole recordings (m4a/mp3/wav), with sherpa-onnx **Qwen3-ASR** / Metal **mlx-whisper**, short-turn merge, and optional bilingual LLM translation; see [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)
 - **Meeting file import** — choose or drop wav/mp3/m4a/mp4 in the meeting library; same transcript + structured minutes pipeline as a live recording
 - **First-run onboarding** — Microphone, then Accessibility on macOS (drag the current app into System Settings instead of hunting with “+”)  
 
@@ -66,7 +66,7 @@ Headless mode on the desktop binary (no GUI, no meeting library writes):
   --format bilingual --translate zh
 ```
 
-Engines: `sensevoice` (CJK dictation), `qwen` (MLX multi-lingual), `mlx-whisper` (Metal Whisper turbo), `whisper` (sherpa CPU only). Full flags and model layout: [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md).
+Engines: `sensevoice` (CJK dictation), `qwen` (sherpa-onnx multi-lingual, auto-detects language), `mlx-whisper` (Metal Whisper turbo), `whisper` (sherpa CPU only). Full flags and model layout: [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md).
 
 ### Requirements
 
@@ -155,7 +155,7 @@ The default remains **SenseVoice** via sherpa-onnx. Lumen keeps a separate model
 | Engine | Best for | What it needs |
 |--------|----------|---------------|
 | **SenseVoice** | Lower resource use, fast local dictation | `model.int8.onnx` (or `model.onnx`) + `tokens.txt` |
-| **Qwen3-ASR 0.6B 8-bit** | Higher local accuracy on Apple Silicon | MLX model directory + a Python environment containing `mlx_qwen3_asr` 0.3.5 |
+| **Qwen3-ASR** | Higher local accuracy; auto-detects the spoken language | sherpa-onnx model dir (`conv_frontend.onnx`, `encoder.int8.onnx`, `decoder.int8.onnx`, `tokenizer/`) — downloadable in Settings |
 | **Whisper** | Alternative local ONNX pipeline | Encoder ONNX + decoder ONNX + tokens text file |
 | **OpenAI Audio** | Cloud transcription | Compatible endpoint, model, and API key |
 
@@ -168,7 +168,7 @@ Engine-specific overrides such as `LUMEN_SENSEVOICE_DIR` and `LUMEN_WHISPER_DIR`
 
 In the app, open **Settings → Speech recognition** to select an engine, choose a discovered model, or validate a custom directory.
 
-For Qwen3-ASR, Settings validates the Python runtime before activation. An optional local terminology-candidate analysis can inspect uncertain spans without changing the transcript delivered to the user.
+Qwen3-ASR runs in-process via sherpa-onnx (no Python runtime); Settings → Speech recognition offers a one-click download of the pinned model package.
 
 #### 5. Choose AI cleanup (recommended path)
 
@@ -264,7 +264,7 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 | 需求 | 建议 |
 |------|------|
 | 隐私、轻量离线识别 | 本地 SenseVoice（默认） |
-| Apple Silicon 上更高精度的本地识别 | 本地 Qwen3-ASR 0.6B 8-bit |
+| 更高精度的本地识别 | 本地 Qwen3-ASR |
 | 另一条全本地识别路径 | 本地 Whisper |
 | 在线语音转写 | OpenAI Audio 兼容接口 |
 | 轻度整理、不上云 | 本地 LLM（Ollama / LM Studio） |
@@ -281,7 +281,7 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 - **个人词库**：从已归因的插入后修改中生成术语与替换候选
 - **终端 pane 观察**：直接跟踪 Herdr、tmux、Zellij 中的修改，不只依赖辅助功能文本
 - **可审计流水线记录**：在会话历史之外保存不可变尝试、上下文来源与编辑观察结果
-- **整段录音 CLI**：对 m4a/mp3/wav 做说话人分段 + 逐段 ASR（Metal **Qwen** / **mlx-whisper**）、短段合并、可选双语 LLM 翻译；详见 [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)
+- **整段录音 CLI**：对 m4a/mp3/wav 做说话人分段 + 逐段 ASR（sherpa-onnx **Qwen3-ASR** / Metal **mlx-whisper**）、短段合并、可选双语 LLM 翻译；详见 [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)
 - **会议文件导入**：在会议库选择或拖入 wav/mp3/m4a/mp4，走与现场录音相同的转写与纪要流程
 
 ### 整段录音离线转写（CLI）
@@ -294,7 +294,7 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
   --format bilingual --translate zh
 ```
 
-引擎：`sensevoice`（听写/CJK）、`qwen`（MLX 多语）、`mlx-whisper`（Metal Whisper）、`whisper`（sherpa CPU）。完整参数与模型目录见 [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)。
+引擎：`sensevoice`（听写/CJK）、`qwen`（sherpa-onnx 多语，自动识别语种）、`mlx-whisper`（Metal Whisper）、`whisper`（sherpa CPU）。完整参数与模型目录见 [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)。
 - **本地模型独立配置**：切换 SenseVoice、Qwen3-ASR、Whisper 时保留各自路径与整理配置
 - 首次启动 **引导**：麦克风，然后（macOS）把当前应用拖进系统设置的辅助功能列表  
 
@@ -377,7 +377,7 @@ npm run tauri dev
 | 引擎 | 适用场景 | 所需内容 |
 |------|----------|----------|
 | **SenseVoice** | 资源占用较低、快速本地听写 | `model.int8.onnx`（或 `model.onnx`）+ `tokens.txt` |
-| **Qwen3-ASR 0.6B 8-bit** | Apple Silicon 上更高精度的本地识别 | MLX 模型目录 + 安装了 `mlx_qwen3_asr` 0.3.5 的 Python 环境 |
+| **Qwen3-ASR** | 更高精度的本地识别；自动识别语种 | sherpa-onnx 模型目录（`conv_frontend.onnx`、`encoder.int8.onnx`、`decoder.int8.onnx`、`tokenizer/`），可在设置页一键下载 |
 | **Whisper** | 另一条本地 ONNX 路线 | encoder ONNX + decoder ONNX + tokens 文本 |
 | **OpenAI Audio** | 在线转写 | 兼容接口、模型与 API Key |
 
@@ -390,7 +390,7 @@ npm run tauri dev
 
 在应用内打开 **设置 → 语音识别**，可以切换引擎、选择已发现模型，或验证自定义目录。
 
-选择 Qwen3-ASR 时，设置页会先验证 Python runtime。还可选择运行本地术语候选分析，对不确定片段做诊断，但不会改动最终交给用户的转写文本。
+Qwen3-ASR 通过 sherpa-onnx 在进程内运行（无需 Python runtime）；设置 → 语音识别里可一键下载钉住哈希的模型包。
 
 #### 5. 配置 AI 整理（推荐策略）
 

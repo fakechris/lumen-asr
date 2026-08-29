@@ -22,7 +22,7 @@ import { api, type AsrModelStatus } from "./api";
 // listener drives progress for whichever download is in flight, and cancel /
 // failure state survives navigation.
 
-export type ModelTarget = "sensevoice" | "streaming" | "offline";
+export type ModelTarget = "sensevoice" | "qwen" | "streaming" | "offline";
 
 export type ModelProgressState = {
   phase: string;
@@ -62,6 +62,8 @@ export function isModelTargetReady(
   switch (target) {
     case "sensevoice":
       return status.sensevoiceReady;
+    case "qwen":
+      return status.qwenReady;
     case "streaming":
       return status.paraformerStreamingReady;
     case "offline":
@@ -159,9 +161,11 @@ function useProvideMeetingModels(): MeetingModels {
         const next =
           target === "sensevoice"
             ? await api.startAsrModelDownload()
-            : target === "streaming"
-              ? await api.downloadParaformerStreaming()
-              : await api.downloadParaformerOffline();
+            : target === "qwen"
+              ? await api.downloadQwen3Sherpa()
+              : target === "streaming"
+                ? await api.downloadParaformerStreaming()
+                : await api.downloadParaformerOffline();
         statusRef.current = next;
         setStatus(next);
       } catch (e) {

@@ -13,10 +13,9 @@ use crate::AppState;
 use lumen_asr::{
     lumen_models_dir, paraformer_offline_ready, prepare_for_asr, probe_status, sensevoice_ready,
     whisper_ready, AsrEngine, AsrRequest, AsrResult, AudioDeviceInfo, EngineKind, EngineStatus,
-    OpenAiAudioAsr, OpenAiAudioConfig, ParaformerAsr, QwenShadowRequest, QwenShadowTerm,
+    OpenAiAudioAsr, OpenAiAudioConfig, ParaformerAsr,
 };
-use lumen_core::{DictEntryKind, FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
-use lumen_dictionary::DictionaryEntry;
+use lumen_core::{FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use lumen_platform_macos::{
     activate_target, frontmost_app_name, frontmost_target, is_self_app_name, is_self_target,
     FrontmostTarget,
@@ -64,7 +63,6 @@ static SESSION_INTENT: Mutex<IntentSpec> = Mutex::new(IntentSpec::Default);
 /// UI-facing copy of session intent; kept until capsule goes idle so processing
 /// phase still knows “翻译” after take_session_intent() for the corrector.
 static UI_SESSION_INTENT: Mutex<IntentSpec> = Mutex::new(IntentSpec::Default);
-const QWEN_SHADOW_TERM_LIMIT: usize = 64;
 
 pub fn set_session_intent(intent: IntentSpec) {
     if let Ok(mut g) = SESSION_INTENT.lock() {
@@ -395,9 +393,6 @@ pub struct AsrStatus {
     pub provider: String,
     pub sensevoice: EngineStatus,
     pub qwen: EngineStatus,
-    pub qwen_runtime_path: String,
-    pub qwen_runtime_ready: bool,
-    pub qwen_runtime_checking: bool,
     pub whisper: EngineStatus,
     pub active_ready: bool,
     /// Short label for UI (e.g. "OpenAI Audio · whisper-1").
@@ -482,6 +477,7 @@ pub fn set_asr_engine(
     state: State<'_, AppState>,
     engine: String,
 ) -> Result<EngineKind, String> {
+    let _ = &app;
     // Accept either local engine names or full provider ids from Settings.
     let provider_id = canonical_asr_provider(&engine);
     let kind = match provider_id.as_str() {
@@ -536,22 +532,14 @@ pub fn set_asr_engine(
         }
         let _ = cfg.save();
     }
-    if kind == EngineKind::Qwen {
-        state
-            .qwen
-            .lock()
-            .map_err(|_| "qwen lock poisoned".to_string())?
-            .activate();
-        crate::schedule_qwen_runtime_refresh(app)?;
-    }
     Ok(kind)
 }
 
 pub(crate) fn unload_qwen(state: &AppState) {
+    // sherpa-onnx Qwen3-ASR: dropping the cached recognizer releases the model;
+    // the next request reloads it lazily. False just means nothing was loaded.
     if let Ok(engine) = state.qwen.lock() {
-        if !engine.unload() {
-            tracing::warn!("Qwen worker is busy and could not be unloaded during engine switch");
-        }
+        engine.unload();
     }
 }
 
@@ -591,41 +579,17 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         .lock()
         .map(|engine| probe_status(EngineKind::Whisper, Some(&engine.model_dir())))
         .unwrap_or_else(|_| lumen_asr::whisper_status());
-    let (mut qwen, qwen_runtime_path) = state
+    let mut qwen = state
         .qwen
         .lock()
-        .map(|engine| {
-            (
-                probe_status(EngineKind::Qwen, Some(engine.model_dir())),
-                engine.python_executable().display().to_string(),
-            )
-        })
-        .unwrap_or_else(|_| {
-            let status = lumen_asr::qwen_status();
-            (
-                status,
-                asr_cfg.qwen_python_executable().display().to_string(),
-            )
-        });
+        .map(|engine| probe_status(EngineKind::Qwen, Some(engine.model_dir())))
+        .unwrap_or_else(|_| lumen_asr::qwen_status());
     sv.model_dir = crate::display_path(std::path::Path::new(&sv.model_dir));
     wh.model_dir = crate::display_path(std::path::Path::new(&wh.model_dir));
     qwen.model_dir = crate::display_path(std::path::Path::new(&qwen.model_dir));
-    let qwen_runtime_path = crate::display_path(std::path::Path::new(&qwen_runtime_path));
-    let (qwen_runtime_ready, qwen_runtime_checking) = if qwen.ready {
-        state
-            .qwen_runtime
-            .lock()
-            .map(|runtime| {
-                let current = runtime.executable == std::path::PathBuf::from(&qwen_runtime_path);
-                (current && runtime.ready, current && runtime.checking)
-            })
-            .unwrap_or((false, false))
-    } else {
-        (false, false)
-    };
     let active_ready = match provider.as_str() {
         "local_sensevoice" => sv.ready,
-        "local_qwen" => qwen.ready && qwen_runtime_ready,
+        "local_qwen" => qwen.ready,
         "local_whisper" => wh.ready,
         "openai_audio" | "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
         // config_only: selectable but not runnable yet
@@ -646,9 +610,6 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         provider,
         sensevoice: sv,
         qwen,
-        qwen_runtime_path,
-        qwen_runtime_ready,
-        qwen_runtime_checking,
         whisper: wh,
         active_ready,
         provider_label,
@@ -664,20 +625,12 @@ pub(crate) fn ensure_active_asr_ready(
     provider: &str,
     provider_label: &str,
     ready: bool,
-    checking: bool,
 ) -> Result<(), String> {
     if ready {
         return Ok(());
     }
-    if checking {
-        return Err(format!(
-            "{provider_label} 正在检查本地运行环境，请稍后再试。"
-        ));
-    }
     let guidance = match canonical_asr_provider(provider).as_str() {
-        "local_qwen" => {
-            "请先选择有效的 Qwen MLX 模型目录和能够导入 mlx_qwen3_asr.Session 的 Python。"
-        }
+        "local_qwen" => "请先在「设置 → 语音识别」下载或选择有效的 Qwen3-ASR（sherpa-onnx）模型。",
         "local_sensevoice" => "请先安装或选择有效的 SenseVoice 模型。",
         "local_whisper" => "请先选择有效的 Whisper 模型。",
         "openai_audio" | "custom" => "请先完成在线 ASR 的地址与凭据配置。",
@@ -752,12 +705,7 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
         return Ok(());
     }
     let status = asr_status_from(state);
-    ensure_active_asr_ready(
-        &status.provider,
-        &status.provider_label,
-        status.active_ready,
-        status.qwen_runtime_checking,
-    )?;
+    ensure_active_asr_ready(&status.provider, &status.provider_label, status.active_ready)?;
     let (target, pane_discovery) = remember_target_app();
     let hint = target.as_ref().map(|target| TargetHint {
         app_name: target.name.clone(),
@@ -1808,7 +1756,7 @@ async fn run_asr(
     }
 
     let selected_local_engine = engine_kind_for_provider(provider).unwrap_or(engine_kind);
-    let result = run_local_asr(state, selected_local_engine, asr_cfg, samples_16k, attempt).await?;
+    let result = run_local_asr(state, selected_local_engine, samples_16k).await?;
     Ok(AsrRun {
         result,
         engine_label: selected_local_engine.as_str().into(),
@@ -1850,7 +1798,7 @@ async fn run_cloud_asr_with_local_hedge(
                 error = %error,
                 "cloud ASR timed out or dropped; falling back to local engine"
             );
-            match run_local_asr(state, local_kind, asr_cfg, samples_16k, attempt).await {
+            match run_local_asr(state, local_kind, samples_16k).await {
                 Ok(result) => {
                     attempt
                         .pipeline_metrics
@@ -1925,9 +1873,7 @@ async fn transcribe_openai_audio(
 async fn run_local_asr(
     state: &AppState,
     engine_kind: EngineKind,
-    asr_cfg: &AsrServiceConfig,
     samples_16k: Vec<f32>,
-    attempt: &mut DictationAttemptRecord,
 ) -> Result<AsrResult, String> {
     if engine_kind == EngineKind::Whisper {
         let eng = state
@@ -1947,51 +1893,10 @@ async fn run_local_asr(
             .lock()
             .map_err(|_| "asr lock poisoned".to_string())?
             .clone();
-        let (shadow, dictionary_captured) =
-            qwen_shadow_request_from_store(state, asr_cfg.qwen_shadow_enabled);
-        let selected = shadow.enabled && !shadow.terms.is_empty();
-        let projection = serde_json::to_vec(&shadow).map_err(|error| error.to_string())?;
-        let capture_id = attempt
-            .pipeline_inputs
-            .context
-            .as_ref()
-            .map(|input| input.capture_id);
-        let not_used_reason = if !shadow.enabled {
-            Some("qwen_shadow_disabled".to_owned())
-        } else if !dictionary_captured {
-            Some("personal_dictionary_unavailable".to_owned())
-        } else if shadow.terms.is_empty() {
-            Some("no_confirmed_personal_terms".to_owned())
-        } else {
-            None
-        };
-        match state.context.record_stage_usage(StageUsageInput {
-            capture_id,
-            attempt_id: attempt.id,
-            stage: PipelineStage::Enhancement,
-            sources: vec!["personal_dictionary".into()],
-            projection: Some(&projection),
-            captured: dictionary_captured,
-            selected,
-            consumed: selected,
-            sent: selected,
-            not_used_reason,
-        }) {
-            Ok(usage) => attempt.pipeline_inputs.stage_usages.push(usage),
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to persist Qwen shadow input provenance");
-                attempt
-                    .pipeline_metrics
-                    .stage_issues
-                    .push(PipelineStageIssue {
-                        stage: PipelineStage::Enhancement,
-                        kind: PipelineIssueKind::InputUnavailable,
-                        message: "qwen shadow input provenance unavailable".into(),
-                    });
-            }
-        }
+        // sherpa-onnx Qwen3-ASR auto-detects the language and has no per-request
+        // hotword/shadow channel — a plain transcribe is the whole contract.
         return eng
-            .transcribe_with_shadow(AsrRequest::new(samples_16k, 16_000), Some(shadow))
+            .transcribe(AsrRequest::new(samples_16k, 16_000))
             .await
             .map_err(|e| e.to_string());
     }
@@ -2004,78 +1909,6 @@ async fn run_local_asr(
     eng.transcribe(AsrRequest::new(samples_16k, 16_000))
         .await
         .map_err(|e| e.to_string())
-}
-
-fn qwen_shadow_request_from_store(state: &AppState, enabled: bool) -> (QwenShadowRequest, bool) {
-    if !enabled {
-        return (
-            QwenShadowRequest {
-                enabled: false,
-                ..QwenShadowRequest::default()
-            }
-            .bounded(),
-            false,
-        );
-    }
-    let (entries, captured) = match state.store.lock() {
-        Ok(store) => match store.as_ref().map(|store| store.list_dictionary()) {
-            Some(Ok(entries)) => (entries, true),
-            Some(Err(error)) => {
-                tracing::warn!(
-                    error = %error,
-                    "dictionary unavailable; Qwen shadow will run without personal terms"
-                );
-                (Vec::new(), false)
-            }
-            None => (Vec::new(), false),
-        },
-        Err(_) => {
-            tracing::warn!(
-                "dictionary store lock poisoned; Qwen shadow will run without personal terms"
-            );
-            (Vec::new(), false)
-        }
-    };
-    (build_qwen_shadow_request(&entries, enabled), captured)
-}
-
-fn build_qwen_shadow_request(entries: &[DictionaryEntry], enabled: bool) -> QwenShadowRequest {
-    if !enabled {
-        return QwenShadowRequest {
-            enabled: false,
-            ..QwenShadowRequest::default()
-        }
-        .bounded();
-    }
-    let mut terms = Vec::new();
-    for entry in entries.iter().filter(|entry| entry.confirmed) {
-        if terms.len() >= QWEN_SHADOW_TERM_LIMIT {
-            break;
-        }
-        let surface = match entry.kind {
-            DictEntryKind::Term => entry.term.as_deref(),
-            DictEntryKind::Replacement => entry.to_text.as_deref(),
-        };
-        let Some(surface) = surface.map(str::trim).filter(|value| !value.is_empty()) else {
-            continue;
-        };
-        if terms
-            .iter()
-            .any(|term: &QwenShadowTerm| term.surface == surface)
-        {
-            continue;
-        }
-        terms.push(QwenShadowTerm {
-            surface: surface.to_owned(),
-            source: "personal_dictionary".into(),
-        });
-    }
-    QwenShadowRequest {
-        enabled,
-        terms,
-        ..QwenShadowRequest::default()
-    }
-    .bounded()
 }
 
 /// Capsule / hotkey lifecycle events for the UI.
@@ -2503,9 +2336,8 @@ pub async fn toggle_dictation_cmd(app: AppHandle) -> Result<(), String> {
 mod attempt_metric_tests {
     use super::*;
     use crate::config::AppConfig;
-    use crate::{AppState, QwenRuntimeStatus};
+    use crate::AppState;
     use lumen_asr::{AsrEngineId, AudioCapture, SenseVoiceSherpaAsr, WhisperAsr};
-    use lumen_dictionary::DictionaryEntry;
     use lumen_store::{Store, MAX_ATTEMPT_PAGE_SIZE};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -2528,7 +2360,6 @@ mod attempt_metric_tests {
         let config = AppConfig::default();
         let context = crate::context_capture::ContextRecorder::new(&config.context, dir);
         let qwen = crate::qwen_engine_from_config(&config.asr);
-        let qwen_executable = qwen.python_executable().to_path_buf();
         let store = Arc::new(Mutex::new(Some(
             Store::open(dir.join("capture.sqlite")).unwrap(),
         )));
@@ -2557,12 +2388,6 @@ mod attempt_metric_tests {
             engine: Mutex::new(EngineKind::SenseVoice),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sensevoice_dir)),
             qwen: Mutex::new(qwen),
-            qwen_runtime: Mutex::new(QwenRuntimeStatus {
-                executable: qwen_executable,
-                ready: false,
-                checking: false,
-                generation: 0,
-            }),
             whisper: Mutex::new(WhisperAsr::new(dir.join("whisper"))),
             config: Mutex::new(config),
             context,
@@ -2748,50 +2573,12 @@ mod attempt_metric_tests {
         assert_eq!(issue.message, INVALID_CAPTURE_ISSUE);
     }
 
-    #[test]
-    fn qwen_shadow_uses_only_confirmed_personal_dictionary_surfaces() {
-        let confirmed_term = DictionaryEntry::term("Codex");
-        let confirmed_replacement = DictionaryEntry::replacement("cotex", "Codex CLI");
-        let mut unconfirmed = DictionaryEntry::term("private draft");
-        unconfirmed.confirmed = false;
-
-        let request = build_qwen_shadow_request(
-            &[
-                confirmed_term,
-                confirmed_replacement,
-                unconfirmed,
-                DictionaryEntry::term("Codex"),
-            ],
-            true,
-        );
-
-        assert!(request.enabled);
-        assert_eq!(
-            request
-                .terms
-                .iter()
-                .map(|term| term.surface.as_str())
-                .collect::<Vec<_>>(),
-            ["Codex", "Codex CLI"]
-        );
-        assert!(request
-            .terms
-            .iter()
-            .all(|term| term.source == "personal_dictionary"));
-
-        let disabled =
-            build_qwen_shadow_request(&[DictionaryEntry::term("must not leave the app")], false);
-        assert!(!disabled.enabled);
-        assert!(disabled.terms.is_empty());
-    }
-
     #[tokio::test]
     async fn capture_stop_runs_and_failure_is_persisted_after_snapshot_lock_poisoning() {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig::default();
         let context = crate::context_capture::ContextRecorder::new(&config.context, dir.path());
         let qwen = crate::qwen_engine_from_config(&config.asr);
-        let qwen_executable = qwen.python_executable().to_path_buf();
         let store = Arc::new(Mutex::new(Some(
             Store::open(dir.path().join("capture.sqlite")).unwrap(),
         )));
@@ -2820,12 +2607,6 @@ mod attempt_metric_tests {
             engine: Mutex::new(EngineKind::SenseVoice),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(dir.path().join("sensevoice"))),
             qwen: Mutex::new(qwen),
-            qwen_runtime: Mutex::new(QwenRuntimeStatus {
-                executable: qwen_executable,
-                ready: false,
-                checking: false,
-                generation: 0,
-            }),
             whisper: Mutex::new(WhisperAsr::new(dir.path().join("whisper"))),
             config: Mutex::new(config),
             context,

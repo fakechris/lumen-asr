@@ -1,7 +1,7 @@
 //! Product-side ASR layer: microphone capture plus re-exports of the shared
 //! Lumen cluster crates.
 //!
-//! The engines (SenseVoice / Whisper via sherpa-onnx, Qwen3-ASR MLX worker,
+//! The engines (SenseVoice / Whisper / Qwen3-ASR via sherpa-onnx,
 //! OpenAI-compatible HTTP) live in `lumen-asr-engine`. Product-specific engines
 //! that are not yet in the shared suite (e.g. mlx-whisper Metal) live here.
 //! Model path resolution / readiness / install locking / downloads live in
@@ -26,12 +26,10 @@ pub use lumen_audio::{
 pub use lumen_asr_engine::{
     model_identity_from_path, paraformer_offline_ready, prepare_for_asr, probe_status,
     resample_linear, AsrEngine, AsrEngineId, AsrError, AsrRequest, AsrResult,
-    AsrRuntimeDiagnostics, AsrTokenEvidence, EngineKind, EngineStatus, OpenAiAudioAsr,
-    OpenAiAudioConfig, ParaformerAsr, ParaformerOfflineModelPaths, QwenAsr, QwenAsrConfig,
-    QwenDecodeMode, QwenRuntimeMetrics, QwenShadowCandidate, QwenShadowDiagnostics,
-    QwenShadowRequest, QwenShadowScore, QwenShadowSpan, QwenShadowStatus, QwenShadowTerm,
-    SenseVoiceSherpaAsr, StreamingAsrEngine, StreamingParaformerAsr, StreamingRecognizer,
-    StreamingResult, StreamingStream, StubAsr, WhisperAsr, WordTiming,
+    AsrRuntimeDiagnostics, EngineKind, EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig,
+    ParaformerAsr, ParaformerOfflineModelPaths, QwenAsr, QwenAsrConfig, SenseVoiceSherpaAsr,
+    StreamingAsrEngine, StreamingParaformerAsr, StreamingRecognizer, StreamingResult,
+    StreamingStream, StubAsr, WhisperAsr, WordTiming,
 };
 
 // Model layer (path resolution, readiness probes, install lock, download).
@@ -42,14 +40,15 @@ pub use lumen_models::{
     default_paraformer_streaming_dir, default_paraformer_streaming_dir_with_root, default_qwen_dir,
     default_sensevoice_dir, default_sensevoice_dir_with_root, default_silero_vad_dir,
     default_whisper_dir, default_whisper_dir_with_root, download_paraformer_offline_package,
-    download_paraformer_streaming_package, download_sensevoice_package,
-    download_silero_vad_package, legacy_model_roots, lumen_models_dir,
-    lumen_models_dir_with_override, paraformer_streaming_ready, qwen_ready, resolve_qwen_asr_dir,
-    resolve_sensevoice_dir, scan_model_candidates, scan_model_candidates_with_root,
-    sensevoice_ready, shared_sensevoice_dir, shared_silero_vad_dir, shared_whisper_dir,
-    silero_vad_model_path, silero_vad_ready, user_home_dir, whisper_ready, DownloadError,
-    DownloadProgress, ModelCandidate, ModelInstallLock, ENV_LUMEN_MODELS_DIR,
-    PARAFORMER_OFFLINE_ARCHIVE_URL, PARAFORMER_STREAMING_ARCHIVE_URL, SENSEVOICE_ARCHIVE_NAME,
+    download_paraformer_streaming_package, download_qwen3_sherpa_package,
+    download_sensevoice_package, download_silero_vad_package, legacy_model_roots,
+    lumen_models_dir, lumen_models_dir_with_override, paraformer_streaming_ready, qwen_ready,
+    resolve_qwen_asr_dir, resolve_sensevoice_dir, scan_model_candidates,
+    scan_model_candidates_with_root, sensevoice_ready, shared_qwen3_sherpa_dir,
+    shared_sensevoice_dir, shared_silero_vad_dir, shared_whisper_dir, silero_vad_model_path,
+    silero_vad_ready, user_home_dir, whisper_ready, DownloadError, DownloadProgress,
+    ModelCandidate, ModelInstallLock, ENV_LUMEN_MODELS_DIR, PARAFORMER_OFFLINE_ARCHIVE_URL,
+    PARAFORMER_STREAMING_ARCHIVE_URL, QWEN3_SHERPA_ARCHIVE_URL, SENSEVOICE_ARCHIVE_NAME,
     SENSEVOICE_ARCHIVE_URL,
 };
 
@@ -65,7 +64,7 @@ pub fn whisper_status() -> EngineStatus {
     probe_status(EngineKind::Whisper, Some(&dir))
 }
 
-/// Status of the default Qwen3-ASR MLX snapshot.
+/// Status of the default Qwen3-ASR sherpa-onnx install (`qwen3-sherpa`).
 pub fn qwen_status() -> EngineStatus {
     let dir = default_qwen_dir();
     probe_status(EngineKind::Qwen, Some(&dir))

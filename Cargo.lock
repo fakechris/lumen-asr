@@ -836,7 +836,7 @@ dependencies = [
 [[package]]
 name = "diar-rs"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7#ffa41c42ee1c6276f48a143e9d679378c1093bc7"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d#236aa1f6528a78672293600fc41853f4efc6c04d"
 dependencies = [
  "byteorder",
  "cc",
@@ -876,7 +876,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1050,7 +1050,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2312,7 +2312,7 @@ dependencies = [
 [[package]]
 name = "lumen-asr-engine"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7#ffa41c42ee1c6276f48a143e9d679378c1093bc7"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d#236aa1f6528a78672293600fc41853f4efc6c04d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2330,7 +2330,7 @@ dependencies = [
 [[package]]
 name = "lumen-audio"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7#ffa41c42ee1c6276f48a143e9d679378c1093bc7"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d#236aa1f6528a78672293600fc41853f4efc6c04d"
 dependencies = [
  "cpal",
  "hound",
@@ -2345,7 +2345,7 @@ dependencies = [
 [[package]]
 name = "lumen-context"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7#ffa41c42ee1c6276f48a143e9d679378c1093bc7"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d#236aa1f6528a78672293600fc41853f4efc6c04d"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2436,7 +2436,7 @@ dependencies = [
 [[package]]
 name = "lumen-identity"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7#ffa41c42ee1c6276f48a143e9d679378c1093bc7"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d#236aa1f6528a78672293600fc41853f4efc6c04d"
 dependencies = [
  "chrono",
  "serde",
@@ -2484,7 +2484,7 @@ dependencies = [
 [[package]]
 name = "lumen-models"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7#ffa41c42ee1c6276f48a143e9d679378c1093bc7"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d#236aa1f6528a78672293600fc41853f4efc6c04d"
 dependencies = [
  "fs2",
  "serde",
@@ -2497,13 +2497,13 @@ dependencies = [
 name = "lumen-platform"
 version = "0.1.0"
 dependencies = [
- "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7)",
+ "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d)",
 ]
 
 [[package]]
 name = "lumen-platform"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7#ffa41c42ee1c6276f48a143e9d679378c1093bc7"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d#236aa1f6528a78672293600fc41853f4efc6c04d"
 dependencies = [
  "async-trait",
  "serde",
@@ -2513,10 +2513,10 @@ dependencies = [
 [[package]]
 name = "lumen-platform-cpal"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7#ffa41c42ee1c6276f48a143e9d679378c1093bc7"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d#236aa1f6528a78672293600fc41853f4efc6c04d"
 dependencies = [
  "cpal",
- "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7)",
+ "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d)",
  "tracing",
 ]
 
@@ -2533,7 +2533,7 @@ dependencies = [
  "lumen-edit-learning",
  "lumen-inject",
  "lumen-platform 0.1.0",
- "lumen-platform-macos 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7)",
+ "lumen-platform-macos 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d)",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -2545,7 +2545,7 @@ dependencies = [
 [[package]]
 name = "lumen-platform-macos"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7#ffa41c42ee1c6276f48a143e9d679378c1093bc7"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d#236aa1f6528a78672293600fc41853f4efc6c04d"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2557,7 +2557,7 @@ dependencies = [
  "core-graphics 0.24.0",
  "foreign-types 0.5.0",
  "image",
- "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7)",
+ "lumen-platform 0.1.0 (git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d)",
  "lumen-platform-cpal",
  "objc2",
  "objc2-app-kit",
@@ -2598,7 +2598,7 @@ dependencies = [
 [[package]]
 name = "lumen-transcript"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=ffa41c42ee1c6276f48a143e9d679378c1093bc7#ffa41c42ee1c6276f48a143e9d679378c1093bc7"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=236aa1f6528a78672293600fc41853f4efc6c04d#236aa1f6528a78672293600fc41853f4efc6c04d"
 dependencies = [
  "serde",
  "serde_json",
@@ -2735,7 +2735,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.18",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2845,7 +2845,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2908,7 +2908,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -3258,7 +3258,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3496,15 +3496,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proc-macro-crate"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
-dependencies = [
- "toml_edit 0.25.12+spec-1.1.0",
-]
-
-[[package]]
 name = "proc-macro-error"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3605,7 +3596,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3896,7 +3887,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4371,7 +4362,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4884,7 +4875,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5144,18 +5135,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml_edit"
-version = "0.25.12+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2153edc6955a6c354fad8f5efd38b6a8769bdccf9fe50f8e1329f81b0baa5d7"
-dependencies = [
- "indexmap 2.14.0",
- "toml_datetime 1.1.1+spec-1.1.0",
- "toml_parser",
- "winnow 1.0.3",
-]
-
-[[package]]
 name = "toml_parser"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5295,7 +5274,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.18",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5812,7 +5791,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6242,9 +6221,6 @@ name = "winnow"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winreg"
