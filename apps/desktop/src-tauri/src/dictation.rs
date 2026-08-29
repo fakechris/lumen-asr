@@ -705,7 +705,11 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
         return Ok(());
     }
     let status = asr_status_from(state);
-    ensure_active_asr_ready(&status.provider, &status.provider_label, status.active_ready)?;
+    ensure_active_asr_ready(
+        &status.provider,
+        &status.provider_label,
+        status.active_ready,
+    )?;
     let (target, pane_discovery) = remember_target_app();
     let hint = target.as_ref().map(|target| TargetHint {
         app_name: target.name.clone(),

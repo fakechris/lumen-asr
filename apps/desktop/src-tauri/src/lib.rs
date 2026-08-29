@@ -867,12 +867,9 @@ mod tests {
 
     #[test]
     fn backend_recording_gate_rejects_unready_qwen() {
-        let error = dictation::ensure_active_asr_ready(
-            "local_qwen",
-            "本地 Qwen3-ASR（高准确率）",
-            false,
-        )
-        .unwrap_err();
+        let error =
+            dictation::ensure_active_asr_ready("local_qwen", "本地 Qwen3-ASR（高准确率）", false)
+                .unwrap_err();
         assert!(error.contains("Qwen"));
         assert!(error.contains("未就绪"));
         assert!(dictation::ensure_active_asr_ready("local_qwen", "Qwen", true).is_ok());

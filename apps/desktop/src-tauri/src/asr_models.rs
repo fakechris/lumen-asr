@@ -6,8 +6,8 @@ use lumen_asr::{
     default_sensevoice_dir, default_whisper_dir, download_paraformer_offline_package,
     download_paraformer_streaming_package, download_qwen3_sherpa_package,
     download_sensevoice_package, lumen_models_dir, paraformer_offline_ready,
-    paraformer_streaming_ready, qwen_ready, scan_model_candidates, sensevoice_ready,
-    whisper_ready, EngineKind, SenseVoiceSherpaAsr, WhisperAsr, PARAFORMER_OFFLINE_ARCHIVE_URL,
+    paraformer_streaming_ready, qwen_ready, scan_model_candidates, sensevoice_ready, whisper_ready,
+    EngineKind, SenseVoiceSherpaAsr, WhisperAsr, PARAFORMER_OFFLINE_ARCHIVE_URL,
     PARAFORMER_STREAMING_ARCHIVE_URL, QWEN3_SHERPA_ARCHIVE_URL, SENSEVOICE_ARCHIVE_URL,
 };
 use serde::{Deserialize, Serialize};

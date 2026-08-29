@@ -41,15 +41,14 @@ pub use lumen_models::{
     default_sensevoice_dir, default_sensevoice_dir_with_root, default_silero_vad_dir,
     default_whisper_dir, default_whisper_dir_with_root, download_paraformer_offline_package,
     download_paraformer_streaming_package, download_qwen3_sherpa_package,
-    download_sensevoice_package, download_silero_vad_package, legacy_model_roots,
-    lumen_models_dir, lumen_models_dir_with_override, paraformer_streaming_ready, qwen_ready,
-    resolve_qwen_asr_dir, resolve_sensevoice_dir, scan_model_candidates,
-    scan_model_candidates_with_root, sensevoice_ready, shared_qwen3_sherpa_dir,
-    shared_sensevoice_dir, shared_silero_vad_dir, shared_whisper_dir, silero_vad_model_path,
-    silero_vad_ready, user_home_dir, whisper_ready, DownloadError, DownloadProgress,
-    ModelCandidate, ModelInstallLock, ENV_LUMEN_MODELS_DIR, PARAFORMER_OFFLINE_ARCHIVE_URL,
-    PARAFORMER_STREAMING_ARCHIVE_URL, QWEN3_SHERPA_ARCHIVE_URL, SENSEVOICE_ARCHIVE_NAME,
-    SENSEVOICE_ARCHIVE_URL,
+    download_sensevoice_package, download_silero_vad_package, legacy_model_roots, lumen_models_dir,
+    lumen_models_dir_with_override, paraformer_streaming_ready, qwen_ready, resolve_qwen_asr_dir,
+    resolve_sensevoice_dir, scan_model_candidates, scan_model_candidates_with_root,
+    sensevoice_ready, shared_qwen3_sherpa_dir, shared_sensevoice_dir, shared_silero_vad_dir,
+    shared_whisper_dir, silero_vad_model_path, silero_vad_ready, user_home_dir, whisper_ready,
+    DownloadError, DownloadProgress, ModelCandidate, ModelInstallLock, ENV_LUMEN_MODELS_DIR,
+    PARAFORMER_OFFLINE_ARCHIVE_URL, PARAFORMER_STREAMING_ARCHIVE_URL, QWEN3_SHERPA_ARCHIVE_URL,
+    SENSEVOICE_ARCHIVE_NAME, SENSEVOICE_ARCHIVE_URL,
 };
 
 /// Status of the default SenseVoice install (default dir + readiness probe).
