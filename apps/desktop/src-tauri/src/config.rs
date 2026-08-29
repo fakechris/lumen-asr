@@ -131,6 +131,13 @@ pub struct MeetingConfig {
     /// identity, the UI shows "我" instead of the enrolled name. `None` until
     /// the user marks an identity as self in the voiceprint library.
     pub self_identity_id: Option<String>,
+    /// On-disk format for new meeting recordings: `"opus"` (Ogg-Opus 16 kHz
+    /// mono, ~10× smaller than PCM16; the default) or `"wav"` (legacy raw
+    /// PCM16). Only recordings started after a change use the new value;
+    /// existing files of either format stay playable/editable/processable.
+    /// Unknown values fall back to `"opus"` at use time.
+    #[serde(default = "default_meeting_audio_format")]
+    pub audio_format: String,
 }
 
 impl Default for MeetingConfig {
@@ -148,8 +155,24 @@ impl Default for MeetingConfig {
             annotation_voiceprint_spread: true,
             auto_enroll_speakers: true,
             self_identity_id: None,
+            audio_format: default_meeting_audio_format(),
         }
     }
+}
+
+impl MeetingConfig {
+    /// Parsed recording format; an unknown or blank value falls back to Opus
+    /// (the default), so a hand-edited config can never break recording.
+    pub fn audio_format(&self) -> lumen_asr::MeetingAudioFormat {
+        lumen_asr::MeetingAudioFormat::parse(&self.audio_format)
+            .unwrap_or(lumen_asr::MeetingAudioFormat::Opus)
+    }
+}
+
+/// Default on-disk format for new meeting recordings (Ogg-Opus; ~10× smaller
+/// than PCM16 WAV for speech).
+fn default_meeting_audio_format() -> String {
+    "opus".to_string()
 }
 
 /// Default minutes of continuous mic silence before an unattended recording
@@ -1187,6 +1210,44 @@ provider = "local_qwen"
     fn meeting_transcript_cleanup_defaults_on() {
         assert!(MeetingConfig::default().transcript_cleanup);
         assert!(AppConfig::default().meeting.transcript_cleanup);
+    }
+
+    #[test]
+    fn meeting_audio_format_defaults_to_opus_and_tolerates_missing_or_unknown() {
+        use lumen_asr::MeetingAudioFormat;
+        // New installs default to Opus.
+        assert_eq!(
+            MeetingConfig::default().audio_format(),
+            MeetingAudioFormat::Opus
+        );
+        // Absent from an existing config → still Opus.
+        let existing: AppConfig = toml::from_str(
+            r#"
+[meeting]
+transcript_cleanup = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(existing.meeting.audio_format(), MeetingAudioFormat::Opus);
+        // An explicit WAV opt-out is honored.
+        let wav: AppConfig = toml::from_str(
+            r#"
+[meeting]
+audio_format = "wav"
+"#,
+        )
+        .unwrap();
+        assert_eq!(wav.meeting.audio_format(), MeetingAudioFormat::Wav);
+        // A hand-edited unknown value parses (it is a plain string) and falls
+        // back to Opus at use time instead of failing the whole config.
+        let unknown: AppConfig = toml::from_str(
+            r#"
+[meeting]
+audio_format = "flac"
+"#,
+        )
+        .unwrap();
+        assert_eq!(unknown.meeting.audio_format(), MeetingAudioFormat::Opus);
     }
 
     #[test]

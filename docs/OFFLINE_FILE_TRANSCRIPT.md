@@ -22,8 +22,9 @@ Binary: `lumen-asr-desktop` (release build or the installed `.app` executable).
 ## Architecture
 
 ```
-audio (wav | m4a | mp3 | …)
-  │  ffmpeg → 16 kHz mono PCM wav (when not already wav)
+audio (wav | opus | m4a | mp3 | …)
+  │  opus: decoded natively (lumen-audio) → 16 kHz mono PCM
+  │  other non-wav: ffmpeg → 16 kHz mono PCM wav
   ▼
 diar-rs  (speaker turns, macOS + diarize feature)
   │  merge short fragments (default < 1.5 s) → fewer false speakers

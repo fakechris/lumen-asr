@@ -282,7 +282,7 @@ Lumen 面向真实写作场景：本地语音识别 + 可选 AI 整理/翻译 + 
 - **终端 pane 观察**：直接跟踪 Herdr、tmux、Zellij 中的修改，不只依赖辅助功能文本
 - **可审计流水线记录**：在会话历史之外保存不可变尝试、上下文来源与编辑观察结果
 - **整段录音 CLI**：对 m4a/mp3/wav 做说话人分段 + 逐段 ASR（sherpa-onnx **Qwen3-ASR** / Metal **mlx-whisper**）、短段合并、可选双语 LLM 翻译；详见 [docs/OFFLINE_FILE_TRANSCRIPT.md](./docs/OFFLINE_FILE_TRANSCRIPT.md)
-- **会议文件导入**：在会议库选择或拖入 wav/mp3/m4a/mp4，走与现场录音相同的转写与纪要流程
+- **会议文件导入**：在会议库选择或拖入 wav/mp3/m4a/mp4/opus，走与现场录音相同的转写与纪要流程（会议录音默认存为 Opus，可在设置中切回 WAV）
 
 ### 整段录音离线转写（CLI）
 

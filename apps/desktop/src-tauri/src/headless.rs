@@ -16,7 +16,8 @@
 //!   [--max-speakers N]
 //!   [--min-turn-seconds 1.5]    # absorb short false-speaker fragments
 //! ```
-//! Non-WAV inputs (m4a/mp3/…) are converted via `ffmpeg` to 16 kHz mono PCM.
+//! Ogg-Opus inputs are decoded natively (no ffmpeg); other non-WAV inputs
+//! (m4a/mp3/…) are converted via `ffmpeg` to 16 kHz mono PCM.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -71,7 +72,7 @@ fn print_help() {
         "lumen-asr-desktop — headless commands:\n  \
          --build-info | --version\n  \
          meeting process <audio> [options]\n    \
-           Offline diarize + per-turn ASR. Accepts wav/m4a/mp3 (ffmpeg).\n    \
+           Offline diarize + per-turn ASR. Accepts wav/opus (native) or m4a/mp3 (ffmpeg).\n    \
            --engine sensevoice|qwen|mlx-whisper|whisper\n    \
            --lang <hint>                     e.g. Spanish, es, zh, auto\n    \
            --format text|json|transcript-v1|bilingual\n    \
@@ -385,8 +386,16 @@ fn split_langs(raw: &str) -> Vec<String> {
 }
 
 /// Convert compressed audio to 16 kHz mono PCM WAV via ffmpeg when needed.
+/// Ogg-Opus passes through untouched: the meeting pipeline decodes it natively
+/// (via lumen-audio), so `meeting process take.opus` needs no ffmpeg.
 /// Returns `(wav_path, temp_dir_to_cleanup)`.
 fn ensure_wav(path: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
+    if crate::audio_convert::audio_extension(path) == "opus" {
+        if !path.is_file() {
+            return Err(format!("找不到音频文件：{}", path.display()));
+        }
+        return Ok((path.to_path_buf(), None));
+    }
     let result = crate::audio_convert::ensure_wav(path)?;
     if result.1.is_some() {
         eprintln!(

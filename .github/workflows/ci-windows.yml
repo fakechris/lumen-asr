@@ -23,6 +23,11 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  # audiopus_sys (lumen-audio's Opus dependency) builds vendored libopus via
+  # CMake; the vendored project declares cmake_minimum_required < 3.5, which
+  # CMake ≥ 4 (windows-latest runners) rejects. This opt-in restores the old
+  # policy compatibility for that configure step.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   test:

@@ -2357,6 +2357,35 @@ function SettingsPanel({
   const [silenceAutoStopMinutes, setSilenceAutoStopMinutes] = useState(15);
   const [maxDurationMinutes, setMaxDurationMinutes] = useState(480);
   const [calendarEndReminder, setCalendarEndReminder] = useState(true);
+  // On-disk format for new meeting recordings ("opus" default, "wav" legacy).
+  const [meetingAudioFormat, setMeetingAudioFormat] = useState("opus");
+  // Latest-wins token so a slow older save cannot clobber a newer selection;
+  // on failure the persisted value is re-read instead of leaving the
+  // optimistic one displayed.
+  const meetingAudioFormatSave = useRef(0);
+  const saveMeetingAudioFormat = useCallback(
+    (next: string) => {
+      setMeetingAudioFormat(next);
+      const request = ++meetingAudioFormatSave.current;
+      void api
+        .setMeetingAudioFormat(next)
+        .then((saved) => {
+          if (meetingAudioFormatSave.current === request) {
+            setMeetingAudioFormat(saved.audioFormat);
+          }
+        })
+        .catch((err) => {
+          onError(String(err));
+          if (meetingAudioFormatSave.current === request) {
+            void api
+              .getMeetingAudioFormat()
+              .then((fmt) => setMeetingAudioFormat(fmt.audioFormat))
+              .catch(() => {});
+          }
+        });
+    },
+    [onError],
+  );
   // Debounce + latest-wins so rapid edits to either field don't race as
   // independent writes (each call persists both fields, so an older in-flight
   // write could otherwise clobber the newer one).
@@ -2465,6 +2494,12 @@ function SettingsPanel({
           setCalendarEndReminder(wd.calendarEndReminder);
         } catch {
           /* watchdog settings are best-effort */
+        }
+        try {
+          const fmt = await api.getMeetingAudioFormat();
+          setMeetingAudioFormat(fmt.audioFormat);
+        } catch {
+          /* recording format is best-effort */
         }
       } catch (e) {
         onError(String(e));
@@ -3421,6 +3456,27 @@ function SettingsPanel({
         ) : (
           <p className="muted-text">会议应用目录尚未载入。</p>
         )}
+
+        <hr className="settings-divider" />
+        <div className="form-row">
+          <label className="form-label" htmlFor="meeting-audio-format">
+            会议录音格式
+          </label>
+          <select
+            id="meeting-audio-format"
+            className="input"
+            value={meetingAudioFormat}
+            disabled={busy}
+            style={{ maxWidth: 200 }}
+            onChange={(e) => saveMeetingAudioFormat(e.target.value)}
+          >
+            <option value="opus">Opus（默认，约省 90% 空间）</option>
+            <option value="wav">WAV（未压缩 PCM）</option>
+          </select>
+        </div>
+        <p className="muted-text">
+          只影响之后开始的录音；已有录音无论哪种格式都能正常播放、剪辑和处理。
+        </p>
 
         <hr className="settings-divider" />
         <p className="muted-text">

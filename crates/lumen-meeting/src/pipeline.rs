@@ -19,6 +19,49 @@ use uuid::Uuid;
 use crate::assemble::{assemble_meeting, new_meeting, turn_sample_range, DiarTurn};
 use crate::correct::CorrectionDict;
 
+/// Whether `path` names an Ogg-Opus track (the desktop's default recording
+/// format for new meetings).
+pub(crate) fn is_opus_track(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("opus"))
+}
+
+/// Hand a track to the pipeline as a WAV: an Ogg-Opus file is decoded (via
+/// lumen-audio, no ffmpeg) to a 16 kHz mono PCM WAV inside a scratch dir
+/// created on demand; anything else is returned unchanged. diar-rs and the
+/// echo pass's window reads stay WAV-only; metadata sidecars are handled by
+/// the callers against the *original* path.
+pub(crate) fn materialize_wav_track(
+    path: &Path,
+    scratch: &mut Option<tempfile::TempDir>,
+    name: &str,
+) -> Result<PathBuf, MeetingError> {
+    if !is_opus_track(path) {
+        return Ok(path.to_path_buf());
+    }
+    let decode_error = |e: std::io::Error| {
+        MeetingError::Diarize(format!("decode opus track {}: {e}", path.display()))
+    };
+    let (samples, rate) = lumen_audio::decode_opus_to_pcm(path).map_err(decode_error)?;
+    let dir = match scratch {
+        Some(dir) => dir,
+        None => {
+            *scratch = Some(tempfile::tempdir().map_err(decode_error)?);
+            scratch.as_mut().expect("just created")
+        }
+    };
+    let wav = dir.path().join(name);
+    std::fs::write(&wav, lumen_audio::pcm_to_wav_bytes(&samples, rate)).map_err(decode_error)?;
+    tracing::info!(
+        opus = %path.display(),
+        wav = %wav.display(),
+        seconds = samples.len() as f64 / f64::from(rate),
+        "decoded opus meeting track to a temporary wav for processing"
+    );
+    Ok(wav)
+}
+
 /// Filesystem locations of the three diarization model artifacts.
 ///
 /// Cross-platform on purpose (no `diar-rs` types) so callers on any OS can
@@ -398,6 +441,11 @@ pub(crate) fn diarize_wav(
 ) -> Result<DiarOutput, MeetingError> {
     use diar_rs::{audio, diarize, DiarizeConfig, ModelPaths};
 
+    // Ogg-Opus tracks are decoded to a scratch WAV first — diar-rs reads WAV
+    // paths. The scratch dir lives until this function returns.
+    let mut opus_scratch = None;
+    let wav = &materialize_wav_track(wav, &mut opus_scratch, "track.decoded.wav")?;
+
     let model_paths = ModelPaths {
         segmentation: models.segmentation.clone(),
         embedding: models.embedding.clone(),
@@ -703,6 +751,10 @@ pub(crate) fn diarize_wav(
     _models: &DiarModels,
     _opts: &MeetingOptions,
 ) -> Result<DiarOutput, MeetingError> {
+    // Same Opus→scratch-WAV decode as the real path, so the silence preflight
+    // below reads Opus tracks too.
+    let mut opus_scratch = None;
+    let wav = &materialize_wav_track(wav, &mut opus_scratch, "track.decoded.wav")?;
     if let Some(samples) = crate::echo::read_full_wav_mono_16k(wav) {
         let scan = crate::preflight::scan_speech(&samples, 16_000);
         if !scan.has_enough_speech() {

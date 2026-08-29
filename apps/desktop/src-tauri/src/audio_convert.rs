@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const MEETING_IMPORT_EXTENSIONS: &[&str] = &["wav", "wave", "mp3", "m4a", "mp4"];
+pub const MEETING_IMPORT_EXTENSIONS: &[&str] = &["wav", "wave", "mp3", "m4a", "mp4", "opus", "ogg"];
 
 pub fn audio_extension(path: &Path) -> String {
     path.extension()
@@ -54,17 +54,23 @@ pub fn convert_to_wav_16k(src: &Path, dest: &Path) -> Result<(), String> {
 pub fn copy_or_convert_to_wav(src: &Path, dest: &Path) -> Result<(), String> {
     let ext = audio_extension(src);
     if matches!(ext.as_str(), "wav" | "wave") {
-        if !src.is_file() {
-            return Err(format!("找不到音频文件：{}", src.display()));
-        }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("无法创建会议目录：{e}"))?;
-        }
-        std::fs::copy(src, dest).map_err(|e| format!("无法复制音频：{e}"))?;
-        Ok(())
+        copy_audio_file(src, dest, "无法复制音频")
     } else {
         convert_to_wav_16k(src, dest)
     }
+}
+
+/// Plain file copy into the meeting library (used for WAV and Opus imports,
+/// both of which the pipeline reads without an ffmpeg conversion).
+pub fn copy_audio_file(src: &Path, dest: &Path, err_prefix: &str) -> Result<(), String> {
+    if !src.is_file() {
+        return Err(format!("找不到音频文件：{}", src.display()));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("无法创建会议目录：{e}"))?;
+    }
+    std::fs::copy(src, dest).map_err(|e| format!("{err_prefix}：{e}"))?;
+    Ok(())
 }
 
 /// Convert compressed audio to a temp 16 kHz wav. WAV inputs are returned as-is.
@@ -103,6 +109,8 @@ mod tests {
         assert!(is_importable_meeting_audio(Path::new("talk.MP3")));
         assert!(is_importable_meeting_audio(Path::new("talk.wav")));
         assert!(is_importable_meeting_audio(Path::new("talk.mp4")));
+        assert!(is_importable_meeting_audio(Path::new("talk.opus")));
+        assert!(is_importable_meeting_audio(Path::new("talk.OGG")));
         assert!(!is_importable_meeting_audio(Path::new("talk.txt")));
         assert!(!is_importable_meeting_audio(Path::new("talk")));
     }
