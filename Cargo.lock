@@ -2487,6 +2487,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "diar-rs",
+ "hound",
  "lumen-asr-engine",
  "lumen-audio",
  "lumen-core",

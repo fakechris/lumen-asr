@@ -35,6 +35,9 @@ lumen-asr-engine = { workspace = true }
 lumen-audio = { workspace = true }
 # Scratch dir holding the decoded Opus→WAV tracks for one pipeline run.
 tempfile = "3"
+# Reading the legacy PCM16 WAV meeting recordings for the `compact` migration
+# (same WAV crate lumen-asr and lumen-audio already use).
+hound = "3"
 
 # On-device diarization. macOS only (C++ fbank + ONNX Runtime): declared under
 # a cfg(target_os = "macos") target section so non-macOS (Windows CI) never
