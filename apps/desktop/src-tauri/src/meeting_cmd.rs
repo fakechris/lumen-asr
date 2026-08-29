@@ -890,9 +890,12 @@ fn start_meeting_recording_with_targets(
     let aec_rate = if VOICE_PROCESSING_SAFE_FOR_MEETINGS
         && crate::meeting_mic_aec::MeetingMicAec::is_supported()
     {
-        let rate = state
-            .meeting_mic_aec
-            .start(device.clone(), out_path.clone(), mic_tap.clone(), audio_format);
+        let rate = state.meeting_mic_aec.start(
+            device.clone(),
+            out_path.clone(),
+            mic_tap.clone(),
+            audio_format,
+        );
         if rate.is_some() {
             tracing::info!("meeting mic path: VoiceProcessingIO (system AEC) engaged");
         } else {
@@ -971,10 +974,7 @@ fn start_meeting_recording_with_targets(
         } else {
             (None, None)
         };
-        let system_path = dir.join(format!(
-            "{meeting_id}.system.{}",
-            audio_format.extension()
-        ));
+        let system_path = dir.join(format!("{meeting_id}.system.{}", audio_format.extension()));
         if let Some(system_rate) =
             state
                 .meeting_system_audio
@@ -1868,8 +1868,8 @@ pub fn read_meeting_audio_wav(
             }
         }
     }
-    let (samples, rate) = lumen_asr::decode_opus_to_pcm(&path)
-        .map_err(|e| format!("解码录音失败：{e}"))?;
+    let (samples, rate) =
+        lumen_asr::decode_opus_to_pcm(&path).map_err(|e| format!("解码录音失败：{e}"))?;
     let bytes = std::sync::Arc::new(lumen_asr::pcm_to_wav_bytes(&samples, rate));
     if let Ok(mut cache) = state.meeting_playback_cache.lock() {
         *cache = Some((path, key, std::sync::Arc::clone(&bytes)));
@@ -2053,7 +2053,10 @@ fn pick_meeting_audio_path(app: &AppHandle) -> Result<PathBuf, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     app.run_on_main_thread(move || {
         let picked = rfd::FileDialog::new()
-            .add_filter("音视频", &["wav", "wave", "mp3", "m4a", "mp4", "opus", "ogg"])
+            .add_filter(
+                "音视频",
+                &["wav", "wave", "mp3", "m4a", "mp4", "opus", "ogg"],
+            )
             .set_title("导入会议录音")
             .pick_file();
         let _ = tx.send(picked);
@@ -2702,7 +2705,9 @@ struct PreparedMeetingTrim {
 /// Outcome of copying a time range of one track to a new file in the source's
 /// own format (WAV stays WAV, Opus stays Opus).
 enum RangeCopy {
-    Written { duration_seconds: f64 },
+    Written {
+        duration_seconds: f64,
+    },
     /// The requested range does not overlap the track's audio (the optional
     /// system track may start after / end before the kept mic interval).
     NoOverlap,
@@ -2761,17 +2766,22 @@ fn prepare_meeting_trim(
     let token = Uuid::new_v4().simple();
     // Each trimmed track keeps its source's format/extension.
     let mic_ext = crate::audio_convert::audio_extension(&mic_source);
-    let mic_ext = if mic_ext.is_empty() { "wav".to_string() } else { mic_ext };
+    let mic_ext = if mic_ext.is_empty() {
+        "wav".to_string()
+    } else {
+        mic_ext
+    };
     let new_mic = directory.join(format!("{id}.trim-{token}.{mic_ext}"));
 
-    let mic_summary = match copy_meeting_audio_range(&mic_source, &new_mic, start_seconds, end_seconds)
-        .map_err(|error| format!("剪辑麦克风录音失败：{error}"))?
-    {
-        RangeCopy::Written { duration_seconds } => duration_seconds,
-        RangeCopy::NoOverlap => {
-            return Err("剪辑麦克风录音失败：保留区间超出录音范围".to_string());
-        }
-    };
+    let mic_summary =
+        match copy_meeting_audio_range(&mic_source, &new_mic, start_seconds, end_seconds)
+            .map_err(|error| format!("剪辑麦克风录音失败：{error}"))?
+        {
+            RangeCopy::Written { duration_seconds } => duration_seconds,
+            RangeCopy::NoOverlap => {
+                return Err("剪辑麦克风录音失败：保留区间超出录音范围".to_string());
+            }
+        };
 
     let (mic_offset, system_offset) =
         read_timeline_offsets(&mic_source.with_extension("timeline.json"));
@@ -2783,7 +2793,11 @@ fn prepare_meeting_trim(
             system_trim_range(start_seconds, end_seconds, system_skew)
         {
             let sys_ext = crate::audio_convert::audio_extension(system_source);
-            let sys_ext = if sys_ext.is_empty() { "wav".to_string() } else { sys_ext };
+            let sys_ext = if sys_ext.is_empty() {
+                "wav".to_string()
+            } else {
+                sys_ext
+            };
             let new_system = directory.join(format!("{id}.trim-{token}.system.{sys_ext}"));
             match copy_meeting_audio_range(system_source, &new_system, local_start, local_end) {
                 Ok(RangeCopy::Written { .. }) => {
@@ -4107,8 +4121,8 @@ mod tests {
         let mic = directory.path().join("meeting.opus");
         write_test_opus(&mic, 1.0);
 
-        let error = prepare_meeting_trim(uuid::Uuid::new_v4(), mic.clone(), None, 5.0, 6.0)
-            .unwrap_err();
+        let error =
+            prepare_meeting_trim(uuid::Uuid::new_v4(), mic.clone(), None, 5.0, 6.0).unwrap_err();
         assert!(error.contains("剪辑麦克风录音失败"));
         assert!(mic.exists());
     }
@@ -4143,7 +4157,6 @@ mod tests {
             super::Salvage::Unrecoverable(_)
         ));
     }
-
 
     #[test]
     fn imported_wav_copies_into_the_meetings_dir_as_processing() {
