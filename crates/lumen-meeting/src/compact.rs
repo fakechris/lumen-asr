@@ -17,10 +17,12 @@
 //!   leaves the WAV and the DB row untouched; the meeting is reported as
 //!   failed and the run continues with the next meeting.
 //! - **Idempotent.** Tracks already stored as `.opus` are skipped, so a
-//!   re-run after an interruption only redoes what never finished. A meeting
-//!   whose conversion crashed between the DB update and the WAV delete shows
-//!   up as "already opus" with an orphan WAV next to it; the orphan is
-//!   removed on the next run (it is no longer referenced by the DB).
+//!   re-run after an interruption only redoes what never finished. A run
+//!   interrupted between the DB update and the WAV delete leaves an orphan
+//!   WAV that the next run removes; a run interrupted between staging the
+//!   Opus and the DB update leaves an unreferenced `.opus` twin that the next
+//!   run verifies against the source duration and adopts (or, if it fails
+//!   verification, removes and re-encodes from the intact WAV).
 //! - **Never touch a live recording.** Meetings in a non-terminal lifecycle
 //!   status (`recording`, `processing`, `transcribing`, `summarizing`) are
 //!   skipped outright — their audio may still be written or read by the
@@ -125,11 +127,17 @@ impl CompactSummary {
 /// project the Opus size of a not-yet-converted track in dry-run mode.
 const OPUS_PROJECTED_BYTES_PER_SECOND: f64 = 24_000.0 / 8.0;
 
-/// Do two sample counts describe the same recording? Compared as durations
-/// (the Opus decoder reports 16 kHz samples while the WAV is at its native
-/// rate). Opus trims the codec pre-skip and pads the final frame, so exact
-/// equality is impossible; ±1% or ±50 ms, whichever is looser, catches real
-/// truncation without flapping on codec edge effects.
+/// Do two durations (seconds) describe the same recording? Opus trims the
+/// codec pre-skip and pads the final frame, so exact equality is impossible;
+/// ±1% or ±50 ms, whichever is looser, catches real truncation without
+/// flapping on codec edge effects.
+fn duration_within(a_seconds: f64, b_seconds: f64) -> bool {
+    let tolerance = (a_seconds * 0.01).max(0.05);
+    (a_seconds - b_seconds).abs() <= tolerance
+}
+
+/// Sample-count twin of [`duration_within`]: compared as durations (the Opus
+/// decoder reports 16 kHz samples while the WAV is at its native rate).
 fn duration_matches(
     source_samples: usize,
     source_rate: u32,
@@ -139,46 +147,68 @@ fn duration_matches(
     if source_rate == 0 || decoded_rate == 0 {
         return false;
     }
-    let source = source_samples as f64 / f64::from(source_rate);
-    let decoded = decoded_samples as f64 / f64::from(decoded_rate);
-    let tolerance = (source * 0.01).max(0.05);
-    (source - decoded).abs() <= tolerance
+    duration_within(
+        source_samples as f64 / f64::from(source_rate),
+        decoded_samples as f64 / f64::from(decoded_rate),
+    )
 }
 
-/// Read a WAV recording as mono f32 samples at the file's native rate.
-/// Integer PCM of any depth ≤ 32 bit and 32-bit float are accepted;
-/// multi-channel files are down-mixed by averaging.
-fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32)> {
-    let mut reader =
-        hound::WavReader::open(path).with_context(|| format!("open wav {}", path.display()))?;
+/// Frames read from the WAV per encode batch (~4 MiB of f32 per channel), so
+/// peak memory stays bounded no matter how long the recording is.
+const ENCODE_BATCH_FRAMES: usize = 1 << 20;
+
+/// Stream a WAV recording through `sink` as mono f32 at the file's native
+/// rate. Integer PCM of any depth ≤ 32 bit and 32-bit float are accepted;
+/// multi-channel files are down-mixed by averaging. Returns the number of
+/// mono samples written (what [`duration_matches`] checks against).
+fn encode_wav_to_opus(wav_path: &Path, sink: &mut lumen_audio::OpusSink) -> Result<u64> {
+    let mut reader = hound::WavReader::open(wav_path)
+        .with_context(|| format!("open wav {}", wav_path.display()))?;
     let spec = reader.spec();
     if spec.channels == 0 {
-        anyhow::bail!("wav {} has zero channels", path.display());
+        anyhow::bail!("wav {} has zero channels", wav_path.display());
     }
     let channels = spec.channels as usize;
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<hound::Result<Vec<f32>>>()?,
-        hound::SampleFormat::Int => {
-            // hound widens without scaling: a 16-bit file read as i32 yields
-            // raw i16 values. Normalize against the depth's full-scale value.
-            let full_scale = (1_i64 << (spec.bits_per_sample.saturating_sub(1))) as f32;
+    // hound widens without scaling: a 16-bit file read as i32 yields raw i16
+    // values. Normalize integer PCM against the depth's full-scale value.
+    let full_scale = (1_i64 << (spec.bits_per_sample.saturating_sub(1))) as f32;
+    let mut samples: Box<dyn Iterator<Item = hound::Result<f32>>> = match spec.sample_format {
+        hound::SampleFormat::Float => Box::new(reader.samples::<f32>()),
+        hound::SampleFormat::Int => Box::new(
             reader
                 .samples::<i32>()
-                .map(|s| s.map(|v| v as f32 / full_scale))
-                .collect::<hound::Result<Vec<f32>>>()?
+                .map(move |s| s.map(|v| v as f32 / full_scale)),
+        ),
+    };
+    let mut total = 0u64;
+    let mut batch: Vec<f32> = Vec::with_capacity(ENCODE_BATCH_FRAMES * channels);
+    let mut flush = |batch: &mut Vec<f32>, total: &mut u64| -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
         }
+        let written = if channels == 1 {
+            sink.write_samples(batch)?;
+            batch.len()
+        } else {
+            let mono: Vec<f32> = batch
+                .chunks_exact(channels)
+                .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                .collect();
+            sink.write_samples(&mono)?;
+            mono.len()
+        };
+        *total += written as u64;
+        batch.clear();
+        Ok(())
     };
-    let mono = if channels == 1 {
-        samples
-    } else {
-        samples
-            .chunks_exact(channels)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
-    Ok((mono, spec.sample_rate))
+    for sample in samples.by_ref() {
+        batch.push(sample?);
+        if batch.len() == batch.capacity() {
+            flush(&mut batch, &mut total)?;
+        }
+    }
+    flush(&mut batch, &mut total)?;
+    Ok(total)
 }
 
 /// Where the Opus twin of a WAV track lives: `<id>.wav` → `<id>.opus`,
@@ -302,12 +332,6 @@ fn convert_track_inner(
     wav_path: &Path,
 ) -> std::result::Result<TrackStatus, String> {
     let opus_path = opus_path_for(wav_path);
-    if opus_path.exists() {
-        return Err(format!(
-            "target {} already exists; refusing to clobber",
-            opus_path.display()
-        ));
-    }
     let probe = probe_wav(wav_path).map_err(|e| e.to_string())?;
     if probe.is_stale() {
         // Crash-interrupted recording: the audio bytes are all there, only
@@ -323,47 +347,34 @@ fn convert_track_inner(
             )
         })?;
     }
-    let (samples, sample_rate) = read_wav_mono(wav_path).map_err(|e| e.to_string())?;
     let before_bytes = probe.file_len;
 
-    let staging = staging_path_for(&opus_path);
-    let _ = std::fs::remove_file(&staging);
-    let encode = || -> std::io::Result<()> {
-        let mut sink = lumen_audio::OpusSink::create(&staging, sample_rate)?;
-        sink.write_samples(&samples)?;
-        sink.finalize()?;
-        Ok(())
-    };
-    if let Err(error) = encode() {
-        let _ = std::fs::remove_file(&staging);
-        return Err(format!("encode {}: {error}", staging.display()));
-    }
-
-    // Verify before anything becomes irreversible: the Opus must decode back
-    // to (almost) the source duration.
-    let verified = lumen_audio::decode_opus_to_pcm(&staging).map_err(|e| e.to_string());
-    let (decoded, decoded_rate) = match verified {
-        Ok(ok) => ok,
-        Err(error) => {
-            let _ = std::fs::remove_file(&staging);
-            return Err(format!("verify decode {}: {error}", staging.display()));
+    if opus_path.exists() {
+        // A previous run crashed between staging the Opus and updating the DB:
+        // the DB still points at the WAV and both files exist. The staged file
+        // was verified before its rename, so adopt it when it still decodes to
+        // the source duration. If it fails verification it is a corrupt
+        // artifact — the intact WAV remains the source of truth, so remove the
+        // artifact and re-encode.
+        match lumen_audio::decode_opus_to_pcm(&opus_path) {
+            Ok((decoded, decoded_rate))
+                if decoded_rate > 0
+                    && duration_within(
+                        probe.duration_seconds(),
+                        decoded.len() as f64 / f64::from(decoded_rate),
+                    ) => {}
+            valid_or_not => {
+                if let Err(error) = &valid_or_not {
+                    tracing::warn!(path = %opus_path.display(), %error, "stray opus does not decode; re-encoding");
+                }
+                std::fs::remove_file(&opus_path).map_err(|e| {
+                    format!("remove unreferenced stray {}: {e}", opus_path.display())
+                })?;
+                encode_fresh_track(wav_path, &opus_path, &probe)?;
+            }
         }
-    };
-    if !duration_matches(samples.len(), sample_rate, decoded.len(), decoded_rate) {
-        let _ = std::fs::remove_file(&staging);
-        return Err(format!(
-            "verify failed: wav has {} samples @ {sample_rate} Hz but opus decodes to {} @ {decoded_rate} Hz",
-            samples.len(),
-            decoded.len()
-        ));
-    }
-    if let Err(error) = std::fs::rename(&staging, &opus_path) {
-        let _ = std::fs::remove_file(&staging);
-        return Err(format!(
-            "rename {} → {}: {error}",
-            staging.display(),
-            opus_path.display()
-        ));
+    } else {
+        encode_fresh_track(wav_path, &opus_path, &probe)?;
     }
 
     // DB first, then the delete: if the DB update fails we remove the new
@@ -396,14 +407,79 @@ fn convert_track_inner(
     })
 }
 
+/// Encode `wav_path` to `opus_path` via a staging file, verifying the staged
+/// result decodes back to (almost) the source duration before it moves to the
+/// final name. Any failure removes the staging file and leaves both the WAV
+/// and any pre-existing state at `opus_path` untouched.
+fn encode_fresh_track(
+    wav_path: &Path,
+    opus_path: &Path,
+    probe: &WavProbe,
+) -> std::result::Result<(), String> {
+    let staging = staging_path_for(opus_path);
+    let _ = std::fs::remove_file(&staging);
+    let encoded = (|| -> Result<u64> {
+        let mut sink = lumen_audio::OpusSink::create(&staging, probe.sample_rate)?;
+        let total = encode_wav_to_opus(wav_path, &mut sink)?;
+        sink.finalize()?;
+        Ok(total)
+    })();
+    let total: u64 = match encoded {
+        Ok(total) => total,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(format!("encode {}: {error}", staging.display()));
+        }
+    };
+
+    // Verify before anything becomes irreversible: the Opus must decode back
+    // to (almost) the source duration.
+    let (decoded, decoded_rate) = match lumen_audio::decode_opus_to_pcm(&staging) {
+        Ok(ok) => ok,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(format!("verify decode {}: {error}", staging.display()));
+        }
+    };
+    if !duration_matches(
+        total as usize,
+        probe.sample_rate,
+        decoded.len(),
+        decoded_rate,
+    ) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!(
+            "verify failed: wav has {total} samples @ {} Hz but opus decodes to {} @ {decoded_rate} Hz",
+            probe.sample_rate,
+            decoded.len()
+        ));
+    }
+    if let Err(error) = std::fs::rename(&staging, opus_path) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!(
+            "rename {} → {}: {error}",
+            staging.display(),
+            opus_path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Project the Opus size of a WAV track for dry-run reporting. Header-only
 /// probe (no sample decoding); a stale header is projected from the actual
-/// file length, exactly as the real run would after repairing it.
+/// file length, exactly as the real run would after repairing it. When the
+/// `.opus` twin already exists (interrupted earlier run), the projection is
+/// the adoption the real run would perform.
 fn dry_run_status(wav_path: &Path) -> TrackStatus {
     match probe_wav(wav_path) {
         Ok(probe) => {
-            let after_bytes =
-                (probe.duration_seconds() * OPUS_PROJECTED_BYTES_PER_SECOND) as u64 + 1024;
+            let opus_path = opus_path_for(wav_path);
+            let after_bytes = match std::fs::metadata(&opus_path) {
+                Ok(meta) => meta.len(),
+                Err(_) => {
+                    (probe.duration_seconds() * OPUS_PROJECTED_BYTES_PER_SECOND) as u64 + 1024
+                }
+            };
             TrackStatus::Converted {
                 before_bytes: probe.file_len,
                 after_bytes,
@@ -413,16 +489,11 @@ fn dry_run_status(wav_path: &Path) -> TrackStatus {
     }
 }
 
-/// A meeting's lifecycle status where the audio may still be written or read
-/// by the live recorder / processing pipeline.
-fn is_live_status(status: MeetingStatus) -> bool {
-    matches!(
-        status,
-        MeetingStatus::Recording
-            | MeetingStatus::Processing
-            | MeetingStatus::Transcribing
-            | MeetingStatus::Summarizing
-    )
+/// The only lifecycle statuses whose audio is safe to migrate: terminal
+/// states where no recorder or pipeline stage can still touch the files.
+/// Fails closed — a status added in the future is skipped until reviewed.
+fn is_compactable_status(status: MeetingStatus) -> bool {
+    matches!(status, MeetingStatus::Ready | MeetingStatus::Failed)
 }
 
 fn is_wav_path(path: &Path) -> bool {
@@ -449,7 +520,7 @@ fn compact_one_meeting(
         title: meeting.title.clone(),
         tracks: Vec::new(),
     };
-    if is_live_status(meeting.status) {
+    if !is_compactable_status(meeting.status) {
         report.tracks.push(TrackReport {
             kind: TrackKind::Mic,
             source: meeting
@@ -904,6 +975,69 @@ mod tests {
         assert!(after_bytes > 6_000);
         // Dry-run must not repair the header either: the file is untouched.
         assert!(probe_wav(&mic).unwrap().is_stale());
+    }
+
+    #[test]
+    fn stray_opus_from_interrupted_run_is_adopted() {
+        let fixture = fixture();
+        let (id, mic, _system) = add_meeting(&fixture, MeetingStatus::Ready, 1.0, false);
+        // Simulate a run that crashed after the verified Opus landed at its
+        // final name but before the DB update: DB still points at the WAV.
+        let opus = mic.with_extension("opus");
+        let mut sink = lumen_audio::OpusSink::create(&opus, 16_000).unwrap();
+        let one_second: Vec<f32> = (0..16_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.4)
+            .collect();
+        sink.write_samples(&one_second).unwrap();
+        sink.finalize().unwrap();
+        let stray_len = std::fs::metadata(&opus).unwrap().len();
+
+        // Dry-run reports the adoption (real opus size, not a projection).
+        let dry = run(
+            &fixture.store,
+            &CompactOptions {
+                dry_run: true,
+                meeting: None,
+            },
+        );
+        let TrackStatus::Converted { after_bytes, .. } = dry.reports[0].tracks[0].status else {
+            panic!("expected a conversion projection");
+        };
+        assert_eq!(after_bytes, stray_len);
+        assert!(mic.is_file());
+
+        let summary = run(&fixture.store, &CompactOptions::default());
+        assert_eq!(summary.converted, 1);
+        assert_eq!(summary.failed, 0);
+        assert!(!mic.exists());
+        // Adopted, not re-encoded: the file is byte-identical.
+        assert_eq!(std::fs::metadata(&opus).unwrap().len(), stray_len);
+        let stored = fixture.store.get_meeting(id).unwrap().unwrap();
+        assert_eq!(
+            stored.audio_path.as_deref(),
+            Some(opus.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn corrupt_stray_opus_is_removed_and_reencoded() {
+        let fixture = fixture();
+        let (id, mic, _system) = add_meeting(&fixture, MeetingStatus::Ready, 1.0, false);
+        let opus = mic.with_extension("opus");
+        std::fs::write(&opus, b"garbage, not ogg").unwrap();
+
+        let summary = run(&fixture.store, &CompactOptions::default());
+        assert_eq!(summary.converted, 1);
+        assert_eq!(summary.failed, 0);
+        assert!(!mic.exists());
+        // The corrupt artifact was replaced by a real encoding of the WAV.
+        let (samples, rate) = lumen_audio::decode_opus_to_pcm(&opus).unwrap();
+        assert!(duration_matches(16_000, 16_000, samples.len(), rate));
+        let stored = fixture.store.get_meeting(id).unwrap().unwrap();
+        assert_eq!(
+            stored.audio_path.as_deref(),
+            Some(opus.to_string_lossy().as_ref())
+        );
     }
 
     #[test]

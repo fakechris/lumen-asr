@@ -226,6 +226,14 @@ fn run_meeting_compact(args: &[String]) -> i32 {
         i += 1;
     }
 
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+
     let store = match lumen_store::Store::open(lumen_platform::default_db_path()) {
         Ok(store) => store,
         Err(error) => {
