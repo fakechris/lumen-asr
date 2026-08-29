@@ -491,7 +491,7 @@ export const api = {
   stopMeetingRecording: (meetingId: string) =>
     invoke<MeetingRecordingResult>("stop_meeting_recording", { meetingId }),
 
-  /** Import wav/mp3/m4a/mp4 into the meeting library and start processing.
+  /** Import wav/mp3/m4a/mp4/opus into the meeting library and start processing.
    * Omit `path` to open a native file picker; drag-and-drop passes the dropped path. */
   importMeetingFile: (path?: string) =>
     invoke<string>("import_meeting_file", { path: path ?? null }),
@@ -582,6 +582,22 @@ export const api = {
     calendarEndReminder: boolean;
   }) =>
     invoke<MeetingWatchdogConfig>("set_meeting_watchdog_config", input),
+
+  /** Read the on-disk recording format for new meetings ("opus" default,
+   * "wav" legacy). */
+  getMeetingAudioFormat: () =>
+    invoke<{ audioFormat: string }>("get_meeting_audio_format"),
+
+  /** Persist the recording format; applies to recordings started after the
+   * change. Resolves the stored value. */
+  setMeetingAudioFormat: (audioFormat: string) =>
+    invoke<{ audioFormat: string }>("set_meeting_audio_format", { audioFormat }),
+
+  /** Read a meeting's mic audio as WAV bytes for playback. Opus tracks (the
+   * default for new recordings) are decoded server-side because WKWebView
+   * cannot play Ogg-Opus; WAV files are returned as-is. */
+  readMeetingAudioWav: (meetingId: string) =>
+    invoke<ArrayBuffer>("read_meeting_audio_wav", { meetingId }),
 
   /** Keep recording after a prolonged-silence warning and re-arm the full
    * configured silence interval from the acknowledgement point. */

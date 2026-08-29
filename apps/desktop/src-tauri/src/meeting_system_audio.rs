@@ -15,7 +15,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use lumen_asr::{LiveTapSender, RecordingSummary, SystemTrackRecorder, SystemTrackSender};
+use lumen_asr::{
+    LiveTapSender, MeetingAudioFormat, RecordingSummary, SystemTrackRecorder, SystemTrackSender,
+};
 use lumen_platform_macos::{SystemAudioCapture, SystemAudioSink, SystemAudioTarget};
 
 /// One live tap→WAV session for the active meeting recording.
@@ -55,6 +57,7 @@ impl MeetingSystemAudio {
         out_path: PathBuf,
         bundle_ids: Vec<String>,
         live: Option<LiveTapSender>,
+        format: MeetingAudioFormat,
     ) -> Option<u32> {
         let mut guard = match self.inner.lock() {
             Ok(guard) => guard,
@@ -103,7 +106,7 @@ impl MeetingSystemAudio {
             }
         };
 
-        let track = match SystemTrackRecorder::create(&out_path, sample_rate) {
+        let track = match SystemTrackRecorder::create_with_format(&out_path, sample_rate, format) {
             Ok(track) => track,
             Err(e) => {
                 capture.stop();

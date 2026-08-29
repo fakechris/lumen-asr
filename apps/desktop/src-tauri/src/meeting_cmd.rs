@@ -98,8 +98,9 @@ fn echo_diagnostics_sidecar(path: &Path) -> PathBuf {
     path.with_file_name(format!("{stem}.echo_suppression.json"))
 }
 
-/// Remove a mic WAV and the two sidecars derived from that exact recording.
-/// Every path is explicit; callers validate that the WAV is app-owned first.
+/// Remove a mic audio file (WAV or Opus) and the two sidecars derived from that
+/// exact recording.
+/// Every path is explicit; callers validate that the file is app-owned first.
 fn remove_mic_audio_artifacts(path: &Path) {
     for artifact in [
         path.to_path_buf(),
@@ -122,8 +123,8 @@ fn remove_audio_file(path: &Path) {
     }
 }
 
-/// Resolve a stored meeting audio path and prove it is a direct WAV child of
-/// Lumen's meetings directory before any destructive replacement is allowed.
+/// Resolve a stored meeting audio path and prove it is a direct WAV/Opus child
+/// of Lumen's meetings directory before any destructive replacement is allowed.
 fn owned_meeting_wav(path: &str) -> Result<PathBuf, String> {
     let meetings_dir = default_data_dir().join("meetings");
     owned_meeting_wav_in(&meetings_dir, Path::new(path))
@@ -136,10 +137,11 @@ fn owned_meeting_wav_in(meetings_dir: &Path, path: &Path) -> Result<PathBuf, Str
     let source = path
         .canonicalize()
         .map_err(|error| format!("无法读取会议音频：{error}"))?;
-    if source.parent() != Some(owned_dir.as_path())
-        || source.extension().and_then(|value| value.to_str()) != Some("wav")
-        || !source.is_file()
-    {
+    let is_meeting_audio = matches!(
+        source.extension().and_then(|value| value.to_str()),
+        Some("wav") | Some("opus")
+    );
+    if source.parent() != Some(owned_dir.as_path()) || !is_meeting_audio || !source.is_file() {
         return Err("会议音频不在 Lumen 管理的目录中，不能执行破坏性剪辑".to_string());
     }
     Ok(source)
@@ -797,7 +799,8 @@ fn spawn_max_duration_watchdog(
 }
 
 /// Start a new meeting recording. Creates the meeting row (`Recording`), begins
-/// the continuous recorder writing to `<data_dir>/meetings/<id>.wav`, and
+/// the continuous recorder writing to `<data_dir>/meetings/<id>.<ext>` (Opus by
+/// default, WAV when configured), and
 /// suspends the dictation hotkey. Returns the new meeting id.
 #[tauri::command]
 pub fn start_meeting_recording(
@@ -844,7 +847,13 @@ fn start_meeting_recording_with_targets(
         return Err(e);
     }
 
-    // 3. Prepare the output path under the app data dir.
+    // 3. Prepare the output path under the app data dir. New recordings use the
+    //    configured format (Opus by default; ~10× smaller than PCM16 WAV).
+    let audio_format = state
+        .config
+        .lock()
+        .map(|cfg| cfg.meeting.audio_format())
+        .unwrap_or(lumen_asr::MeetingAudioFormat::Opus);
     let dir = default_data_dir().join("meetings");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         state.capture.force_idle();
@@ -855,7 +864,7 @@ fn start_meeting_recording_with_targets(
         });
         return Err(reason);
     }
-    let out_path = dir.join(format!("{meeting_id}.wav"));
+    let out_path = dir.join(format!("{meeting_id}.{}", audio_format.extension()));
 
     // 4. Start the independent continuous recorder. When the real-time layer is
     //    engaged (macOS + streaming Paraformer installed), attach a bounded
@@ -883,7 +892,7 @@ fn start_meeting_recording_with_targets(
     {
         let rate = state
             .meeting_mic_aec
-            .start(device.clone(), out_path.clone(), mic_tap.clone());
+            .start(device.clone(), out_path.clone(), mic_tap.clone(), audio_format);
         if rate.is_some() {
             tracing::info!("meeting mic path: VoiceProcessingIO (system AEC) engaged");
         } else {
@@ -896,10 +905,12 @@ fn start_meeting_recording_with_targets(
     };
     let sample_rate = match aec_rate {
         Some(rate) => rate,
-        None => match state
-            .meeting_recorder
-            .start_with_sink(device, out_path.clone(), mic_tap)
-        {
+        None => match state.meeting_recorder.start_with_options(
+            device,
+            out_path.clone(),
+            audio_format,
+            mic_tap,
+        ) {
             Ok(rate) => rate,
             Err(e) => {
                 // Roll back: mark failed and release the arbiter. No hotkey suspend
@@ -960,11 +971,14 @@ fn start_meeting_recording_with_targets(
         } else {
             (None, None)
         };
-        let system_path = dir.join(format!("{meeting_id}.system.wav"));
+        let system_path = dir.join(format!(
+            "{meeting_id}.system.{}",
+            audio_format.extension()
+        ));
         if let Some(system_rate) =
             state
                 .meeting_system_audio
-                .start(system_path.clone(), targets, system_tap)
+                .start(system_path.clone(), targets, system_tap, audio_format)
         {
             system_offset_seconds = Some(t0.elapsed().as_secs_f64());
             if let Some(rx) = system_rx {
@@ -1774,6 +1788,95 @@ pub fn set_meeting_watchdog_config(
     get_meeting_watchdog_config(state)
 }
 
+/// Serialized meeting recording-format preference for the settings UI.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingAudioFormatConfig {
+    /// `"opus"` (default) or `"wav"` — applies to recordings started after the
+    /// change; existing files of either format keep working.
+    pub audio_format: String,
+}
+
+/// Read the meeting recording format (`opus`/`wav`) for the settings UI.
+#[tauri::command]
+pub fn get_meeting_audio_format(
+    state: State<'_, AppState>,
+) -> Result<MeetingAudioFormatConfig, String> {
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    Ok(MeetingAudioFormatConfig {
+        audio_format: cfg.meeting.audio_format().as_str().to_string(),
+    })
+}
+
+/// Persist the meeting recording format. Takes effect for the next recording;
+/// a running recording keeps the format it started with.
+#[tauri::command]
+pub fn set_meeting_audio_format(
+    state: State<'_, AppState>,
+    audio_format: String,
+) -> Result<MeetingAudioFormatConfig, String> {
+    let parsed = lumen_asr::MeetingAudioFormat::parse(&audio_format)
+        .ok_or_else(|| "录音格式只支持 opus 或 wav".to_string())?;
+    {
+        let mut cfg = state
+            .config
+            .lock()
+            .map_err(|_| "config lock poisoned".to_string())?;
+        cfg.meeting.audio_format = parsed.as_str().to_string();
+        cfg.save()?;
+    }
+    get_meeting_audio_format(state)
+}
+
+/// Read a meeting's mic audio as WAV bytes for in-app playback. WKWebView
+/// cannot play Ogg-Opus (the default format for new recordings), so Opus files
+/// are decoded with [`lumen_asr::decode_opus_to_pcm`] and re-rendered as
+/// in-memory WAV; WAV files are returned as-is. Decodes are cached single-slot
+/// by path + length + mtime so seeking/replaying one meeting never re-decodes.
+/// The path comes from the store (never the client) and must be an app-owned
+/// meeting file.
+#[tauri::command]
+pub fn read_meeting_audio_wav(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<tauri::ipc::Response, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    let stored = with_store(&state, |s| {
+        s.get_meeting(id)
+            .map_err(|e| e.to_string())?
+            .and_then(|meeting| meeting.audio_path)
+            .ok_or_else(|| "会议没有录音文件".to_string())
+    })?;
+    let path = owned_meeting_wav(&stored)?;
+    if crate::audio_convert::audio_extension(&path) != "opus" {
+        let bytes = std::fs::read(&path).map_err(|e| format!("读取录音失败：{e}"))?;
+        return Ok(tauri::ipc::Response::new(bytes));
+    }
+    let meta = std::fs::metadata(&path).map_err(|e| format!("读取录音失败：{e}"))?;
+    let key = (meta.len(), meta.modified().ok());
+    {
+        let cache = state
+            .meeting_playback_cache
+            .lock()
+            .map_err(|_| "playback cache lock poisoned".to_string())?;
+        if let Some((cached_path, cached_key, bytes)) = cache.as_ref() {
+            if *cached_path == path && *cached_key == key {
+                return Ok(tauri::ipc::Response::new(bytes.as_ref().clone()));
+            }
+        }
+    }
+    let (samples, rate) = lumen_asr::decode_opus_to_pcm(&path)
+        .map_err(|e| format!("解码录音失败：{e}"))?;
+    let bytes = std::sync::Arc::new(lumen_asr::pcm_to_wav_bytes(&samples, rate));
+    if let Ok(mut cache) = state.meeting_playback_cache.lock() {
+        *cache = Some((path, key, std::sync::Arc::clone(&bytes)));
+    }
+    Ok(tauri::ipc::Response::new(bytes.as_ref().clone()))
+}
+
 /// The user confirmed that a silence warning is a real pause rather than an
 /// abandoned meeting. Re-arm the watchdog from the current captured-silence
 /// position, giving the recording a fresh full threshold before it can warn
@@ -1922,7 +2025,7 @@ fn prepare_imported_meeting_audio(
         return Err(format!("找不到音频文件：{}", source.display()));
     }
     if !crate::audio_convert::is_importable_meeting_audio(source) {
-        return Err("仅支持 wav / mp3 / m4a / mp4".into());
+        return Err("仅支持 wav / mp3 / m4a / mp4 / opus".into());
     }
     let mut meeting = Meeting::new();
     meeting.status = MeetingStatus::Processing;
@@ -1930,8 +2033,18 @@ fn prepare_imported_meeting_audio(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty());
-    let dest = meetings_dir.join(format!("{}.wav", meeting.id));
-    crate::audio_convert::copy_or_convert_to_wav(source, &dest)?;
+    let ext = crate::audio_convert::audio_extension(source);
+    let dest = if ext == "opus" {
+        // Opus imports are stored as-is: the pipeline decodes them natively
+        // (no ffmpeg) and copying avoids a ~10× re-inflation to PCM16.
+        let dest = meetings_dir.join(format!("{}.opus", meeting.id));
+        crate::audio_convert::copy_audio_file(source, &dest, "无法复制音频")?;
+        dest
+    } else {
+        let dest = meetings_dir.join(format!("{}.wav", meeting.id));
+        crate::audio_convert::copy_or_convert_to_wav(source, &dest)?;
+        dest
+    };
     meeting.audio_path = Some(dest.to_string_lossy().into_owned());
     Ok(PreparedImport { meeting, wav: dest })
 }
@@ -1940,7 +2053,7 @@ fn pick_meeting_audio_path(app: &AppHandle) -> Result<PathBuf, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     app.run_on_main_thread(move || {
         let picked = rfd::FileDialog::new()
-            .add_filter("音视频", &["wav", "wave", "mp3", "m4a", "mp4"])
+            .add_filter("音视频", &["wav", "wave", "mp3", "m4a", "mp4", "opus", "ogg"])
             .set_title("导入会议录音")
             .pick_file();
         let _ = tx.send(picked);
@@ -2294,19 +2407,50 @@ pub fn recover_interrupted_meetings(app: AppHandle) {
     });
 }
 
+/// Outcome of salvaging an interrupted track, format-aware: a WAV is repaired
+/// (back-filled header) while an Ogg-Opus stream needs no repair — a crashed
+/// take still decodes up to its last completed page, so decoding it both
+/// validates the file and yields the true duration.
+enum Salvage {
+    Recovered(f64),
+    Empty,
+    Unrecoverable(String),
+}
+
+fn salvage_track(path: &Path) -> Salvage {
+    if crate::audio_convert::audio_extension(path) == "opus" {
+        return match lumen_asr::decode_opus_to_pcm(path) {
+            Ok((samples, rate)) if !samples.is_empty() && rate > 0 => {
+                Salvage::Recovered(samples.len() as f64 / f64::from(rate))
+            }
+            Ok(_) => Salvage::Empty,
+            Err(e) => Salvage::Unrecoverable(e.to_string()),
+        };
+    }
+    match lumen_asr::repair_wav_header(path) {
+        Ok(repaired) if repaired.data_bytes > 0 => Salvage::Recovered(repaired.duration_seconds),
+        Ok(_) => Salvage::Empty,
+        Err(e) => Salvage::Unrecoverable(e.to_string()),
+    }
+}
+
 /// Recover a single interrupted meeting. See [`recover_interrupted_meetings`].
 fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
     let id = meeting.id;
     // Prefer the stored mic path; fall back to the conventional
-    // `<meetings>/<id>.wav` when it is missing (older meetings interrupted
-    // before the start path persisted it, or a lost store write) — the WAV is
-    // still on disk under that name, so it can be salvaged instead of lost.
+    // `<meetings>/<id>.opus` / `<id>.wav` when it is missing (older meetings
+    // interrupted before the start path persisted it, or a lost store write) —
+    // the audio is still on disk under that name, so it can be salvaged
+    // instead of lost.
     let audio_path = meeting.audio_path.clone().unwrap_or_else(|| {
-        default_data_dir()
-            .join("meetings")
-            .join(format!("{id}.wav"))
-            .to_string_lossy()
-            .to_string()
+        let dir = default_data_dir().join("meetings");
+        let opus = dir.join(format!("{id}.opus"));
+        let conventional = if opus.exists() {
+            opus
+        } else {
+            dir.join(format!("{id}.wav"))
+        };
+        conventional.to_string_lossy().to_string()
     });
     let wav = PathBuf::from(&audio_path);
     // A missing or truly empty (0-byte) file has nothing to salvage.
@@ -2318,13 +2462,13 @@ fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
         return;
     }
 
-    match lumen_asr::repair_wav_header(&wav) {
-        // Real PCM data recovered → advance to Processing and transcribe it.
-        Ok(repaired) if repaired.data_bytes > 0 => {
+    match salvage_track(&wav) {
+        // Real audio recovered → advance to Processing and transcribe it.
+        Salvage::Recovered(duration_seconds) => {
             if let Err(e) = store.set_meeting_audio(
                 id,
                 &audio_path,
-                repaired.duration_seconds,
+                duration_seconds,
                 MeetingStatus::Processing,
             ) {
                 tracing::warn!(meeting_id = %id, error = %e, "crash recovery: could not update recovered meeting");
@@ -2333,25 +2477,19 @@ fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
             let system_wav = recover_system_track(store, meeting);
             tracing::info!(
                 meeting_id = %id,
-                duration_seconds = repaired.duration_seconds,
+                duration_seconds,
                 dual_track = system_wav.is_some(),
-                "crash recovery: salvaged recording, header repaired → processing"
+                "crash recovery: salvaged recording → processing"
             );
-            emit_recovery(
-                app,
-                meeting,
-                "recovered",
-                Some(repaired.duration_seconds),
-                None,
-            );
+            emit_recovery(app, meeting, "recovered", Some(duration_seconds), None);
             spawn_meeting_processing(app.clone(), id, wav, system_wav);
         }
-        // Header-only WAV: repaired to a valid 0-length take — no audio to keep.
-        Ok(_) => fail_interrupted(app, store, meeting),
-        Err(e) => {
-            // File exists but is not a repairable WAV (truncated / corrupt).
+        // Header-only WAV / empty Opus: a valid 0-length take — no audio to keep.
+        Salvage::Empty => fail_interrupted(app, store, meeting),
+        Salvage::Unrecoverable(e) => {
+            // File exists but is not salvageable (truncated / corrupt).
             let reason = format!("recording interrupted, audio unrecoverable: {e}");
-            tracing::warn!(meeting_id = %id, error = %e, "crash recovery: wav unrepairable");
+            tracing::warn!(meeting_id = %id, error = %e, "crash recovery: audio unsalvageable");
             if let Err(e) = store.fail_meeting(id, Some(&reason)) {
                 tracing::warn!(meeting_id = %id, error = %e, "crash recovery: could not mark failed");
             }
@@ -2361,26 +2499,26 @@ fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
 }
 
 /// Best-effort crash recovery for a salvaged meeting's optional **system**
-/// track: repair its WAV header the same way as the mic track's. Any problem
-/// (no path, missing/empty file, unrepairable header) clears the stored path
+/// track: salvage it the same way as the mic track. Any problem
+/// (no path, missing/empty file, unsalvageable audio) clears the stored path
 /// and drops the track — the meeting still recovers mic-only, mirroring the
 /// live degrade contract.
 fn recover_system_track(store: &Store, meeting: &Meeting) -> Option<PathBuf> {
     let path = meeting.system_audio_path.clone()?;
     let wav = PathBuf::from(&path);
-    let recovered = match lumen_asr::repair_wav_header(&wav) {
-        Ok(repaired) if repaired.data_bytes > 0 => Some(wav),
-        Ok(_) => {
-            // Header-only: nothing captured; remove the empty shell.
+    let recovered = match salvage_track(&wav) {
+        Salvage::Recovered(_) => Some(wav),
+        Salvage::Empty => {
+            // Nothing captured; remove the empty shell.
             let _ = std::fs::remove_file(&wav);
             None
         }
-        Err(e) => {
+        Salvage::Unrecoverable(e) => {
             tracing::warn!(
                 meeting_id = %meeting.id,
                 path = %wav.display(),
                 error = %e,
-                "crash recovery: system track unrepairable, continuing mic-only"
+                "crash recovery: system track unsalvageable, continuing mic-only"
             );
             None
         }
@@ -2554,10 +2692,60 @@ pub fn rename_meeting(
     })
 }
 
+#[derive(Debug)]
 struct PreparedMeetingTrim {
     mic: PathBuf,
     system: Option<PathBuf>,
     duration_seconds: f64,
+}
+
+/// Outcome of copying a time range of one track to a new file in the source's
+/// own format (WAV stays WAV, Opus stays Opus).
+enum RangeCopy {
+    Written { duration_seconds: f64 },
+    /// The requested range does not overlap the track's audio (the optional
+    /// system track may start after / end before the kept mic interval).
+    NoOverlap,
+}
+
+/// Copy `[start_seconds, end_seconds)` of `source` to `dest`, keeping the
+/// source's on-disk format: PCM16 WAVs are range-copied directly; Ogg-Opus
+/// tracks are decoded, sliced, and re-encoded through [`lumen_asr::OpusSink`].
+fn copy_meeting_audio_range(
+    source: &Path,
+    dest: &Path,
+    start_seconds: f64,
+    end_seconds: f64,
+) -> Result<RangeCopy, String> {
+    if crate::audio_convert::audio_extension(source) == "opus" {
+        let (samples, rate) = lumen_asr::decode_opus_to_pcm(source)
+            .map_err(|error| format!("解码录音失败：{error}"))?;
+        if rate == 0 {
+            return Err("录音采样率无效".to_string());
+        }
+        let start = (start_seconds.max(0.0) * f64::from(rate)) as usize;
+        let end = ((end_seconds.max(0.0) * f64::from(rate)) as usize).min(samples.len());
+        if start >= samples.len() || end <= start {
+            return Ok(RangeCopy::NoOverlap);
+        }
+        let kept = &samples[start..end];
+        let mut sink = lumen_asr::OpusSink::create(dest, rate)
+            .map_err(|error| format!("写入录音失败：{error}"))?;
+        sink.write_samples(kept)
+            .map_err(|error| format!("写入录音失败：{error}"))?;
+        sink.finalize()
+            .map_err(|error| format!("写入录音失败：{error}"))?;
+        return Ok(RangeCopy::Written {
+            duration_seconds: kept.len() as f64 / f64::from(rate),
+        });
+    }
+    match copy_pcm16_wav_range(source, dest, start_seconds, end_seconds) {
+        Ok(summary) => Ok(RangeCopy::Written {
+            duration_seconds: summary.duration_seconds,
+        }),
+        Err(WavRangeError::InvalidRange { .. }) => Ok(RangeCopy::NoOverlap),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn prepare_meeting_trim(
@@ -2571,11 +2759,19 @@ fn prepare_meeting_trim(
         .parent()
         .ok_or_else(|| "会议音频目录无效".to_string())?;
     let token = Uuid::new_v4().simple();
-    let new_mic = directory.join(format!("{id}.trim-{token}.wav"));
-    let new_system = directory.join(format!("{id}.trim-{token}.system.wav"));
+    // Each trimmed track keeps its source's format/extension.
+    let mic_ext = crate::audio_convert::audio_extension(&mic_source);
+    let mic_ext = if mic_ext.is_empty() { "wav".to_string() } else { mic_ext };
+    let new_mic = directory.join(format!("{id}.trim-{token}.{mic_ext}"));
 
-    let mic_summary = copy_pcm16_wav_range(&mic_source, &new_mic, start_seconds, end_seconds)
-        .map_err(|error| format!("剪辑麦克风录音失败：{error}"))?;
+    let mic_summary = match copy_meeting_audio_range(&mic_source, &new_mic, start_seconds, end_seconds)
+        .map_err(|error| format!("剪辑麦克风录音失败：{error}"))?
+    {
+        RangeCopy::Written { duration_seconds } => duration_seconds,
+        RangeCopy::NoOverlap => {
+            return Err("剪辑麦克风录音失败：保留区间超出录音范围".to_string());
+        }
+    };
 
     let (mic_offset, system_offset) =
         read_timeline_offsets(&mic_source.with_extension("timeline.json"));
@@ -2586,15 +2782,18 @@ fn prepare_meeting_trim(
         if let Some((local_start, local_end, kept_skew)) =
             system_trim_range(start_seconds, end_seconds, system_skew)
         {
-            match copy_pcm16_wav_range(system_source, &new_system, local_start, local_end) {
-                Ok(_) => {
-                    kept_system = Some(new_system.clone());
-                    // Usually both kept WAVs now begin together. When the
+            let sys_ext = crate::audio_convert::audio_extension(system_source);
+            let sys_ext = if sys_ext.is_empty() { "wav".to_string() } else { sys_ext };
+            let new_system = directory.join(format!("{id}.trim-{token}.system.{sys_ext}"));
+            match copy_meeting_audio_range(system_source, &new_system, local_start, local_end) {
+                Ok(RangeCopy::Written { .. }) => {
+                    kept_system = Some(new_system);
+                    // Usually both kept tracks now begin together. When the
                     // selected range starts before the system capture did,
                     // preserve the remaining positive start skew.
                     new_system_skew = Some(kept_skew);
                 }
-                Err(WavRangeError::InvalidRange { .. }) => {
+                Ok(RangeCopy::NoOverlap) => {
                     // The optional system track has no overlap with the kept
                     // interval; the mic track remains authoritative.
                 }
@@ -2618,12 +2817,13 @@ fn prepare_meeting_trim(
     Ok(PreparedMeetingTrim {
         mic: new_mic,
         system: kept_system,
-        duration_seconds: mic_summary.duration_seconds,
+        duration_seconds: mic_summary,
     })
 }
 
 /// Destructively keep one continuous range of a finished meeting and discard
-/// everything before/after it. New WAVs are fully prepared first; only then is
+/// everything before/after it. New audio files (same format as the sources) are
+/// fully prepared first; only then is
 /// the database atomically switched to the new sources and its time-aligned
 /// derived data cleared. The old files are removed after that commit and the
 /// normal offline pipeline regenerates the transcript and minutes.
@@ -2733,7 +2933,7 @@ pub async fn trim_meeting_audio(
 
 /// Delete a meeting and everything attached to it. The store cascade removes the
 /// segments, speakers, and summaries; this command additionally deletes the
-/// meeting's recorded WAV from disk (best-effort — a missing file is fine, and a
+/// meeting's recorded audio from disk (best-effort — a missing file is fine, and a
 /// remove error is logged but does not fail the delete, since the row is already
 /// gone). Returns `true` if a meeting row was deleted.
 #[tauri::command]
@@ -3811,9 +4011,10 @@ mod tests {
         let nested = meetings.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         let owned = meetings.join("owned.wav");
+        let owned_opus = meetings.join("owned.opus");
         let outside = directory.path().join("outside.wav");
         let nested_wav = nested.join("nested.wav");
-        for path in [&owned, &outside, &nested_wav] {
+        for path in [&owned, &owned_opus, &outside, &nested_wav] {
             std::fs::write(path, b"fixture").unwrap();
         }
 
@@ -3821,9 +4022,128 @@ mod tests {
             owned_meeting_wav_in(&meetings, &owned).unwrap(),
             owned.canonicalize().unwrap()
         );
+        // Opus recordings (the default for new meetings) are equally owned.
+        assert_eq!(
+            owned_meeting_wav_in(&meetings, &owned_opus).unwrap(),
+            owned_opus.canonicalize().unwrap()
+        );
         assert!(owned_meeting_wav_in(&meetings, &outside).is_err());
         assert!(owned_meeting_wav_in(&meetings, &nested_wav).is_err());
     }
+
+    #[test]
+    fn imported_opus_copies_as_is_into_the_meetings_dir() {
+        let directory = tempfile::tempdir().unwrap();
+        let meetings = directory.path().join("meetings");
+        let source = directory.path().join("standup.opus");
+        std::fs::write(&source, b"OggS-fixture").unwrap();
+
+        let prepared = prepare_imported_meeting_audio(&source, &meetings).unwrap();
+        assert_eq!(prepared.meeting.status, MeetingStatus::Processing);
+        // Stored as `.opus` (no ffmpeg, no PCM re-inflation).
+        assert_eq!(
+            prepared.wav,
+            meetings.join(format!("{}.opus", prepared.meeting.id))
+        );
+        assert_eq!(std::fs::read(&prepared.wav).unwrap(), b"OggS-fixture");
+    }
+
+    fn write_test_opus(path: &std::path::Path, seconds: f64) {
+        let rate = 16_000u32;
+        let total = (seconds * f64::from(rate)) as usize;
+        let samples: Vec<f32> = (0..total)
+            .map(|i| 0.2 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / rate as f32).sin())
+            .collect();
+        let mut sink = lumen_asr::OpusSink::create(path, rate).unwrap();
+        sink.write_samples(&samples).unwrap();
+        sink.finalize().unwrap();
+    }
+
+    #[test]
+    fn trimming_an_opus_meeting_re_encodes_opus_and_keeps_alignment() {
+        let directory = tempfile::tempdir().unwrap();
+        let mic = directory.path().join("meeting.opus");
+        let system = directory.path().join("meeting.system.opus");
+        write_test_opus(&mic, 3.0);
+        write_test_opus(&system, 3.0);
+        write_timeline_sidecar(
+            &mic.with_extension("timeline.json"),
+            &MeetingTimeline {
+                mic_offset_seconds: 0.0,
+                system_offset_seconds: Some(0.2),
+                t0_wall_clock: "2026-01-01T00:00:00+00:00".into(),
+            },
+        );
+
+        let prepared = prepare_meeting_trim(
+            uuid::Uuid::new_v4(),
+            mic.clone(),
+            Some(system.clone()),
+            0.5,
+            2.5,
+        )
+        .unwrap();
+        assert!((prepared.duration_seconds - 2.0).abs() < 0.1);
+        assert_eq!(
+            prepared.mic.extension().and_then(|e| e.to_str()),
+            Some("opus")
+        );
+        let (pcm, rate) = lumen_asr::decode_opus_to_pcm(&prepared.mic).unwrap();
+        assert_eq!(rate, 16_000);
+        assert!((pcm.len() as f64 / 16_000.0 - 2.0).abs() < 0.1);
+        assert!(prepared.system.as_ref().is_some_and(|path| {
+            path.extension().and_then(|e| e.to_str()) == Some("opus") && path.exists()
+        }));
+        assert!(mic.exists(), "the coordinator owns old-file deletion");
+        assert_eq!(
+            read_timeline_offsets(&prepared.mic.with_extension("timeline.json")),
+            (0.0, Some(0.0))
+        );
+    }
+
+    #[test]
+    fn opus_trim_range_beyond_the_track_is_a_no_overlap() {
+        let directory = tempfile::tempdir().unwrap();
+        let mic = directory.path().join("meeting.opus");
+        write_test_opus(&mic, 1.0);
+
+        let error = prepare_meeting_trim(uuid::Uuid::new_v4(), mic.clone(), None, 5.0, 6.0)
+            .unwrap_err();
+        assert!(error.contains("剪辑麦克风录音失败"));
+        assert!(mic.exists());
+    }
+
+    #[test]
+    fn salvaging_opus_decodes_duration_without_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let opus = directory.path().join("meeting.opus");
+        write_test_opus(&opus, 2.0);
+        match super::salvage_track(&opus) {
+            super::Salvage::Recovered(seconds) => assert!((seconds - 2.0).abs() < 0.1),
+            _ => panic!("finalized opus should salvage"),
+        }
+
+        // A crashed take (no finalize) still decodes its completed pages.
+        let crashed = directory.path().join("crashed.opus");
+        let rate = 16_000u32;
+        let samples = vec![0.2f32; 3 * rate as usize];
+        let mut sink = lumen_asr::OpusSink::create(&crashed, rate).unwrap();
+        sink.write_samples(&samples).unwrap();
+        drop(sink);
+        match super::salvage_track(&crashed) {
+            super::Salvage::Recovered(seconds) => assert!(seconds >= 1.0),
+            _ => panic!("crashed opus should salvage its completed pages"),
+        }
+
+        // Garbage is unrecoverable.
+        let junk = directory.path().join("junk.opus");
+        std::fs::write(&junk, b"not ogg").unwrap();
+        assert!(matches!(
+            super::salvage_track(&junk),
+            super::Salvage::Unrecoverable(_)
+        ));
+    }
+
 
     #[test]
     fn imported_wav_copies_into_the_meetings_dir_as_processing() {

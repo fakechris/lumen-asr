@@ -285,6 +285,19 @@ pub struct AppState {
     /// front-end drains them (it can miss the live event if recovery runs before
     /// its listener is ready). See `meeting_cmd::take_recovery_notices`.
     pub meeting_recovery_notices: std::sync::Mutex<Vec<meeting_cmd::MeetingRecoveryEvent>>,
+    /// Single-slot cache for the last Opus meeting track decoded to WAV bytes
+    /// for playback (`meeting_cmd::read_meeting_audio_wav`), keyed by path +
+    /// (length, mtime) so a trimmed/replaced file is never served stale.
+    /// `Arc` keeps cache hits from re-decoding; the bytes are cloned out per
+    /// IPC response.
+    #[allow(clippy::type_complexity)]
+    pub meeting_playback_cache: std::sync::Mutex<
+        Option<(
+            std::path::PathBuf,
+            (u64, Option<std::time::SystemTime>),
+            std::sync::Arc<Vec<u8>>,
+        )>,
+    >,
     /// Real-time (P3) streaming-Paraformer live-transcript worker for the
     /// active recording. Idle (no worker) unless a recording is streaming.
     pub meeting_live: meeting_live::MeetingLive,
@@ -452,6 +465,7 @@ pub fn run() {
             meeting_recording_owner: Mutex::new(meeting_cmd::MeetingRecordingOwner::default()),
             meeting_audio_edit: tokio::sync::Mutex::new(()),
             meeting_recovery_notices: Mutex::new(Vec::new()),
+            meeting_playback_cache: Mutex::new(None),
             meeting_live: meeting_live::MeetingLive::default(),
             meeting_system_audio: meeting_system_audio::MeetingSystemAudio::default(),
             meeting_mic_aec: meeting_mic_aec::MeetingMicAec::default(),
@@ -535,6 +549,9 @@ pub fn run() {
             meeting_cmd::get_meeting_detection_stats,
             meeting_cmd::get_meeting_watchdog_config,
             meeting_cmd::set_meeting_watchdog_config,
+            meeting_cmd::get_meeting_audio_format,
+            meeting_cmd::set_meeting_audio_format,
+            meeting_cmd::read_meeting_audio_wav,
             meeting_cmd::continue_meeting_after_silence,
             meeting_cmd::continue_meeting_after_max_duration,
             meeting_cmd::process_meeting_now,

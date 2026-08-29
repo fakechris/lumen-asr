@@ -356,12 +356,12 @@ function MeetingLibrary({
         } else if (event.payload.type === "drop") {
           setDropActive(false);
           const path = event.payload.paths.find((p) =>
-            /\.(wav|wave|mp3|m4a|mp4)$/i.test(p),
+            /\.(wav|wave|mp3|m4a|mp4|opus|ogg)$/i.test(p),
           );
           if (path) {
             void importFile(path);
           } else if (event.payload.paths.length > 0) {
-            onError("仅支持 wav / mp3 / m4a / mp4");
+            onError("仅支持 wav / mp3 / m4a / mp4 / opus");
           }
         }
       })
@@ -518,7 +518,7 @@ function MeetingLibrary({
             <p className="muted-text">
               {query.trim()
                 ? "没有匹配的会议标题。"
-                : "点上方“开始会议”录一场，或“导入文件”选择 wav / mp3 / m4a / mp4。也可把文件拖到这里。"}
+                : "点上方“开始会议”录一场，或“导入文件”选择 wav / mp3 / m4a / mp4 / opus。也可把文件拖到这里。"}
             </p>
           </div>
         ) : (
@@ -2385,15 +2385,40 @@ function MeetingDetailView({
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
 
-  // Only expose a player when the meeting is done and has a recorded WAV. The
-  // asset: URL is produced by Tauri's asset protocol (scoped to the meetings
-  // dir in tauri.conf.json) so <audio> can stream + seek the file directly
-  // without shuttling megabytes of PCM over IPC.
-  const audioSrc = useMemo(() => {
+  // Only expose a player when the meeting is done and has recorded audio. WAV
+  // files stream + seek directly through Tauri's asset protocol (scoped to the
+  // meetings dir in tauri.conf.json) without shuttling megabytes of PCM over
+  // IPC. Ogg-Opus files (the default for new recordings) cannot play in
+  // WKWebView, so they are decoded server-side to in-memory WAV bytes (cached
+  // there) and played from a blob URL — seeking works the same once loaded.
+  const [audioSrc, setAudioSrc] = useState<string | null>(null);
+  useEffect(() => {
     const path = detail?.meeting.audio_path;
-    if (!path || detail?.meeting.status !== "ready") return null;
-    return convertFileSrc(path);
-  }, [detail?.meeting.audio_path, detail?.meeting.status]);
+    if (!path || detail?.meeting.status !== "ready") {
+      setAudioSrc(null);
+      return;
+    }
+    if (!/\.opus$/i.test(path)) {
+      setAudioSrc(convertFileSrc(path));
+      return;
+    }
+    let cancelled = false;
+    let blobUrl: string | null = null;
+    api
+      .readMeetingAudioWav(meetingId)
+      .then((buf) => {
+        if (cancelled) return;
+        blobUrl = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+        setAudioSrc(blobUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setAudioSrc(null);
+      });
+    return () => {
+      cancelled = true;
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
+  }, [detail?.meeting.audio_path, detail?.meeting.status, meetingId]);
 
   // Reset the playhead when the audio source changes (switching meetings reuses
   // this component instance, so state would otherwise carry over).

@@ -18,7 +18,7 @@
 //! [`Corrector`] trait) and is skipped when no corrector is supplied.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use lumen_asr_engine::AsrEngine;
 use lumen_core::MeetingStatus;
@@ -211,6 +211,20 @@ async fn transcribe_track(
     Ok((take, diar.speaker_embeddings, sample_rate, duration))
 }
 
+/// Decode an Ogg-Opus track to a temporary 16 kHz PCM WAV (see
+/// [`crate::pipeline::materialize_wav_track`]). Every downstream stage —
+/// diar-rs's path-based decoder, the echo pass's window reads, per-turn ASR
+/// slicing — stays WAV-only, while sidecar reads/writes (timeline offsets,
+/// echo diagnostics) keep using the *original* path, which sits next to the
+/// meeting's metadata.
+fn materialize_wav_track(
+    path: &Path,
+    scratch: &mut Option<tempfile::TempDir>,
+    name: &str,
+) -> Result<PathBuf, ProcessError> {
+    Ok(crate::pipeline::materialize_wav_track(path, scratch, name)?)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     store: &Store,
@@ -243,10 +257,34 @@ async fn run(
         .update_meeting_status(meeting_id, MeetingStatus::Transcribing)
         .map_err(ProcessError::Store)?;
 
+    // Opus tracks are decoded to temporary WAVs for the audio-consuming stages;
+    // `wav`/`system_wav` keep pointing at the originals so metadata sidecars
+    // (`<id>.timeline.json`, echo diagnostics) are read/written in place. The
+    // scratch dir lives until the end of `run`.
+    let mut opus_scratch: Option<tempfile::TempDir> = None;
+    let mic_audio = materialize_wav_track(wav, &mut opus_scratch, "mic.decoded.wav")?;
+    // The system track is best-effort end to end: an opus decode failure
+    // degrades to mic-only with a warning, exactly like a transcribe failure.
+    let system_audio = match system_wav {
+        Some(sys) => match materialize_wav_track(sys, &mut opus_scratch, "system.decoded.wav") {
+            Ok(path) => Some(path),
+            Err(error) => {
+                tracing::warn!(
+                    meeting_id = %meeting_id,
+                    system_wav = %sys.display(),
+                    error = %error,
+                    "could not decode system track; continuing mic-only"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     // Mic track: authoritative — any failure here fails the meeting, exactly
     // as before dual-track existed.
     let (mic_take, mic_embeddings, sample_rate, mut duration) = transcribe_track(
-        wav,
+        &mic_audio,
         diar_models,
         asr_engine,
         opts,
@@ -271,7 +309,7 @@ async fn run(
     // The system track's real (non-silence) failure, when it had one — kept so
     // layer 3 below can surface it if the mic track also has nothing to say.
     let mut system_track_error: Option<String> = None;
-    let system_take = match system_wav {
+    let system_take = match system_audio.as_deref() {
         Some(sys) => match transcribe_track(
             sys,
             diar_models,
@@ -359,7 +397,8 @@ async fn run(
     // is then simply absent.
     let mut echo_diagnostics: Option<crate::echo::EchoDiagnostics> = None;
     if opts.echo_suppression {
-        if let (Some((system, _)), Some(sys_wav)) = (system_take.as_ref(), system_wav) {
+        if let (Some((system, _)), Some(sys_audio)) = (system_take.as_ref(), system_audio.as_ref())
+        {
             // The cross-correlation is CPU-bound (hundreds of millions of
             // multiply-adds per candidate pair) and the sidecar write is file
             // IO, so both run on the blocking pool rather than starving the
@@ -367,23 +406,27 @@ async fn run(
             // a panicked/cancelled task keeps every mic segment.
             let mic_clone = mic_take.clone();
             let system_clone = system.clone();
-            let mic_wav = wav.to_path_buf();
-            let sys_wav = sys_wav.to_path_buf();
+            // Window reads use the (possibly decoded-from-opus) WAV paths;
+            // timeline/diagnostics sidecars live next to the *original* mic
+            // track, so those keep using `wav`.
+            let mic_audio_path = mic_audio.clone();
+            let sys_audio_path = sys_audio.clone();
+            let mic_meta_path = wav.to_path_buf();
             let outcome = tokio::task::spawn_blocking(move || {
                 // Measured system→mic start skew from the recording-time
                 // timeline sidecar (0.0 when absent), so the delay/coverage
                 // evidence compares both tracks on one timeline instead of
                 // assuming a near-common start.
-                let system_skew_s = crate::echo::read_timeline_skew(&mic_wav);
+                let system_skew_s = crate::echo::read_timeline_skew(&mic_meta_path);
                 let result = crate::echo::suppress_cross_track_echoes(
                     &mic_clone,
                     &system_clone,
-                    &mic_wav,
-                    &sys_wav,
+                    &mic_audio_path,
+                    &sys_audio_path,
                     system_skew_s,
                 );
                 if let Err(err) =
-                    crate::echo::write_diagnostics_sidecar(&result.diagnostics, &mic_wav)
+                    crate::echo::write_diagnostics_sidecar(&result.diagnostics, &mic_meta_path)
                 {
                     tracing::warn!(
                         error = %err,
@@ -774,6 +817,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("m.sqlite")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn opus_tracks_materialize_to_wav_and_everything_else_passes_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scratch: Option<tempfile::TempDir> = None;
+
+        // A WAV path is returned unchanged and no scratch dir is created.
+        let wav = dir.path().join("meeting.wav");
+        std::fs::write(&wav, b"RIFF").unwrap();
+        assert_eq!(
+            materialize_wav_track(&wav, &mut scratch, "mic.decoded.wav").unwrap(),
+            wav
+        );
+        assert!(scratch.is_none());
+
+        // An Opus track decodes to a 16 kHz mono PCM WAV in the scratch dir.
+        let opus = dir.path().join("meeting.opus");
+        let rate = 16_000u32;
+        let samples: Vec<f32> = (0..rate)
+            .map(|i| 0.2 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / rate as f32).sin())
+            .collect();
+        let mut sink = lumen_audio::OpusSink::create(&opus, rate).unwrap();
+        sink.write_samples(&samples).unwrap();
+        sink.finalize().unwrap();
+
+        let decoded = materialize_wav_track(&opus, &mut scratch, "mic.decoded.wav").unwrap();
+        assert_ne!(decoded, opus);
+        assert!(decoded.exists());
+        let pcm = crate::echo::read_full_wav_mono_16k(&decoded)
+            .expect("materialized wav should be readable");
+        assert!((pcm.len() as f64 / 16_000.0 - 1.0).abs() < 0.1);
+
+        // A corrupt opus is a transcribe-stage error, not a panic.
+        let junk = dir.path().join("junk.opus");
+        std::fs::write(&junk, b"not ogg").unwrap();
+        assert!(materialize_wav_track(&junk, &mut scratch, "junk.decoded.wav").is_err());
     }
 
     // On any build without the macOS `diarize` feature, `diarize_wav` returns

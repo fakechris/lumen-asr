@@ -21,7 +21,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lumen_asr::{LiveTapSender, RecordingSummary, SystemTrackRecorder, SystemTrackSender};
+use lumen_asr::{
+    LiveTapSender, MeetingAudioFormat, RecordingSummary, SystemTrackRecorder, SystemTrackSender,
+};
 use lumen_platform_macos::{VoiceInputSink, VoiceProcessingError, VoiceProcessingInput};
 
 const STARTUP_AUDIO_TIMEOUT: Duration = Duration::from_millis(1_500);
@@ -92,11 +94,13 @@ impl MeetingMicAec {
         device: Option<String>,
         out_path: PathBuf,
         live: Option<LiveTapSender>,
+        format: MeetingAudioFormat,
     ) -> Option<u32> {
         self.start_with_capture(
             device,
             out_path,
             live,
+            format,
             Box::new(VoiceProcessingInput::new()),
             STARTUP_AUDIO_TIMEOUT,
         )
@@ -107,6 +111,7 @@ impl MeetingMicAec {
         device: Option<String>,
         out_path: PathBuf,
         live: Option<LiveTapSender>,
+        format: MeetingAudioFormat,
         mut capture: Box<dyn VoiceCaptureBackend>,
         first_audio_timeout: Duration,
     ) -> Option<u32> {
@@ -176,7 +181,7 @@ impl MeetingMicAec {
             }
         };
 
-        let track = match SystemTrackRecorder::create(&out_path, sample_rate) {
+        let track = match SystemTrackRecorder::create_with_format(&out_path, sample_rate, format) {
             Ok(track) => track,
             Err(e) => {
                 capture.stop();
@@ -461,6 +466,7 @@ mod tests {
             None,
             path.clone(),
             None,
+            MeetingAudioFormat::Wav,
             Box::new(SilentCapture {
                 stopped: Arc::clone(&stopped),
                 sink: None,
@@ -484,6 +490,7 @@ mod tests {
             None,
             path.clone(),
             Some(live),
+            MeetingAudioFormat::Wav,
             Box::new(ActiveCapture::default()),
             Duration::from_millis(200),
         );
@@ -508,6 +515,7 @@ mod tests {
             None,
             path.clone(),
             Some(live),
+            MeetingAudioFormat::Wav,
             Box::new(OneShotCapture {
                 stopped: Arc::clone(&stopped),
                 sink: None,
@@ -532,6 +540,7 @@ mod tests {
             None,
             path.clone(),
             None,
+            MeetingAudioFormat::Wav,
             Box::new(FailingCapture),
             Duration::from_millis(10),
         );
@@ -551,6 +560,7 @@ mod tests {
             None,
             path,
             None,
+            MeetingAudioFormat::Wav,
             Box::new(SilentCapture {
                 stopped: Arc::clone(&stopped),
                 sink: None,
@@ -572,6 +582,7 @@ mod tests {
                 None,
                 path.clone(),
                 None,
+                MeetingAudioFormat::Wav,
                 Box::new(ActiveCapture::default()),
                 Duration::from_millis(200),
             ),
@@ -583,6 +594,7 @@ mod tests {
             None,
             temp_wav("rejected-second-aec"),
             None,
+            MeetingAudioFormat::Wav,
             Box::new(StartTrackingCapture {
                 started: Arc::clone(&second_started),
             }),
@@ -611,6 +623,7 @@ mod tests {
             None,
             temp_wav("poisoned-aec-lock"),
             None,
+            MeetingAudioFormat::Wav,
             Box::new(StartTrackingCapture {
                 started: Arc::clone(&started),
             }),
