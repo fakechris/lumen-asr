@@ -71,6 +71,18 @@ export function isModelTargetReady(
   }
 }
 
+/** Any usable dictation engine: an installed SenseVoice, or the active engine
+ * (qwen/whisper) with its model ready. Shared by the onboarding auto-queue and
+ * the final-step readiness pill so they never disagree. */
+export function isDictationReady(status: AsrModelStatus | null): boolean {
+  if (!status) return false;
+  return (
+    status.sensevoiceReady ||
+    (status.activeEngine === "qwen" && status.qwenReady) ||
+    (status.activeEngine === "whisper" && status.whisperReady)
+  );
+}
+
 /** Union of two target lists, `add` entries last, no duplicates. */
 function mergeTargets(prev: ModelTarget[], add: ModelTarget[]): ModelTarget[] {
   return [...prev.filter((t) => !add.includes(t)), ...add];

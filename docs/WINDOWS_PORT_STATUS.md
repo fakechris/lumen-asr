@@ -34,9 +34,10 @@ At this point, no intentional macOS behavior break has been introduced.
   until UI Automation, Windows Graphics Capture and secure storage are added.
 - First-run Windows config migrates the collision-prone `Alt+Space` default to
   `Ctrl+Shift+Space`.
-- Qwen3-ASR now runs in-process via sherpa-onnx (CPU, cross-platform) and works
-  on Windows like on macOS; the old Apple MLX Python runtime and its Qwen
-  shadow mode are gone.
+- Qwen3-ASR now runs in-process via sherpa-onnx (CPU) and is implemented
+  cross-platform, including Windows; the old Apple MLX Python runtime and its
+  Qwen shadow mode are gone. Windows runtime verification of the Qwen engine is
+  still pending (see below).
 - SenseVoice downloads stream and extract in-process through `lumen-models`;
   packaged apps no longer require system `curl` or `tar`.
 - Windows CI definitions now exercise the shared crates, frontend, and desktop

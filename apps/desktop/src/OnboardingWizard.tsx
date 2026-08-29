@@ -9,6 +9,7 @@ import { formatHotkeyLabel } from "./hotkeyFormat";
 import { Icon } from "./Icons";
 import { chooseAudioDevice } from "./audioDeviceSelection";
 import {
+  isDictationReady,
   useMeetingModels,
   type MeetingModels,
   type ModelTarget,
@@ -156,11 +157,7 @@ export function OnboardingWizard({ onDone }: Props) {
     const s = models.status;
     if (!s || autoQueuedRef.current) return;
     autoQueuedRef.current = true;
-    const dictationReady =
-      s.sensevoiceReady ||
-      (s.activeEngine === "qwen" && s.qwenReady) ||
-      (s.activeEngine === "whisper" && s.whisperReady);
-    if (!dictationReady) models.enqueue(["sensevoice"]);
+    if (!isDictationReady(s)) models.enqueue(["sensevoice"]);
   }, [models]);
 
   useEffect(() => {
@@ -273,7 +270,7 @@ export function OnboardingWizard({ onDone }: Props) {
   const axOk = perm?.accessibilityTrusted ?? false;
   const canLeavePerms = micOk;
   const meterPct = Math.min(100, Math.round(Math.max(peak, rms * 2) * 200));
-  const asrReady = models.status?.sensevoiceReady ?? false;
+  const asrReady = isDictationReady(models.status);
 
   return (
     <div
