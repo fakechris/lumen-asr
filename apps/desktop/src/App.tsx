@@ -2359,6 +2359,33 @@ function SettingsPanel({
   const [calendarEndReminder, setCalendarEndReminder] = useState(true);
   // On-disk format for new meeting recordings ("opus" default, "wav" legacy).
   const [meetingAudioFormat, setMeetingAudioFormat] = useState("opus");
+  // Latest-wins token so a slow older save cannot clobber a newer selection;
+  // on failure the persisted value is re-read instead of leaving the
+  // optimistic one displayed.
+  const meetingAudioFormatSave = useRef(0);
+  const saveMeetingAudioFormat = useCallback(
+    (next: string) => {
+      setMeetingAudioFormat(next);
+      const request = ++meetingAudioFormatSave.current;
+      void api
+        .setMeetingAudioFormat(next)
+        .then((saved) => {
+          if (meetingAudioFormatSave.current === request) {
+            setMeetingAudioFormat(saved.audioFormat);
+          }
+        })
+        .catch((err) => {
+          onError(String(err));
+          if (meetingAudioFormatSave.current === request) {
+            void api
+              .getMeetingAudioFormat()
+              .then((fmt) => setMeetingAudioFormat(fmt.audioFormat))
+              .catch(() => {});
+          }
+        });
+    },
+    [onError],
+  );
   // Debounce + latest-wins so rapid edits to either field don't race as
   // independent writes (each call persists both fields, so an older in-flight
   // write could otherwise clobber the newer one).
@@ -3441,14 +3468,7 @@ function SettingsPanel({
             value={meetingAudioFormat}
             disabled={busy}
             style={{ maxWidth: 200 }}
-            onChange={(e) => {
-              const next = e.target.value;
-              setMeetingAudioFormat(next);
-              void api
-                .setMeetingAudioFormat(next)
-                .then((saved) => setMeetingAudioFormat(saved.audioFormat))
-                .catch((err) => onError(String(err)));
-            }}
+            onChange={(e) => saveMeetingAudioFormat(e.target.value)}
           >
             <option value="opus">Opus（默认，约省 90% 空间）</option>
             <option value="wav">WAV（未压缩 PCM）</option>

@@ -261,6 +261,10 @@ async fn run(
     // `wav`/`system_wav` keep pointing at the originals so metadata sidecars
     // (`<id>.timeline.json`, echo diagnostics) are read/written in place. The
     // scratch dir lives until the end of `run`.
+    //
+    // The system track's real (non-silence) failure, when it had one — kept so
+    // layer 3 below can surface it if the mic track also has nothing to say.
+    let mut system_track_error: Option<String> = None;
     let mut opus_scratch: Option<tempfile::TempDir> = None;
     let mic_audio = materialize_wav_track(wav, &mut opus_scratch, "mic.decoded.wav")?;
     // The system track is best-effort end to end: an opus decode failure
@@ -275,6 +279,10 @@ async fn run(
                     error = %error,
                     "could not decode system track; continuing mic-only"
                 );
+                system_track_error = Some(match &error {
+                    ProcessError::Transcribe(inner) => inner.to_string(),
+                    other => other.to_string(),
+                });
                 None
             }
         },
@@ -305,10 +313,8 @@ async fn run(
     // System track (optional): best-effort. The remote-participants track is a
     // bonus on top of a working mic recording, so a diarize/ASR failure here
     // degrades to the mic-only transcript with a warning instead of failing
-    // the whole meeting.
-    // The system track's real (non-silence) failure, when it had one — kept so
-    // layer 3 below can surface it if the mic track also has nothing to say.
-    let mut system_track_error: Option<String> = None;
+    // the whole meeting. (`system_track_error` was declared before opus
+    // materialization above, so a decode failure is surfaced the same way.)
     let system_take = match system_audio.as_deref() {
         Some(sys) => match transcribe_track(
             sys,

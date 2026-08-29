@@ -361,7 +361,7 @@ function MeetingLibrary({
           if (path) {
             void importFile(path);
           } else if (event.payload.paths.length > 0) {
-            onError("仅支持 wav / mp3 / m4a / mp4 / opus");
+            onError("仅支持 wav / mp3 / m4a / mp4 / opus / ogg");
           }
         }
       })
@@ -518,7 +518,7 @@ function MeetingLibrary({
             <p className="muted-text">
               {query.trim()
                 ? "没有匹配的会议标题。"
-                : "点上方“开始会议”录一场，或“导入文件”选择 wav / mp3 / m4a / mp4 / opus。也可把文件拖到这里。"}
+                : "点上方“开始会议”录一场，或“导入文件”选择 wav / mp3 / m4a / mp4 / opus / ogg。也可把文件拖到这里。"}
             </p>
           </div>
         ) : (
@@ -2394,8 +2394,11 @@ function MeetingDetailView({
   const [audioSrc, setAudioSrc] = useState<string | null>(null);
   useEffect(() => {
     const path = detail?.meeting.audio_path;
+    // Reset first: while an Opus decode is in flight the player must not keep
+    // serving the previous meeting's audio (this component instance is reused
+    // across meetings).
+    setAudioSrc(null);
     if (!path || detail?.meeting.status !== "ready") {
-      setAudioSrc(null);
       return;
     }
     if (!/\.opus$/i.test(path)) {
