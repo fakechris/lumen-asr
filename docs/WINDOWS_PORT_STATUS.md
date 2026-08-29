@@ -34,8 +34,10 @@ At this point, no intentional macOS behavior break has been introduced.
   until UI Automation, Windows Graphics Capture and secure storage are added.
 - First-run Windows config migrates the collision-prone `Alt+Space` default to
   `Ctrl+Shift+Space`.
-- On Windows, the Apple MLX Qwen3-ASR runtime and Qwen shadow mode are disabled.
-  The resource recommendation reports the reason and selects SenseVoice.
+- Qwen3-ASR now runs in-process via sherpa-onnx (CPU) and is implemented
+  cross-platform, including Windows; the old Apple MLX Python runtime and its
+  Qwen shadow mode are gone. Windows runtime verification of the Qwen engine is
+  still pending (see below).
 - SenseVoice downloads stream and extract in-process through `lumen-models`;
   packaged apps no longer require system `curl` or `tar`.
 - Windows CI definitions now exercise the shared crates, frontend, and desktop
@@ -63,9 +65,6 @@ At this point, no intentional macOS behavior break has been introduced.
 - The CI-produced MSIX is also unsigned. Microsoft signs it after Store
   certification; direct sideload distribution still requires a trusted
   signature.
-- Qwen local inference uses the Apple MLX worker and is intentionally not
-  offered as a Windows local engine. On Windows it falls back to SenseVoice;
-  a future CUDA/DirectML/ONNX backend can replace this restriction.
 - `diar-rs` has an unconditional Unix-style rpath linker argument and is not
   part of the first Windows desktop milestone.
 

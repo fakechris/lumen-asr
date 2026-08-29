@@ -13,7 +13,7 @@ import { ThemeToggle } from "./ThemeToggle";
 import { ChordCaptureChip } from "./ChordCaptureChip";
 import { MeetingPanel } from "./MeetingPanel";
 import { IdentityPanel } from "./IdentityPanel";
-import { MeetingModelsProvider } from "./meetingModels";
+import { MeetingModelsProvider, useMeetingModels } from "./meetingModels";
 import {
   acknowledgeWindowsMicrophoneNotice,
   hasAcknowledgedWindowsMicrophoneNotice,
@@ -1727,8 +1727,6 @@ function RecordPanel({
   );
   const [showMicrophoneConsent, setShowMicrophoneConsent] = useState(false);
   const microphoneConsentTriggerRef = useRef<HTMLElement | null>(null);
-  const onSavedRef = useRef(onSaved);
-  onSavedRef.current = onSaved;
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -1763,21 +1761,6 @@ function RecordPanel({
       await refreshStatus();
     })();
   }, [onError, refreshStatus]);
-
-  useEffect(() => {
-    if (!status?.qwenRuntimeChecking) return;
-    const timer = window.setInterval(
-      () =>
-        void (async () => {
-          const next = await refreshStatus();
-          if (next && !next.qwenRuntimeChecking) {
-            await onSavedRef.current();
-          }
-        })(),
-      500,
-    );
-    return () => window.clearInterval(timer);
-  }, [refreshStatus, status?.qwenRuntimeChecking]);
 
   // Hotkey dictation done → fill result + baseline for learning
   useEffect(() => {
@@ -2072,12 +2055,8 @@ function RecordPanel({
               本地 SenseVoice {status?.sensevoice.ready ? "✓" : "（模型未就绪）"}
             </option>
             <option value="local_qwen">
-              本地 Qwen3-ASR 0.6B 8-bit（高准确率）{" "}
-              {status?.qwenRuntimeChecking
-                ? "（正在检查运行环境…）"
-                : status?.qwen.ready && status?.qwenRuntimeReady
-                  ? "✓"
-                  : "（模型或运行环境未就绪）"}
+              本地 Qwen3-ASR（高准确率，自动识别语种）{" "}
+              {status?.qwen.ready ? "✓" : "（模型未就绪）"}
             </option>
             <option value="local_whisper">
               本地 Whisper {status?.whisper.ready ? "✓" : "（模型未就绪）"}
@@ -2165,7 +2144,7 @@ function RecordPanel({
           <p className="muted-text" style={{ marginTop: 12 }}>
             当前本地引擎未就绪。
             {provider.includes("qwen")
-              ? "请到「设置 → 语音识别」选择 Qwen MLX 模型目录，并填写包含 mlx_qwen3_asr 的 Python 可执行文件。"
+              ? "请到「设置 → 语音识别」下载或选择 Qwen3-ASR（sherpa-onnx）模型目录。"
               : provider.includes("whisper")
                 ? "请到「设置 → 语音识别」选择可用的 Whisper 模型目录。"
                 : "请将 SenseVoice 的 model.int8.onnx 与 tokens.txt 放到模型目录，或到「设置 → 语音识别」切换其它 ASR。"}
@@ -2334,7 +2313,6 @@ function SettingsPanel({
   >([]);
   const [asrProvider, setAsrProvider] = useState("local_sensevoice");
   const [asrRuntimePath, setAsrRuntimePath] = useState("");
-  const [qwenShadowEnabled, setQwenShadowEnabled] = useState(false);
   const [asrBaseUrl, setAsrBaseUrl] = useState("");
   const [asrModel, setAsrModel] = useState("");
   const [asrApiKey, setAsrApiKey] = useState("");
@@ -2422,7 +2400,6 @@ function SettingsPanel({
         setAsrPresets(asrP);
         setAsrProvider(asrC.provider);
         setAsrRuntimePath(asrC.runtimePath || "");
-        setQwenShadowEnabled(asrC.qwenShadowEnabled);
         setAsrBaseUrl(asrC.baseUrl);
         setAsrModel(asrC.model);
         setAsrLanguage(asrC.language || "");
@@ -3631,33 +3608,7 @@ function SettingsPanel({
           </div>
         )}
         {asrProvider === "local_qwen" && (
-          <>
-            <div className="form-row">
-              <label className="form-label wide">
-                Qwen Python
-              </label>
-              <input
-                className="input"
-                value={asrRuntimePath}
-                disabled={busy}
-                onChange={(event) => setAsrRuntimePath(event.target.value)}
-                placeholder="包含 mlx_qwen3_asr 的 Python 可执行文件"
-              />
-            </div>
-            <div className="form-row">
-              <label className="muted-text">
-                <input
-                  type="checkbox"
-                  checked={qwenShadowEnabled}
-                  disabled={busy}
-                  onChange={(event) =>
-                    setQwenShadowEnabled(event.target.checked)
-                  }
-                />{" "}
-                启用本地术语候选分析（不改变输出）
-              </label>
-            </div>
-          </>
+          <QwenDownloadRow onError={onError} onSaved={onSaved} />
         )}
         {!asrProvider.startsWith("local") && (
           <>
@@ -3728,7 +3679,6 @@ function SettingsPanel({
                   const input: Parameters<typeof api.saveAsrServiceConfig>[0] = {
                     provider: asrProvider,
                     runtimePath: asrRuntimePath,
-                    qwenShadowEnabled,
                     baseUrl: asrBaseUrl,
                     model: asrModel,
                     language: asrLanguage,
@@ -3737,7 +3687,6 @@ function SettingsPanel({
                   const s = await api.saveAsrServiceConfig(input);
                   setAsrProvider(s.provider);
                   setAsrRuntimePath(s.runtimePath || "");
-                  setQwenShadowEnabled(s.qwenShadowEnabled);
                   setAsrBaseUrl(s.baseUrl);
                   setAsrModel(s.model);
                   setAsrLanguage(s.language);
@@ -4239,6 +4188,70 @@ function SettingsPanel({
             : `v${buildInfo.version} · ${buildInfo.git_sha} · ${buildInfo.build_time}`}
       </p>
     </>
+  );
+}
+
+/** One-click Qwen3-ASR (sherpa-onnx) install inside 设置 → 语音识别. Rides the
+ * app-level download queue (single-flight, cancellable); hides itself once the
+ * model is installed. */
+function QwenDownloadRow({
+  onError,
+  onSaved,
+}: {
+  onError: (e: string | null) => void;
+  onSaved: () => void;
+}) {
+  const models = useMeetingModels();
+  const downloading = models.active === "qwen";
+  const otherBusy = models.active !== null && !downloading;
+  const wasDownloading = useRef(false);
+  useEffect(() => {
+    if (wasDownloading.current && !downloading && models.status?.qwenReady) {
+      // The download command also switches the active engine to Qwen.
+      onSaved();
+    }
+    wasDownloading.current = downloading;
+  }, [downloading, models.status, onSaved]);
+  if (models.status?.qwenReady) return null;
+  return (
+    <div className="onboard-status" style={{ marginBottom: 12 }}>
+      <div className="muted-text">
+        Qwen3-ASR 是本地高准确率引擎（sherpa-onnx，自动识别语种，无需 Python）。模型包约 838
+        MB，下载完成后会自动切换为当前引擎。
+      </div>
+      {downloading && models.progress && (
+        <p className="muted-text">
+          {models.progress.message}
+          {models.progress.percent != null
+            ? ` ${Math.round(models.progress.percent)}%`
+            : ""}
+        </p>
+      )}
+      <div className="actions">
+        {downloading ? (
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => void models.cancel()}
+          >
+            取消下载
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="btn"
+            disabled={otherBusy}
+            onClick={() => {
+              onError(null);
+              models.enqueue(["qwen"]);
+            }}
+          >
+            下载 Qwen3-ASR 模型
+          </button>
+        )}
+      </div>
+      {models.error && <p className="meeting-model-error">{models.error}</p>}
+    </div>
   );
 }
 

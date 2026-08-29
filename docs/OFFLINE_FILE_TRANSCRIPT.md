@@ -28,7 +28,7 @@ audio (wav | m4a | mp3 | …)
 diar-rs  (speaker turns, macOS + diarize feature)
   │  merge short fragments (default < 1.5 s) → fewer false speakers
   ▼
-per-turn AsrEngine  (SenseVoice | Qwen MLX | mlx-whisper Metal | sherpa Whisper)
+per-turn AsrEngine  (SenseVoice | Qwen3-ASR sherpa | mlx-whisper Metal | sherpa Whisper)
   │
   ├─ optional LLM corrector: --translate zh[,en,…]
   ▼
@@ -59,7 +59,7 @@ time windows; ASR owns text**.
 | Engine | Runtime | Best for | Notes |
 |--------|---------|----------|--------|
 | **sensevoice** | sherpa-onnx | CJK dictation | Official langs: zh / en / ja / ko / yue — **not** Spanish |
-| **qwen** | MLX Python worker (Metal) | Multi-lingual file ASR (fast) | Uses `config.toml` `[asr] runtime_path` or `LUMEN_QWEN_PYTHON` |
+| **qwen** | sherpa-onnx (in-process) | Multi-lingual file ASR (fast) | Auto-detects language; uses the shared `qwen3-sherpa` model dir |
 | **mlx-whisper** | mlx-whisper worker (Metal) | Multi-lingual quality Whisper | Production Whisper path; needs `mlx-whisper` in the Python env |
 | **whisper** | sherpa-onnx CPU | Tiny/debug only | **Not** for large multi-lingual production |
 
@@ -105,7 +105,7 @@ meeting process talk.m4a --lang es
 
 # Right:
 meeting process talk.m4a --engine mlx-whisper --lang es
-meeting process talk.m4a --engine qwen --lang Spanish
+meeting process talk.m4a --engine qwen --lang es
 ```
 
 ---
@@ -127,7 +127,7 @@ lumen-asr-desktop meeting process talk.m4a \
 
 # Structured Cut-ready JSON with translations.zh on each segment
 lumen-asr-desktop meeting process talk.m4a \
-  --engine qwen --lang Spanish \
+  --engine qwen --lang es \
   --format transcript-v1 --translate zh
 ```
 
@@ -136,9 +136,9 @@ lumen-asr-desktop meeting process talk.m4a \
 ## Examples
 
 ```bash
-# Multi-lingual file, Metal Qwen, printable speakers
+# Multi-lingual file, sherpa Qwen3-ASR, printable speakers
 ./target/release/lumen-asr-desktop meeting process ./recording.m4a \
-  --engine qwen --lang Spanish --format text
+  --engine qwen --lang es --format text
 
 # Production Whisper (Metal turbo)
 ./target/release/lumen-asr-desktop meeting process ./recording.m4a \
@@ -161,24 +161,25 @@ Shared root: `~/Library/Application Support/Lumen/models/`
 |------|------|
 | `diar/` | diar-rs seg + emb + plda |
 | `sensevoice/` | sherpa SenseVoice |
-| `qwen3-asr-0.6b-8bit/` | Qwen3-ASR MLX snapshot |
+| `qwen3-sherpa/` | Qwen3-ASR sherpa-onnx (`conv_frontend.onnx`, `encoder.int8.onnx`, `decoder.int8.onnx`, `tokenizer/`) |
 | `whisper/` | sherpa Whisper ONNX (optional CPU path) |
 | HF cache `mlx-community/whisper-large-v3-turbo` | mlx-whisper weights (auto-fetched) |
 
-Python for Qwen / mlx-whisper: `[asr] runtime_path` in config, or env `LUMEN_QWEN_PYTHON`.
-Install mlx stack once, e.g.:
+Python for mlx-whisper only: `[asr] runtime_path` in config, or env `LUMEN_QWEN_PYTHON`.
+Install it once, e.g.:
 
 ```bash
-uv pip install --python "$LUMEN_QWEN_PYTHON" mlx-qwen3-asr mlx-whisper
+uv pip install --python "$LUMEN_QWEN_PYTHON" mlx-whisper
 ```
 
 ---
 
 ## Optional helper script (experimental)
 
-`scripts/offline_file_transcript.py` can reuse a diar turns JSON and run Qwen /
-mlx-whisper outside the desktop binary for local experiments. Supported
-production path: `lumen-asr-desktop meeting process`.
+`scripts/offline_file_transcript.py` can reuse a diar turns JSON and run
+mlx-whisper (or the legacy MLX Qwen stack, if still installed) outside the
+desktop binary for local experiments. Supported production path:
+`lumen-asr-desktop meeting process`.
 
 ---
 

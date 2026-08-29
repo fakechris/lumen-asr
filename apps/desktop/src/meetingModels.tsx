@@ -22,7 +22,7 @@ import { api, type AsrModelStatus } from "./api";
 // listener drives progress for whichever download is in flight, and cancel /
 // failure state survives navigation.
 
-export type ModelTarget = "sensevoice" | "streaming" | "offline";
+export type ModelTarget = "sensevoice" | "qwen" | "streaming" | "offline";
 
 export type ModelProgressState = {
   phase: string;
@@ -62,11 +62,25 @@ export function isModelTargetReady(
   switch (target) {
     case "sensevoice":
       return status.sensevoiceReady;
+    case "qwen":
+      return status.qwenReady;
     case "streaming":
       return status.paraformerStreamingReady;
     case "offline":
       return status.paraformerOfflineReady;
   }
+}
+
+/** Any usable dictation engine: an installed SenseVoice, or the active engine
+ * (qwen/whisper) with its model ready. Shared by the onboarding auto-queue and
+ * the final-step readiness pill so they never disagree. */
+export function isDictationReady(status: AsrModelStatus | null): boolean {
+  if (!status) return false;
+  return (
+    status.sensevoiceReady ||
+    (status.activeEngine === "qwen" && status.qwenReady) ||
+    (status.activeEngine === "whisper" && status.whisperReady)
+  );
 }
 
 /** Union of two target lists, `add` entries last, no duplicates. */
@@ -159,9 +173,11 @@ function useProvideMeetingModels(): MeetingModels {
         const next =
           target === "sensevoice"
             ? await api.startAsrModelDownload()
-            : target === "streaming"
-              ? await api.downloadParaformerStreaming()
-              : await api.downloadParaformerOffline();
+            : target === "qwen"
+              ? await api.downloadQwen3Sherpa()
+              : target === "streaming"
+                ? await api.downloadParaformerStreaming()
+                : await api.downloadParaformerOffline();
         statusRef.current = next;
         setStatus(next);
       } catch (e) {

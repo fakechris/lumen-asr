@@ -26,10 +26,7 @@ pub use types::{
 // ASR engine identity and runtime diagnostics moved to the shared
 // `lumen-asr-engine` crate (lumen-suite). Re-exported here so existing
 // `lumen_core::…` imports and the persisted serde shapes stay unchanged.
-pub use lumen_asr_engine::{
-    AsrEngineId, AsrRuntimeDiagnostics, AsrTokenEvidence, QwenDecodeMode, QwenRuntimeMetrics,
-    QwenShadowCandidate, QwenShadowDiagnostics, QwenShadowScore, QwenShadowSpan, QwenShadowStatus,
-};
+pub use lumen_asr_engine::{AsrEngineId, AsrRuntimeDiagnostics};
 
 // Shared `lumen-transcript.v1` interchange types (lumen-suite), re-exported
 // so app-layer callers of the export functions can name the document types

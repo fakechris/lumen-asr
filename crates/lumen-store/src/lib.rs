@@ -172,6 +172,8 @@ fn parse_pipeline_stage(value: &str) -> Option<PipelineStage> {
 pub enum EnhancementMode {
     #[default]
     None,
+    /// Legacy: produced by the removed MLX Qwen shadow pass. Kept so older
+    /// persisted attempts still deserialize; new attempts never set it.
     QwenShadow,
     #[serde(other)]
     Unknown,
@@ -3209,20 +3211,8 @@ mod tests {
         let mut attempt = DictationAttemptRecord::new(session.id);
         attempt.pipeline_metrics.asr_runtime = Some(AsrRuntimeDiagnostics {
             worker_reused: Some(true),
-            model: Some("Qwen3-ASR-0.6B-8bit".into()),
-            token_evidence: vec![lumen_core::AsrTokenEvidence {
-                token_index: 3,
-                token_id: 42,
-                selected_logprob: -0.5,
-                ..lumen_core::AsrTokenEvidence::default()
-            }],
-            qwen: Some(lumen_core::QwenRuntimeMetrics {
-                chunk_count: Some(1),
-                audio_encode_count: Some(1),
-                prompt_prefill_count: Some(1),
-                ..lumen_core::QwenRuntimeMetrics::default()
-            }),
-            ..AsrRuntimeDiagnostics::default()
+            model: Some("Qwen3-ASR-0.6B".into()),
+            model_revision: Some("revision-1".into()),
         });
         store.append_dictation_attempt(attempt).unwrap();
 
@@ -3232,15 +3222,8 @@ mod tests {
         let diagnostics = stored[0].pipeline_metrics.asr_runtime.as_ref().unwrap();
         assert_eq!(stored[0].pipeline_metrics.schema_version, 3);
         assert_eq!(diagnostics.worker_reused, Some(true));
-        assert_eq!(diagnostics.token_evidence[0].token_index, 3);
-        assert_eq!(
-            diagnostics.qwen.as_ref().unwrap().audio_encode_count,
-            Some(1)
-        );
-        assert_eq!(
-            diagnostics.qwen.as_ref().unwrap().prompt_prefill_count,
-            Some(1)
-        );
+        assert_eq!(diagnostics.model.as_deref(), Some("Qwen3-ASR-0.6B"));
+        assert_eq!(diagnostics.model_revision.as_deref(), Some("revision-1"));
     }
 
     #[test]

@@ -58,22 +58,22 @@ lumen-dictionary = { path = "crates/lumen-dictionary" }
 lumen-edit-learning = { path = "crates/lumen-edit-learning" }
 lumen-store = { path = "crates/lumen-store" }
 lumen-meeting = { path = "crates/lumen-meeting" }
-lumen-identity = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ffa41c42ee1c6276f48a143e9d679378c1093bc7" }
+lumen-identity = { git = "https://github.com/fakechris/lumen-suite.git", rev = "236aa1f6528a78672293600fc41853f4efc6c04d" }
 lumen-inject = { path = "crates/lumen-inject" }
 lumen-platform = { path = "crates/lumen-platform" }
 lumen-platform-macos = { path = "crates/lumen-platform-macos" }
 lumen-prompts = { path = "crates/lumen-prompts" }
 # Versioned capture contracts shared with Lumen's local macOS context collector.
-lumen-context = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ffa41c42ee1c6276f48a143e9d679378c1093bc7" }
+lumen-context = { git = "https://github.com/fakechris/lumen-suite.git", rev = "236aa1f6528a78672293600fc41853f4efc6c04d" }
 # Shared model path/lock/download layer and ASR engine layer for the Lumen
 # product cluster (replaces the former in-repo paths/install_lock/engine code).
-lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ffa41c42ee1c6276f48a143e9d679378c1093bc7" }
-lumen-asr-engine = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ffa41c42ee1c6276f48a143e9d679378c1093bc7", default-features = false }
+lumen-models = { git = "https://github.com/fakechris/lumen-suite.git", rev = "236aa1f6528a78672293600fc41853f4efc6c04d" }
+lumen-asr-engine = { git = "https://github.com/fakechris/lumen-suite.git", rev = "236aa1f6528a78672293600fc41853f4efc6c04d", default-features = false }
 # Shared serde types for the lumen-transcript.v1 interchange format.
-lumen-transcript = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ffa41c42ee1c6276f48a143e9d679378c1093bc7" }
-lumen_platform_suite_macos = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ffa41c42ee1c6276f48a143e9d679378c1093bc7", package = "lumen-platform-macos" }
-lumen-audio = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ffa41c42ee1c6276f48a143e9d679378c1093bc7" }
-lumen_platform_suite = { git = "https://github.com/fakechris/lumen-suite.git", rev = "ffa41c42ee1c6276f48a143e9d679378c1093bc7", package = "lumen-platform" }
+lumen-transcript = { git = "https://github.com/fakechris/lumen-suite.git", rev = "236aa1f6528a78672293600fc41853f4efc6c04d" }
+lumen_platform_suite_macos = { git = "https://github.com/fakechris/lumen-suite.git", rev = "236aa1f6528a78672293600fc41853f4efc6c04d", package = "lumen-platform-macos" }
+lumen-audio = { git = "https://github.com/fakechris/lumen-suite.git", rev = "236aa1f6528a78672293600fc41853f4efc6c04d" }
+lumen_platform_suite = { git = "https://github.com/fakechris/lumen-suite.git", rev = "236aa1f6528a78672293600fc41853f4efc6c04d", package = "lumen-platform" }
 parking_lot = "0.12"
 cpal = "0.15"
 blake3 = "1"

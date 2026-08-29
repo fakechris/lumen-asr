@@ -74,7 +74,7 @@ pub fn app_health(state: State<'_, AppState>) -> Health {
         session_count,
         dictionary_count,
         sensevoice_ready: asr.sensevoice.ready,
-        qwen_ready: asr.qwen.ready && asr.qwen_runtime_ready,
+        qwen_ready: asr.qwen.ready,
         whisper_ready: asr.whisper.ready,
         active_asr_ready: asr.active_ready,
         active_asr_label: asr.provider_label,

@@ -174,17 +174,6 @@ impl AppConfig {
         #[cfg(target_os = "windows")]
         {
             let mut changed = false;
-            if matches!(
-                self.asr.provider.to_ascii_lowercase().as_str(),
-                "qwen" | "qwen3_asr" | "local_qwen"
-            ) {
-                self.asr.provider = "local_sensevoice".into();
-                changed = true;
-            }
-            if self.asr.qwen_shadow_enabled {
-                self.asr.qwen_shadow_enabled = false;
-                changed = true;
-            }
             if self.asr.migrate_windows_shared_model_dirs() {
                 changed = true;
             }
@@ -246,9 +235,11 @@ pub struct AsrServiceConfig {
     pub sensevoice_model_dir: String,
     pub qwen_model_dir: String,
     pub whisper_model_dir: String,
-    /// Python executable containing `mlx_qwen3_asr` for the local Qwen engine.
+    /// Legacy: Python executable for the former MLX Qwen engine. Still read by
+    /// the headless mlx-whisper path; the sherpa-onnx Qwen engine ignores it.
     pub runtime_path: String,
-    /// Opt into bounded same-worker Qwen candidate analysis without changing output.
+    /// Legacy: opt-in flag for the removed MLX Qwen shadow analysis. Tolerated
+    /// on load (older configs carry it) but no longer read anywhere.
     pub qwen_shadow_enabled: bool,
     pub base_url: String,
     pub model: String,
@@ -397,7 +388,10 @@ impl AsrServiceConfig {
         self.model_dir = value;
     }
 
-    pub fn qwen_python_executable(&self) -> PathBuf {
+    /// Python executable for the Python-backed mlx-whisper worker. Backed by
+    /// the legacy `runtime_path` field (which used to configure the MLX Qwen
+    /// engine) so existing configs keep working.
+    pub fn python_executable(&self) -> PathBuf {
         let configured = self.runtime_path.trim();
         if !configured.is_empty() {
             return expand_user_path(configured);
@@ -1066,27 +1060,30 @@ mod tests {
     }
 
     #[test]
-    fn qwen_runtime_path_expands_home_prefix() {
+    fn runtime_path_expands_home_prefix() {
         let mut asr = AsrServiceConfig::default();
-        asr.runtime_path = "~/qwen-env/bin/python".into();
+        asr.runtime_path = "~/mlx-env/bin/python".into();
 
         assert_eq!(
-            asr.qwen_python_executable(),
-            lumen_asr::user_home_dir().join("qwen-env/bin/python")
+            asr.python_executable(),
+            lumen_asr::user_home_dir().join("mlx-env/bin/python")
         );
     }
 
     #[test]
-    fn qwen_shadow_remains_opt_in_for_existing_configs_without_the_new_field() {
+    fn legacy_qwen_shadow_flag_is_tolerated_and_ignored() {
         let asr: AsrServiceConfig = toml::from_str(
             r#"
 provider = "local_qwen"
 runtime_path = "/qwen/bin/python"
+qwen_shadow_enabled = true
 "#,
         )
         .unwrap();
 
-        assert!(!asr.qwen_shadow_enabled);
+        // Legacy field still deserializes; nothing reads it anymore.
+        assert!(asr.qwen_shadow_enabled);
+        assert_eq!(asr.runtime_path, "/qwen/bin/python");
     }
 
     #[test]
@@ -1444,15 +1441,11 @@ provider = "minimax"
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_falls_back_from_mlx_qwen_and_migrates_default_hotkey() {
+    fn windows_migrates_default_hotkey() {
         let mut config = AppConfig::default();
-        config.asr.provider = "local_qwen".into();
-        config.asr.qwen_shadow_enabled = true;
         config.hotkey.toggle = "Alt+Space".into();
 
         assert!(config.apply_platform_fallbacks());
-        assert_eq!(config.asr.provider, "local_sensevoice");
-        assert!(!config.asr.qwen_shadow_enabled);
         assert_eq!(config.hotkey.toggle, "Ctrl+Shift+Space");
     }
 

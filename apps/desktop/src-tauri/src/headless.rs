@@ -84,7 +84,7 @@ fn print_help() {
          \nWith no headless command the desktop app launches normally.\n\
          \nEngines:\n  \
          sensevoice    sherpa-onnx (zh/en/ja/ko/yue) — dictation default\n  \
-         qwen          Qwen3-ASR MLX (Metal) — multi-lingual production path\n  \
+         qwen          Qwen3-ASR sherpa-onnx — multi-lingual, auto-detects language\n  \
          mlx-whisper   mlx-whisper large-v3-turbo (Metal) — production Whisper\n  \
          whisper       sherpa-onnx Whisper (CPU) — not for large multi-lingual"
     );
@@ -402,38 +402,26 @@ fn normalize_lang_hint(raw: &str, engine: EngineChoice) -> Option<String> {
     if t.is_empty() || t.eq_ignore_ascii_case("auto") {
         return None;
     }
-    // Qwen worker prefers full language names; Whisper/SenseVoice use short codes.
+    // sherpa-onnx engines use short codes (Qwen3-ASR auto-detects the language;
+    // the hint is informational). Only the legacy full-name mapping is gone.
     match engine {
-        EngineChoice::Qwen => Some(match t.to_ascii_lowercase().as_str() {
-            "es" | "spa" | "spanish" | "español" | "espanol" => "Spanish".into(),
-            "en" | "eng" | "english" => "English".into(),
-            "zh" | "zh-cn" | "zh-hans" | "chinese" | "中文" => "Chinese".into(),
-            "ja" | "jpn" | "japanese" => "Japanese".into(),
-            "ko" | "kor" | "korean" => "Korean".into(),
-            "fr" | "fra" | "french" => "French".into(),
-            "de" | "deu" | "german" => "German".into(),
-            "pt" | "por" | "portuguese" => "Portuguese".into(),
-            "it" | "ita" | "italian" => "Italian".into(),
-            _ => t.to_string(),
+        EngineChoice::Qwen
+        | EngineChoice::Whisper
+        | EngineChoice::SenseVoice
+        | EngineChoice::MlxWhisper => Some(match t.to_ascii_lowercase().as_str() {
+            "spanish" | "español" | "espanol" | "spa" => "es".into(),
+            "english" | "eng" => "en".into(),
+            "chinese" | "中文" | "zh-cn" | "zh-hans" => "zh".into(),
+            "japanese" | "jpn" => "ja".into(),
+            "korean" | "kor" => "ko".into(),
+            "yue" | "cantonese" => "yue".into(),
+            _ => t.to_ascii_lowercase(),
         }),
-        EngineChoice::Whisper | EngineChoice::SenseVoice | EngineChoice::MlxWhisper => {
-            Some(match t.to_ascii_lowercase().as_str() {
-                "spanish" | "español" | "espanol" | "spa" => "es".into(),
-                "english" | "eng" => "en".into(),
-                "chinese" | "中文" | "zh-cn" | "zh-hans" => "zh".into(),
-                "japanese" | "jpn" => "ja".into(),
-                "korean" | "kor" => "ko".into(),
-                "yue" | "cantonese" => "yue".into(),
-                _ => t.to_ascii_lowercase(),
-            })
-        }
     }
 }
 
 fn python_for_mlx() -> PathBuf {
-    crate::config::AppConfig::load()
-        .asr
-        .qwen_python_executable()
+    crate::config::AppConfig::load().asr.python_executable()
 }
 
 fn build_engine(
@@ -467,15 +455,13 @@ fn build_engine(
             if !qwen_ready(&dir) {
                 return Err(format!("Qwen3-ASR model not ready under {}", dir.display()));
             }
-            let python = python_for_mlx();
             let language = lang.map(|s| s.to_string());
             eprintln!(
-                "meeting process: engine=qwen (MLX) dir={} python={} lang={:?}",
+                "meeting process: engine=qwen (sherpa-onnx) dir={} lang={:?}",
                 dir.display(),
-                python.display(),
                 language
             );
-            let cfg = QwenAsrConfig::product(python, dir, language, Duration::from_secs(600));
+            let cfg = QwenAsrConfig::product(dir, language, Duration::from_secs(600));
             Ok(Box::new(QwenAsr::new(cfg)))
         }
         EngineChoice::MlxWhisper => {
