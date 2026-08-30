@@ -690,7 +690,9 @@ pub struct VadConfig {
     /// RMS below which input counts as silence once speaking. Matches the
     /// 0.005 (≈ −46 dBFS) gate used by meeting preflight / diar-rs.
     pub end_threshold: f32,
-    /// Sustained silence that ends the current dictation.
+    /// Sustained silence that ends the current dictation. Long enough to wait
+    /// out natural mid-thought pauses — a short timeout cuts people off while
+    /// they are still thinking.
     pub silence_timeout_ms: u64,
     /// Drop the silent tail before ASR (keeps a 300ms padding).
     pub trim_trailing: bool,
@@ -708,7 +710,7 @@ impl Default for VadConfig {
             mode: "rms".into(),
             start_threshold: 0.02,
             end_threshold: 0.005,
-            silence_timeout_ms: 1500,
+            silence_timeout_ms: 10_000,
             trim_trailing: true,
             silero_model_path: String::new(),
         }
