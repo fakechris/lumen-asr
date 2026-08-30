@@ -35,6 +35,7 @@ mod pipeline_attempt;
 mod provider_presets;
 mod session_debug;
 mod ui_cmd;
+mod volcengine_asr;
 mod volume_mon;
 
 pub use headless::maybe_run_cli;

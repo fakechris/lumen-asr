@@ -2318,6 +2318,7 @@ function SettingsPanel({
   const [asrApiKey, setAsrApiKey] = useState("");
   const [asrLanguage, setAsrLanguage] = useState("");
   const [asrHasKey, setAsrHasKey] = useState(false);
+  const [asrAppId, setAsrAppId] = useState("");
   const [asrModels, setAsrModels] = useState<AsrModelStatus | null>(null);
   const [asrCustomPath, setAsrCustomPath] = useState("");
   const [cleanup, setCleanup] = useState("medium");
@@ -2464,6 +2465,7 @@ function SettingsPanel({
         setAsrModel(asrC.model);
         setAsrLanguage(asrC.language || "");
         setAsrHasKey(asrC.hasApiKey);
+        setAsrAppId(asrC.volcengineAppId || "");
         setAsrModels(asrStatus);
         setAsrCustomPath(asrStatus.activeModelDir || "");
         setEnabled(c.enabled);
@@ -3769,6 +3771,20 @@ function SettingsPanel({
                 ))}
               </datalist>
             </div>
+            {asrProvider === "volcengine" && (
+              <div className="form-row">
+                <label className="form-label">
+                  App ID
+                </label>
+                <input
+                  className="input"
+                  value={asrAppId}
+                  disabled={busy}
+                  onChange={(e) => setAsrAppId(e.target.value)}
+                  placeholder="旧版控制台必填；新版控制台可留空"
+                />
+              </div>
+            )}
             <div className="form-row">
               <label className="form-label">
                 API Key
@@ -3779,7 +3795,13 @@ function SettingsPanel({
                 value={asrApiKey}
                 disabled={busy}
                 onChange={(e) => setAsrApiKey(e.target.value)}
-                placeholder={asrHasKey ? "已保存（留空不改）" : "必填"}
+                placeholder={
+                  asrHasKey
+                    ? "已保存（留空不改）"
+                    : asrProvider === "volcengine"
+                      ? "Access Token / 新版 APP Key"
+                      : "必填"
+                }
               />
             </div>
             <div className="form-row">
@@ -3813,6 +3835,8 @@ function SettingsPanel({
                     language: asrLanguage,
                   };
                   if (asrApiKey.trim()) input.apiKey = asrApiKey.trim();
+                  if (asrProvider === "volcengine")
+                    input.volcengineAppId = asrAppId.trim();
                   const s = await api.saveAsrServiceConfig(input);
                   setAsrProvider(s.provider);
                   setAsrRuntimePath(s.runtimePath || "");
@@ -3820,6 +3844,7 @@ function SettingsPanel({
                   setAsrModel(s.model);
                   setAsrLanguage(s.language);
                   setAsrHasKey(s.hasApiKey);
+                  setAsrAppId(s.volcengineAppId || "");
                   setAsrApiKey("");
                   await refreshActiveCleanupProfile();
                   onSaved();

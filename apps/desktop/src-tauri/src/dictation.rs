@@ -592,6 +592,8 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         "local_qwen" => qwen.ready,
         "local_whisper" => wh.ready,
         "openai_audio" | "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
+        // volcengine: ready once the access token (or 新版控制台 APP Key) is set.
+        "volcengine" => !asr_cfg.api_key.is_empty(),
         // config_only: selectable but not runnable yet
         _ => false,
     };
@@ -634,6 +636,7 @@ pub(crate) fn ensure_active_asr_ready(
         "local_sensevoice" => "请先安装或选择有效的 SenseVoice 模型。",
         "local_whisper" => "请先选择有效的 Whisper 模型。",
         "openai_audio" | "custom" => "请先完成在线 ASR 的地址与凭据配置。",
+        "volcengine" => "请先在「设置 → 语音识别」填写火山引擎的 Access Token（新版控制台填 APP Key；旧版控制台还需 App ID）。",
         _ => "当前 ASR 尚未接入可运行的识别客户端。",
     };
     Err(format!("{provider_label} 未就绪。{guidance}"))
@@ -1745,16 +1748,13 @@ async fn run_asr(
     let provider = canonical_asr_provider(&asr_cfg.provider);
     let provider = provider.as_str();
 
-    if matches!(
-        provider,
-        "aliyun_qwen" | "volcengine" | "soniox" | "stepfun" | "mimo"
-    ) {
+    if matches!(provider, "aliyun_qwen" | "soniox" | "stepfun" | "mimo") {
         return Err(format!(
             "ASR「{provider}」仅预置了 endpoint，完整流式客户端尚未接入。请改用本地 SenseVoice 或 OpenAI Audio。"
         ));
     }
 
-    if matches!(provider, "openai_audio" | "custom") {
+    if matches!(provider, "openai_audio" | "custom" | "volcengine") {
         return run_cloud_asr_with_local_hedge(state, provider, asr_cfg, samples_16k, attempt)
             .await;
     }
@@ -1777,7 +1777,7 @@ async fn run_cloud_asr_with_local_hedge(
     let local_kind = local_hedge_engine_kind(state);
     let configured = Duration::from_secs(asr_cfg.timeout_secs.max(30));
     let deadline = cloud_asr_hedge_deadline(configured, local_kind.is_some());
-    let cloud = transcribe_openai_audio(asr_cfg, samples_16k.clone());
+    let cloud = transcribe_cloud_asr(provider, asr_cfg, samples_16k.clone());
     let cloud_outcome = match tokio::time::timeout(deadline, cloud).await {
         Ok(outcome) => outcome,
         Err(_) => Err("timeout".into()),
@@ -1838,6 +1838,43 @@ fn local_hedge_engine_kind(state: &AppState) -> Option<EngineKind> {
         }
     }
     None
+}
+
+async fn transcribe_cloud_asr(
+    provider: &str,
+    asr_cfg: &AsrServiceConfig,
+    samples_16k: Vec<f32>,
+) -> Result<AsrResult, String> {
+    if provider == "volcengine" {
+        return transcribe_volcengine(asr_cfg, samples_16k).await;
+    }
+    transcribe_openai_audio(asr_cfg, samples_16k).await
+}
+
+/// Volcengine 录音文件识别极速版：one synchronous HTTP POST, batch semantics
+/// (dictation only — meetings stay on the local streaming engine).
+async fn transcribe_volcengine(
+    asr_cfg: &AsrServiceConfig,
+    samples_16k: Vec<f32>,
+) -> Result<AsrResult, String> {
+    use crate::volcengine_asr::{VolcengineAsr, VolcengineAsrConfig, DEFAULT_FLASH_URL};
+
+    let base = if asr_cfg.base_url.trim().is_empty() {
+        DEFAULT_FLASH_URL.into()
+    } else {
+        asr_cfg.base_url.clone()
+    };
+    let eng = VolcengineAsr::new(VolcengineAsrConfig {
+        base_url: base,
+        app_id: asr_cfg.volcengine_app_id.clone(),
+        access_token: asr_cfg.api_key.clone(),
+        timeout: Duration::from_secs(asr_cfg.timeout_secs.max(30)),
+        ..VolcengineAsrConfig::default()
+    })
+    .map_err(|e| e.to_string())?;
+    eng.transcribe(AsrRequest::new(samples_16k, 16_000))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn transcribe_openai_audio(

@@ -1,7 +1,8 @@
 //! Built-in LLM / ASR provider catalogs (endpoints + default models).
 //!
 //! LLM presets use OpenAI-compatible chat completions unless noted.
-//! Cloud ASR: `openai_audio` + local engines are fully wired; other entries may be config-only.
+//! Cloud ASR: `openai_audio` + `volcengine` + local engines are fully wired;
+//! other entries may be config-only.
 
 use serde::Serialize;
 
@@ -309,14 +310,14 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
         },
         AsrProviderPreset {
             id: "volcengine".into(),
-            label: "火山引擎 ASR".into(),
-            kind: "websocket".into(),
-            base_url: String::new(),
+            label: "火山引擎 ASR（极速版）".into(),
+            kind: "http_batch".into(),
+            base_url: "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash".into(),
             default_model: String::new(),
             models: vec![],
             needs_api_key: true,
-            status: "config_only".into(),
-            notes: "需要 app_id + access_token；流式客户端待接".into(),
+            status: "wired".into(),
+            notes: "同步 HTTP 一句话识别（极速版，资源 volc.bigasr.auc_turbo）。凭据：Access Token 填在 API Key；旧版控制台还需在 App ID 栏填 App ID，新版控制台只需把 APP Key 填进 API Key。".into(),
         },
         AsrProviderPreset {
             id: "soniox".into(),
