@@ -1167,6 +1167,17 @@ impl VerificationStreak {
     fn observe_miss(&mut self, track: &'static str) {
         self.by_track.remove(track);
     }
+
+    /// Forget every tally for `speaker` on all tracks: the annotation that
+    /// name was keyed by was retracted or renamed, so the freed name may be
+    /// reused for a *different* person and must not inherit the old group's
+    /// established streak.
+    fn forget_speaker(&mut self, speaker: &SpeakerKey) {
+        for tallies in self.by_track.values_mut() {
+            tallies.remove(speaker);
+        }
+        self.by_track.retain(|_, tallies| !tallies.is_empty());
+    }
 }
 
 /// Spawn the embedder thread when the layer can run: macOS with the diar
@@ -1268,6 +1279,9 @@ fn run_verifier(
                         "session voiceprint retracted (annotation cleared)"
                     );
                 }
+                // A cleared name may be reused for a different person: it
+                // must not keep the old group's streak tally.
+                streak.forget_speaker(&SpeakerKey::Session(display_name));
                 continue;
             }
             VerifierMsg::Rename { old_name, new_name } => {
@@ -1277,6 +1291,10 @@ fn run_verifier(
                         "session voiceprint relabeled (annotation renamed)"
                     );
                 }
+                // The mistyped name is free for reuse; the renamed speaker
+                // re-establishes under the corrected name instead of the old
+                // name's tally silently following it.
+                streak.forget_speaker(&SpeakerKey::Session(old_name));
                 continue;
             }
             VerifierMsg::Verify(job) => job,
@@ -1340,7 +1358,7 @@ fn run_verifier(
                 // Same streak rule as the permanent library, keyed by the
                 // session name: once this speaker is established on the
                 // track, a grey-zone hit displays verified — including the
-                // first utterance of a return after other speakers (P4).
+                // first utterance of a return after other speakers.
                 let upgraded =
                     streak.observe_hit(job.track, SpeakerKey::Session(hit.display_name.clone()));
                 let provisional = hit.provisional && !upgraded;
@@ -2233,6 +2251,29 @@ mod tests {
         // Another cluster interleaves; 说话人1's established tally survives.
         assert!(!streak.observe_hit(TRACK_MIC, c2));
         assert!(streak.observe_hit(TRACK_MIC, c1));
+    }
+
+    #[test]
+    fn retracted_or_renamed_session_name_loses_its_streak() {
+        let mut streak = VerificationStreak::default();
+        let name = SpeakerKey::Session("客户A".into());
+        // Establish the name on both tracks.
+        assert!(!streak.observe_hit(TRACK_MIC, name.clone()));
+        assert!(!streak.observe_hit(TRACK_MIC, name.clone()));
+        assert!(streak.observe_hit(TRACK_MIC, name.clone()));
+        assert!(!streak.observe_hit(TRACK_SYSTEM, name.clone()));
+        assert!(!streak.observe_hit(TRACK_SYSTEM, name.clone()));
+        // The annotation is cleared: the freed name may belong to a different
+        // person next time, so its tally is forgotten on every track.
+        streak.forget_speaker(&name);
+        assert!(!streak.observe_hit(TRACK_MIC, name.clone()));
+        assert!(!streak.observe_hit(TRACK_SYSTEM, name.clone()));
+        // Forgetting one speaker never touches another's tally.
+        let b = identity_key(Uuid::new_v4());
+        assert!(!streak.observe_hit(TRACK_MIC, b.clone()));
+        assert!(!streak.observe_hit(TRACK_MIC, b.clone()));
+        streak.forget_speaker(&name);
+        assert!(streak.observe_hit(TRACK_MIC, b));
     }
 
     // ---- L3.5: session voiceprints ---------------------------------------
