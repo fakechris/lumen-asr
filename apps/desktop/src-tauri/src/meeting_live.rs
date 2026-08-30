@@ -611,10 +611,13 @@ const VERIFY_MIN_UTTERANCE_SECONDS: f64 =
 /// unlabeled) rather than ever back-pressuring the transcription loop.
 const EMBED_QUEUE_CAPACITY: usize = 4;
 
-/// Consecutive same-identity hits a track needs before *later* provisional
-/// hits may display as verified (the streak upgrade). Two agreeing utterances
-/// establish the streak; from the next hit on, the person is evidently the
-/// one talking on that track, so a grey-zone score stops re-adding the "?".
+/// Hits on the same speaker a track needs before *later* provisional hits for
+/// that speaker may display as verified (the streak upgrade). Two agreeing
+/// utterances establish the speaker on that track; from the next hit on, the
+/// person is evidently the one talking there, so a grey-zone score stops
+/// re-adding the "?". Tallies are kept per speaker (see
+/// [`VerificationStreak`]), so an established speaker who returns after
+/// others talked is re-verified on their first utterance back.
 const STREAK_UPGRADE_AFTER: u32 = 2;
 
 /// Rolling window of a track's recent audio (model-rate mono), stamped on the
@@ -1097,40 +1100,83 @@ impl LiveVerifier {
     }
 }
 
-/// Per-track consecutive-hit bookkeeping for the streak upgrade rule: after
-/// [`STREAK_UPGRADE_AFTER`] consecutive hits (provisional or verified) on the
-/// same identity, *subsequent* provisional hits on that track may display as
-/// verified. Only actually-matched segments are ever revised; a differing
-/// identity resets the streak, while skipped/short utterances (no report)
-/// leave it untouched. Pure and unit-testable — kept un-gated (like
-/// [`EmbedJob`]) so the rule is tested on every platform; its only non-test
-/// caller is the macOS embedder thread, hence the dead-code allowance
-/// elsewhere.
+/// Which speaker a live verification decision pointed at, across the three
+/// attribution sources. Streak tallies are keyed by this — not by "whoever
+/// spoke last on the track" — so a speaker who returns after someone else
+/// talked keeps their own accumulated evidence instead of restarting from
+/// zero. The sources are distinct namespaces that never alias each other,
+/// even when the display strings coincide (a user could literally annotate
+/// someone "说话人1").
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SpeakerKey {
+    /// Enrolled identity library hit (L3).
+    Identity(Uuid),
+    /// Session voiceprint hit (L3.5), keyed by the annotated name.
+    Session(String),
+    /// Unknown-speaker session cluster hit (L4), keyed by the 说话人N label.
+    Cluster(String),
+}
+
+/// Per-track hit tallies for the streak upgrade rule: after
+/// [`STREAK_UPGRADE_AFTER`] hits (provisional or verified) on the same
+/// speaker, *subsequent* provisional hits for that speaker on that track may
+/// display as verified. Tallies are kept **per speaker** ([`SpeakerKey`]):
+///
+/// - an established speaker who returns after other speakers talked is
+///   re-verified on their first utterance back (the streak pre-rolls),
+///   instead of needing two fresh consecutive hits;
+/// - an interleaved different speaker neither inherits nor extends anyone
+///   else's tally — their own streak starts from zero, and they break the
+///   would-be consecutive run (a speaker whose tally is still 1 after an
+///   interleave has no streak yet and stays provisional);
+/// - a fully unlabeled utterance (verification ran but no source claimed it)
+///   clears the track's tallies entirely, while skipped/short utterances
+///   (no report) leave them untouched.
+///
+/// Pure and unit-testable — kept un-gated (like [`EmbedJob`]) so the rule is
+/// tested on every platform; its only non-test caller is the macOS embedder
+/// thread, hence the dead-code allowance elsewhere.
 #[derive(Default)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct VerificationStreak {
-    by_track: std::collections::HashMap<&'static str, (Uuid, u32)>,
+    by_track: std::collections::HashMap<&'static str, std::collections::HashMap<SpeakerKey, u32>>,
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl VerificationStreak {
-    /// Record a hit for `identity` on `track`; returns `true` when a
-    /// provisional hit may display as verified (streak established *before*
-    /// this hit).
-    fn observe_hit(&mut self, track: &'static str, identity: Uuid) -> bool {
-        let entry = self.by_track.entry(track).or_insert((identity, 0));
-        if entry.0 != identity {
-            *entry = (identity, 0);
-        }
-        let upgraded = entry.1 >= STREAK_UPGRADE_AFTER;
-        entry.1 += 1;
+    /// Record a hit for `speaker` on `track`; returns `true` when a
+    /// provisional hit may display as verified — i.e. the speaker's tally on
+    /// this track had *already* reached [`STREAK_UPGRADE_AFTER`] before this
+    /// hit (the streak was established earlier, possibly before other
+    /// speakers interleaved).
+    fn observe_hit(&mut self, track: &'static str, speaker: SpeakerKey) -> bool {
+        let tally = self
+            .by_track
+            .entry(track)
+            .or_default()
+            .entry(speaker)
+            .or_insert(0);
+        let upgraded = *tally >= STREAK_UPGRADE_AFTER;
+        *tally += 1;
         upgraded
     }
 
-    /// A confident-enough report pointed at a *different* person (or the
-    /// policy rejected it): the run of agreement is broken.
+    /// Verification ran but nothing labeled the utterance: the run of
+    /// agreement on this track is broken and all its tallies reset.
     fn observe_miss(&mut self, track: &'static str) {
         self.by_track.remove(track);
+    }
+
+    /// Forget every tally for `speaker` on all tracks: the annotation that
+    /// name was keyed by was retracted or renamed, so the freed name may be
+    /// reused for a *different* person and must not inherit the old group's
+    /// established streak.
+    fn forget_speaker(&mut self, speaker: &SpeakerKey) {
+        for tallies in self.by_track.values_mut() {
+            tallies.remove(speaker);
+        }
+        self.by_track.retain(|_, tallies| !tallies.is_empty());
     }
 }
 
@@ -1166,14 +1212,16 @@ fn spawn_live_verifier(_app: AppHandle, _meeting_id: String) -> Option<LiveVerif
 /// Embedder thread body: load the WeSpeaker model once, then process queued
 /// messages — session voiceprint seeds/retractions (L3.5) and finalized
 /// utterances to verify (L3). Verification checks the **permanent identity
-/// library first** (unchanged behaviour); when it does not label the
-/// utterance it falls back to the in-memory session set (L3.5, emitted with
-/// no `identity_id`), and when that also misses, to the unknown-speaker
-/// session clusters (L4, emitted as a stable session-scoped `说话人N`
-/// placeholder label). Every failure path skips the message; nothing here
-/// can affect the transcription loop. The session set and the clusters — the
-/// only places session embeddings ever live — are dropped when this thread
-/// exits at recording stop.
+/// library first**; when it does not label the utterance it falls back to
+/// the in-memory session set (L3.5, emitted with no `identity_id`), and when
+/// that also misses, to the unknown-speaker session clusters (L4, emitted as
+/// a stable session-scoped `说话人N` placeholder label). Whichever source
+/// labels the utterance feeds the per-speaker streak
+/// ([`VerificationStreak`]); an utterance no source claims breaks the track's
+/// run. Every failure path skips the message; nothing here can affect the
+/// transcription loop. The session set and the clusters — the only places
+/// session embeddings ever live — are dropped when this thread exits at
+/// recording stop.
 #[cfg(target_os = "macos")]
 fn run_verifier(
     app: AppHandle,
@@ -1231,6 +1279,9 @@ fn run_verifier(
                         "session voiceprint retracted (annotation cleared)"
                     );
                 }
+                // A cleared name may be reused for a different person: it
+                // must not keep the old group's streak tally.
+                streak.forget_speaker(&SpeakerKey::Session(display_name));
                 continue;
             }
             VerifierMsg::Rename { old_name, new_name } => {
@@ -1240,6 +1291,10 @@ fn run_verifier(
                         "session voiceprint relabeled (annotation renamed)"
                     );
                 }
+                // The mistyped name is free for reuse; the renamed speaker
+                // re-establishes under the corrected name instead of the old
+                // name's tally silently following it.
+                streak.forget_speaker(&SpeakerKey::Session(old_name));
                 continue;
             }
             VerifierMsg::Verify(job) => job,
@@ -1265,16 +1320,18 @@ fn run_verifier(
         let mut speaker: Option<LiveSpeaker> = None;
         if let Some(report) = identities.and_then(|ids| ids.verify_speaker(&embedding)) {
             match live_decision(&report, voiced_ms) {
-                LiveDecision::NoMatch => {
-                    streak.observe_miss(job.track);
-                }
+                // No streak wipe here: the session/cluster fallbacks below
+                // may still label the utterance, and only a fully unlabeled
+                // utterance breaks the track's run of agreement.
+                LiveDecision::NoMatch => {}
                 decision => {
+                    let key = SpeakerKey::Identity(report.identity_id);
                     let provisional = match decision {
                         LiveDecision::VerifiedAuto => {
-                            streak.observe_hit(job.track, report.identity_id);
+                            streak.observe_hit(job.track, key);
                             false
                         }
-                        _ => !streak.observe_hit(job.track, report.identity_id),
+                        _ => !streak.observe_hit(job.track, key),
                     };
                     // Ids and scores only — the matched name is PII.
                     tracing::info!(
@@ -1298,18 +1355,25 @@ fn run_verifier(
         //    for this meeting.
         if speaker.is_none() {
             if let Some(hit) = session.match_speaker(&embedding, voiced_ms) {
+                // Same streak rule as the permanent library, keyed by the
+                // session name: once this speaker is established on the
+                // track, a grey-zone hit displays verified — including the
+                // first utterance of a return after other speakers.
+                let upgraded =
+                    streak.observe_hit(job.track, SpeakerKey::Session(hit.display_name.clone()));
+                let provisional = hit.provisional && !upgraded;
                 tracing::info!(
                     segment = %job.segment_id,
                     score = hit.best_score,
                     margin = hit.margin,
-                    provisional = hit.provisional,
+                    provisional,
                     "session voiceprint hit"
                 );
                 speaker = Some(LiveSpeaker {
                     identity_id: None,
                     display_name: hit.display_name,
                     source: "voiceprint",
-                    provisional: hit.provisional,
+                    provisional,
                 });
             }
         }
@@ -1321,6 +1385,10 @@ fn run_verifier(
         //    Counts and scores only — the embedding itself is never logged.
         if speaker.is_none() {
             if let Some(hit) = clusters.assign(&embedding) {
+                // Cluster labels always display non-provisional, but the hit
+                // still feeds the streak so tallies stay uniform across all
+                // three attribution sources.
+                streak.observe_hit(job.track, SpeakerKey::Cluster(hit.label.clone()));
                 tracing::info!(
                     segment = %job.segment_id,
                     created = hit.created,
@@ -1337,6 +1405,10 @@ fn run_verifier(
             }
         }
         let Some(speaker) = speaker else {
+            // Verification ran but no source labeled the utterance: the run
+            // of agreement on this track is broken (the same wipe the old
+            // library-NoMatch path applied).
+            streak.observe_miss(job.track);
             continue;
         };
         emit(
@@ -2091,33 +2163,117 @@ mod tests {
 
     // ---- L3: streak upgrade rule -----------------------------------------
 
-    #[test]
-    fn streak_upgrades_provisional_only_after_two_consecutive_hits() {
-        let a = Uuid::new_v4();
-        let mut streak = VerificationStreak::default();
-        // Hits 1 and 2 establish the streak but do not upgrade themselves.
-        assert!(!streak.observe_hit(TRACK_MIC, a));
-        assert!(!streak.observe_hit(TRACK_MIC, a));
-        // From the 3rd consecutive hit on, provisional may display verified.
-        assert!(streak.observe_hit(TRACK_MIC, a));
-        assert!(streak.observe_hit(TRACK_MIC, a));
+    fn identity_key(id: Uuid) -> SpeakerKey {
+        SpeakerKey::Identity(id)
     }
 
     #[test]
-    fn streak_is_per_track_and_resets_on_identity_change_or_miss() {
+    fn streak_upgrades_provisional_only_after_two_hits() {
+        let a = Uuid::new_v4();
+        let mut streak = VerificationStreak::default();
+        // Hits 1 and 2 establish the streak but do not upgrade themselves.
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(a)));
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(a)));
+        // From the 3rd hit on, provisional may display verified.
+        assert!(streak.observe_hit(TRACK_MIC, identity_key(a)));
+        assert!(streak.observe_hit(TRACK_MIC, identity_key(a)));
+    }
+
+    #[test]
+    fn streak_is_per_track_and_a_miss_clears_it() {
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         let mut streak = VerificationStreak::default();
-        assert!(!streak.observe_hit(TRACK_MIC, a));
-        assert!(!streak.observe_hit(TRACK_MIC, a));
-        // The system track has its own independent streak.
-        assert!(!streak.observe_hit(TRACK_SYSTEM, a));
-        assert!(streak.observe_hit(TRACK_MIC, a));
-        // A different identity on the same track resets the run.
-        assert!(!streak.observe_hit(TRACK_MIC, b));
-        assert!(!streak.observe_hit(TRACK_MIC, b));
-        // A rejected/differing report breaks it too.
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(a)));
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(a)));
+        // The system track has its own independent tallies.
+        assert!(!streak.observe_hit(TRACK_SYSTEM, identity_key(a)));
+        assert!(streak.observe_hit(TRACK_MIC, identity_key(a)));
+        // A different speaker starts their own fresh tally.
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(b)));
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(b)));
+        // A fully unlabeled utterance wipes the track's tallies.
         streak.observe_miss(TRACK_MIC);
-        assert!(!streak.observe_hit(TRACK_MIC, b));
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(b)));
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(a)));
+    }
+
+    #[test]
+    fn streak_preroll_verifies_a_returning_established_speaker() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut streak = VerificationStreak::default();
+        // a establishes the streak (2 hits), then b talks for a while.
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(a)));
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(a)));
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(b)));
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(b)));
+        assert!(streak.observe_hit(TRACK_MIC, identity_key(b)));
+        // a returns: the first utterance back already counts as continuing
+        // a's established streak — no two fresh consecutive hits needed.
+        assert!(streak.observe_hit(TRACK_MIC, identity_key(a)));
+    }
+
+    #[test]
+    fn interleaved_speaker_breaks_an_unestablished_run() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut streak = VerificationStreak::default();
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(a)));
+        // b in between: a's tally stays at 1 (the provisional-only previous
+        // result), so a's return does NOT pre-roll to verified…
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(b)));
+        assert!(!streak.observe_hit(TRACK_MIC, identity_key(a)));
+        // …only now does a's tally reach 2, so the next hit upgrades —
+        // the interleave broke the would-be consecutive run.
+        assert!(streak.observe_hit(TRACK_MIC, identity_key(a)));
+    }
+
+    #[test]
+    fn streak_keys_are_independent_per_attribution_source() {
+        let mut streak = VerificationStreak::default();
+        let session = SpeakerKey::Session("说话人1".into());
+        let cluster = SpeakerKey::Cluster("说话人1".into());
+        // The same display string in different sources never aliases.
+        assert!(!streak.observe_hit(TRACK_MIC, session.clone()));
+        assert!(!streak.observe_hit(TRACK_MIC, session.clone()));
+        assert!(streak.observe_hit(TRACK_MIC, session));
+        assert!(
+            !streak.observe_hit(TRACK_MIC, cluster),
+            "a cluster label keeps its own tally"
+        );
+    }
+
+    #[test]
+    fn cluster_labels_follow_the_same_streak_rule() {
+        let c1 = SpeakerKey::Cluster("说话人1".into());
+        let c2 = SpeakerKey::Cluster("说话人2".into());
+        let mut streak = VerificationStreak::default();
+        assert!(!streak.observe_hit(TRACK_MIC, c1.clone()));
+        assert!(!streak.observe_hit(TRACK_MIC, c1.clone()));
+        // Another cluster interleaves; 说话人1's established tally survives.
+        assert!(!streak.observe_hit(TRACK_MIC, c2));
+        assert!(streak.observe_hit(TRACK_MIC, c1));
+    }
+
+    #[test]
+    fn retracted_or_renamed_session_name_loses_its_streak() {
+        let mut streak = VerificationStreak::default();
+        let name = SpeakerKey::Session("客户A".into());
+        // Establish the name on both tracks.
+        assert!(!streak.observe_hit(TRACK_MIC, name.clone()));
+        assert!(!streak.observe_hit(TRACK_MIC, name.clone()));
+        assert!(streak.observe_hit(TRACK_MIC, name.clone()));
+        assert!(!streak.observe_hit(TRACK_SYSTEM, name.clone()));
+        assert!(!streak.observe_hit(TRACK_SYSTEM, name.clone()));
+        // The annotation is cleared: the freed name may belong to a different
+        // person next time, so its tally is forgotten on every track.
+        streak.forget_speaker(&name);
+        assert!(!streak.observe_hit(TRACK_MIC, name.clone()));
+        assert!(!streak.observe_hit(TRACK_SYSTEM, name.clone()));
+        // Forgetting one speaker never touches another's tally.
+        let b = identity_key(Uuid::new_v4());
+        assert!(!streak.observe_hit(TRACK_MIC, b.clone()));
+        assert!(!streak.observe_hit(TRACK_MIC, b.clone()));
+        streak.forget_speaker(&name);
+        assert!(streak.observe_hit(TRACK_MIC, b));
     }
 
     // ---- L3.5: session voiceprints ---------------------------------------
