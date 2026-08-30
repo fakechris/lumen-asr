@@ -934,11 +934,18 @@ fn write_cli_minutes(
     let segments = store.list_segments(meeting_id).map_err(|e| e.to_string())?;
     let speakers = store.list_speakers(meeting_id).map_err(|e| e.to_string())?;
     let transcript = lumen_meeting::minutes::render_transcript_for_minutes(&segments, &speakers);
+    // Same template resolution as the GUI pipeline: built-ins plus user
+    // templates under `<data_dir>/minutes-templates`; empty/unknown → default.
+    let template = lumen_meeting::resolve_template(
+        &cfg.meeting.minutes_template,
+        Some(&lumen_platform::default_data_dir().join("minutes-templates")),
+    );
     let minutes = tauri::async_runtime::block_on(lumen_meeting::minutes::generate_minutes(
         corrector.as_ref(),
         &transcript,
         None,
         None,
+        Some(&template),
     ))
     .map_err(|e| e.to_string())?;
     let model = cfg.corrector.model.trim();

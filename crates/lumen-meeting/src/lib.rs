@@ -30,6 +30,7 @@ pub mod export;
 mod identify;
 mod merge;
 pub mod minutes;
+pub mod minutes_template;
 mod pipeline;
 mod preflight;
 mod process;
@@ -61,6 +62,10 @@ pub use identify::{
     IDENTIFY_MIN_VOICED_MS,
 };
 pub use merge::{merge_tracks, system_speaker_offset, MergedTake, TrackTake};
+pub use minutes_template::{
+    builtin_templates, list_templates, load_user_templates, parse_template, resolve_template,
+    MinutesTemplate, TemplateError, DEFAULT_TEMPLATE_NAME,
+};
 #[cfg(all(target_os = "macos", feature = "diarize"))]
 pub use pipeline::LiveVoiceprintEmbedder;
 pub use pipeline::{transcribe_meeting, DiarModels, MeetingError, MeetingOptions};

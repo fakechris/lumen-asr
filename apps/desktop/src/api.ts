@@ -153,6 +153,19 @@ export type MeetingDetectionStats = {
   stopDeclined: number;
 };
 
+/** A minutes style template selectable for the structured-minutes LLM pass.
+ * Built-ins ship with the app; user templates are Markdown files with YAML
+ * frontmatter under `<data_dir>/minutes-templates/` and override same-named
+ * built-ins. */
+export type MinutesTemplateInfo = {
+  /** Selection key (the frontmatter `name`) stored in the config. */
+  id: string;
+  name: string;
+  description: string;
+  language?: string | null;
+  builtin: boolean;
+};
+
 /** Meeting watchdog settings: auto-stop after prolonged mic silence, a
  * wall-clock cap on one recording's length, and a prompt to stop when a
  * calendar-linked meeting's end time passes. */
@@ -592,6 +605,22 @@ export const api = {
    * change. Resolves the stored value. */
   setMeetingAudioFormat: (audioFormat: string) =>
     invoke<{ audioFormat: string }>("set_meeting_audio_format", { audioFormat }),
+
+  /** List the available minutes style templates (built-ins + user templates
+   * from `<data_dir>/minutes-templates`, which override same-named built-ins). */
+  listMinutesTemplates: () =>
+    invoke<MinutesTemplateInfo[]>("list_minutes_templates"),
+
+  /** Read the configured minutes template name ("" = the default template). */
+  getMinutesTemplate: () =>
+    invoke<{ minutesTemplate: string }>("get_minutes_template"),
+
+  /** Persist the minutes template selection; applies to minutes generated
+   * after the change. Resolves the stored value. */
+  setMinutesTemplate: (minutesTemplate: string) =>
+    invoke<{ minutesTemplate: string }>("set_minutes_template", {
+      minutesTemplate,
+    }),
 
   /** Read a meeting's mic audio as WAV bytes for playback. Opus tracks (the
    * default for new recordings) are decoded server-side because WKWebView

@@ -60,6 +60,10 @@ pub struct MinutesConfig<'a> {
     pub model: Option<String>,
     /// Output-token override; `None` uses the minutes default.
     pub max_tokens: Option<u32>,
+    /// Minutes style template (see [`crate::minutes_template`]), already
+    /// resolved by the caller from the configured name. `None` (or the built-in
+    /// default template, whose body is empty) keeps the pre-template prompt.
+    pub template: Option<crate::minutes_template::MinutesTemplate>,
 }
 
 /// Process an already-recorded meeting to `ready`, advancing status at each
@@ -785,6 +789,7 @@ async fn run(
             &transcript,
             Some(notes.as_str()),
             cfg.max_tokens,
+            cfg.template.as_ref(),
         )
         .await
         .and_then(|doc| minutes_summaries(meeting_id, &doc, cfg.model.as_deref()));
@@ -882,6 +887,7 @@ mod tests {
             corrector: &corrector,
             model: None,
             max_tokens: None,
+            template: None,
         };
         let models = DiarModels::new("seg.onnx", "emb.onnx", PathBuf::from("plda"));
 
