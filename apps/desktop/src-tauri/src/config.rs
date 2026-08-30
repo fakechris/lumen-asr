@@ -275,6 +275,9 @@ pub struct AsrServiceConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    /// Volcengine（火山引擎）App ID (`X-Api-App-Key`, 旧版控制台). Empty means
+    /// the 新版控制台 single-APP-Key auth, where `api_key` alone authenticates.
+    pub volcengine_app_id: String,
     /// Optional BCP-47 / ISO language hint for cloud ASR.
     pub language: String,
     pub timeout_secs: u64,
@@ -293,6 +296,7 @@ impl Default for AsrServiceConfig {
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
+            volcengine_app_id: String::new(),
             language: String::new(),
             timeout_secs: 120,
         }
@@ -1117,6 +1121,22 @@ qwen_shadow_enabled = true
         // Legacy field still deserializes; nothing reads it anymore.
         assert!(asr.qwen_shadow_enabled);
         assert_eq!(asr.runtime_path, "/qwen/bin/python");
+    }
+
+    #[test]
+    fn existing_config_without_volcengine_app_id_loads_unchanged() {
+        let asr: AsrServiceConfig = toml::from_str(
+            r#"
+provider = "volcengine"
+api_key = "token"
+"#,
+        )
+        .unwrap();
+
+        // New credential field defaults to empty; nothing else changes.
+        assert_eq!(asr.volcengine_app_id, "");
+        assert_eq!(asr.provider, "volcengine");
+        assert_eq!(asr.api_key, "token");
     }
 
     #[test]

@@ -248,6 +248,7 @@ export const api = {
       baseUrl: string;
       model: string;
       hasApiKey: boolean;
+      volcengineAppId: string;
       language: string;
       timeoutSecs: number;
     }>("get_asr_service_config"),
@@ -257,6 +258,7 @@ export const api = {
     baseUrl?: string;
     model?: string;
     apiKey?: string;
+    volcengineAppId?: string;
     language?: string;
     timeoutSecs?: number;
   }) =>
@@ -266,6 +268,7 @@ export const api = {
       baseUrl: string;
       model: string;
       hasApiKey: boolean;
+      volcengineAppId: string;
       language: string;
       timeoutSecs: number;
     }>("save_asr_service_config", { input }),

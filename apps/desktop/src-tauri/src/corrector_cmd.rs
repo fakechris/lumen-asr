@@ -86,6 +86,9 @@ pub struct AsrServiceStatus {
     pub base_url: String,
     pub model: String,
     pub has_api_key: bool,
+    /// Volcengine App ID (an account identifier, not a secret; surfaced so
+    /// the Settings field can round-trip it like base_url/model).
+    pub volcengine_app_id: String,
     pub language: String,
     pub timeout_secs: u64,
 }
@@ -98,6 +101,7 @@ pub struct AsrServiceInput {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
+    pub volcengine_app_id: Option<String>,
     pub language: Option<String>,
     pub timeout_secs: Option<u64>,
 }
@@ -114,6 +118,7 @@ pub fn get_asr_service_config(state: State<'_, AppState>) -> Result<AsrServiceSt
         base_url: cfg.asr.base_url.clone(),
         model: cfg.asr.model.clone(),
         has_api_key: !cfg.asr.api_key.is_empty(),
+        volcengine_app_id: cfg.asr.volcengine_app_id.clone(),
         language: cfg.asr.language.clone(),
         timeout_secs: cfg.asr.timeout_secs,
     })
@@ -154,6 +159,9 @@ pub fn save_asr_service_config(
     if let Some(v) = input.api_key {
         guard.asr.api_key = v;
     }
+    if let Some(v) = input.volcengine_app_id {
+        guard.asr.volcengine_app_id = v;
+    }
     if let Some(v) = input.language {
         guard.asr.language = v;
     }
@@ -168,6 +176,7 @@ pub fn save_asr_service_config(
         base_url: guard.asr.base_url.clone(),
         model: guard.asr.model.clone(),
         has_api_key: !guard.asr.api_key.is_empty(),
+        volcengine_app_id: guard.asr.volcengine_app_id.clone(),
         language: guard.asr.language.clone(),
         timeout_secs: guard.asr.timeout_secs,
     };
