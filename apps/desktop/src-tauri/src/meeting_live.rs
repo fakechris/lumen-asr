@@ -783,10 +783,6 @@ struct SessionVoiceprints {
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl SessionVoiceprints {
-    fn is_empty(&self) -> bool {
-        self.by_name.is_empty()
-    }
-
     /// Add one sample for `name` (a repeat annotation appends), rolling the
     /// oldest sample out beyond the per-name cap.
     fn seed(&mut self, name: &str, embedding: Vec<f32>) {
@@ -882,6 +878,146 @@ impl SessionVoiceprints {
             provisional,
             best_score: best,
             margin,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// L4: unknown-speaker session clusters — 说话人1, 说话人2, … for people who
+// are neither enrolled (L3) nor manually annotated (L3.5). An utterance that
+// neither the identity library nor the session voiceprint set claims joins
+// the nearest in-memory cluster, or founds a new one with the next
+// session-scoped placeholder label.
+//
+// Same privacy boundary as L3.5: clusters live only in the embedder thread's
+// memory, are never persisted, and are dropped at recording stop. A label is
+// stable once founded — clusters are never renamed or merged — and one shared
+// counter across both tracks keeps 说话人N unique meeting-wide (the UI keys
+// speaker colors by display name). After stop the offline pipeline re-decides
+// every speaker from scratch; these labels never leave the live preview.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cosine floor for joining an existing cluster. Deliberately a notch *above*
+/// the session-voiceprint verified floor ([`SESSION_VERIFIED_THRESHOLD`] =
+/// 0.72): joining folds the voice into a running centroid with no human
+/// anchor, and the unrecoverable error is merging two people into one label —
+/// splitting one person into 说话人1/说话人2 is recoverable (the annotate chip
+/// can still name each), so the gate errs high. Same-session same-speaker
+/// cosine typically lands ≥ 0.75 (see [`SESSION_VERIFIED_THRESHOLD`]), so the
+/// same voice still groups reliably; mic-track echo bleed and merely-similar
+/// voices fall through to a fresh cluster.
+const CLUSTER_ASSIGN_THRESHOLD: f32 = 0.75;
+
+/// Minimum `best − runner_up` between clusters for joining one. A grey-zone
+/// utterance between two clusters founds a new one instead of being merged
+/// into either on a coin flip. Reuses the permanent live rule's margin
+/// ([`lumen_identity::LIVE_VERIFIED_MIN_MARGIN`]).
+const CLUSTER_ASSIGN_MIN_MARGIN: f32 = lumen_identity::LIVE_VERIFIED_MIN_MARGIN;
+
+/// Upper bound on clusters per meeting. Real meetings have a handful of
+/// unknown speakers; the cap bounds per-utterance matching cost and stops
+/// pathological fragmentation. At the cap, unmatched utterances simply stay
+/// unlabeled.
+const MAX_SESSION_CLUSTERS: usize = 16;
+
+/// Outcome of assigning one utterance embedding to the cluster set.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq)]
+struct ClusterMatch {
+    /// Session-scoped placeholder label, e.g. `说话人2`.
+    label: String,
+    /// Cosine to the nearest cluster's centroid: the (passing) join score,
+    /// or the (failing) best score when this utterance founded a new cluster
+    /// (-1.0 when the set was empty).
+    best_score: f32,
+    /// `true` when this utterance founded the cluster.
+    created: bool,
+}
+
+/// One unknown-speaker cluster: a running centroid over the embeddings
+/// assigned to it, plus the stable label given at founding.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct SessionCluster {
+    label: String,
+    /// Running **sum** of the member embeddings. Cosine is scale-invariant
+    /// (`lumen_identity::cosine_similarity` normalizes internally), so the
+    /// plain sum scores identically to the mean while keeping every member's
+    /// full weight in later updates.
+    centroid: Vec<f32>,
+    count: u32,
+}
+
+/// The in-memory unknown-speaker cluster set, consulted only when neither the
+/// permanent identity library nor the session voiceprints label an utterance.
+/// Owned by the embedder thread; dropped — centroids and all — when the worker
+/// exits at recording stop. Pure and unit-testable.
+#[derive(Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct SessionClusters {
+    /// Clusters in founding order (labels only ever append).
+    clusters: Vec<SessionCluster>,
+    /// Next label number; never decremented, so labels are never reused even
+    /// though clusters are never removed either.
+    next_label: u32,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl SessionClusters {
+    /// Assign one utterance embedding to the nearest cluster, founding a new
+    /// one (with the next `说话人N` label) when nothing clears
+    /// [`CLUSTER_ASSIGN_THRESHOLD`] with a [`CLUSTER_ASSIGN_MIN_MARGIN`] lead —
+    /// or when the cluster cap is reached (`None`, the utterance stays
+    /// unlabeled). A joined cluster adds the embedding to its running centroid
+    /// sum, so the anchor drifts toward the speaker's typical voice over the
+    /// meeting. A degenerate (empty/zero) embedding never founds anything.
+    fn assign(&mut self, embedding: &[f32]) -> Option<ClusterMatch> {
+        if embedding.is_empty() || embedding.iter().all(|v| *v == 0.0) {
+            return None;
+        }
+        let mut scored: Vec<(usize, f32)> = self
+            .clusters
+            .iter()
+            .enumerate()
+            .map(|(index, cluster)| {
+                (
+                    index,
+                    lumen_identity::cosine_similarity(embedding, &cluster.centroid),
+                )
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let nearest = scored.first().map_or(-1.0, |&(_, s)| s);
+        if let Some(&(index, best)) = scored.first() {
+            // Sole cluster → the margin is maximally permissive (cosine
+            // floor), mirroring `SessionVoiceprints::match_speaker`.
+            let runner_up = scored.get(1).map_or(-1.0, |&(_, s)| s);
+            if best >= CLUSTER_ASSIGN_THRESHOLD && best - runner_up >= CLUSTER_ASSIGN_MIN_MARGIN {
+                let cluster = &mut self.clusters[index];
+                for (c, e) in cluster.centroid.iter_mut().zip(embedding) {
+                    *c += e;
+                }
+                cluster.count += 1;
+                return Some(ClusterMatch {
+                    label: cluster.label.clone(),
+                    best_score: best,
+                    created: false,
+                });
+            }
+        }
+        if self.clusters.len() >= MAX_SESSION_CLUSTERS {
+            return None;
+        }
+        self.next_label += 1;
+        let label = format!("说话人{}", self.next_label);
+        self.clusters.push(SessionCluster {
+            label: label.clone(),
+            centroid: embedding.to_vec(),
+            count: 1,
+        });
+        Some(ClusterMatch {
+            label,
+            best_score: nearest,
+            created: true,
         })
     }
 }
@@ -1004,9 +1140,9 @@ impl VerificationStreak {
 ///
 /// Unlike the original L3 gate this no longer requires a non-empty identity
 /// library: session voiceprints (L3.5) must work precisely for *unregistered*
-/// people, and an annotation can arrive at any moment mid-recording. With
-/// both the library and the session set empty, the verify path skips before
-/// embedding, so the idle cost is just the ring windows (~1.9 MB/track).
+/// people, an annotation can arrive at any moment mid-recording, and unknown
+/// speakers can always earn a session-cluster label (L4) — so the verify path
+/// embeds every queued utterance regardless of library state.
 #[cfg(target_os = "macos")]
 fn spawn_live_verifier(app: AppHandle, meeting_id: String) -> Option<LiveVerifier> {
     let emb_model = lumen_asr::lumen_models_dir().join("diar").join("emb.onnx");
@@ -1030,11 +1166,13 @@ fn spawn_live_verifier(_app: AppHandle, _meeting_id: String) -> Option<LiveVerif
 /// Embedder thread body: load the WeSpeaker model once, then process queued
 /// messages — session voiceprint seeds/retractions (L3.5) and finalized
 /// utterances to verify (L3). Verification checks the **permanent identity
-/// library first** (unchanged behaviour), and only when it does not label the
-/// utterance falls back to the in-memory session set; a session hit is
-/// emitted with no `identity_id`. Every failure path skips the message;
-/// nothing here can affect the transcription loop. The session set — the
-/// only place session embeddings ever live — is dropped when this thread
+/// library first** (unchanged behaviour); when it does not label the
+/// utterance it falls back to the in-memory session set (L3.5, emitted with
+/// no `identity_id`), and when that also misses, to the unknown-speaker
+/// session clusters (L4, emitted as a stable session-scoped `说话人N`
+/// placeholder label). Every failure path skips the message; nothing here
+/// can affect the transcription loop. The session set and the clusters — the
+/// only places session embeddings ever live — are dropped when this thread
 /// exits at recording stop.
 #[cfg(target_os = "macos")]
 fn run_verifier(
@@ -1058,6 +1196,10 @@ fn run_verifier(
     // In-memory only; never persisted, dropped at thread exit (privacy
     // boundary of L3.5 — one click must not permanently enroll biometrics).
     let mut session = SessionVoiceprints::default();
+    // Same boundary for L4's unknown-speaker clusters: in-memory session
+    // state only, dropped with this thread. Labels are session-scoped
+    // placeholders (说话人N), shared across tracks via this one instance.
+    let mut clusters = SessionClusters::default();
     while let Ok(msg) = rx.recv() {
         let job = match msg {
             VerifierMsg::Seed {
@@ -1104,13 +1246,11 @@ fn run_verifier(
         };
         // Reopen per utterance so enrollments made mid-recording are picked up
         // (the library is a handful of small JSON files). An empty/unreadable
-        // library is fine now: session voiceprints may still label.
+        // library is fine: session voiceprints and session clusters (L4) can
+        // still label, so the embedding work always pays off.
         let identities = IdentityStore::open(&identity_dir)
             .ok()
             .filter(|store| !store.list().is_empty());
-        if identities.is_none() && session.is_empty() {
-            continue; // nothing could match — skip the embedding work
-        }
         let embedding = match embedder.embed(&job.samples, STREAMING_TARGET_RATE) {
             Ok(Some(embedding)) => embedding,
             Ok(None) => continue, // too short to embed reliably
@@ -1170,6 +1310,29 @@ fn run_verifier(
                     display_name: hit.display_name,
                     source: "voiceprint",
                     provisional: hit.provisional,
+                });
+            }
+        }
+        // 3) Unknown-speaker session clusters (L4): when nothing named the
+        //    utterance, join the nearest cluster or found a new one, earning
+        //    a stable session-scoped 说话人N label. Emitted non-provisional:
+        //    the placeholder name already reads as "unknown speaker", so a
+        //    permanent "?" on every line would add noise without information.
+        //    Counts and scores only — the embedding itself is never logged.
+        if speaker.is_none() {
+            if let Some(hit) = clusters.assign(&embedding) {
+                tracing::info!(
+                    segment = %job.segment_id,
+                    created = hit.created,
+                    score = hit.best_score,
+                    clusters = clusters.clusters.len(),
+                    "session cluster label"
+                );
+                speaker = Some(LiveSpeaker {
+                    identity_id: None,
+                    display_name: hit.label,
+                    source: "voiceprint",
+                    provisional: false,
                 });
             }
         }
@@ -1975,7 +2138,7 @@ mod tests {
     #[test]
     fn session_seed_then_match_uses_best_of_samples() {
         let mut session = SessionVoiceprints::default();
-        assert!(session.is_empty());
+        assert!(session.by_name.is_empty());
         assert_eq!(session.match_speaker(&probe(), VOICED_LONG), None);
 
         session.seed("客户A", toward(0.30));
@@ -2101,7 +2264,7 @@ mod tests {
         session.seed("客户A", toward(0.90));
         session.seed("客户A", toward(0.85));
         assert!(session.retract("客户A"));
-        assert!(session.is_empty());
+        assert!(session.by_name.is_empty());
         assert_eq!(session.match_speaker(&probe(), VOICED_LONG), None);
         // Retracting an unknown name is a no-op.
         assert!(!session.retract("客户B"));
@@ -2155,5 +2318,113 @@ mod tests {
         // A closed span is taken as-is (within the cap).
         let closed = plan_session_seed(None, Some(&window), 2.0, Some(5.0)).unwrap();
         assert_eq!(closed.len(), 3 * rate as usize);
+    }
+
+    // ---- L4: unknown-speaker session clusters ----------------------------
+
+    #[test]
+    fn cluster_same_speaker_keeps_one_stable_label() {
+        let mut clusters = SessionClusters::default();
+        let first = clusters.assign(&toward(0.98)).unwrap();
+        assert_eq!(first.label, "说话人1");
+        assert!(first.created);
+        // Same voice, slightly noisy reads around the same direction: every
+        // one rejoins the cluster and the label never changes.
+        for cosine in [0.96, 0.90, 0.99, 0.93, 0.95] {
+            let hit = clusters.assign(&toward(cosine)).unwrap();
+            assert_eq!(hit.label, "说话人1", "same voice must keep its label");
+            assert!(!hit.created);
+        }
+        assert_eq!(clusters.clusters.len(), 1);
+        assert_eq!(clusters.clusters[0].count, 6);
+        // The running centroid sum keeps pointing at the speaker (cosine is
+        // scale-invariant, so the raw sum scores like the mean).
+        let score = lumen_identity::cosine_similarity(&clusters.clusters[0].centroid, &probe());
+        assert!(score > 0.9, "centroid drifted off the speaker: {score}");
+    }
+
+    #[test]
+    fn two_separated_speakers_get_two_labels() {
+        let mut clusters = SessionClusters::default();
+        assert_eq!(clusters.assign(&[1.0, 0.0]).unwrap().label, "说话人1");
+        // Orthogonal voice: cosine 0, far below the join gate.
+        let second = clusters.assign(&[0.0, 1.0]).unwrap();
+        assert_eq!(second.label, "说话人2");
+        assert!(second.created);
+        // And each voice keeps its own label afterwards.
+        assert_eq!(clusters.assign(&[0.98, 0.2]).unwrap().label, "说话人1");
+        assert_eq!(clusters.assign(&[0.2, 0.98]).unwrap().label, "说话人2");
+        assert_eq!(clusters.clusters.len(), 2);
+    }
+
+    #[test]
+    fn below_threshold_voice_founds_a_new_cluster_instead_of_merging() {
+        let mut clusters = SessionClusters::default();
+        clusters.assign(&probe()).unwrap(); // 说话人1 at [1, 0]
+                                            // 0.70: same hemisphere but under the 0.75 join gate — treated as a
+                                            // different voice, not a noisy read of the first one.
+        let hit = clusters.assign(&toward(0.70)).unwrap();
+        assert_eq!(hit.label, "说话人2");
+        assert!(hit.created);
+        assert_eq!(clusters.clusters.len(), 2);
+    }
+
+    #[test]
+    fn grey_zone_between_two_clusters_founds_a_third() {
+        let mut clusters = SessionClusters::default();
+        clusters.assign(&probe()).unwrap(); // 说话人1 at angle 0°
+        clusters.assign(&toward(0.70)).unwrap(); // 说话人2 at ≈45.6°
+                                                 // toward(0.92) sits ≈23° off each — cosine ≈ 0.92 to both, so both
+                                                 // clear the join threshold but with a margin far under 0.08. Joining
+                                                 // either on a coin flip risks merging two people; it founds a new
+                                                 // cluster instead.
+        let hit = clusters.assign(&toward(0.92)).unwrap();
+        assert_eq!(hit.label, "说话人3");
+        assert!(hit.created);
+    }
+
+    #[test]
+    fn label_numbers_are_never_reused() {
+        let mut clusters = SessionClusters::default();
+        let a = clusters.assign(&[1.0, 0.0]).unwrap();
+        let b = clusters.assign(&[0.0, 1.0]).unwrap();
+        let c = clusters.assign(&[-1.0, 0.0]).unwrap();
+        assert_eq!(a.label, "说话人1");
+        assert_eq!(b.label, "说话人2");
+        assert_eq!(c.label, "说话人3");
+        // Rejoining an existing cluster does not burn a number...
+        assert_eq!(clusters.assign(&[0.99, 0.1]).unwrap().label, "说话人1");
+        // ...and the next new voice continues the sequence.
+        assert_eq!(clusters.assign(&[0.0, -1.0]).unwrap().label, "说话人4");
+    }
+
+    #[test]
+    fn cluster_cap_stops_new_labels_but_not_joins() {
+        let mut clusters = SessionClusters::default();
+        // 64-d axis vectors are mutually orthogonal: each founds a cluster.
+        for axis in 0..MAX_SESSION_CLUSTERS {
+            let mut v = vec![0.0; 64];
+            v[axis] = 1.0;
+            assert!(clusters.assign(&v).unwrap().created);
+        }
+        // At the cap a new voice stays unlabeled rather than fragmenting on.
+        let mut extra = vec![0.0; 64];
+        extra[MAX_SESSION_CLUSTERS] = 1.0;
+        assert_eq!(clusters.assign(&extra), None);
+        // Joining an existing cluster still works at the cap.
+        let mut near_first = vec![0.0; 64];
+        near_first[0] = 0.99;
+        near_first[1] = 0.05;
+        assert_eq!(clusters.assign(&near_first).unwrap().label, "说话人1");
+        assert_eq!(clusters.clusters.len(), MAX_SESSION_CLUSTERS);
+    }
+
+    #[test]
+    fn degenerate_embeddings_never_found_a_cluster() {
+        let mut clusters = SessionClusters::default();
+        assert_eq!(clusters.assign(&[]), None);
+        assert_eq!(clusters.assign(&[0.0, 0.0]), None);
+        assert!(clusters.clusters.is_empty());
+        assert_eq!(clusters.next_label, 0);
     }
 }
