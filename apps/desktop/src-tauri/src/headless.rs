@@ -27,7 +27,10 @@ use lumen_asr::{
     AsrEngine, MlxWhisperAsr, MlxWhisperConfig, QwenAsr, QwenAsrConfig, SenseVoiceSherpaAsr,
     WhisperAsr, DEFAULT_MLX_WHISPER_MODEL,
 };
-use lumen_meeting::{export_meeting, DiarModels, ExportPreset, MeetingOptions};
+use lumen_meeting::{
+    compact_meetings, export_meeting, CompactOptions, CompactTrackStatus, DiarModels, ExportPreset,
+    MeetingOptions,
+};
 use lumen_prompts::{
     build_system_prompt_from, Casing, CleanupLevel, IntentSpec, PromptBuildInput, PunctPolicy,
     Style,
@@ -46,6 +49,9 @@ pub fn maybe_run_cli() -> Option<i32> {
         }
         Some("meeting") if args.get(1).map(String::as_str) == Some("process") => {
             Some(run_meeting_process(&args[2..]))
+        }
+        Some("meeting") if args.get(1).map(String::as_str) == Some("compact") => {
+            Some(run_meeting_compact(&args[2..]))
         }
         Some("voiceprint-match") => Some(run_voiceprint_match(&args[1..])),
         Some("--help") | Some("-h") => {
@@ -81,6 +87,9 @@ fn print_help() {
            --json                            alias for --format json\n    \
            --max-speakers N                  diar clustering cap (default: 6)\n    \
            --min-turn-seconds SEC            absorb shorter diar fragments (default: 1.5)\n  \
+         meeting compact [--dry-run] [--meeting <id>]\n    \
+           Migrate stored meeting recordings from PCM WAV to Ogg-Opus in place.\n    \
+           Verify-then-delete per track; safe to re-run; skips live recordings.\n  \
          voiceprint-match <meeting_id>\n\
          \nWith no headless command the desktop app launches normally.\n\
          \nEngines:\n  \
@@ -169,6 +178,141 @@ fn run_voiceprint_match(args: &[String]) -> i32 {
         );
     }
     0
+}
+
+/// `meeting compact [--dry-run] [--meeting <id>]`: migrate stored meeting
+/// recordings from PCM WAV to Ogg-Opus in place. Conversion is
+/// verify-then-delete per track, skips live recordings and tracks already on
+/// Opus, and keeps the WAV on any failure — safe to re-run until the backlog
+/// is clean.
+fn run_meeting_compact(args: &[String]) -> i32 {
+    let mut options = CompactOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => options.dry_run = true,
+            "--meeting" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("meeting compact: missing value for --meeting");
+                    return 2;
+                };
+                match raw.parse::<uuid::Uuid>() {
+                    Ok(id) => options.meeting = Some(id),
+                    Err(_) => {
+                        eprintln!("meeting compact: invalid meeting id `{raw}`");
+                        return 2;
+                    }
+                }
+            }
+            flag if flag.starts_with("--meeting=") => {
+                let raw = &flag["--meeting=".len()..];
+                match raw.parse::<uuid::Uuid>() {
+                    Ok(id) => options.meeting = Some(id),
+                    Err(_) => {
+                        eprintln!("meeting compact: invalid meeting id `{raw}`");
+                        return 2;
+                    }
+                }
+            }
+            other => {
+                eprintln!(
+                    "meeting compact: unexpected argument `{other}`\n\
+                     usage: meeting compact [--dry-run] [--meeting <id>]"
+                );
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+
+    let store = match lumen_store::Store::open(lumen_platform::default_db_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("meeting compact: open store: {error}");
+            return 1;
+        }
+    };
+
+    let print_report = |report: &lumen_meeting::CompactMeetingReport| {
+        let title = report.title.as_deref().unwrap_or("(untitled)");
+        if report.tracks.is_empty() {
+            println!("{} {title}: no audio tracks", report.id);
+            return;
+        }
+        for track in &report.tracks {
+            let outcome = match &track.status {
+                CompactTrackStatus::Converted {
+                    before_bytes,
+                    after_bytes,
+                } => format!(
+                    "{} {} → {}",
+                    if options.dry_run {
+                        "would convert"
+                    } else {
+                        "converted"
+                    },
+                    format_bytes(*before_bytes),
+                    format_bytes(*after_bytes)
+                ),
+                CompactTrackStatus::Skipped(reason) => format!("skipped ({reason})"),
+                CompactTrackStatus::Failed(reason) => format!("FAILED ({reason})"),
+            };
+            println!("{} {title} [{}]: {outcome}", report.id, track.kind.as_str());
+        }
+    };
+
+    let summary = match compact_meetings(&store, &options, print_report) {
+        Ok(summary) => summary,
+        Err(error) => {
+            eprintln!("meeting compact: {error:#}");
+            return 1;
+        }
+    };
+
+    println!(
+        "{}: converted {}, skipped {}, failed {}; {} → {} ({} {})",
+        if options.dry_run { "dry-run" } else { "done" },
+        summary.converted,
+        summary.skipped,
+        summary.failed,
+        format_bytes(summary.bytes_before),
+        format_bytes(summary.bytes_after),
+        format_bytes(summary.projected_savings_bytes()),
+        if options.dry_run {
+            "projected savings"
+        } else {
+            "reclaimed"
+        },
+    );
+    if summary.failed > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -22,6 +22,7 @@
 mod annotate;
 mod assemble;
 mod cleanup;
+pub mod compact;
 mod correct;
 mod echo;
 mod enroll;
@@ -45,6 +46,11 @@ pub use assemble::{
     turn_sample_range, AssembledMeeting, DiarTurn,
 };
 pub use cleanup::{cleanup_transcript, should_cleanup, CleanupStats};
+pub use compact::{
+    compact_meetings, CompactOptions, CompactSummary, MeetingReport as CompactMeetingReport,
+    TrackKind as CompactTrackKind, TrackReport as CompactTrackReport,
+    TrackStatus as CompactTrackStatus,
+};
 pub use correct::{correct_segment, correct_words, CorrectionDict};
 pub use enroll::{
     auto_enroll_named_speakers, AutoEnrollOutcome, EnrollConflict, ENROLL_CONFLICT_THRESHOLD,
