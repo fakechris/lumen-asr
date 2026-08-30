@@ -2386,6 +2386,37 @@ function SettingsPanel({
     },
     [onError],
   );
+  // Minutes style template selection (built-in name or a user template from
+  // `<data_dir>/minutes-templates`); "" = the default template.
+  const [minutesTemplate, setMinutesTemplate] = useState("");
+  const [minutesTemplates, setMinutesTemplates] = useState<
+    import("./api").MinutesTemplateInfo[]
+  >([]);
+  // Latest-wins token, same rationale as `meetingAudioFormatSave` above.
+  const minutesTemplateSave = useRef(0);
+  const saveMinutesTemplate = useCallback(
+    (next: string) => {
+      setMinutesTemplate(next);
+      const request = ++minutesTemplateSave.current;
+      void api
+        .setMinutesTemplate(next)
+        .then((saved) => {
+          if (minutesTemplateSave.current === request) {
+            setMinutesTemplate(saved.minutesTemplate);
+          }
+        })
+        .catch((err) => {
+          onError(String(err));
+          if (minutesTemplateSave.current === request) {
+            void api
+              .getMinutesTemplate()
+              .then((tpl) => setMinutesTemplate(tpl.minutesTemplate))
+              .catch(() => {});
+          }
+        });
+    },
+    [onError],
+  );
   // Debounce + latest-wins so rapid edits to either field don't race as
   // independent writes (each call persists both fields, so an older in-flight
   // write could otherwise clobber the newer one).
@@ -2500,6 +2531,13 @@ function SettingsPanel({
           setMeetingAudioFormat(fmt.audioFormat);
         } catch {
           /* recording format is best-effort */
+        }
+        try {
+          setMinutesTemplates(await api.listMinutesTemplates());
+          const tpl = await api.getMinutesTemplate();
+          setMinutesTemplate(tpl.minutesTemplate);
+        } catch {
+          /* minutes templates are best-effort */
         }
       } catch (e) {
         onError(String(e));
@@ -3476,6 +3514,41 @@ function SettingsPanel({
         </div>
         <p className="muted-text">
           只影响之后开始的录音；已有录音无论哪种格式都能正常播放、剪辑和处理。
+        </p>
+
+        <hr className="settings-divider" />
+        <div className="form-row">
+          <label className="form-label" htmlFor="minutes-template">
+            会议纪要模板
+          </label>
+          <select
+            id="minutes-template"
+            className="input"
+            value={minutesTemplate}
+            disabled={busy}
+            style={{ maxWidth: 320 }}
+            onChange={(e) => saveMinutesTemplate(e.target.value)}
+          >
+            <option value="">默认</option>
+            {minutesTemplates
+              .filter((t) => t.id !== "default")
+              .map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.description ? `${t.name} — ${t.description}` : t.name}
+                </option>
+              ))}
+            {/* A configured template whose file was removed still shows as the
+                current value instead of silently snapping to 默认. */}
+            {minutesTemplate &&
+              !minutesTemplates.some((t) => t.id === minutesTemplate) && (
+                <option value={minutesTemplate}>{minutesTemplate}（未找到）</option>
+              )}
+          </select>
+        </div>
+        <p className="muted-text">
+          只影响之后生成纪要的侧重与措辞。可在数据目录的
+          minutes-templates 文件夹中放入自定义模板（Markdown + YAML
+          frontmatter，含 name 与 description），同名会覆盖内置模板。
         </p>
 
         <hr className="settings-divider" />

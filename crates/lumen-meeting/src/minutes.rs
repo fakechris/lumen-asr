@@ -12,9 +12,10 @@
 //! real network call is exercised only by an `#[ignore]`d integration test.
 //! This module has **no** platform gating — the LLM path is cross-platform.
 
+use crate::minutes_template::MinutesTemplate;
 use lumen_core::{MeetingSummary, Speaker, SummaryKind, TranscriptSegment};
 use lumen_corrector::{CorrectRequest, Corrector, DictionaryContext};
-use lumen_prompts::{build_minutes_system_prompt, minutes_user_message_with_notes};
+use lumen_prompts::{build_minutes_system_prompt_with_template, minutes_user_message_with_notes};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -201,17 +202,23 @@ pub fn minutes_summaries(
 /// present and non-blank they are fused into the prompt as extra context so the
 /// structured minutes reflect what the user flagged as important (Granola-style).
 /// Passing `None` (or blank notes) yields the transcript-only behaviour.
+///
+/// `template` steers the style/emphasis of the minutes (see
+/// [`crate::minutes_template`]): its body is interpolated into the system
+/// prompt as an advisory section. `None` (or a template with an empty body, as
+/// the built-in default has) produces the exact pre-template prompt.
 pub async fn generate_minutes(
     corrector: &dyn Corrector,
     transcript: &str,
     notes: Option<&str>,
     max_tokens: Option<u32>,
+    template: Option<&MinutesTemplate>,
 ) -> Result<Minutes, MinutesError> {
     let request = CorrectRequest {
         text: minutes_user_message_with_notes(transcript, notes),
         dictionary: DictionaryContext::default(),
         context_json: None,
-        system_prompt: build_minutes_system_prompt(),
+        system_prompt: build_minutes_system_prompt_with_template(template.map(|t| t.body.as_str())),
         temperature: 0.2,
         max_tokens: Some(max_tokens.unwrap_or(DEFAULT_MINUTES_MAX_TOKENS)),
     };
@@ -350,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn generate_minutes_parses_canned_llm_output() {
         let corrector = CannedCorrector(Ok(SAMPLE_JSON.to_string()));
-        let minutes = generate_minutes(&corrector, "[0-2] S1：你好", None, None)
+        let minutes = generate_minutes(&corrector, "[0-2] S1：你好", None, None, None)
             .await
             .unwrap();
         assert_eq!(minutes.decisions.len(), 1);
@@ -360,20 +367,20 @@ mod tests {
     async fn generate_minutes_surfaces_llm_and_parse_failures() {
         let failed = CannedCorrector(Err(()));
         assert!(matches!(
-            generate_minutes(&failed, "x", None, None).await,
+            generate_minutes(&failed, "x", None, None, None).await,
             Err(MinutesError::Llm(_))
         ));
 
         let garbage = CannedCorrector(Ok("no json here".to_string()));
         assert!(matches!(
-            generate_minutes(&garbage, "x", None, None).await,
+            generate_minutes(&garbage, "x", None, None, None).await,
             Err(MinutesError::NoJson)
         ));
     }
 
     /// Corrector that records the prompt text it was asked to correct, so a test
     /// can assert the user's notes were fused into the minutes request.
-    struct CapturingCorrector(std::sync::Mutex<Option<String>>);
+    struct CapturingCorrector(std::sync::Mutex<Option<CorrectRequest>>);
 
     #[async_trait]
     impl Corrector for CapturingCorrector {
@@ -381,7 +388,7 @@ mod tests {
             CorrectorEngineId::OpenAiCompatible
         }
         async fn correct(&self, req: CorrectRequest) -> Result<CorrectResult, CorrectorError> {
-            *self.0.lock().unwrap() = Some(req.text.clone());
+            *self.0.lock().unwrap() = Some(req);
             Ok(CorrectResult {
                 text: SAMPLE_JSON.to_string(),
                 engine: CorrectorEngineId::OpenAiCompatible,
@@ -394,20 +401,55 @@ mod tests {
     #[tokio::test]
     async fn generate_minutes_fuses_user_notes_into_the_prompt() {
         let corrector = CapturingCorrector(std::sync::Mutex::new(None));
-        let minutes = generate_minutes(&corrector, "[0-2] S1：你好", Some("跟进预算问题"), None)
-            .await
-            .unwrap();
+        let minutes = generate_minutes(
+            &corrector,
+            "[0-2] S1：你好",
+            Some("跟进预算问题"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(minutes.decisions.len(), 1);
         let sent = corrector.0.lock().unwrap().clone().unwrap();
-        assert!(sent.contains("USER_NOTES_BEGIN"));
-        assert!(sent.contains("跟进预算问题"));
+        assert!(sent.text.contains("USER_NOTES_BEGIN"));
+        assert!(sent.text.contains("跟进预算问题"));
 
         // Blank notes leave the prompt in its transcript-only shape.
         let corrector = CapturingCorrector(std::sync::Mutex::new(None));
-        generate_minutes(&corrector, "[0-2] S1：你好", Some("  "), None)
+        generate_minutes(&corrector, "[0-2] S1：你好", Some("  "), None, None)
             .await
             .unwrap();
         let sent = corrector.0.lock().unwrap().clone().unwrap();
-        assert!(!sent.contains("USER_NOTES_BEGIN"));
+        assert!(!sent.text.contains("USER_NOTES_BEGIN"));
+    }
+
+    #[tokio::test]
+    async fn generate_minutes_interpolates_the_template_body_into_the_system_prompt() {
+        let template = MinutesTemplate {
+            name: "action-items".into(),
+            description: String::new(),
+            language: None,
+            body: "- 以 action_items 为核心".into(),
+            builtin: true,
+        };
+        let corrector = CapturingCorrector(std::sync::Mutex::new(None));
+        generate_minutes(&corrector, "[0-2] S1：你好", None, None, Some(&template))
+            .await
+            .unwrap();
+        let sent = corrector.0.lock().unwrap().clone().unwrap();
+        assert!(sent.system_prompt.contains("TEMPLATE_BEGIN"));
+        assert!(sent.system_prompt.contains("以 action_items 为核心"));
+        // The JSON contract is intact ahead of the template section.
+        assert!(sent.system_prompt.contains("one_liner"));
+        assert!(sent.system_prompt.contains("只输出一个 JSON 对象"));
+
+        // No template → the pre-template constant prompt.
+        let corrector = CapturingCorrector(std::sync::Mutex::new(None));
+        generate_minutes(&corrector, "[0-2] S1：你好", None, None, None)
+            .await
+            .unwrap();
+        let sent = corrector.0.lock().unwrap().clone().unwrap();
+        assert!(!sent.system_prompt.contains("TEMPLATE_BEGIN"));
     }
 }

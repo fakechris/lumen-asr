@@ -1831,6 +1831,91 @@ pub fn set_meeting_audio_format(
     get_meeting_audio_format(state)
 }
 
+/// Directory holding the user's custom minutes templates (`*.md` files with
+/// YAML frontmatter; see `lumen_meeting::minutes_template`). Not created on
+/// read — discovery treats a missing directory as "no user templates".
+fn minutes_templates_dir() -> PathBuf {
+    default_data_dir().join("minutes-templates")
+}
+
+/// Resolve a configured template name against built-ins + user templates.
+/// Empty/unknown names fall back to the built-in default (never fatal).
+fn resolve_minutes_template(name: &str) -> lumen_meeting::MinutesTemplate {
+    lumen_meeting::resolve_template(name, Some(&minutes_templates_dir()))
+}
+
+/// One available minutes template as shown in the settings UI.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MinutesTemplateDto {
+    /// Selection key stored in `meeting.minutes_template` (the frontmatter
+    /// `name`).
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub language: Option<String>,
+    /// Built-in (embedded) vs. discovered from `<data_dir>/minutes-templates`.
+    pub builtin: bool,
+}
+
+/// List the available minutes templates (built-ins plus user templates from
+/// `<data_dir>/minutes-templates`, which override same-named built-ins) for the
+/// settings UI dropdown. Discovery is fail-open: malformed files are skipped
+/// and this command never errors.
+#[tauri::command]
+pub fn list_minutes_templates() -> Vec<MinutesTemplateDto> {
+    lumen_meeting::list_templates(Some(&minutes_templates_dir()))
+        .into_iter()
+        .map(|t| MinutesTemplateDto {
+            id: t.name.clone(),
+            name: t.name,
+            description: t.description,
+            language: t.language,
+            builtin: t.builtin,
+        })
+        .collect()
+}
+
+/// Serialized minutes-template preference for the settings UI.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MinutesTemplateConfig {
+    /// The configured template name; empty means the built-in default.
+    pub minutes_template: String,
+}
+
+/// Read the configured minutes template name for the settings UI.
+#[tauri::command]
+pub fn get_minutes_template(state: State<'_, AppState>) -> Result<MinutesTemplateConfig, String> {
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    Ok(MinutesTemplateConfig {
+        minutes_template: cfg.meeting.minutes_template.clone(),
+    })
+}
+
+/// Persist the minutes template selection. Any name is accepted (a template
+/// file with that name may be dropped into the templates directory later);
+/// unknown names fall back to the default template at generation time. Takes
+/// effect for the next minutes run.
+#[tauri::command]
+pub fn set_minutes_template(
+    state: State<'_, AppState>,
+    minutes_template: String,
+) -> Result<MinutesTemplateConfig, String> {
+    {
+        let mut cfg = state
+            .config
+            .lock()
+            .map_err(|_| "config lock poisoned".to_string())?;
+        cfg.meeting.minutes_template = minutes_template.trim().to_string();
+        cfg.save()?;
+    }
+    get_minutes_template(state)
+}
+
 /// Read a meeting's mic audio as WAV bytes for in-app playback. WKWebView
 /// cannot play Ogg-Opus (the default format for new recordings), so Opus files
 /// are decoded with [`lumen_asr::decode_opus_to_pcm`] and re-rendered as
@@ -2189,6 +2274,7 @@ async fn process_meeting_pipeline(
         echo_suppression,
         annotation_voiceprint_spread,
         auto_enroll_speakers,
+        minutes_template_name,
     ) = {
         let state = app.state::<AppState>();
         let (
@@ -2197,6 +2283,7 @@ async fn process_meeting_pipeline(
             echo_suppression,
             annotation_voiceprint_spread,
             auto_enroll_speakers,
+            minutes_template_name,
         ) = {
             let cfg = state
                 .config
@@ -2208,6 +2295,7 @@ async fn process_meeting_pipeline(
                 cfg.meeting.echo_suppression,
                 cfg.meeting.annotation_voiceprint_spread,
                 cfg.meeting.auto_enroll_speakers,
+                cfg.meeting.minutes_template.clone(),
             )
         };
         let asr_engine = crate::dictation::build_meeting_asr_engine(state.inner())?;
@@ -2231,6 +2319,7 @@ async fn process_meeting_pipeline(
             echo_suppression,
             annotation_voiceprint_spread,
             auto_enroll_speakers,
+            minutes_template_name,
         )
     };
 
@@ -2243,6 +2332,11 @@ async fn process_meeting_pipeline(
         corrector: corrector.as_ref(),
         model: minutes_model,
         max_tokens: None,
+        // Resolve the configured minutes style template (built-in, or a user
+        // template from `<data_dir>/minutes-templates/*.md`). Empty/unknown
+        // names resolve to the built-in default, whose empty body keeps the
+        // pre-template prompt.
+        template: Some(resolve_minutes_template(&minutes_template_name)),
     });
 
     // Feed the user's personal dictionary into the post-ASR correction pass

@@ -138,6 +138,13 @@ pub struct MeetingConfig {
     /// Unknown values fall back to `"opus"` at use time.
     #[serde(default = "default_meeting_audio_format")]
     pub audio_format: String,
+    /// Minutes style template name (see `lumen_meeting::minutes_template`):
+    /// a built-in (`default` / `action-items` / `decision-log` / `write-email`)
+    /// or the `name` of a user template dropped into
+    /// `<data_dir>/minutes-templates/*.md`. Empty = the default template.
+    /// An unknown name falls back to the default at generation time, so a
+    /// hand-edited config can never break minutes.
+    pub minutes_template: String,
 }
 
 impl Default for MeetingConfig {
@@ -156,6 +163,7 @@ impl Default for MeetingConfig {
             auto_enroll_speakers: true,
             self_identity_id: None,
             audio_format: default_meeting_audio_format(),
+            minutes_template: String::new(),
         }
     }
 }
@@ -1212,6 +1220,31 @@ provider = "local_qwen"
     fn meeting_transcript_cleanup_defaults_on() {
         assert!(MeetingConfig::default().transcript_cleanup);
         assert!(AppConfig::default().meeting.transcript_cleanup);
+    }
+
+    #[test]
+    fn minutes_template_defaults_empty_and_tolerates_missing_or_unknown() {
+        // New installs default to the built-in default template (empty name).
+        assert_eq!(MeetingConfig::default().minutes_template, "");
+        // Absent from an existing config → still empty (the default template).
+        let existing: AppConfig = toml::from_str(
+            r#"
+[meeting]
+transcript_cleanup = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(existing.meeting.minutes_template, "");
+        // Any name round-trips verbatim; unknown names are resolved to the
+        // default template at minutes-generation time (never a config error).
+        let custom: AppConfig = toml::from_str(
+            r#"
+[meeting]
+minutes_template = "action-items"
+"#,
+        )
+        .unwrap();
+        assert_eq!(custom.meeting.minutes_template, "action-items");
     }
 
     #[test]
