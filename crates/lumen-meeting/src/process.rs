@@ -212,6 +212,16 @@ async fn transcribe_track(
             reporter.tick(ProcessingStage::Transcribe, Some(track), i + 1, total_turns);
         }
     }
+
+    // Sentence×turn realignment: re-attribute each word-timed sentence to the
+    // diar turn it overlaps most (splitting the rare sentence that straddles a
+    // speaker change), so diar boundary imprecision and engine timestamp drift
+    // do not pin text to the wrong speaker. Byte-for-byte no-op when no
+    // sentence moves (including engines without word timings).
+    let (texts, words) = crate::align::realign_turn_texts(&take.turns, &take.texts, &take.words);
+    take.texts = texts;
+    take.words = words;
+
     Ok((take, diar.speaker_embeddings, sample_rate, duration))
 }
 
