@@ -245,6 +245,12 @@ pub async fn transcribe_meeting(
         words.push(turn_words);
     }
 
+    // Sentence×turn realignment (same pass as the recorded-meeting pipeline):
+    // re-attribute each word-timed sentence to the diar turn it overlaps most,
+    // splitting sentences that straddle a speaker change. No-op when nothing
+    // moves (including engines without word timings).
+    let (texts, words) = crate::align::realign_turn_texts(&diar.turns, &texts, &words);
+
     let mut meeting = new_meeting(wav.to_str().map(str::to_string), duration);
     meeting.title = opts.title.clone();
     let meeting_id = meeting.id;

@@ -19,6 +19,7 @@
 //! network. The real diar-rs + real-ASR path is exercised by an `#[ignore]`d
 //! integration test that needs model weights and a wav (see `tests/`).
 
+mod align;
 mod annotate;
 mod assemble;
 mod cleanup;
@@ -41,6 +42,10 @@ mod spread;
 mod turns;
 mod unify;
 
+pub use align::{
+    align_sentences, backfill_fragment, overlap_seconds, realign_turn_texts, sentences_from_turn,
+    AlignedFragment, AsrSentence, SNAP_WINDOW_CHARS,
+};
 pub use annotate::{reconcile_annotations, resolve_annotation_names, AnnotationReconciliation};
 pub use assemble::{
     assemble_meeting, assemble_meeting_with_channels, new_meeting, speaker_label,
