@@ -5,6 +5,13 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/fakechris/lumen-asr/actions/workflows/ci-macos.yml"><img src="https://github.com/fakechris/lumen-asr/actions/workflows/ci-macos.yml/badge.svg" alt="CI macOS" /></a>
+  <a href="https://github.com/fakechris/lumen-asr/actions/workflows/ci-windows.yml"><img src="https://github.com/fakechris/lumen-asr/actions/workflows/ci-windows.yml/badge.svg" alt="CI Windows" /></a>
+  <img src="https://img.shields.io/badge/platform-macOS%2012%2B%20%7C%20Windows%2010%2F11-blue" alt="Platform: macOS 12+ | Windows 10/11" />
+  <img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="License: GPL-3.0" />
+</p>
+
+<p align="center">
   <strong>Speak. Polish. Paste.</strong><br />
   Local-first voice dictation for macOS and Windows — hold a hotkey, talk, get clean text for the app you’re already using.
 </p>
@@ -18,6 +25,14 @@
 <a id="english"></a>
 
 ## English
+
+### Quick start
+
+1. **Install** — grab the ad-hoc signed DMG (Apple Silicon) or Windows x64 NSIS installer from [GitHub Releases](https://github.com/fakechris/lumen-asr/releases); to build from source on macOS instead, run `./dev-install.sh --open`
+2. **Grant permissions** — microphone, plus Accessibility on macOS (needed to paste into other apps)
+3. **Hold the hotkey, speak, release** — text is inserted into the focused field; if a target refuses input (e.g. an elevated window on Windows), it falls back to copying the text to the clipboard
+
+Details and engine choices below.
 
 ### Why Lumen
 
@@ -252,6 +267,14 @@ processing.
 ## 中文
 
 <p align="right"><a href="#english">English</a> · <a href="#中文">中文</a></p>
+
+### 快速开始
+
+1. **安装** —— 从 [GitHub Releases](https://github.com/fakechris/lumen-asr/releases) 下载 ad-hoc 签名的 DMG（Apple Silicon）或 Windows x64 NSIS 安装包；macOS 上也可以源码构建（`./dev-install.sh --open`）
+2. **授权** —— 麦克风，macOS 上再加辅助功能（用于向其他应用粘贴）
+3. **按住快捷键说话，松开** —— 文本插入到当前焦点输入框；目标拒绝输入时（如 Windows 上的提权窗口），自动退回复制到剪贴板
+
+细节与引擎选择见下文。
 
 ### Lumen 是什么
 
