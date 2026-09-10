@@ -28,9 +28,9 @@
 
 ### Quick start
 
-1. **Install** — grab the ad-hoc signed DMG (Apple Silicon) or Windows x64 NSIS installer from [GitHub Releases](https://github.com/fakechris/lumen-asr/releases), then build from source if you prefer (`./dev-install.sh --open`)
+1. **Install** — grab the ad-hoc signed DMG (Apple Silicon) or Windows x64 NSIS installer from [GitHub Releases](https://github.com/fakechris/lumen-asr/releases); to build from source on macOS instead, run `./dev-install.sh --open`
 2. **Grant permissions** — microphone, plus Accessibility on macOS (needed to paste into other apps)
-3. **Hold the hotkey, speak, release** — text lands in whatever field your cursor is in
+3. **Hold the hotkey, speak, release** — text is inserted into the focused field; if a target refuses input (e.g. an elevated window on Windows), it falls back to copying the text to the clipboard
 
 Details and engine choices below.
 
@@ -270,9 +270,9 @@ processing.
 
 ### 快速开始
 
-1. **安装** —— 从 [GitHub Releases](https://github.com/fakechris/lumen-asr/releases) 下载 ad-hoc 签名的 DMG（Apple Silicon）或 Windows x64 NSIS 安装包；也可以源码构建（`./dev-install.sh --open`）
+1. **安装** —— 从 [GitHub Releases](https://github.com/fakechris/lumen-asr/releases) 下载 ad-hoc 签名的 DMG（Apple Silicon）或 Windows x64 NSIS 安装包；macOS 上也可以源码构建（`./dev-install.sh --open`）
 2. **授权** —— 麦克风，macOS 上再加辅助功能（用于向其他应用粘贴）
-3. **按住快捷键说话，松开** —— 文本直接落到光标所在的输入框
+3. **按住快捷键说话，松开** —— 文本插入到当前焦点输入框；目标拒绝输入时（如 Windows 上的提权窗口），自动退回复制到剪贴板
 
 细节与引擎选择见下文。
 
