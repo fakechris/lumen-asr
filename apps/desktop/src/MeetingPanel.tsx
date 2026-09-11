@@ -1919,7 +1919,7 @@ function MeetingRow({
       </button>
       {!locked && (
         <div className="meeting-row-actions">
-          {meeting.audio_path && (
+          {(meeting.audio_path || meeting.system_audio_path) && (
             <button
               type="button"
               className="icon-btn"
@@ -2648,7 +2648,7 @@ function MeetingDetailView({
           )}
         </div>
         <div className="meeting-detail-actions">
-          {meeting?.audio_path && (
+          {(meeting?.audio_path || meeting?.system_audio_path) && (
             <button
               type="button"
               className="icon-btn"
