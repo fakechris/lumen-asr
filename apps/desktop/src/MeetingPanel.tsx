@@ -390,6 +390,15 @@ function MeetingLibrary({
     [refresh, query, onError],
   );
 
+  // Reveal a meeting's audio file in the system file manager.
+  const revealMeetingAudio = useCallback(
+    (id: string) => {
+      onError(null);
+      api.revealAudioInFolder("meeting", id).catch((e) => onError(String(e)));
+    },
+    [onError],
+  );
+
   // Delete flow: a row asks to delete → we hold the target here and render a
   // confirmation dialog; only an explicit confirm calls the backend.
   const [pendingDelete, setPendingDelete] = useState<Meeting | null>(null);
@@ -533,6 +542,7 @@ function MeetingLibrary({
                         meeting={m}
                         onOpen={() => onOpen(m.id)}
                         onRename={(title) => renameMeeting(m.id, title)}
+                        onRevealAudio={() => revealMeetingAudio(m.id)}
                         onRequestDelete={() => setPendingDelete(m)}
                       />
                     </li>
@@ -1797,12 +1807,15 @@ function MeetingRow({
   meeting,
   onOpen,
   onRename,
+  onRevealAudio,
   onRequestDelete,
 }: {
   meeting: Meeting;
   onOpen: () => void;
   /** Persist a new title. Resolves when the backend write + refresh finish. */
   onRename: (title: string) => Promise<void>;
+  /** Reveal this meeting's audio file in the system file manager. */
+  onRevealAudio: () => void;
   /** Ask the library to open the delete-confirmation dialog for this meeting. */
   onRequestDelete: () => void;
 }) {
@@ -1906,6 +1919,17 @@ function MeetingRow({
       </button>
       {!locked && (
         <div className="meeting-row-actions">
+          {meeting.audio_path && (
+            <button
+              type="button"
+              className="icon-btn"
+              title="在文件夹中显示音频"
+              aria-label="在文件夹中显示音频"
+              onClick={onRevealAudio}
+            >
+              <Icon name="folder" size={15} />
+            </button>
+          )}
           <button
             type="button"
             className="icon-btn"
@@ -2624,6 +2648,22 @@ function MeetingDetailView({
           )}
         </div>
         <div className="meeting-detail-actions">
+          {meeting?.audio_path && (
+            <button
+              type="button"
+              className="icon-btn"
+              title="在文件夹中显示音频"
+              aria-label="在文件夹中显示音频"
+              onClick={() => {
+                onError(null);
+                void api
+                  .revealAudioInFolder("meeting", meetingId)
+                  .catch((e) => onError(String(e)));
+              }}
+            >
+              <Icon name="folder" size={15} />
+            </button>
+          )}
           {audioSrc && (
             <button
               type="button"

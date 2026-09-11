@@ -499,6 +499,7 @@ pub fn run() {
             commands::add_dictionary_term,
             commands::add_dictionary_replacement,
             commands::delete_dictionary_entry,
+            commands::reveal_audio_in_folder,
             dictation::list_audio_devices,
             dictation::get_audio_device,
             dictation::set_audio_device,

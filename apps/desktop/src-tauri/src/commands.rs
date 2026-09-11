@@ -463,3 +463,81 @@ pub fn delete_dictionary_entry(state: State<'_, AppState>, id: String) -> Result
         s.delete_dictionary_entry(id).map_err(|e| e.to_string())
     })
 }
+
+// ── Reveal audio in folder ────────────────────────────────────────────────
+
+/// Reveal a session or meeting audio file in the platform file manager
+/// (Finder on macOS, Explorer on Windows). The path never crosses the IPC
+/// boundary: it is resolved from the database by id, and only files inside
+/// Lumen's own data directory are ever revealed.
+#[tauri::command]
+pub fn reveal_audio_in_folder(
+    state: State<'_, AppState>,
+    kind: String,
+    id: String,
+) -> Result<(), String> {
+    let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let path = match kind.as_str() {
+        "session" => {
+            let rec = with_store(&state, |s| {
+                s.get_session(id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "session not found".to_string())
+            })?;
+            rec.audio_path
+                .ok_or_else(|| "此会话没有保存音频".to_string())?
+        }
+        "meeting" => {
+            let meeting = with_store(&state, |s| {
+                s.get_meeting(id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "meeting not found".to_string())
+            })?;
+            meeting
+                .audio_path
+                .or(meeting.system_audio_path)
+                .ok_or_else(|| "此会议没有保存音频".to_string())?
+        }
+        other => return Err(format!("unknown audio kind: {other}")),
+    };
+
+    let path = std::path::Path::new(&path);
+    if !is_app_owned_audio(path) || !path.is_file() {
+        return Err("音频文件不存在或不在 Lumen 数据目录中".to_string());
+    }
+    reveal_in_file_manager(path)
+}
+
+/// Prove the stored path resolves to a real file inside the app data
+/// directory (guards against tampered rows in the database).
+fn is_app_owned_audio(path: &std::path::Path) -> bool {
+    let Ok(data_dir) = default_data_dir().canonicalize() else {
+        return false;
+    };
+    matches!(path.canonicalize(), Ok(resolved) if resolved.starts_with(&data_dir))
+}
+
+fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("打开文件夹失败：{error}"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("打开文件夹失败：{error}"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = path;
+        Err("当前平台不支持打开文件夹".into())
+    }
+}

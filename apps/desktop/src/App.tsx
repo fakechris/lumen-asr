@@ -1713,6 +1713,7 @@ function RecordPanel({
   const [meta, setMeta] = useState<string>("");
   const [baseline, setBaseline] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionHasAudio, setSessionHasAudio] = useState(false);
   const [liveCandidates, setLiveCandidates] = useState<LearnCandidate[]>([]);
   const [startError, setStartError] = useState<string | null>(null);
   const [microphoneNoticeAcknowledged, setMicrophoneNoticeAcknowledged] = useState(
@@ -1831,6 +1832,7 @@ function RecordPanel({
     setText("");
     setAsrText("");
     setMeta("");
+    setSessionHasAudio(false);
     try {
       if (IS_WINDOWS) {
         const currentPermission = await api.getPermissionStatus();
@@ -1891,6 +1893,7 @@ function RecordPanel({
       setText(out.text);
       setBaseline(out.text);
       setSessionId(out.session?.id ?? null);
+      setSessionHasAudio(Boolean(out.session?.audio_path));
       setLiveCandidates([]);
       const copied = copyToastLabel(out.insertNotice);
       if (copied) onCopyToast(copied);
@@ -2153,7 +2156,26 @@ function RecordPanel({
       </section>
 
       <section className="card">
-        <h2>转写结果</h2>
+        <h2>
+          转写结果
+          {!recording && sessionId && sessionHasAudio && (
+            <button
+              type="button"
+              className="icon-btn"
+              style={{ marginLeft: 8, verticalAlign: "-3px" }}
+              onClick={() => {
+                onError(null);
+                void api
+                  .revealAudioInFolder("session", sessionId)
+                  .catch((e) => onError(String(e)));
+              }}
+              title="在文件夹中显示音频"
+              aria-label="在文件夹中显示音频"
+            >
+              <Icon name="folder" size={15} />
+            </button>
+          )}
+        </h2>
         {meta && <p className="muted-text">{meta}</p>}
         {asrText && asrText !== text && (
           <div className="field-block">
@@ -4919,6 +4941,23 @@ function HistoryPanel({
                     aria-label={playing ? "停止播放" : "听录音"}
                   >
                     <Icon name={playing ? "stop" : "play"} size={16} />
+                  </button>
+                )}
+                {hasAudio && (
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    disabled={busy}
+                    onClick={() => {
+                      onError(null);
+                      void api
+                        .revealAudioInFolder("session", selected.id)
+                        .catch((e) => onError(String(e)));
+                    }}
+                    title="在文件夹中显示音频"
+                    aria-label="在文件夹中显示音频"
+                  >
+                    <Icon name="folder" size={16} />
                   </button>
                 )}
                 {hasAudio && (

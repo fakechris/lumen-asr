@@ -425,6 +425,10 @@ export const api = {
   /** Raw WAV bytes for playback. */
   getSessionAudio: (id: string) => invoke<number[]>("get_session_audio", { id }),
 
+  /** Reveal a session ("session") or meeting ("meeting") audio file in Finder. */
+  revealAudioInFolder: (kind: "session" | "meeting", id: string) =>
+    invoke<void>("reveal_audio_in_folder", { kind, id }),
+
   retrySessionTranscription: (id: string) =>
     invoke<{
       session: SessionRecord;

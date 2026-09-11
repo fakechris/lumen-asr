@@ -28,6 +28,7 @@ export type IconName =
   | "wave"
   | "clipboard"
   | "pencil"
+  | "folder"
   | "sun"
   | "moon";
 
@@ -180,6 +181,11 @@ const PATHS: Record<IconName, ReactNode> = {
     <>
       <path d="M14.5 5.5l4 4" />
       <path d="M4 20l1-4L16 5a1.6 1.6 0 0 1 2.3 0l.7.7a1.6 1.6 0 0 1 0 2.3L8 19z" />
+    </>
+  ),
+  folder: (
+    <>
+      <path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2.5h8A1.5 1.5 0 0 1 20.5 9v8.5A1.5 1.5 0 0 1 19 19H5a1.5 1.5 0 0 1-1.5-1.5z" />
     </>
   ),
   sun: (
