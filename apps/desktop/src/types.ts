@@ -402,6 +402,9 @@ export type Meeting = {
   created_at: string;
   title?: string | null;
   audio_path?: string | null;
+  /** Optional second, synchronized system-audio track (dual-track recordings);
+   * absent for mic-only meetings. */
+  system_audio_path?: string | null;
   duration_seconds?: number | null;
   status: MeetingStatus;
   language?: string | null;
