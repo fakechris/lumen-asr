@@ -258,6 +258,10 @@ body {
   font-weight: 650;
   letter-spacing: 0.02em;
   pointer-events: none;
+  max-width: 90vw;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
   animation: copy-toast-in 0.16s ease-out;
 }
 

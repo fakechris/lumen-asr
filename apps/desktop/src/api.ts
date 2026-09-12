@@ -12,8 +12,10 @@ import type {
   EditLearningFeedback,
   EditLearningObservability,
   EditObservation,
+  ExportFileResult,
   ExportOutput,
   ExportPreset,
+  ExportTarget,
   Health,
   LearnCandidate,
   LearningProposal,
@@ -687,6 +689,11 @@ export const api = {
   /** Export a meeting's audio in the specified format ("mp3" | "ogg" | "wav"). */
   exportMeetingAudio: (meetingId: string, format: "mp3" | "ogg" | "wav") =>
     invoke<ArrayBuffer>("export_meeting_audio", { meetingId, format }),
+
+  /** Export a meeting document or audio directly to the user's Downloads folder
+   * and reveal it in the platform file manager. */
+  exportMeetingFile: (meetingId: string, target: ExportTarget) =>
+    invoke<ExportFileResult>("export_meeting_file", { meetingId, target }),
 
   // Speaker-correction commands (backend ready in M4a; the correction UI is
   // wired in M4c, these bindings are provided for that stage).

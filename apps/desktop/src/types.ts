@@ -589,9 +589,14 @@ export type Minutes = {
 /** Rendered export payload from `export_meeting`. */
 export type ExportOutput = { filename: string; content: string };
 
+/** Saved export file result from `export_meeting_file`. */
+export type ExportFileResult = { path: string; filename: string };
+
 /** The four fixed export presets. */
 export type ExportPreset =
   | "minutes_md"
   | "transcript_md"
   | "subtitles_srt"
   | "data_json";
+
+export type ExportTarget = ExportPreset | "mp3" | "ogg" | "wav";
