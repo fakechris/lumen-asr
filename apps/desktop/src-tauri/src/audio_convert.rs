@@ -50,6 +50,72 @@ pub fn convert_to_wav_16k(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Convert any ffmpeg-readable input to an MP3 file at `dest`.
+pub fn convert_to_mp3(src: &Path, dest: &Path) -> Result<(), String> {
+    if !src.is_file() {
+        return Err(format!("找不到音频文件：{}", src.display()));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("无法创建输出目录：{e}"))?;
+    }
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            &src.display().to_string(),
+            "-vn",
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "2",
+        ])
+        .arg(dest)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("无法启动 ffmpeg（{e}）。导出 MP3 需要安装 ffmpeg。"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg 导出 MP3 失败：{}", src.display()));
+    }
+    if !dest.is_file() {
+        return Err("ffmpeg 没有生成 mp3 文件".into());
+    }
+    Ok(())
+}
+
+/// Convert any ffmpeg-readable input to an Ogg Vorbis file at `dest`.
+pub fn convert_to_ogg(src: &Path, dest: &Path) -> Result<(), String> {
+    if !src.is_file() {
+        return Err(format!("找不到音频文件：{}", src.display()));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("无法创建输出目录：{e}"))?;
+    }
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            &src.display().to_string(),
+            "-vn",
+            "-c:a",
+            "libvorbis",
+            "-q:a",
+            "4",
+        ])
+        .arg(dest)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("无法启动 ffmpeg（{e}）。导出 OGG 需要安装 ffmpeg。"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg 导出 OGG 失败：{}", src.display()));
+    }
+    if !dest.is_file() {
+        return Err("ffmpeg 没有生成 ogg 文件".into());
+    }
+    Ok(())
+}
+
 /// Copy a wav as-is, otherwise convert through ffmpeg into `dest`.
 pub fn copy_or_convert_to_wav(src: &Path, dest: &Path) -> Result<(), String> {
     let ext = audio_extension(src);
@@ -123,5 +189,39 @@ mod tests {
         std::fs::write(&src, b"RIFF....WAVEfmt ").unwrap();
         copy_or_convert_to_wav(&src, &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"RIFF....WAVEfmt ");
+    }
+
+    #[test]
+    fn convert_missing_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.mp3");
+        let err = convert_to_mp3(Path::new("/path/that/does/not/exist.wav"), &dest).unwrap_err();
+        assert!(err.contains("找不到音频文件"));
+
+        let ogg_dest = dir.path().join("out.ogg");
+        let err = convert_to_ogg(Path::new("/path/that/does/not/exist.wav"), &ogg_dest).unwrap_err();
+        assert!(err.contains("找不到音频文件"));
+    }
+
+    #[test]
+    fn convert_wav_to_mp3_and_ogg_with_ffmpeg() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let wav_path = dir.path().join("test.wav");
+        let samples = vec![0.0f32; 1600];
+        let wav_bytes = lumen_asr::pcm_to_wav_bytes(&samples, 16000);
+        std::fs::write(&wav_path, &wav_bytes).unwrap();
+
+        let mp3_path = dir.path().join("test.mp3");
+        convert_to_mp3(&wav_path, &mp3_path).expect("convert to mp3");
+        assert!(mp3_path.is_file());
+        assert!(std::fs::metadata(&mp3_path).unwrap().len() > 0);
+
+        let ogg_path = dir.path().join("test.ogg");
+        convert_to_ogg(&wav_path, &ogg_path).expect("convert to ogg");
+        assert!(ogg_path.is_file());
+        assert!(std::fs::metadata(&ogg_path).unwrap().len() > 0);
     }
 }

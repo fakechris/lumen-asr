@@ -594,6 +594,7 @@ pub fn run() {
             meeting_cmd::set_self_identity,
             meeting_cmd::enroll_self_from_recordings,
             meeting_cmd::export_meeting,
+            meeting_cmd::export_meeting_audio,
             learning::get_learning_config,
             learning::save_learning_config,
             ui_cmd::get_ui_config,

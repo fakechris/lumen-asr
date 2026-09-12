@@ -2922,6 +2922,12 @@ html:has(.capsule-root) body {
   background: color-mix(in srgb, var(--text) 5%, transparent);
 }
 
+.meeting-export-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
 /* Transcript-first detail body: a narrow left minutes index + the transcript
    as the always-visible main column. */
 .meeting-detail-body {

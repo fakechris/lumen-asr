@@ -2556,6 +2556,38 @@ function MeetingDetailView({
     }
   }
 
+  async function doExportAudio(format: "mp3" | "ogg" | "wav") {
+    setExportOpen(false);
+    setExporting(true);
+    onError(null);
+    try {
+      const bytes = await api.exportMeetingAudio(meetingId, format);
+      const mime =
+        format === "mp3"
+          ? "audio/mpeg"
+          : format === "ogg"
+            ? "audio/ogg"
+            : "audio/wav";
+      const blob = new Blob([bytes], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const safeTitle = (detail?.meeting.title || "meeting").replace(
+        /[/\\?%*:|"<>]/g,
+        "_"
+      );
+      a.download = `${safeTitle}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
+
   async function doTrim(startSeconds: number, endSeconds: number) {
     setTrimming(true);
     onError(null);
@@ -2703,6 +2735,29 @@ function MeetingDetailView({
                 <button type="button" onClick={() => void doExport("data_json")}>
                   会议数据.json
                 </button>
+                {detail?.meeting.audio_path && (
+                  <>
+                    <div className="meeting-export-divider" />
+                    <button
+                      type="button"
+                      onClick={() => void doExportAudio("mp3")}
+                    >
+                      录音音频.mp3
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void doExportAudio("ogg")}
+                    >
+                      录音音频.ogg
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void doExportAudio("wav")}
+                    >
+                      录音音频.wav
+                    </button>
+                  </>
+                )}
               </div>
             )}
           </div>
