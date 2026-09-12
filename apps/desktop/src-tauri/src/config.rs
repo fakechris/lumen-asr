@@ -665,13 +665,21 @@ impl Default for OnboardingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
+    /// macOS only: lower output while dictation captures audio.
+    pub duck_output: bool,
+    /// Absolute output volume ceiling in [0, 1]; never raises quiet output.
+    pub duck_volume: f32,
     /// Empty = system default input.
     pub device_name: Option<String>,
 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { device_name: None }
+        Self {
+            device_name: None,
+            duck_output: false,
+            duck_volume: 0.15,
+        }
     }
 }
 
@@ -1576,5 +1584,21 @@ provider = "minimax"
         assert_eq!(config.hotkey.toggle, "Ctrl+Shift+Space");
         assert_eq!(config.hotkey.intents[0].chord, "Alt+Shift+T");
         assert!(!config.hotkey.intents[0].enabled);
+    }
+}
+
+#[cfg(test)]
+mod ducking_config_tests {
+    use super::*;
+    #[test]
+    fn existing_audio_config_keeps_ducking_off() {
+        let old: AudioConfig = toml::from_str("device_name = 'Microphone'").unwrap();
+        assert!(!old.duck_output);
+        assert_eq!(old.duck_volume, 0.15);
+        let enabled: AudioConfig = toml::from_str("duck_output = true\nduck_volume = 0.0").unwrap();
+        assert!(enabled.duck_output);
+        assert_eq!(enabled.duck_volume, 0.0);
+        let roundtrip: AudioConfig = toml::from_str(&toml::to_string(&enabled).unwrap()).unwrap();
+        assert!(roundtrip.duck_output);
     }
 }

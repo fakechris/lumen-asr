@@ -11,6 +11,8 @@ mod edit_surface;
 mod focused_field;
 mod inject;
 mod meeting_activity;
+mod output_ducking;
+pub use output_ducking::AudioDuckingGuard;
 
 pub use ax_drag::{
     dismiss_accessibility_drag_overlay, drag_payload_path, present_accessibility_drag_overlay,

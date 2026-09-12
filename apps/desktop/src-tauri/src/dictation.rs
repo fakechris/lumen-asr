@@ -704,6 +704,10 @@ fn kick_silero_model_download() {
 }
 
 pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
+    let mut ducking = state
+        .dictation_ducking
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if state.audio.is_recording() {
         return Ok(());
     }
@@ -721,11 +725,29 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     });
     state.context.begin(hint);
     configure_session_vad(state);
+    let audio_config = state
+        .config
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .audio
+        .clone();
+    let guard = if audio_config.duck_output {
+        match lumen_platform_macos::AudioDuckingGuard::acquire(audio_config.duck_volume) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::warn!(%error, "output ducking unavailable; continuing recording");
+                None
+            }
+        }
+    } else {
+        None
+    };
     state.audio.start().map_err(|error| {
         cancel_pane_target_discovery();
         state.context.clear_active();
         error.to_string()
     })?;
+    *ducking = guard;
     crate::permissions_cmd::mark_microphone_capture_started();
     // Notify the capture arbiter that a dictation is now live (CaptureMode::
     // Dictation). Recording is already running here, so this is a state-only
@@ -734,6 +756,7 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     if let Err(e) = state.capture.begin_dictation() {
         tracing::warn!(error = %e, "arbiter begin_dictation (meeting active?)");
     }
+    drop(ducking);
     let pane_observation_enabled = state
         .config
         .lock()
@@ -943,10 +966,16 @@ pub async fn stop_and_transcribe_inner(
         intent.clone(),
     );
 
-    let capture_result = state.audio.stop();
-    // Dictation capture is done — return the arbiter to Idle so a meeting can
-    // start again. State-only signal; the audio path already stopped above.
-    state.capture.end_dictation();
+    let capture_result = {
+        let mut ducking = state
+            .dictation_ducking
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = state.audio.stop();
+        drop(ducking.take());
+        state.capture.end_dictation();
+        result
+    };
     let FrozenContextAttachment {
         corrector_projection: captured_context,
         late_archive: mut late_context_archive,
@@ -1662,6 +1691,10 @@ pub fn cancel_recording(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
+    let mut ducking = state
+        .dictation_ducking
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     state.context.clear_active();
     state
         .edit_learning
@@ -1670,6 +1703,7 @@ pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
     if state.audio.is_recording() {
         let _ = state.audio.stop();
     }
+    drop(ducking.take());
     // Cancelled dictation still owns the arbiter — release it back to Idle.
     state.capture.end_dictation();
     Ok(())
@@ -2411,6 +2445,7 @@ mod attempt_metric_tests {
             ),
             store,
             audio: AudioCapture::new(),
+            dictation_ducking: Mutex::new(None),
             meeting_recorder: lumen_asr::MeetingRecorder::new(),
             meeting_power_guard: std::sync::Mutex::new(None),
             meeting_battery_poll: std::sync::Mutex::new(None),
@@ -2631,6 +2666,7 @@ mod attempt_metric_tests {
             ),
             store,
             audio: AudioCapture::new(),
+            dictation_ducking: Mutex::new(None),
             meeting_recorder: lumen_asr::MeetingRecorder::new(),
             meeting_power_guard: std::sync::Mutex::new(None),
             meeting_battery_poll: std::sync::Mutex::new(None),

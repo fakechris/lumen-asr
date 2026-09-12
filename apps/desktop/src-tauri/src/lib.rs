@@ -250,6 +250,8 @@ pub struct AppState {
     pub store: Arc<Mutex<Option<Store>>>,
     pub(crate) edit_learning: edit_learning_runtime::DesktopEditLearning,
     pub audio: AudioCapture,
+    /// Serializes capture transitions and holds attenuation only while recording.
+    pub dictation_ducking: Mutex<Option<lumen_platform_macos::AudioDuckingGuard>>,
     /// Independent continuous recorder for meetings (never touches `audio`).
     pub meeting_recorder: MeetingRecorder,
     /// Held while a meeting is recording to prevent idle system sleep and App
@@ -458,6 +460,7 @@ pub fn run() {
             store,
             edit_learning,
             audio,
+            dictation_ducking: Mutex::new(None),
             meeting_recorder: MeetingRecorder::new(),
             meeting_power_guard: Mutex::new(None),
             meeting_battery_poll: Mutex::new(None),
@@ -716,8 +719,14 @@ pub fn run() {
             );
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                let state = app.state::<AppState>();
+                let _ = dictation::cancel_recording_inner(&state);
+            }
+        });
 }
 
 #[cfg(all(test, unix))]
