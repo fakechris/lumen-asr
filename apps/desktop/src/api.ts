@@ -684,6 +684,10 @@ export const api = {
   exportMeeting: (meetingId: string, preset: ExportPreset) =>
     invoke<ExportOutput>("export_meeting", { meetingId, preset }),
 
+  /** Export a meeting's audio in the specified format ("mp3" | "ogg" | "wav"). */
+  exportMeetingAudio: (meetingId: string, format: "mp3" | "ogg" | "wav") =>
+    invoke<ArrayBuffer>("export_meeting_audio", { meetingId, format }),
+
   // Speaker-correction commands (backend ready in M4a; the correction UI is
   // wired in M4c, these bindings are provided for that stage).
   /** Edit the text of one transcript segment (manual correction on the review

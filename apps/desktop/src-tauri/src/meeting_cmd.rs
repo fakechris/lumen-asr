@@ -4028,6 +4028,57 @@ pub fn export_meeting(
     render_export(&detail, preset).map_err(|e| e.to_string())
 }
 
+/// Export a meeting's recording audio into MP3, OGG (Vorbis), or WAV.
+#[tauri::command]
+pub fn export_meeting_audio(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    format: String,
+) -> Result<tauri::ipc::Response, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    let fmt = format.trim().to_ascii_lowercase();
+    if !matches!(fmt.as_str(), "mp3" | "ogg" | "wav") {
+        return Err(format!("不支持的音频导出格式：{format}，仅支持 mp3、ogg、wav"));
+    }
+
+    let stored = with_store(&state, |s| {
+        s.get_meeting(id)
+            .map_err(|e| e.to_string())?
+            .and_then(|meeting| meeting.audio_path)
+            .ok_or_else(|| "会议没有录音文件".to_string())
+    })?;
+    let path = owned_meeting_wav(&stored)?;
+
+    match fmt.as_str() {
+        "wav" => {
+            if crate::audio_convert::audio_extension(&path) == "wav" {
+                let bytes = std::fs::read(&path).map_err(|e| format!("读取录音失败：{e}"))?;
+                Ok(tauri::ipc::Response::new(bytes))
+            } else {
+                let (samples, rate) = lumen_asr::decode_opus_to_pcm(&path)
+                    .map_err(|e| format!("解码录音失败：{e}"))?;
+                let bytes = lumen_asr::pcm_to_wav_bytes(&samples, rate);
+                Ok(tauri::ipc::Response::new(bytes))
+            }
+        }
+        "mp3" => {
+            let tmp_out = std::env::temp_dir().join(format!("lumen-export-{}-{}.mp3", id, Uuid::new_v4()));
+            crate::audio_convert::convert_to_mp3(&path, &tmp_out)?;
+            let bytes = std::fs::read(&tmp_out).map_err(|e| format!("读取导出的 MP3 失败：{e}"));
+            let _ = std::fs::remove_file(&tmp_out);
+            Ok(tauri::ipc::Response::new(bytes?))
+        }
+        "ogg" => {
+            let tmp_out = std::env::temp_dir().join(format!("lumen-export-{}-{}.ogg", id, Uuid::new_v4()));
+            crate::audio_convert::convert_to_ogg(&path, &tmp_out)?;
+            let bytes = std::fs::read(&tmp_out).map_err(|e| format!("读取导出的 OGG 失败：{e}"));
+            let _ = std::fs::remove_file(&tmp_out);
+            Ok(tauri::ipc::Response::new(bytes?))
+        }
+        _ => unreachable!(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
