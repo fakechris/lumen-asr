@@ -199,7 +199,8 @@ mod tests {
         assert!(err.contains("找不到音频文件"));
 
         let ogg_dest = dir.path().join("out.ogg");
-        let err = convert_to_ogg(Path::new("/path/that/does/not/exist.wav"), &ogg_dest).unwrap_err();
+        let err =
+            convert_to_ogg(Path::new("/path/that/does/not/exist.wav"), &ogg_dest).unwrap_err();
         assert!(err.contains("找不到音频文件"));
     }
 

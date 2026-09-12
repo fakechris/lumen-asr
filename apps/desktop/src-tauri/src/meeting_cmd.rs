@@ -4038,7 +4038,9 @@ pub fn export_meeting_audio(
     let id = parse_id(&meeting_id, "meeting")?;
     let fmt = format.trim().to_ascii_lowercase();
     if !matches!(fmt.as_str(), "mp3" | "ogg" | "wav") {
-        return Err(format!("不支持的音频导出格式：{format}，仅支持 mp3、ogg、wav"));
+        return Err(format!(
+            "不支持的音频导出格式：{format}，仅支持 mp3、ogg、wav"
+        ));
     }
 
     let stored = with_store(&state, |s| {
@@ -4062,14 +4064,16 @@ pub fn export_meeting_audio(
             }
         }
         "mp3" => {
-            let tmp_out = std::env::temp_dir().join(format!("lumen-export-{}-{}.mp3", id, Uuid::new_v4()));
+            let tmp_out =
+                std::env::temp_dir().join(format!("lumen-export-{}-{}.mp3", id, Uuid::new_v4()));
             crate::audio_convert::convert_to_mp3(&path, &tmp_out)?;
             let bytes = std::fs::read(&tmp_out).map_err(|e| format!("读取导出的 MP3 失败：{e}"));
             let _ = std::fs::remove_file(&tmp_out);
             Ok(tauri::ipc::Response::new(bytes?))
         }
         "ogg" => {
-            let tmp_out = std::env::temp_dir().join(format!("lumen-export-{}-{}.ogg", id, Uuid::new_v4()));
+            let tmp_out =
+                std::env::temp_dir().join(format!("lumen-export-{}-{}.ogg", id, Uuid::new_v4()));
             crate::audio_convert::convert_to_ogg(&path, &tmp_out)?;
             let bytes = std::fs::read(&tmp_out).map_err(|e| format!("读取导出的 OGG 失败：{e}"));
             let _ = std::fs::remove_file(&tmp_out);
