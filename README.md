@@ -262,6 +262,30 @@ processing.
 
 ---
 
+### Lower playback volume during dictation (macOS)
+
+To enable output ducking, edit the existing `[audio]` section in your
+Application Support/LumenAsr `config.toml`, then restart Lumen ASR:
+
+```toml
+[audio]
+duck_output = true
+duck_volume = 0.15
+```
+
+This option is off by default. `duck_volume` is an absolute volume ceiling
+between `0.0` and `1.0`; already quieter output stays quiet. It lowers all audio
+on the output device selected when dictation starts, and restores that device
+when capture stops or is cancelled, before transcription finishes. Meeting
+recording does not use this option. Devices without a writable master volume
+are skipped; dictation continues normally.
+
+An observed volume adjustment during recording is preserved instead of being
+overwritten on restore. Device changes do not transfer the saved volume to the
+new device. Volume changes racing restoration cannot be fully excluded, and
+force-quitting or power loss cannot restore volume automatically. Playback is
+not paused; this option does not change the system mute switch.
+
 <a id="中文"></a>
 
 ## 中文
@@ -480,6 +504,15 @@ docs/             设计与平台说明
 ```
 
 更多：[PRODUCT.md](./PRODUCT.md) · [ARCHITECTURE.md](./ARCHITECTURE.md)
+
+### 听写期间降低播放音量（macOS）
+
+在 Application Support/LumenAsr 的 `config.toml` 中，将现有 `[audio]`
+段的 `duck_output` 设为 `true`、`duck_volume` 设为 `0.15`，重启生效。
+默认关闭；音量值范围为 0–1，是绝对上限，不会调高本来更低的音量。
+停止采集或取消后恢复原设备，检测到用户调整音量时保留其选择。
+不支持主音量调节的设备会跳过；会议不受影响；不暂停播放或改变静音开关。
+恢复瞬间的并发音量调整无法完全排除；强制退出或断电无法保证自动恢复。
 
 ### 许可证
 
