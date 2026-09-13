@@ -517,7 +517,7 @@ fn is_app_owned_audio(path: &std::path::Path) -> bool {
     matches!(path.canonicalize(), Ok(resolved) if resolved.starts_with(&data_dir))
 }
 
-fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+pub fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")

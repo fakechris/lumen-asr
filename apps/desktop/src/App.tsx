@@ -1192,7 +1192,11 @@ export default function App() {
             )}
 
             {tab === "meeting" && (
-              <MeetingPanel onError={setError} onNavigate={(t) => setTab(t)} />
+              <MeetingPanel
+                onError={setError}
+                onNavigate={(t) => setTab(t)}
+                onToast={showCopyToast}
+              />
             )}
 
             {tab === "overview" && (

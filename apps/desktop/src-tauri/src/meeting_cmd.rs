@@ -4083,6 +4083,208 @@ pub fn export_meeting_audio(
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportFileResult {
+    pub path: String,
+    pub filename: String,
+}
+
+fn get_download_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            let downloads = PathBuf::from(home).join("Downloads");
+            if downloads.is_dir() {
+                return downloads;
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            let downloads = PathBuf::from(profile).join("Downloads");
+            if downloads.is_dir() {
+                return downloads;
+            }
+        }
+    }
+    std::env::temp_dir()
+}
+
+fn sanitize_export_filename(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '?' | '%' | '*' | ':' | '|' | '"' | '<' | '>' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        "会议".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn create_unique_export_file(
+    dir: &Path,
+    filename: &str,
+) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use std::fs::OpenOptions;
+
+    let p = dir.join(filename);
+    match OpenOptions::new().write(true).create_new(true).open(&p) {
+        Ok(file) => return Ok((p, file)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+
+    let (stem, ext) = match filename.rsplit_once('.') {
+        Some((s, e)) => (s, format!(".{e}")),
+        None => (filename, String::new()),
+    };
+    for i in 1..10000 {
+        let candidate = dir.join(format!("{stem} ({i}){ext}"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let fallback = dir.join(format!("{stem}_{}{ext}", Uuid::new_v4()));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&fallback)?;
+    Ok((fallback, file))
+}
+
+/// Export a meeting's document or audio directly to the user's Downloads folder
+/// and reveal it in the platform file manager (Finder / Explorer).
+#[tauri::command]
+pub fn export_meeting_file(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    target: String,
+) -> Result<ExportFileResult, String> {
+    let id = parse_id(&meeting_id, "meeting")?;
+    let target = target.trim().to_ascii_lowercase();
+
+    let detail = with_store(&state, |s| {
+        s.get_meeting_detail(id).map_err(|e| e.to_string())
+    })?
+    .ok_or_else(|| "会议不存在".to_string())?;
+
+    let title_stem = sanitize_export_filename(detail.meeting.title.as_deref().unwrap_or(""));
+
+    let (base_filename, bytes) = match target.as_str() {
+        "minutes_md" | "minutes" => {
+            let out = render_export(&detail, ExportPreset::MinutesMd).map_err(|e| e.to_string())?;
+            (
+                format!("{title_stem} - 会议纪要.md"),
+                out.content.into_bytes(),
+            )
+        }
+        "transcript_md" | "transcript" => {
+            let out =
+                render_export(&detail, ExportPreset::TranscriptMd).map_err(|e| e.to_string())?;
+            (
+                format!("{title_stem} - 完整逐字稿.md"),
+                out.content.into_bytes(),
+            )
+        }
+        "subtitles_srt" | "subtitles" | "srt" => {
+            let out =
+                render_export(&detail, ExportPreset::SubtitlesSrt).map_err(|e| e.to_string())?;
+            (format!("{title_stem} - 字幕.srt"), out.content.into_bytes())
+        }
+        "data_json" | "json" => {
+            let out = render_export(&detail, ExportPreset::DataJson).map_err(|e| e.to_string())?;
+            (
+                format!("{title_stem} - 会议数据.json"),
+                out.content.into_bytes(),
+            )
+        }
+        "mp3" | "ogg" | "wav" => {
+            let stored = detail
+                .meeting
+                .audio_path
+                .as_deref()
+                .ok_or_else(|| "会议没有录音文件".to_string())?;
+            let path = owned_meeting_wav(stored)?;
+
+            let audio_bytes = match target.as_str() {
+                "wav" => {
+                    if crate::audio_convert::audio_extension(&path) == "wav" {
+                        std::fs::read(&path).map_err(|e| format!("读取录音失败：{e}"))?
+                    } else {
+                        let (samples, rate) = lumen_asr::decode_opus_to_pcm(&path)
+                            .map_err(|e| format!("解码录音失败：{e}"))?;
+                        lumen_asr::pcm_to_wav_bytes(&samples, rate)
+                    }
+                }
+                "mp3" => {
+                    let tmp_out = std::env::temp_dir().join(format!(
+                        "lumen-export-{}-{}.mp3",
+                        id,
+                        Uuid::new_v4()
+                    ));
+                    crate::audio_convert::convert_to_mp3(&path, &tmp_out)?;
+                    let b =
+                        std::fs::read(&tmp_out).map_err(|e| format!("读取导出的 MP3 失败：{e}"));
+                    let _ = std::fs::remove_file(&tmp_out);
+                    b?
+                }
+                "ogg" => {
+                    let tmp_out = std::env::temp_dir().join(format!(
+                        "lumen-export-{}-{}.ogg",
+                        id,
+                        Uuid::new_v4()
+                    ));
+                    crate::audio_convert::convert_to_ogg(&path, &tmp_out)?;
+                    let b =
+                        std::fs::read(&tmp_out).map_err(|e| format!("读取导出的 OGG 失败：{e}"));
+                    let _ = std::fs::remove_file(&tmp_out);
+                    b?
+                }
+                _ => unreachable!(),
+            };
+            (format!("{title_stem}.{target}"), audio_bytes)
+        }
+        _ => return Err(format!("不支持的导出类型: {target}")),
+    };
+
+    use std::io::Write;
+    let download_dir = get_download_dir();
+    let (dest_path, mut file) = create_unique_export_file(&download_dir, &base_filename)
+        .map_err(|e| format!("创建导出文件失败：{e}"))?;
+    file.write_all(&bytes)
+        .map_err(|e| format!("写入导出文件失败：{e}"))?;
+    file.flush().map_err(|e| format!("保存导出文件失败：{e}"))?;
+
+    // Best-effort reveal: file is saved, reveal failure does not fail export
+    if let Err(err) = crate::commands::reveal_in_file_manager(&dest_path) {
+        tracing::warn!(path = %dest_path.display(), error = %err, "无法打开文件所在位置");
+    }
+
+    let final_filename = dest_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(&base_filename)
+        .to_string();
+
+    Ok(ExportFileResult {
+        path: dest_path.display().to_string(),
+        filename: final_filename,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

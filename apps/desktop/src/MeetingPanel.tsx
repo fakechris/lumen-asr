@@ -17,7 +17,7 @@ import { buildSpeakerColorMap, colorForSpeaker } from "./speakerColors";
 import type {
   ActionItem,
   EnrolledSpeaker,
-  ExportPreset,
+  ExportTarget,
   LiveAnnotation,
   Meeting,
   MeetingDetail,
@@ -170,10 +170,13 @@ function parseMinutes(detail: MeetingDetail): Minutes | null {
 export function MeetingPanel({
   onError,
   onNavigate,
+  onToast,
 }: {
   onError: (e: string | null) => void;
   /** Switch the top-level app tab (used by the "配置 LLM" / "去设置" links). */
   onNavigate?: (tab: TabId) => void;
+  /** Surface a brief notification toast at the top level. */
+  onToast?: (text: string) => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // App-level model state (from MeetingModelsProvider at the App root). It is
@@ -189,6 +192,7 @@ export function MeetingPanel({
         onBack={() => setSelectedId(null)}
         onError={onError}
         onNavigate={onNavigate}
+        onToast={onToast}
         models={models}
       />
     );
@@ -2313,12 +2317,14 @@ function MeetingDetailView({
   onBack,
   onError,
   onNavigate,
+  onToast,
   models,
 }: {
   meetingId: string;
   onBack: () => void;
   onError: (e: string | null) => void;
   onNavigate?: (tab: TabId) => void;
+  onToast?: (text: string) => void;
   models: MeetingModels;
 }) {
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
@@ -2530,57 +2536,13 @@ function MeetingDetailView({
     }
   }, [titleDraft, detail?.meeting.title, meetingId, load, onError]);
 
-  async function doExport(preset: ExportPreset) {
+  async function doExportFile(target: ExportTarget) {
     setExportOpen(false);
     setExporting(true);
     onError(null);
     try {
-      const out = await api.exportMeeting(meetingId, preset);
-      const blob = new Blob([out.content], {
-        type: "text/plain;charset=utf-8",
-      });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = out.filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      // Revoke only after the download has had a chance to start; revoking
-      // synchronously can cut the download off before the webview reads it.
-      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-    } catch (e) {
-      onError(String(e));
-    } finally {
-      setExporting(false);
-    }
-  }
-
-  async function doExportAudio(format: "mp3" | "ogg" | "wav") {
-    setExportOpen(false);
-    setExporting(true);
-    onError(null);
-    try {
-      const bytes = await api.exportMeetingAudio(meetingId, format);
-      const mime =
-        format === "mp3"
-          ? "audio/mpeg"
-          : format === "ogg"
-            ? "audio/ogg"
-            : "audio/wav";
-      const blob = new Blob([bytes], { type: mime });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      const safeTitle = (detail?.meeting.title || "meeting").replace(
-        /[/\\?%*:|"<>]/g,
-        "_"
-      );
-      a.download = `${safeTitle}.${format}`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      const result = await api.exportMeetingFile(meetingId, target);
+      onToast?.(`已导出并定位文件：${result.filename}`);
     } catch (e) {
       onError(String(e));
     } finally {
@@ -2717,22 +2679,28 @@ function MeetingDetailView({
             </button>
             {exportOpen && (
               <div className="meeting-export-menu" role="menu">
-                <button type="button" onClick={() => void doExport("minutes_md")}>
+                <button
+                  type="button"
+                  onClick={() => void doExportFile("minutes_md")}
+                >
                   会议纪要.md
                 </button>
                 <button
                   type="button"
-                  onClick={() => void doExport("transcript_md")}
+                  onClick={() => void doExportFile("transcript_md")}
                 >
                   完整逐字稿.md
                 </button>
                 <button
                   type="button"
-                  onClick={() => void doExport("subtitles_srt")}
+                  onClick={() => void doExportFile("subtitles_srt")}
                 >
                   字幕.srt
                 </button>
-                <button type="button" onClick={() => void doExport("data_json")}>
+                <button
+                  type="button"
+                  onClick={() => void doExportFile("data_json")}
+                >
                   会议数据.json
                 </button>
                 {detail?.meeting.audio_path && (
@@ -2740,19 +2708,19 @@ function MeetingDetailView({
                     <div className="meeting-export-divider" />
                     <button
                       type="button"
-                      onClick={() => void doExportAudio("mp3")}
+                      onClick={() => void doExportFile("mp3")}
                     >
                       录音音频.mp3
                     </button>
                     <button
                       type="button"
-                      onClick={() => void doExportAudio("ogg")}
+                      onClick={() => void doExportFile("ogg")}
                     >
                       录音音频.ogg
                     </button>
                     <button
                       type="button"
-                      onClick={() => void doExportAudio("wav")}
+                      onClick={() => void doExportFile("wav")}
                     >
                       录音音频.wav
                     </button>
