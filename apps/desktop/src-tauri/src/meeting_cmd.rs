@@ -4128,22 +4128,41 @@ fn sanitize_export_filename(raw: &str) -> String {
     }
 }
 
-fn unique_export_path(dir: &Path, filename: &str) -> PathBuf {
+fn create_unique_export_file(
+    dir: &Path,
+    filename: &str,
+) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use std::fs::OpenOptions;
+
     let p = dir.join(filename);
-    if !p.exists() {
-        return p;
+    match OpenOptions::new().write(true).create_new(true).open(&p) {
+        Ok(file) => return Ok((p, file)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
     }
+
     let (stem, ext) = match filename.rsplit_once('.') {
         Some((s, e)) => (s, format!(".{e}")),
         None => (filename, String::new()),
     };
     for i in 1..10000 {
         let candidate = dir.join(format!("{stem} ({i}){ext}"));
-        if !candidate.exists() {
-            return candidate;
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
-    dir.join(format!("{stem}_{}{ext}", Uuid::new_v4()))
+    let fallback = dir.join(format!("{stem}_{}{ext}", Uuid::new_v4()));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&fallback)?;
+    Ok((fallback, file))
 }
 
 /// Export a meeting's document or audio directly to the user's Downloads folder
@@ -4241,9 +4260,13 @@ pub fn export_meeting_file(
         _ => return Err(format!("不支持的导出类型: {target}")),
     };
 
+    use std::io::Write;
     let download_dir = get_download_dir();
-    let dest_path = unique_export_path(&download_dir, &base_filename);
-    std::fs::write(&dest_path, bytes).map_err(|e| format!("保存导出文件失败：{e}"))?;
+    let (dest_path, mut file) = create_unique_export_file(&download_dir, &base_filename)
+        .map_err(|e| format!("创建导出文件失败：{e}"))?;
+    file.write_all(&bytes)
+        .map_err(|e| format!("写入导出文件失败：{e}"))?;
+    file.flush().map_err(|e| format!("保存导出文件失败：{e}"))?;
 
     // Best-effort reveal: file is saved, reveal failure does not fail export
     if let Err(err) = crate::commands::reveal_in_file_manager(&dest_path) {
