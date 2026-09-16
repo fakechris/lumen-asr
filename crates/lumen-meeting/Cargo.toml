@@ -46,7 +46,7 @@ hound = "3"
 # fetch, the C++ toolchain, nor the ONNX Runtime download.
 [target.'cfg(target_os = "macos")'.dependencies]
 # Keep this rev in sync with the other lumen-suite deps in the workspace root Cargo.toml.
-diar-rs = { git = "https://github.com/fakechris/lumen-suite.git", rev = "5b22eb603134a69a460c84dd2b05ba2b3c54ad03", optional = true }
+diar-rs = { git = "https://github.com/fakechris/lumen-suite.git", rev = "87d5a902ad79555a930a3a37716b3f0b0ab67d45", optional = true }
 
 [features]
 default = []

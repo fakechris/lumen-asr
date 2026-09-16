@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use lumen_asr::{
     LiveTapSender, MeetingAudioFormat, RecordingSummary, SystemTrackRecorder, SystemTrackSender,
 };
-use lumen_platform_macos::{SystemAudioCapture, SystemAudioSink, SystemAudioTarget};
+use lumen_platform_macos::{SystemAudioCapture, SystemAudioError, SystemAudioSink, SystemAudioTarget};
 
 /// One live tap→WAV session for the active meeting recording.
 struct Session {
@@ -95,15 +95,30 @@ impl MeetingSystemAudio {
         }
 
         let mut capture = SystemAudioCapture::new();
-        let sample_rate = match capture.start(&target, sink) {
-            Ok(rate) => rate,
-            Err(e) => {
-                // Capability absent, permission denied, or a HAL failure —
-                // all degrade to mic-only. This is the designed fallback, so
-                // log-and-continue rather than surfacing an error.
-                tracing::warn!(error = %e, "system audio capture unavailable; recording mic-only");
-                return None;
+        let mut sample_rate_opt = None;
+        // The conference app may momentarily be silent or finishing output setup
+        // at recording start. Give a brief grace window (up to ~600ms) before giving up.
+        for attempt in 0..4 {
+            match capture.start(&target, Arc::clone(&sink)) {
+                Ok(rate) => {
+                    sample_rate_opt = Some(rate);
+                    break;
+                }
+                Err(SystemAudioError::NoMatchingProcesses { .. }) if attempt < 3 => {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => {
+                    // Capability absent, permission denied, or a HAL failure —
+                    // all degrade to mic-only. This is the designed fallback, so
+                    // log-and-continue rather than surfacing an error.
+                    tracing::warn!(error = %e, "system audio capture unavailable; recording mic-only");
+                    return None;
+                }
             }
+        }
+        let Some(sample_rate) = sample_rate_opt else {
+            tracing::warn!("system audio capture target had no active audio processes; recording mic-only");
+            return None;
         };
 
         let track = match SystemTrackRecorder::create_with_format(&out_path, sample_rate, format) {

@@ -359,6 +359,7 @@ impl MeetingLive {
         &self,
         app: AppHandle,
         meeting_id: String,
+        out_path: PathBuf,
         streaming_dir: PathBuf,
         mic: LiveTrackFeed,
         system: Option<LiveTrackFeed>,
@@ -376,6 +377,7 @@ impl MeetingLive {
                 run_worker(
                     app,
                     worker_meeting_id,
+                    out_path,
                     streaming_dir,
                     mic,
                     system,
@@ -1190,7 +1192,11 @@ impl VerificationStreak {
 /// speakers can always earn a session-cluster label (L4) — so the verify path
 /// embeds every queued utterance regardless of library state.
 #[cfg(target_os = "macos")]
-fn spawn_live_verifier(app: AppHandle, meeting_id: String) -> Option<LiveVerifier> {
+fn spawn_live_verifier(
+    app: AppHandle,
+    meeting_id: String,
+    out_path: PathBuf,
+) -> Option<LiveVerifier> {
     let emb_model = lumen_asr::lumen_models_dir().join("diar").join("emb.onnx");
     if !emb_model.is_file() {
         return None;
@@ -1199,13 +1205,17 @@ fn spawn_live_verifier(app: AppHandle, meeting_id: String) -> Option<LiveVerifie
     let (tx, rx) = std::sync::mpsc::sync_channel::<VerifierMsg>(EMBED_QUEUE_CAPACITY);
     let handle = std::thread::Builder::new()
         .name("lumen-meeting-live-verify".into())
-        .spawn(move || run_verifier(app, meeting_id, emb_model, identity_dir, rx))
+        .spawn(move || run_verifier(app, meeting_id, out_path, emb_model, identity_dir, rx))
         .ok()?;
     Some(LiveVerifier { tx, handle })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn spawn_live_verifier(_app: AppHandle, _meeting_id: String) -> Option<LiveVerifier> {
+fn spawn_live_verifier(
+    _app: AppHandle,
+    _meeting_id: String,
+    _out_path: PathBuf,
+) -> Option<LiveVerifier> {
     None
 }
 
@@ -1226,6 +1236,7 @@ fn spawn_live_verifier(_app: AppHandle, _meeting_id: String) -> Option<LiveVerif
 fn run_verifier(
     app: AppHandle,
     meeting_id: String,
+    out_path: PathBuf,
     emb_model: PathBuf,
     identity_dir: PathBuf,
     rx: Receiver<VerifierMsg>,
@@ -1248,6 +1259,7 @@ fn run_verifier(
     // state only, dropped with this thread. Labels are session-scoped
     // placeholders (说话人N), shared across tracks via this one instance.
     let mut clusters = SessionClusters::default();
+    let mut verified_segments: Vec<lumen_meeting::LiveSegmentSnapshot> = Vec::new();
     while let Ok(msg) = rx.recv() {
         let job = match msg {
             VerifierMsg::Seed {
@@ -1411,6 +1423,12 @@ fn run_verifier(
             streak.observe_miss(job.track);
             continue;
         };
+        verified_segments.push(lumen_meeting::LiveSegmentSnapshot {
+            track: job.track.to_string(),
+            start_seconds: job.start_seconds,
+            end_seconds: job.end_seconds,
+            speaker_label: speaker.display_name.clone(),
+        });
         emit(
             &app,
             &meeting_id,
@@ -1424,6 +1442,46 @@ fn run_verifier(
                 is_final: true,
             },
             Some(speaker),
+        );
+    }
+    // Summarize stable clusters (count >= 2 or duration >= 2.0s) and export sidecar
+    let mut stable_clusters = Vec::new();
+    for c in &clusters.clusters {
+        let voiced_sec: f64 = verified_segments
+            .iter()
+            .filter(|s| s.speaker_label == c.label)
+            .map(|s| (s.end_seconds - s.start_seconds).max(0.0))
+            .sum();
+        if c.count >= 2 || voiced_sec >= 2.0 {
+            let mut norm_centroid = c.centroid.clone();
+            let inv = 1.0 / (c.count as f32).max(1e-6);
+            for v in norm_centroid.iter_mut() {
+                *v *= inv;
+            }
+            let norm = norm_centroid.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+            for v in norm_centroid.iter_mut() {
+                *v /= norm;
+            }
+            stable_clusters.push(lumen_meeting::LiveClusterSnapshot {
+                label: c.label.clone(),
+                centroid: norm_centroid,
+                count: c.count,
+                voiced_seconds: voiced_sec,
+            });
+        }
+    }
+    let summary = lumen_meeting::LiveDiarSessionSummary {
+        clusters: stable_clusters,
+        segments: verified_segments,
+    };
+    if let Err(e) = lumen_meeting::write_live_diar_summary(&out_path, &summary) {
+        tracing::warn!(error = %e, path = %out_path.display(), "could not write live diarization sidecar");
+    } else {
+        tracing::info!(
+            path = %out_path.display(),
+            clusters = summary.clusters.len(),
+            segments = summary.segments.len(),
+            "live diarization session summary persisted"
         );
     }
     tracing::info!("live speaker verification stopped");
@@ -1631,6 +1689,7 @@ fn handle_annotation_notice(
 fn run_worker(
     app: AppHandle,
     meeting_id: String,
+    out_path: PathBuf,
     streaming_dir: PathBuf,
     mic: LiveTrackFeed,
     system: Option<LiveTrackFeed>,
@@ -1655,7 +1714,7 @@ fn run_worker(
     // L3: live speaker verification (macOS + diar embedding model + non-empty
     // identity library, otherwise `None` and everything below degrades to the
     // exact L1/L2 behaviour — no ring buffers, no jobs, no speaker events).
-    let verifier = spawn_live_verifier(app.clone(), meeting_id.clone());
+    let verifier = spawn_live_verifier(app.clone(), meeting_id.clone(), out_path);
     let keep_window = verifier.is_some();
 
     let mut tracks = vec![TrackState::new(

@@ -1020,6 +1020,7 @@ fn start_meeting_recording_with_targets(
         state.meeting_live.start(
             app.clone(),
             meeting_id.to_string(),
+            out_path.clone(),
             streaming,
             crate::meeting_live::LiveTrackFeed {
                 rx,
