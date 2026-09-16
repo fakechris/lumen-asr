@@ -29,6 +29,7 @@ mod echo;
 mod enroll;
 pub mod export;
 mod identify;
+pub mod live_diar;
 mod merge;
 pub mod minutes;
 pub mod minutes_template;
@@ -65,6 +66,10 @@ pub use export::{export_meeting, ExportError, ExportOutput, ExportPreset};
 pub use identify::{
     auto_identify_speakers, reidentify_speakers, speaker_voiced_ms, AutoIdentification,
     IDENTIFY_MIN_VOICED_MS,
+};
+pub use live_diar::{
+    read_live_diar_summary, rescue_turns_with_live_prior, write_live_diar_summary,
+    LiveClusterSnapshot, LiveDiarSessionSummary, LiveSegmentSnapshot,
 };
 pub use merge::{merge_tracks, system_speaker_offset, MergedTake, TrackTake};
 pub use minutes_template::{

@@ -5,7 +5,7 @@ use crate::assemble::DiarTurn;
 
 /// Default minimum turn length (seconds). Fragments shorter than this are
 /// absorbed into a neighbouring turn (see [`merge_short_diar_turns`]).
-pub const DEFAULT_MIN_TURN_SECONDS: f64 = 1.5;
+pub const DEFAULT_MIN_TURN_SECONDS: f64 = 0.6;
 
 /// Default maximum silence gap (seconds) across which a short fragment may be
 /// absorbed into a neighbour. Larger gaps leave the fragment alone so ASR is
@@ -127,16 +127,17 @@ mod tests {
     }
 
     #[test]
-    fn absorbs_short_s2_into_previous_s1() {
-        // Real pattern from the Spanish dogfood: long S1, 0.75s S2, long S1.
-        let turns = vec![t(0.0, 100.0, 0), t(100.0, 100.75, 1), t(100.75, 200.0, 0)];
-        let out = merge_short_diar_turns(&turns, 1.5);
-        // short S2 → absorbed into S1; consecutive S1 collapse → one turn
-        assert_eq!(out.len(), 1);
+    fn preserves_conversational_short_interjection_with_default_min() {
+        // Natural 0.75s conversational response ("对", "好的") between two turns of speaker 0.
+        // With DEFAULT_MIN_TURN_SECONDS = 0.6, it is preserved as an independent turn!
+        let turns = vec![t(0.0, 10.0, 0), t(10.0, 10.75, 1), t(10.75, 20.0, 0)];
+        let out = merge_short_diar_turns(&turns, DEFAULT_MIN_TURN_SECONDS);
+        assert_eq!(out.len(), 3);
         assert_eq!(out[0].speaker, 0);
-        assert!((out[0].start - 0.0).abs() < 1e-9);
-        assert!((out[0].end - 200.0).abs() < 1e-9);
+        assert_eq!(out[1].speaker, 1);
+        assert_eq!(out[2].speaker, 0);
     }
+
 
     #[test]
     fn absorbs_leading_short_into_next() {

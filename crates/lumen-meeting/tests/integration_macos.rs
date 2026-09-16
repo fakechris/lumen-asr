@@ -51,8 +51,16 @@ async fn diarize_transcribe_persist_end_to_end() {
 
     let segments = store.list_segments(meeting_id).unwrap();
     let speakers = store.list_speakers(meeting_id).unwrap();
+    let min_speakers = std::env::var("MIN_SPEAKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2);
     assert!(!segments.is_empty(), "expected at least one turn");
-    assert!(!speakers.is_empty(), "expected at least one speaker");
+    assert!(
+        speakers.len() >= min_speakers,
+        "expected at least {min_speakers} speakers on dialogue audio, got {}",
+        speakers.len()
+    );
     eprintln!(
         "diarized {} turns across {} speakers",
         segments.len(),

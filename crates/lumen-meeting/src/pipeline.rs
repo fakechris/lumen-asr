@@ -511,6 +511,23 @@ pub(crate) fn diarize_wav(
         }
     };
 
+    // Layer 2.5 — live session acoustic prior: if offline diarization collapsed
+    // to a single speaker, but the real-time live session identified >= 2 stable
+    // speakers, rescue the turn attributions using the live segment boundaries.
+    let raw_turns = if let Some(summary) = crate::live_diar::read_live_diar_summary(wav) {
+        let rescued = crate::live_diar::rescue_turns_with_live_prior(&raw_turns, &summary);
+        if rescued != raw_turns {
+            tracing::warn!(
+                wav = %wav.display(),
+                live_speakers = summary.clusters.len(),
+                "rescued single-speaker collapse using live diarization prior"
+            );
+        }
+        rescued
+    } else {
+        raw_turns
+    };
+
     // Absorb sub-second noise fragments so they do not become false speakers
     // (e.g. a 0.7s "S2" between long monologue turns).
     let min_turn = opts
