@@ -103,8 +103,12 @@ fn build_form(model: &str, wav: Vec<u8>) -> Result<reqwest::multipart::Form, Asr
 
 /// Interpret one provider response. Errors may arrive on any HTTP status as
 /// an OpenAI-style envelope; `http_code` inside is authoritative when present.
+/// A success body that is not JSON, or without a string `text` field, is an
+/// error too — silently storing an empty transcript would hide a broken
+/// response (and, in cloud meeting mode, skip the local fallback).
 fn parse_response(http_status: reqwest::StatusCode, body: &str) -> Result<String, AsrError> {
-    let value: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| AsrError::Inference("malformed provider response".into()))?;
     if let Some(err) = value.get("error") {
         let code = match err.get("http_code") {
             Some(serde_json::Value::String(s)) => s.trim().to_string(),
@@ -128,12 +132,13 @@ fn parse_response(http_status: reqwest::StatusCode, body: &str) -> Result<String
             "provider rejected request with status {http_status}: {body}"
         )));
     }
-    Ok(value
-        .get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string())
+    match value.get("text") {
+        // An explicit empty string stays a valid (silent-audio) transcript.
+        Some(serde_json::Value::String(text)) => Ok(text.trim().to_string()),
+        _ => Err(AsrError::Inference(
+            "malformed provider response: missing text field".into(),
+        )),
+    }
 }
 
 /// User-facing Chinese message for a documented provider HTTP code.
@@ -264,16 +269,34 @@ mod tests {
     }
 
     #[test]
-    fn text_is_trimmed_and_missing_text_yields_empty_string() {
+    fn success_text_is_trimmed_and_empty_string_stays_valid() {
         assert_eq!(
             parse_response(reqwest::StatusCode::OK, r#"{"text":"  嗨  "}"#).unwrap(),
             "嗨"
         );
-        assert_eq!(parse_response(reqwest::StatusCode::OK, "{}").unwrap(), "");
+        // Silence: an explicit empty string is a valid transcript.
         assert_eq!(
-            parse_response(reqwest::StatusCode::OK, "not json at all").unwrap(),
+            parse_response(reqwest::StatusCode::OK, r#"{"text":""}"#).unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn malformed_success_responses_are_errors_not_empty_transcripts() {
+        // Missing / non-string text and non-JSON bodies must surface as errors
+        // (so dictation shows them and cloud meetings fall back per turn)
+        // instead of silently storing empty text.
+        for body in [
+            "{}",
+            r#"{"text":123}"#,
+            r#"{"duration":1.0}"#,
+            "not json at all",
+        ] {
+            let err = parse_response(reqwest::StatusCode::OK, body)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("malformed"), "{body}: {err}");
+        }
     }
 
     #[test]
@@ -327,12 +350,14 @@ mod tests {
     }
 
     #[test]
-    fn non_json_error_body_falls_back_to_http_status() {
+    fn non_json_error_body_is_reported_as_malformed() {
+        // A body that is not JSON at all is malformed on any HTTP status
+        // (the status-based fallback only applies to well-formed envelopes
+        // without an `http_code`).
         let err = parse_response(reqwest::StatusCode::UNAUTHORIZED, "unauthorized")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("401"), "{err}");
-        assert!(err.contains("unauthorized"), "{err}");
+        assert!(err.contains("malformed"), "{err}");
     }
 
     #[tokio::test]
