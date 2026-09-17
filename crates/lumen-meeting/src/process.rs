@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lumen_asr_engine::AsrEngine;
 use lumen_core::MeetingStatus;
@@ -33,7 +34,7 @@ use crate::merge::{merge_tracks, system_speaker_offset, TrackTake};
 use crate::minutes::{
     generate_minutes, minutes_summaries, render_transcript_for_minutes, MinutesError,
 };
-use crate::pipeline::{diarize_wav, transcribe_turn, DiarModels, MeetingError, MeetingOptions};
+use crate::pipeline::{diarize_wav, transcribe_turns, DiarModels, MeetingError, MeetingOptions};
 use crate::progress::{
     ProcessingPlan, ProcessingProgress, ProcessingStage, ProcessingTrack, ProgressReporter,
 };
@@ -94,7 +95,7 @@ pub async fn process_meeting(
     wav: &Path,
     system_wav: Option<&Path>,
     diar_models: &DiarModels,
-    asr_engine: &dyn AsrEngine,
+    asr_engine: Arc<dyn AsrEngine>,
     minutes: Option<&MinutesConfig<'_>>,
     opts: &MeetingOptions,
     progress: Option<&dyn Fn(ProcessingProgress)>,
@@ -173,7 +174,7 @@ pub fn reconcile_stored_annotations(
 async fn transcribe_track(
     wav: &Path,
     diar_models: &DiarModels,
-    asr_engine: &dyn AsrEngine,
+    asr_engine: Arc<dyn AsrEngine>,
     opts: &MeetingOptions,
     reporter: Option<&ProgressReporter<'_>>,
     track: ProcessingTrack,
@@ -198,19 +199,29 @@ async fn transcribe_track(
         words: Vec::with_capacity(diar.turns.len()),
     };
     // Per-turn ASR — the loop-heavy stage. Report entering it, then tick once
-    // per finished turn (throttled) so a long meeting shows "识别 i/N".
+    // per finished turn (throttled) so a long meeting shows "识别 i/N". With
+    // `opts.turn_concurrency > 1` (cloud engines) turns run bounded-concurrent;
+    // results are still delivered in turn order.
     let total_turns = diar.turns.len();
     if let Some(reporter) = reporter {
         reporter.stage_start(ProcessingStage::Transcribe, Some(track));
     }
-    for (i, turn) in diar.turns.iter().enumerate() {
-        let (text, turn_words) =
-            transcribe_turn(asr_engine, &diar.samples, sample_rate, turn, opts).await?;
+    let results = transcribe_turns(
+        asr_engine,
+        Arc::clone(&diar.samples),
+        sample_rate,
+        &diar.turns,
+        opts,
+        |done| {
+            if let Some(reporter) = reporter {
+                reporter.tick(ProcessingStage::Transcribe, Some(track), done, total_turns);
+            }
+        },
+    )
+    .await?;
+    for (text, turn_words) in results {
         take.texts.push(text);
         take.words.push(turn_words);
-        if let Some(reporter) = reporter {
-            reporter.tick(ProcessingStage::Transcribe, Some(track), i + 1, total_turns);
-        }
     }
 
     // Sentence×turn realignment: re-attribute each word-timed sentence to the
@@ -246,7 +257,7 @@ async fn run(
     wav: &Path,
     system_wav: Option<&Path>,
     diar_models: &DiarModels,
-    asr_engine: &dyn AsrEngine,
+    asr_engine: Arc<dyn AsrEngine>,
     minutes: Option<&MinutesConfig<'_>>,
     opts: &MeetingOptions,
     progress: Option<&dyn Fn(ProcessingProgress)>,
@@ -308,7 +319,7 @@ async fn run(
     let (mic_take, mic_embeddings, sample_rate, mut duration) = transcribe_track(
         &mic_audio,
         diar_models,
-        asr_engine,
+        Arc::clone(&asr_engine),
         opts,
         reporter,
         ProcessingTrack::Mic,
@@ -333,7 +344,7 @@ async fn run(
         Some(sys) => match transcribe_track(
             sys,
             diar_models,
-            asr_engine,
+            Arc::clone(&asr_engine),
             opts,
             reporter,
             ProcessingTrack::System,
@@ -907,7 +918,7 @@ mod tests {
             Path::new("/does/not/exist.wav"),
             None,
             &models,
-            &engine,
+            Arc::new(engine),
             Some(&cfg),
             &MeetingOptions::default(),
             None,

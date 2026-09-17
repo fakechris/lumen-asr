@@ -592,8 +592,9 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         "local_qwen" => qwen.ready,
         "local_whisper" => wh.ready,
         "openai_audio" | "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
-        // volcengine: ready once the access token (or 新版控制台 APP Key) is set.
-        "volcengine" => !asr_cfg.api_key.is_empty(),
+        // volcengine / minimax: ready once the API key (volcengine 新版控制台
+        // APP Key 亦填在这里) is set.
+        "volcengine" | "minimax" => !asr_cfg.api_key.is_empty(),
         // config_only: selectable but not runnable yet
         _ => false,
     };
@@ -637,6 +638,7 @@ pub(crate) fn ensure_active_asr_ready(
         "local_whisper" => "请先选择有效的 Whisper 模型。",
         "openai_audio" | "custom" => "请先完成在线 ASR 的地址与凭据配置。",
         "volcengine" => "请先在「设置 → 语音识别」填写火山引擎的 Access Token（新版控制台填 APP Key；旧版控制台还需 App ID）。",
+        "minimax" => "请先在「设置 → 语音识别」填写 MiniMax 的 API Key（platform.minimaxi.com 接口密钥）。",
         _ => "当前 ASR 尚未接入可运行的识别客户端。",
     };
     Err(format!("{provider_label} 未就绪。{guidance}"))
@@ -1732,7 +1734,7 @@ pub fn cancel_recording_inner(state: &AppState) -> Result<(), String> {
 ///
 /// The returned engine is `Send + Sync` (trait requirement), so it can be moved
 /// into the background meeting-processing task.
-pub(crate) fn build_meeting_asr_engine(state: &AppState) -> Result<Box<dyn AsrEngine>, String> {
+pub(crate) fn build_meeting_asr_engine(state: &AppState) -> Result<Arc<dyn AsrEngine>, String> {
     // Preferred: the shared SenseVoice engine (punctuation + multilingual),
     // resolved at startup from the shared cluster root / legacy dirs.
     let sensevoice = state
@@ -1745,7 +1747,7 @@ pub(crate) fn build_meeting_asr_engine(state: &AppState) -> Result<Box<dyn AsrEn
             dir = %sensevoice.model_dir().display(),
             "meeting ASR engine: SenseVoice (punctuation + multilingual, shared with dictation)"
         );
-        return Ok(Box::new(sensevoice));
+        return Ok(Arc::new(sensevoice));
     }
 
     // Legacy fallback: SenseVoice not provisioned, but an offline Paraformer model
@@ -1757,7 +1759,7 @@ pub(crate) fn build_meeting_asr_engine(state: &AppState) -> Result<Box<dyn AsrEn
             dir = %paraformer_dir.display(),
             "SenseVoice model not provisioned; meeting falls back to offline Paraformer"
         );
-        return Ok(Box::new(ParaformerAsr::new(paraformer_dir)));
+        return Ok(Arc::new(ParaformerAsr::new(paraformer_dir)));
     }
 
     Err(
@@ -1788,7 +1790,10 @@ async fn run_asr(
         ));
     }
 
-    if matches!(provider, "openai_audio" | "custom" | "volcengine") {
+    if matches!(
+        provider,
+        "openai_audio" | "custom" | "volcengine" | "minimax"
+    ) {
         return run_cloud_asr_with_local_hedge(state, provider, asr_cfg, samples_16k, attempt)
             .await;
     }
@@ -1879,70 +1884,84 @@ async fn transcribe_cloud_asr(
     asr_cfg: &AsrServiceConfig,
     samples_16k: Vec<f32>,
 ) -> Result<AsrResult, String> {
-    if provider == "volcengine" {
-        return transcribe_volcengine(asr_cfg, samples_16k).await;
+    build_cloud_asr_engine(provider, asr_cfg)?
+        .transcribe(AsrRequest::new(samples_16k, 16_000))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Build the online ASR engine for a wired cloud provider, honoring the
+/// per-provider endpoint/model defaults plus the shared language hint and
+/// timeout. Shared by dictation and the cloud meeting-transcription mode.
+pub(crate) fn build_cloud_asr_engine(
+    provider: &str,
+    asr_cfg: &AsrServiceConfig,
+) -> Result<Arc<dyn AsrEngine>, String> {
+    let timeout = Duration::from_secs(asr_cfg.timeout_secs.max(30));
+    match provider {
+        "volcengine" => {
+            use crate::volcengine_asr::{VolcengineAsr, VolcengineAsrConfig, DEFAULT_FLASH_URL};
+            let eng = VolcengineAsr::new(VolcengineAsrConfig {
+                base_url: if asr_cfg.base_url.trim().is_empty() {
+                    DEFAULT_FLASH_URL.into()
+                } else {
+                    asr_cfg.base_url.clone()
+                },
+                app_id: asr_cfg.volcengine_app_id.clone(),
+                access_token: asr_cfg.api_key.clone(),
+                timeout,
+                ..VolcengineAsrConfig::default()
+            })
+            .map_err(|e| e.to_string())?;
+            Ok(Arc::new(eng))
+        }
+        "minimax" => {
+            use crate::minimax_asr::{MinimaxAsr, MinimaxAsrConfig, DEFAULT_SPEECH_TO_TEXT_URL};
+            let eng = MinimaxAsr::new(MinimaxAsrConfig {
+                base_url: if asr_cfg.base_url.trim().is_empty() {
+                    DEFAULT_SPEECH_TO_TEXT_URL.into()
+                } else {
+                    asr_cfg.base_url.clone()
+                },
+                api_key: asr_cfg.api_key.clone(),
+                model: asr_cfg.model.clone(),
+                language: asr_cfg.language.clone(),
+                timeout,
+                ..MinimaxAsrConfig::default()
+            })
+            .map_err(|e| e.to_string())?;
+            Ok(Arc::new(eng))
+        }
+        "openai_audio" | "custom" => {
+            let eng = OpenAiAudioAsr::new(OpenAiAudioConfig {
+                base_url: if asr_cfg.base_url.trim().is_empty() {
+                    "https://api.openai.com/v1".into()
+                } else {
+                    asr_cfg.base_url.clone()
+                },
+                api_key: asr_cfg.api_key.clone(),
+                model: if asr_cfg.model.trim().is_empty() {
+                    "whisper-1".into()
+                } else {
+                    asr_cfg.model.clone()
+                },
+                timeout,
+                language: if asr_cfg.language.trim().is_empty() {
+                    None
+                } else {
+                    Some(asr_cfg.language.clone())
+                },
+                // Keep the shared engine's defaults for the new knobs
+                // (8 MiB request cap, "openai_audio" transcript label).
+                ..OpenAiAudioConfig::default()
+            })
+            .map_err(|e| e.to_string())?;
+            Ok(Arc::new(eng))
+        }
+        other => Err(format!(
+            "在线 ASR「{other}」仅预置了 endpoint，完整客户端尚未接入。"
+        )),
     }
-    transcribe_openai_audio(asr_cfg, samples_16k).await
-}
-
-/// Volcengine 录音文件识别极速版：one synchronous HTTP POST, batch semantics
-/// (dictation only — meetings stay on the local streaming engine).
-async fn transcribe_volcengine(
-    asr_cfg: &AsrServiceConfig,
-    samples_16k: Vec<f32>,
-) -> Result<AsrResult, String> {
-    use crate::volcengine_asr::{VolcengineAsr, VolcengineAsrConfig, DEFAULT_FLASH_URL};
-
-    let base = if asr_cfg.base_url.trim().is_empty() {
-        DEFAULT_FLASH_URL.into()
-    } else {
-        asr_cfg.base_url.clone()
-    };
-    let eng = VolcengineAsr::new(VolcengineAsrConfig {
-        base_url: base,
-        app_id: asr_cfg.volcengine_app_id.clone(),
-        access_token: asr_cfg.api_key.clone(),
-        timeout: Duration::from_secs(asr_cfg.timeout_secs.max(30)),
-        ..VolcengineAsrConfig::default()
-    })
-    .map_err(|e| e.to_string())?;
-    eng.transcribe(AsrRequest::new(samples_16k, 16_000))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-async fn transcribe_openai_audio(
-    asr_cfg: &AsrServiceConfig,
-    samples_16k: Vec<f32>,
-) -> Result<AsrResult, String> {
-    let base = if asr_cfg.base_url.trim().is_empty() {
-        "https://api.openai.com/v1".into()
-    } else {
-        asr_cfg.base_url.clone()
-    };
-    let model = if asr_cfg.model.trim().is_empty() {
-        "whisper-1".into()
-    } else {
-        asr_cfg.model.clone()
-    };
-    let eng = OpenAiAudioAsr::new(OpenAiAudioConfig {
-        base_url: base,
-        api_key: asr_cfg.api_key.clone(),
-        model,
-        timeout: Duration::from_secs(asr_cfg.timeout_secs.max(30)),
-        language: if asr_cfg.language.trim().is_empty() {
-            None
-        } else {
-            Some(asr_cfg.language.clone())
-        },
-        // Keep the shared engine's defaults for the new knobs
-        // (8 MiB request cap, "openai_audio" transcript label).
-        ..OpenAiAudioConfig::default()
-    })
-    .map_err(|e| e.to_string())?;
-    eng.transcribe(AsrRequest::new(samples_16k, 16_000))
-        .await
-        .map_err(|e| e.to_string())
 }
 
 async fn run_local_asr(

@@ -83,7 +83,7 @@ async fn transcribe_meeting_is_unsupported_without_diarize() {
     let result = transcribe_meeting(
         Path::new("/nonexistent/does-not-exist.wav"),
         &models,
-        &engine,
+        std::sync::Arc::new(engine),
         &store,
         &MeetingOptions::default(),
     )

@@ -750,7 +750,7 @@ fn run_meeting_process(args: &[String]) -> i32 {
         let outcome = tauri::async_runtime::block_on(lumen_meeting::transcribe_meeting(
             &wav_path,
             &diar_models,
-            engine.as_ref(),
+            std::sync::Arc::from(engine),
             &store,
             &opts,
         ));

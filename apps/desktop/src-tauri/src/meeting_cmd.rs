@@ -1917,6 +1917,52 @@ pub fn set_minutes_template(
     get_minutes_template(state)
 }
 
+/// Serialized meeting transcription-engine selection for the settings UI.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingTranscribeEngineConfig {
+    /// `local`（默认，本机引擎，音频不出设备）or `cloud`（使用设置 → 语音识别
+    /// 配置的在线 ASR，音频上传 provider）。
+    pub transcribe_engine: String,
+}
+
+/// Read the configured meeting transcription engine for the settings UI.
+#[tauri::command]
+pub fn get_meeting_transcribe_engine(
+    state: State<'_, AppState>,
+) -> Result<MeetingTranscribeEngineConfig, String> {
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    Ok(MeetingTranscribeEngineConfig {
+        transcribe_engine: cfg.meeting.transcribe_engine.clone(),
+    })
+}
+
+/// Persist the meeting transcription-engine selection. Unknown values fall
+/// back to `local` (the private-by-default choice). Takes effect on the next
+/// meeting processing run.
+#[tauri::command]
+pub fn set_meeting_transcribe_engine(
+    state: State<'_, AppState>,
+    transcribe_engine: String,
+) -> Result<MeetingTranscribeEngineConfig, String> {
+    let value = match transcribe_engine.trim().to_ascii_lowercase().as_str() {
+        "cloud" => "cloud".to_string(),
+        _ => "local".to_string(),
+    };
+    {
+        let mut cfg = state
+            .config
+            .lock()
+            .map_err(|_| "config lock poisoned".to_string())?;
+        cfg.meeting.transcribe_engine = value;
+        cfg.save()?;
+    }
+    get_meeting_transcribe_engine(state)
+}
+
 /// Read a meeting's mic audio as WAV bytes for in-app playback. WKWebView
 /// cannot play Ogg-Opus (the default format for new recordings), so Opus files
 /// are decoded with [`lumen_asr::decode_opus_to_pcm`] and re-rendered as
@@ -2268,7 +2314,7 @@ async fn process_meeting_pipeline(
     // settings under brief locks, then drop the app-state handle before the long
     // async run below.
     let (
-        asr_engine,
+        meeting_asr,
         corrector,
         minutes_model,
         cleanup_transcript,
@@ -2299,7 +2345,7 @@ async fn process_meeting_pipeline(
                 cfg.meeting.minutes_template.clone(),
             )
         };
-        let asr_engine = crate::dictation::build_meeting_asr_engine(state.inner())?;
+        let meeting_asr = crate::meeting_asr::build_meeting_transcribe_engine(state.inner())?;
         // Only build a corrector when an LLM is actually configured. With none,
         // the minutes step is skipped (transcript-only → ready) rather than
         // failing on an unparseable non-LLM response.
@@ -2313,7 +2359,7 @@ async fn process_meeting_pipeline(
             (!model.is_empty()).then(|| model.to_string())
         });
         (
-            asr_engine,
+            meeting_asr,
             corrector,
             minutes_model,
             cleanup_transcript,
@@ -2368,6 +2414,10 @@ async fn process_meeting_pipeline(
         // Enroll manually named speakers into the local identity library so
         // future meetings auto-identify them. Config: `meeting.auto_enroll_speakers`.
         auto_enroll_speakers,
+        // 1 = serial for the local engine (CPU-bound); a small bound when the
+        // cloud engine is selected (`meeting.transcribe_engine`), where each
+        // turn is an HTTP round trip.
+        turn_concurrency: meeting_asr.turn_concurrency,
         ..MeetingOptions::default()
     };
 
@@ -2404,7 +2454,7 @@ async fn process_meeting_pipeline(
         wav,
         system_wav,
         &diar_models,
-        asr_engine.as_ref(),
+        meeting_asr.engine,
         minutes_cfg.as_ref(),
         &opts,
         Some(&emit_progress),

@@ -39,7 +39,7 @@ async fn diarize_transcribe_persist_end_to_end() {
     let meeting_id = transcribe_meeting(
         &PathBuf::from(wav),
         &models,
-        &engine,
+        std::sync::Arc::new(engine),
         &store,
         &MeetingOptions::default(),
     )

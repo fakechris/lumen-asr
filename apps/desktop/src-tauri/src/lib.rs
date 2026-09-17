@@ -20,11 +20,13 @@ mod hotkey_validate;
 mod inject_cmd;
 mod learning;
 mod meeting_apps;
+mod meeting_asr;
 mod meeting_cmd;
 mod meeting_detection;
 mod meeting_live;
 mod meeting_mic_aec;
 mod meeting_system_audio;
+mod minimax_asr;
 mod mod_chord;
 mod mode_arbiter;
 mod model_integrity;
@@ -559,6 +561,8 @@ pub fn run() {
             meeting_cmd::list_minutes_templates,
             meeting_cmd::get_minutes_template,
             meeting_cmd::set_minutes_template,
+            meeting_cmd::get_meeting_transcribe_engine,
+            meeting_cmd::set_meeting_transcribe_engine,
             meeting_cmd::read_meeting_audio_wav,
             meeting_cmd::continue_meeting_after_silence,
             meeting_cmd::continue_meeting_after_max_duration,
