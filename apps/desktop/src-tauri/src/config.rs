@@ -145,6 +145,13 @@ pub struct MeetingConfig {
     /// An unknown name falls back to the default at generation time, so a
     /// hand-edited config can never break minutes.
     pub minutes_template: String,
+    /// Engine that produces the final (offline) meeting transcript: `"local"`
+    /// (default; the on-device SenseVoice engine — meeting audio never leaves
+    /// this machine) or `"cloud"` (the online ASR configured under
+    /// 设置 → 语音识别, e.g. MiniMax ASR — every turn's audio is uploaded to
+    /// the provider, and a ready local engine silently covers failed turns).
+    /// Unknown values fall back to `"local"` at use time.
+    pub transcribe_engine: String,
 }
 
 impl Default for MeetingConfig {
@@ -164,6 +171,7 @@ impl Default for MeetingConfig {
             self_identity_id: None,
             audio_format: default_meeting_audio_format(),
             minutes_template: String::new(),
+            transcribe_engine: "local".into(),
         }
     }
 }

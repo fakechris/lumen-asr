@@ -631,6 +631,19 @@ export const api = {
       minutesTemplate,
     }),
 
+  /** Read the meeting transcription engine: "local" (on-device, default) or
+   * "cloud" (the online ASR configured under 语音识别 settings; uploads the
+   * meeting audio to the provider). */
+  getMeetingTranscribeEngine: () =>
+    invoke<{ transcribeEngine: string }>("get_meeting_transcribe_engine"),
+
+  /** Persist the meeting transcription engine; applies to the next meeting
+   * processing run. Resolves the stored value. */
+  setMeetingTranscribeEngine: (transcribeEngine: string) =>
+    invoke<{ transcribeEngine: string }>("set_meeting_transcribe_engine", {
+      transcribeEngine,
+    }),
+
   /** Read a meeting's mic audio as WAV bytes for playback. Opus tracks (the
    * default for new recordings) are decoded server-side because WKWebView
    * cannot play Ogg-Opus; WAV files are returned as-is. */

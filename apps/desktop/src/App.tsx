@@ -2069,11 +2069,10 @@ function RecordPanel({
               本地 Whisper {status?.whisper.ready ? "✓" : "（模型未就绪）"}
             </option>
             <option value="openai_audio">OpenAI Audio / Whisper（在线）</option>
+            <option value="volcengine">火山 ASR（极速版，在线）</option>
+            <option value="minimax">MiniMax ASR（在线）</option>
             <option value="aliyun_qwen" disabled>
               阿里 Qwen ASR（预设，流式待接）
-            </option>
-            <option value="volcengine" disabled>
-              火山 ASR（预设，待接）
             </option>
             <option value="soniox" disabled>
               Soniox（预设，待接）
@@ -2444,6 +2443,35 @@ function SettingsPanel({
     },
     [onError],
   );
+  // Meeting transcription engine: "local" (on-device, default) or "cloud"
+  // (the online ASR configured under 语音识别 settings; uploads meeting audio).
+  const [meetingTranscribeEngine, setMeetingTranscribeEngine] =
+    useState("local");
+  // Latest-wins token, same rationale as `meetingAudioFormatSave` above.
+  const meetingTranscribeEngineSave = useRef(0);
+  const saveMeetingTranscribeEngine = useCallback(
+    (next: string) => {
+      setMeetingTranscribeEngine(next);
+      const request = ++meetingTranscribeEngineSave.current;
+      void api
+        .setMeetingTranscribeEngine(next)
+        .then((saved) => {
+          if (meetingTranscribeEngineSave.current === request) {
+            setMeetingTranscribeEngine(saved.transcribeEngine);
+          }
+        })
+        .catch((err) => {
+          onError(String(err));
+          if (meetingTranscribeEngineSave.current === request) {
+            void api
+              .getMeetingTranscribeEngine()
+              .then((saved) => setMeetingTranscribeEngine(saved.transcribeEngine))
+              .catch(() => {});
+          }
+        });
+    },
+    [onError],
+  );
   // Debounce + latest-wins so rapid edits to either field don't race as
   // independent writes (each call persists both fields, so an older in-flight
   // write could otherwise clobber the newer one).
@@ -2566,6 +2594,12 @@ function SettingsPanel({
           setMinutesTemplate(tpl.minutesTemplate);
         } catch {
           /* minutes templates are best-effort */
+        }
+        try {
+          const engine = await api.getMeetingTranscribeEngine();
+          setMeetingTranscribeEngine(engine.transcribeEngine);
+        } catch {
+          /* transcription engine selection is best-effort */
         }
       } catch (e) {
         onError(String(e));
@@ -3542,6 +3576,28 @@ function SettingsPanel({
         </div>
         <p className="muted-text">
           只影响之后开始的录音；已有录音无论哪种格式都能正常播放、剪辑和处理。
+        </p>
+
+        <hr className="settings-divider" />
+        <div className="form-row">
+          <label className="form-label" htmlFor="meeting-transcribe-engine">
+            转写引擎
+          </label>
+          <select
+            id="meeting-transcribe-engine"
+            className="input"
+            value={meetingTranscribeEngine}
+            disabled={busy}
+            style={{ maxWidth: 320 }}
+            onChange={(e) => saveMeetingTranscribeEngine(e.target.value)}
+          >
+            <option value="local">本地引擎（默认，音频不出本机）</option>
+            <option value="cloud">云端引擎（跟随「语音识别」的在线 ASR）</option>
+          </select>
+        </div>
+        <p className="muted-text">
+          决定会议最终转写用哪个识别引擎（说话人分离始终在本地完成）。选择云端会把录音逐句上传到所选的在线
+          ASR（如 MiniMax ASR），通常对远场、口音更准，按时长计费；网络或鉴权失败的单句会自动回退本地引擎。
         </p>
 
         <hr className="settings-divider" />

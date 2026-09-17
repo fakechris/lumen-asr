@@ -1,8 +1,8 @@
 //! Built-in LLM / ASR provider catalogs (endpoints + default models).
 //!
 //! LLM presets use OpenAI-compatible chat completions unless noted.
-//! Cloud ASR: `openai_audio` + `volcengine` + local engines are fully wired;
-//! other entries may be config-only.
+//! Cloud ASR: `openai_audio` + `volcengine` + `minimax` + local engines are
+//! fully wired; other entries may be config-only.
 
 use serde::Serialize;
 
@@ -318,6 +318,17 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             needs_api_key: true,
             status: "wired".into(),
             notes: "同步 HTTP 一句话识别（极速版，资源 volc.bigasr.auc_turbo）。凭据：Access Token 填在 API Key；旧版控制台还需在 App ID 栏填 App ID，新版控制台只需把 APP Key 填进 API Key。".into(),
+        },
+        AsrProviderPreset {
+            id: "minimax".into(),
+            label: "MiniMax ASR".into(),
+            kind: "http_batch".into(),
+            base_url: "https://api.minimaxi.com/v1/speech_to_text".into(),
+            default_model: "asr-1.0".into(),
+            models: vec!["asr-1.0".into()],
+            needs_api_key: true,
+            status: "wired".into(),
+            notes: "同步 multipart 一句话识别（模型 asr-1.0，单次 ≤500 秒 / 50 MB）。API Key 填 platform.minimaxi.com 的接口密钥；语言留空为混合识别。".into(),
         },
         AsrProviderPreset {
             id: "soniox".into(),

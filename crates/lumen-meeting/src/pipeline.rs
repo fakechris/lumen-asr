@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lumen_asr_engine::{AsrEngine, AsrError, AsrRequest};
 use lumen_core::MeetingStatus;
@@ -166,6 +167,12 @@ pub struct MeetingOptions {
     /// `identity_dir`; a no-op without it. `Default` is `false` — the app layer
     /// sets it from config (`meeting.auto_enroll_speakers`, default **on**).
     pub auto_enroll_speakers: bool,
+    /// Max per-turn ASR requests in flight. `0`/`1` keeps the fully serial
+    /// loop — the right choice for in-process engines whose `transcribe` is
+    /// CPU-bound (SenseVoice offline). Cloud engines benefit from a small
+    /// bound (4) because each turn is an HTTP round trip. Regardless of the
+    /// value, results are delivered strictly in turn order.
+    pub turn_concurrency: usize,
 }
 
 /// Failure modes of [`transcribe_meeting`].
@@ -200,7 +207,7 @@ pub enum MeetingError {
 /// Result of diarization: the decoded 16 kHz mono samples plus the speaker
 /// turns, so the caller can slice per-turn audio for ASR without reloading.
 pub(crate) struct DiarOutput {
-    pub(crate) samples: Vec<f32>,
+    pub(crate) samples: Arc<Vec<f32>>,
     pub(crate) sample_rate: u32,
     pub(crate) turns: Vec<DiarTurn>,
     /// Per-speaker centroid voiceprint embedding (engine speaker id → 256-d
@@ -221,7 +228,7 @@ pub(crate) struct DiarOutput {
 pub async fn transcribe_meeting(
     wav: &Path,
     diar_models: &DiarModels,
-    asr_engine: &dyn AsrEngine,
+    asr_engine: Arc<dyn AsrEngine>,
     store: &Store,
     opts: &MeetingOptions,
 ) -> Result<Uuid, MeetingError> {
@@ -234,13 +241,20 @@ pub async fn transcribe_meeting(
     let duration =
         (diar.sample_rate > 0).then(|| diar.samples.len() as f64 / diar.sample_rate as f64);
 
-    // Transcribe each turn's audio slice. Order is preserved so turns, texts,
-    // and words zip positionally in `assemble_meeting`.
-    let mut texts = Vec::with_capacity(diar.turns.len());
-    let mut words = Vec::with_capacity(diar.turns.len());
-    for turn in &diar.turns {
-        let (text, turn_words) =
-            transcribe_turn(asr_engine, &diar.samples, diar.sample_rate, turn, opts).await?;
+    // Per-turn ASR (order-preserving; concurrency from `opts.turn_concurrency`),
+    // so turns, texts, and words zip positionally in `assemble_meeting`.
+    let results = transcribe_turns(
+        asr_engine,
+        Arc::clone(&diar.samples),
+        diar.sample_rate,
+        &diar.turns,
+        opts,
+        |_| {},
+    )
+    .await?;
+    let mut texts = Vec::with_capacity(results.len());
+    let mut words = Vec::with_capacity(results.len());
+    for (text, turn_words) in results {
         texts.push(text);
         words.push(turn_words);
     }
@@ -326,11 +340,11 @@ pub async fn transcribe_meeting(
 ///
 /// [`WordTiming`]: lumen_asr_engine::WordTiming
 pub(crate) async fn transcribe_turn(
-    engine: &dyn AsrEngine,
-    samples: &[f32],
+    engine: Arc<dyn AsrEngine>,
+    samples: Arc<Vec<f32>>,
     sample_rate: u32,
-    turn: &DiarTurn,
-    opts: &MeetingOptions,
+    turn: DiarTurn,
+    opts: Arc<MeetingOptions>,
 ) -> Result<(String, Vec<Word>), MeetingError> {
     let Some((start, end)) = turn_sample_range(turn.start, turn.end, sample_rate, samples.len())
     else {
@@ -377,6 +391,124 @@ pub(crate) async fn transcribe_turn(
         }
     }
     Ok((text_parts.join(" "), words))
+}
+
+/// Transcribe `turns` positionally: `results[i]` is `turns[i]`'s `(text,
+/// words)`, whatever the completion order. `opts.turn_concurrency` bounds the
+/// requests in flight — `0`/`1` runs the fully serial loop (the right choice
+/// for in-process engines whose `transcribe` is CPU-bound); a small bound (4)
+/// suits cloud engines where each turn is an HTTP round trip. `on_done` fires
+/// once per finished turn with the running completion count (progress bars).
+///
+/// Fail-fast like the legacy serial loop: a turn error propagates as soon as
+/// it is observed — before the next turn is submitted — and dropping the
+/// `JoinSet` cancels the tasks still in flight, so a hard failure (e.g. a
+/// cloud 401 with no fallback) never burns through the whole meeting.
+pub(crate) async fn transcribe_turns(
+    engine: Arc<dyn AsrEngine>,
+    samples: Arc<Vec<f32>>,
+    sample_rate: u32,
+    turns: &[DiarTurn],
+    opts: &MeetingOptions,
+    mut on_done: impl FnMut(usize),
+) -> Result<Vec<(String, Vec<Word>)>, MeetingError> {
+    let total = turns.len();
+    let concurrency = opts.turn_concurrency.max(1);
+    if concurrency == 1 || total <= 1 {
+        let mut out = Vec::with_capacity(total);
+        for (i, turn) in turns.iter().enumerate() {
+            out.push(
+                transcribe_turn(
+                    Arc::clone(&engine),
+                    Arc::clone(&samples),
+                    sample_rate,
+                    *turn,
+                    Arc::new(opts.clone()),
+                )
+                .await?,
+            );
+            on_done(i + 1);
+        }
+        return Ok(out);
+    }
+
+    // One queued per-turn task: its turn index (for positional reassembly)
+    // and its transcribe outcome.
+    type TurnTask = (usize, Result<(String, Vec<Word>), MeetingError>);
+
+    /// Owns the in-flight turn set and everything a task needs, so each spawn
+    /// is one short call. Waiting for a permit inside [`Self::spawn`] is
+    /// deadlock-free even mid-drain: a permit frees exactly when some
+    /// in-flight task finishes, and finished results buffer in the `JoinSet`.
+    struct TurnSpawner {
+        tasks: tokio::task::JoinSet<TurnTask>,
+        engine: Arc<dyn AsrEngine>,
+        samples: Arc<Vec<f32>>,
+        opts: Arc<MeetingOptions>,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        sample_rate: u32,
+    }
+
+    impl TurnSpawner {
+        /// Acquire a permit (bounding in-flight work), then submit the turn.
+        async fn spawn(&mut self, index: usize, turn: DiarTurn) -> Result<(), MeetingError> {
+            let permit = Arc::clone(&self.semaphore)
+                .acquire_owned()
+                .await
+                .map_err(|e| {
+                    MeetingError::Asr(AsrError::Inference(format!("turn semaphore: {e}")))
+                })?;
+            let engine = Arc::clone(&self.engine);
+            let samples = Arc::clone(&self.samples);
+            let opts = Arc::clone(&self.opts);
+            let sample_rate = self.sample_rate;
+            self.tasks.spawn(async move {
+                let _permit = permit;
+                let result = transcribe_turn(engine, samples, sample_rate, turn, opts).await;
+                (index, result)
+            });
+            Ok(())
+        }
+    }
+
+    let mut spawner = TurnSpawner {
+        tasks: tokio::task::JoinSet::new(),
+        engine,
+        samples,
+        opts: Arc::new(opts.clone()),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(concurrency)),
+        sample_rate,
+    };
+
+    // Fill the initial window, then replenish strictly *after* observing each
+    // completion — and only when it succeeded — so failures stop the pipeline
+    // before the remaining turns are submitted.
+    let mut next = 0usize;
+    while next < total.min(concurrency) {
+        spawner.spawn(next, turns[next]).await?;
+        next += 1;
+    }
+    let mut results: Vec<Option<(String, Vec<Word>)>> = (0..total).map(|_| None).collect();
+    let mut done = 0usize;
+    loop {
+        let Some(joined) = spawner.tasks.join_next().await else {
+            break;
+        };
+        let (index, result) = joined
+            .map_err(|e| MeetingError::Asr(AsrError::Inference(format!("turn task: {e}"))))?;
+        results[index] = Some(result?);
+        done += 1;
+        on_done(done);
+        if next < total {
+            spawner.spawn(next, turns[next]).await?;
+            next += 1;
+        }
+    }
+    // The loop only exits when the set has drained, so no slot is left unset.
+    Ok(results
+        .into_iter()
+        .map(|slot| slot.expect("turn slot filled"))
+        .collect())
 }
 
 /// Upper bound on how much audio is fed to the ASR engine in a single decode.
@@ -481,7 +613,7 @@ pub(crate) fn diarize_wav(
             "track skipped: effectively silent"
         );
         return Ok(DiarOutput {
-            samples,
+            samples: Arc::new(samples),
             sample_rate,
             turns: Vec::new(),
             speaker_embeddings: BTreeMap::new(),
@@ -561,7 +693,7 @@ pub(crate) fn diarize_wav(
     };
 
     Ok(DiarOutput {
-        samples,
+        samples: Arc::new(samples),
         sample_rate,
         turns,
         speaker_embeddings,
@@ -788,7 +920,7 @@ pub(crate) fn diarize_wav(
                 "track skipped: effectively silent"
             );
             return Ok(DiarOutput {
-                samples,
+                samples: Arc::new(samples),
                 sample_rate: 16_000,
                 turns: Vec::new(),
                 speaker_embeddings: BTreeMap::new(),
@@ -851,10 +983,15 @@ mod tests {
         // 16 kHz buffer long enough to cover the [1.0, 2.0) turn slice.
         let samples = vec![0.1f32; 40_000];
         let turn = DiarTurn::new(1.0, 2.0, 0);
-        let (text, words) =
-            transcribe_turn(&engine, &samples, 16_000, &turn, &MeetingOptions::default())
-                .await
-                .unwrap();
+        let (text, words) = transcribe_turn(
+            Arc::new(engine),
+            Arc::new(samples),
+            16_000,
+            turn,
+            Arc::new(MeetingOptions::default()),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(text, "你好");
         assert_eq!(words.len(), 2);
@@ -901,11 +1038,11 @@ mod tests {
         let samples = vec![0.1f32; 25 * sr];
         let turn = DiarTurn::new(0.0, 25.0, 0);
         let (text, words) = transcribe_turn(
-            &engine,
-            &samples,
+            Arc::new(engine),
+            Arc::new(samples),
             sr as u32,
-            &turn,
-            &MeetingOptions::default(),
+            turn,
+            Arc::new(MeetingOptions::default()),
         )
         .await
         .unwrap();
@@ -1022,11 +1159,127 @@ mod tests {
         let samples = vec![0.1f32; 16_000];
         // Zero-length turn -> no slice, no ASR call.
         let turn = DiarTurn::new(1.0, 1.0, 0);
-        let (text, words) =
-            transcribe_turn(&engine, &samples, 16_000, &turn, &MeetingOptions::default())
-                .await
-                .unwrap();
+        let (text, words) = transcribe_turn(
+            Arc::new(engine),
+            Arc::new(samples),
+            16_000,
+            turn,
+            Arc::new(MeetingOptions::default()),
+        )
+        .await
+        .unwrap();
         assert!(text.is_empty());
         assert!(words.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcribe_turns_preserves_order_under_concurrency() {
+        // 8.5 s buffer covers every [i+0.2, i+0.8) turn slice.
+        let samples = Arc::new(vec![0.1f32; 8 * 16_000 + 8_000]);
+        let turns: Vec<DiarTurn> = (0..8)
+            .map(|i| DiarTurn::new(i as f64 + 0.2, i as f64 + 0.8, (i % 2) as u32))
+            .collect();
+        let opts = MeetingOptions {
+            turn_concurrency: 4,
+            ..MeetingOptions::default()
+        };
+        let mut ticks = Vec::new();
+        let results = transcribe_turns(
+            Arc::new(WordEchoAsr),
+            samples,
+            16_000,
+            &turns,
+            &opts,
+            |done| ticks.push(done),
+        )
+        .await
+        .unwrap();
+
+        // One text per turn, in turn order regardless of completion order.
+        assert_eq!(results.len(), 8);
+        assert!(results.iter().all(|(text, _)| text == "你好"));
+        // The progress callback observed every completion count 1..=8 once.
+        let mut sorted = ticks;
+        sorted.sort_unstable();
+        assert_eq!(sorted, (1..=8).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn transcribe_turns_serial_default_matches_turn_order() {
+        // turn_concurrency unset (0 → serial) must behave identically.
+        let samples = Arc::new(vec![0.1f32; 8 * 16_000 + 8_000]);
+        let turns: Vec<DiarTurn> = (0..3)
+            .map(|i| DiarTurn::new(i as f64 + 0.2, i as f64 + 0.8, 0))
+            .collect();
+        let results = transcribe_turns(
+            Arc::new(WordEchoAsr),
+            samples,
+            16_000,
+            &turns,
+            &MeetingOptions::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|(text, _)| text == "你好"));
+    }
+
+    /// Engine that succeeds except on one specific call index, counting calls
+    /// so tests can assert how far the pipeline got before failing.
+    struct CountingFailAsr {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_on_call: usize,
+    }
+
+    #[async_trait]
+    impl AsrEngine for CountingFailAsr {
+        fn id(&self) -> AsrEngineId {
+            AsrEngineId::Other
+        }
+
+        async fn transcribe(&self, _req: AsrRequest) -> Result<AsrResult, AsrError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == self.fail_on_call {
+                return Err(AsrError::Inference("boom".into()));
+            }
+            Ok(AsrResult::new("ok", AsrEngineId::Other))
+        }
+    }
+
+    #[tokio::test]
+    async fn transcribe_turns_concurrent_fails_fast_before_submitting_all_turns() {
+        let engine = Arc::new(CountingFailAsr {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            // The second submitted call fails (the first may still be in flight).
+            fail_on_call: 1,
+        });
+        // 10 s buffer covers every [i+0.2, i+0.8) slice of the 10 turns.
+        let samples = Arc::new(vec![0.1f32; 160_000]);
+        let turns: Vec<DiarTurn> = (0..10)
+            .map(|i| DiarTurn::new(i as f64 + 0.2, i as f64 + 0.8, 0))
+            .collect();
+        let opts = MeetingOptions {
+            turn_concurrency: 2,
+            ..MeetingOptions::default()
+        };
+        let err = transcribe_turns(
+            Arc::clone(&engine) as Arc<dyn AsrEngine>,
+            samples,
+            16_000,
+            &turns,
+            &opts,
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("boom"), "{err}");
+        // The window (2) plus at most one replenished turn ever ran — the
+        // remaining turns were never submitted after the failure surfaced.
+        assert!(
+            engine.calls.load(std::sync::atomic::Ordering::SeqCst) < 10,
+            "fail-fast violated: ran too many turns"
+        );
     }
 }
