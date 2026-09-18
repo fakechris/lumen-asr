@@ -1,6 +1,6 @@
+mod app_notifications;
 mod asr_models;
 mod audio_convert;
-mod app_notifications;
 mod capsule;
 mod commands;
 mod config;
