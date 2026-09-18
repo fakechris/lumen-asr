@@ -438,6 +438,12 @@ fn apply_outputs(app: &AppHandle, shared: &DetectionShared, outputs: &[Detection
                 app_class,
             } => {
                 shared.stats.increment(StatCounter::PromptShown);
+                // The prompt renders inside the main window; surface it first
+                // (no focus steal) and post a system heads-up, so a hidden /
+                // miniaturized window still reaches the user. Best-effort.
+                crate::app_notifications::ensure_main_window_visible(app);
+                let display_name = shared.apps.label(bundle_id);
+                crate::app_notifications::notify_meeting_detected(app, &display_name);
                 let _ = app.emit(
                     "meeting-detected",
                     MeetingDetectedEvent {
@@ -448,7 +454,7 @@ fn apply_outputs(app: &AppHandle, shared: &DetectionShared, outputs: &[Detection
                             AppClass::Other => "other",
                         }
                         .to_string(),
-                        display_name: shared.apps.label(bundle_id),
+                        display_name,
                     },
                 );
             }
@@ -457,6 +463,9 @@ fn apply_outputs(app: &AppHandle, shared: &DetectionShared, outputs: &[Detection
             }
             DetectionOutput::SuggestStop { bundle_id } => {
                 shared.stats.increment(StatCounter::StopSuggested);
+                // Same visibility story as ShowPrompt: the question renders in
+                // the main window, so un-hide it (no focus steal) first.
+                crate::app_notifications::ensure_main_window_visible(app);
                 let meeting_id = shared
                     .active_meeting
                     .lock()

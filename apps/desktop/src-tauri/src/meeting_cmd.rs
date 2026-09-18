@@ -2476,6 +2476,43 @@ async fn process_meeting_pipeline(
             .save_summary(&marker)
             .map_err(|e| format!("save no-llm marker: {e}"))?;
     }
+
+    // Completion heads-up (best-effort — never affects the pipeline outcome):
+    // stash the meeting id so a later macOS dock / notification click can
+    // navigate the front-end back here, and post a system notification with
+    // the resulting stats (duration / transcript / minutes, 豆包-style). The
+    // no-LLM sentinel marker is not real minutes, so it is not counted.
+    let stored = store.get_meeting(meeting_id).ok().flatten();
+    let transcript_chars = store
+        .list_segments(meeting_id)
+        .map(|segs| {
+            segs.iter()
+                .map(|s| crate::app_notifications::count_chars(&s.text))
+                .sum()
+        })
+        .unwrap_or(0);
+    let minutes_chars = if no_llm {
+        None
+    } else {
+        store
+            .get_summary(meeting_id, SummaryKind::Summary)
+            .ok()
+            .flatten()
+            .map(|s| crate::app_notifications::count_chars(&s.content))
+            .filter(|chars| *chars > 0)
+    };
+    let stats = crate::app_notifications::MeetingDoneStats {
+        title: stored.as_ref().and_then(|m| m.title.clone()),
+        duration_seconds: stored.as_ref().and_then(|m| m.duration_seconds),
+        transcript_chars,
+        minutes_chars,
+    };
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        if let Ok(mut slot) = state.last_finished_meeting.lock() {
+            *slot = Some(meeting_id.to_string());
+        }
+    }
+    crate::app_notifications::notify_minutes_ready(app, &stats);
     Ok(())
 }
 

@@ -278,6 +278,12 @@ export default function App() {
     meetingId: string | null;
     displayName: string;
   } | null>(null);
+  // Meeting the library should open programmatically, set when the user
+  // clicks the dock icon / a notification banner (macOS `app-reopened`).
+  // `{ id, seq }` so repeated clicks on the same meeting still re-open it.
+  const [openMeeting, setOpenMeeting] = useState<{ id: string; seq: number } | null>(
+    null,
+  );
 
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -520,6 +526,22 @@ export default function App() {
       unDetected?.();
       unCancelled?.();
     };
+  }, []);
+
+  // macOS dock icon / notification-banner click (`RunEvent::Reopen` →
+  // `app-reopened`): go to the meetings tab and open the meeting the
+  // completion notification pointed at, if one was stashed.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    listen<{ meetingId: string | null }>("app-reopened", (e) => {
+      setTab("meeting");
+      if (e.payload.meetingId) {
+        setOpenMeeting({ id: e.payload.meetingId, seq: Date.now() });
+      }
+    }).then((fn) => {
+      un = fn;
+    });
+    return () => un?.();
   }, []);
 
   // Power warnings during a meeting recording: the backend emits
@@ -1197,6 +1219,8 @@ export default function App() {
                 onError={setError}
                 onNavigate={(t) => setTab(t)}
                 onToast={showCopyToast}
+                openMeeting={openMeeting}
+                onOpenMeetingConsumed={() => setOpenMeeting(null)}
               />
             )}
 
