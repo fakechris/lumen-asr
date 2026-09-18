@@ -1,3 +1,4 @@
+mod app_notifications;
 mod asr_models;
 mod audio_convert;
 mod capsule;
@@ -317,6 +318,10 @@ pub struct AppState {
     pub capture: CaptureArbiter,
     /// Opt-in, capability-gated meeting activity detection + prompt policy.
     pub meeting_detection: meeting_detection::MeetingDetectionService,
+    /// Meeting the completion notification last pointed at, so a macOS dock /
+    /// notification click (`RunEvent::Reopen`) can navigate the front-end
+    /// back to it. Replaced on every pipeline completion; never cleared.
+    pub last_finished_meeting: std::sync::Mutex<Option<String>>,
     pub engine: Mutex<EngineKind>,
     pub sensevoice: Mutex<SenseVoiceSherpaAsr>,
     pub qwen: Mutex<QwenAsr>,
@@ -458,6 +463,23 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
+        .on_window_event(|window, event| {
+            // macOS idiom: the red close button hides the main window and the
+            // app (dictation hotkeys, meeting detection) keeps running. That
+            // is what makes the detection prompt reachable while "closed" —
+            // `app_notifications::ensure_main_window_visible` re-shows it.
+            // Other platforms keep close-quits (there is no tray to live in).
+            #[cfg(target_os = "macos")]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (window, event);
+        })
         .manage(AppState {
             store,
             edit_learning,
@@ -477,6 +499,7 @@ pub fn run() {
             meeting_mic_aec: meeting_mic_aec::MeetingMicAec::default(),
             capture: CaptureArbiter::new(),
             meeting_detection: meeting_detection::MeetingDetectionService::new(),
+            last_finished_meeting: Mutex::new(None),
             engine: Mutex::new(initial_engine),
             sensevoice: Mutex::new(SenseVoiceSherpaAsr::new(sv_dir)),
             qwen: Mutex::new(qwen),
@@ -684,9 +707,10 @@ pub fn run() {
                 });
             }
 
-            // Opt-in meeting detection: only start when the user enabled it AND
-            // the OS capability is present. Off by default; failure to start
-            // (unavailable capability) is silent — the feature just stays dark.
+            // Meeting detection: on by default, so start it unless the user
+            // opted out in Settings AND only when the OS capability is
+            // present. Failure to start (unavailable capability) is silent —
+            // the feature just stays dark.
             let detection_enabled = app
                 .state::<AppState>()
                 .config
@@ -728,9 +752,19 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            if matches!(event, tauri::RunEvent::Exit) {
-                let state = app.state::<AppState>();
-                let _ = dictation::cancel_recording_inner(&state);
+            match event {
+                tauri::RunEvent::Exit => {
+                    let state = app.state::<AppState>();
+                    let _ = dictation::cancel_recording_inner(&state);
+                }
+                // macOS dock icon / notification-banner click while the app
+                // runs: surface the window and let the front-end open the
+                // meeting the completion notification pointed at.
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { .. } => {
+                    app_notifications::handle_reopen(app);
+                }
+                _ => {}
             }
         });
 }

@@ -56,12 +56,15 @@ pub struct MeetingConfig {
     /// Defaults to `true` so a user with an LLM configured gets a cleaned
     /// transcript automatically.
     pub transcript_cleanup: bool,
-    /// Opt-in automatic meeting detection: watch for audio-input activity from
-    /// apps enabled in the external runtime catalog and *prompt* (never
+    /// Automatic meeting detection: watch for audio-input activity from apps
+    /// enabled in the external runtime catalog and *prompt* (never
     /// auto-record) to start a meeting.
-    /// Defaults to `false` — the feature ships off so users enable it
-    /// deliberately, keeping first-run false positives out of the default
-    /// experience. Only runs when this is on AND the OS capability is present.
+    /// Defaults to `true` — a prompt only fires while a known meeting app is
+    /// actually holding microphone input, and recording starts solely on the
+    /// user's acceptance, so shipping it on costs non-meeting users nothing
+    /// and saves everyone a settings hunt. An explicit value in the config
+    /// file always wins (opt out in Settings). Only runs when the OS
+    /// capability is present.
     pub detection_enabled: bool,
     /// Link a just-started recording to the calendar: look up the current /
     /// imminent (EventKit) event once at recording start, auto-title an
@@ -158,7 +161,7 @@ impl Default for MeetingConfig {
     fn default() -> Self {
         Self {
             transcript_cleanup: true,
-            detection_enabled: false,
+            detection_enabled: true,
             calendar_link: true,
             silence_auto_stop_minutes: default_silence_auto_stop_minutes(),
             max_duration_minutes: default_max_duration_minutes(),
@@ -1498,11 +1501,11 @@ self_identity_id = "11111111-2222-3333-4444-555555555555"
     }
 
     #[test]
-    fn meeting_detection_defaults_off_and_opts_in() {
-        // Ships off by default…
-        assert!(!MeetingConfig::default().detection_enabled);
-        assert!(!AppConfig::default().meeting.detection_enabled);
-        // …absent from an existing config → still off…
+    fn meeting_detection_defaults_on_and_opts_out() {
+        // Ships on by default…
+        assert!(MeetingConfig::default().detection_enabled);
+        assert!(AppConfig::default().meeting.detection_enabled);
+        // …absent from an existing config → still on…
         let existing: AppConfig = toml::from_str(
             r#"
 [asr]
@@ -1510,16 +1513,16 @@ provider = "local_sensevoice"
 "#,
         )
         .unwrap();
-        assert!(!existing.meeting.detection_enabled);
-        // …and can be explicitly enabled.
-        let enabled: AppConfig = toml::from_str(
+        assert!(existing.meeting.detection_enabled);
+        // …and an explicit opt-out is honored.
+        let disabled: AppConfig = toml::from_str(
             r#"
 [meeting]
-detection_enabled = true
+detection_enabled = false
 "#,
         )
         .unwrap();
-        assert!(enabled.meeting.detection_enabled);
+        assert!(!disabled.meeting.detection_enabled);
     }
 
     #[test]

@@ -171,12 +171,18 @@ export function MeetingPanel({
   onError,
   onNavigate,
   onToast,
+  openMeeting,
+  onOpenMeetingConsumed,
 }: {
   onError: (e: string | null) => void;
   /** Switch the top-level app tab (used by the "配置 LLM" / "去设置" links). */
   onNavigate?: (tab: TabId) => void;
   /** Surface a brief notification toast at the top level. */
   onToast?: (text: string) => void;
+  /** Meeting to open programmatically (dock icon / notification click). */
+  openMeeting?: { id: string; seq: number } | null;
+  /** Tell the parent the request was consumed (so a repeat click re-fires). */
+  onOpenMeetingConsumed?: () => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // App-level model state (from MeetingModelsProvider at the App root). It is
@@ -184,6 +190,16 @@ export function MeetingPanel({
   // progress/cancel survive switching tabs away and back, and the library and
   // detail view always share one listener and one in-flight download.
   const models = useMeetingModels();
+
+  // A programmatic open (from the macOS `app-reopened` event) wins over
+  // whatever the library was showing: select the meeting and report back so
+  // clicking the same meeting's notification again later still re-opens it.
+  useEffect(() => {
+    if (openMeeting) {
+      setSelectedId(openMeeting.id);
+      onOpenMeetingConsumed?.();
+    }
+  }, [openMeeting, onOpenMeetingConsumed]);
 
   if (selectedId) {
     return (

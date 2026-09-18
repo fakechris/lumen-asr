@@ -262,9 +262,10 @@ export default function App() {
   const [hotkeyEnabled, setHotkeyEnabledUi] = useState(true);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [onboardingIncomplete, setOnboardingIncomplete] = useState(false);
-  // App-level meeting-detection prompt (opt-in, capability-gated). The backend
-  // policy decides *when* to prompt; here we only render it and relay the user's
-  // choice. Kept out of MeetingPanel on purpose so it is visible on any tab.
+  // App-level meeting-detection prompt (on by default, capability-gated). The
+  // backend policy decides *when* to prompt; here we only render it and relay
+  // the user's choice. Kept out of MeetingPanel on purpose so it is visible on
+  // any tab.
   const [detected, setDetected] = useState<{
     bundleId: string;
     appClass: string;
@@ -277,6 +278,12 @@ export default function App() {
     meetingId: string | null;
     displayName: string;
   } | null>(null);
+  // Meeting the library should open programmatically, set when the user
+  // clicks the dock icon / a notification banner (macOS `app-reopened`).
+  // `{ id, seq }` so repeated clicks on the same meeting still re-open it.
+  const [openMeeting, setOpenMeeting] = useState<{ id: string; seq: number } | null>(
+    null,
+  );
 
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -519,6 +526,22 @@ export default function App() {
       unDetected?.();
       unCancelled?.();
     };
+  }, []);
+
+  // macOS dock icon / notification-banner click (`RunEvent::Reopen` →
+  // `app-reopened`): go to the meetings tab and open the meeting the
+  // completion notification pointed at, if one was stashed.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    listen<{ meetingId: string | null }>("app-reopened", (e) => {
+      setTab("meeting");
+      if (e.payload.meetingId) {
+        setOpenMeeting({ id: e.payload.meetingId, seq: Date.now() });
+      }
+    }).then((fn) => {
+      un = fn;
+    });
+    return () => un?.();
   }, []);
 
   // Power warnings during a meeting recording: the backend emits
@@ -1196,6 +1219,8 @@ export default function App() {
                 onError={setError}
                 onNavigate={(t) => setTab(t)}
                 onToast={showCopyToast}
+                openMeeting={openMeeting}
+                onOpenMeetingConsumed={() => setOpenMeeting(null)}
               />
             )}
 
@@ -2375,7 +2400,10 @@ function SettingsPanel({
   const [soundsEnabledUi, setSoundsEnabledUi] = useState(true);
   const [savingSounds, setSavingSounds] = useState(false);
   const [detectionEnabled, setDetectionEnabled] = useState(false);
-  const [detectionCapable, setDetectionCapable] = useState(false);
+  // `null` until the first successful status lookup: a lookup that fails must
+  // not read as "device unsupported", which would disable the toggle and show
+  // the unsupported-device note on perfectly capable machines.
+  const [detectionCapable, setDetectionCapable] = useState<boolean | null>(null);
   const [meetingApps, setMeetingApps] = useState<MeetingAppCatalog | null>(null);
   const [meetingAppsSaving, setMeetingAppsSaving] = useState(false);
   // Meeting watchdog settings (silence auto-stop minutes, max-duration cap,
@@ -3319,7 +3347,7 @@ function SettingsPanel({
         <h2>会议自动检测</h2>
         <p className="muted-text">
           开启后，Lumen 会按下方的外置应用目录留意会议 App 与浏览器的麦克风活动，并在检测到时<strong>弹窗提示</strong>——
-          仅在你点击「开始记录」后才会录音，绝不自动录制。默认关闭。
+          仅在你点击「开始记录」后才会录音，绝不自动录制。默认开启，可随时在这里关闭。
         </p>
         <div className="form-row">
           <label className="muted-text">
@@ -3346,9 +3374,9 @@ function SettingsPanel({
             启用会议自动检测（弹窗提示，不自动录制）
           </label>
         </div>
-        {!detectionCapable && (
+        {detectionCapable === false && (
           <p className="muted-text" style={{ fontSize: "0.85rem", marginTop: 8 }}>
-            当前系统不支持会议检测所需的系统能力（需要较新的 macOS），此开关已停用。
+            当前系统不支持会议检测所需的系统能力（需要较新的 macOS），此设备上检测不会运行。
           </p>
         )}
 
