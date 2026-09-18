@@ -262,9 +262,10 @@ export default function App() {
   const [hotkeyEnabled, setHotkeyEnabledUi] = useState(true);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [onboardingIncomplete, setOnboardingIncomplete] = useState(false);
-  // App-level meeting-detection prompt (opt-in, capability-gated). The backend
-  // policy decides *when* to prompt; here we only render it and relay the user's
-  // choice. Kept out of MeetingPanel on purpose so it is visible on any tab.
+  // App-level meeting-detection prompt (on by default, capability-gated). The
+  // backend policy decides *when* to prompt; here we only render it and relay
+  // the user's choice. Kept out of MeetingPanel on purpose so it is visible on
+  // any tab.
   const [detected, setDetected] = useState<{
     bundleId: string;
     appClass: string;
@@ -3319,7 +3320,7 @@ function SettingsPanel({
         <h2>会议自动检测</h2>
         <p className="muted-text">
           开启后，Lumen 会按下方的外置应用目录留意会议 App 与浏览器的麦克风活动，并在检测到时<strong>弹窗提示</strong>——
-          仅在你点击「开始记录」后才会录音，绝不自动录制。默认关闭。
+          仅在你点击「开始记录」后才会录音，绝不自动录制。默认开启，可随时在这里关闭。
         </p>
         <div className="form-row">
           <label className="muted-text">
@@ -3348,7 +3349,7 @@ function SettingsPanel({
         </div>
         {!detectionCapable && (
           <p className="muted-text" style={{ fontSize: "0.85rem", marginTop: 8 }}>
-            当前系统不支持会议检测所需的系统能力（需要较新的 macOS），此开关已停用。
+            当前系统不支持会议检测所需的系统能力（需要较新的 macOS），此设备上检测不会运行。
           </p>
         )}
 

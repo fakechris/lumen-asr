@@ -1518,7 +1518,7 @@ pub fn stop_meeting_recording(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingDetectionStatus {
-    /// The user's opt-in preference (persisted).
+    /// The user's meeting-detection preference (persisted; defaults to on).
     pub enabled: bool,
     /// Whether this OS exposes the audio-activity capability at all. When
     /// `false`, the toggle can explain the feature is unavailable here.
@@ -1544,7 +1544,7 @@ pub fn get_meeting_detection(state: State<'_, AppState>) -> Result<MeetingDetect
     })
 }
 
-/// Toggle the opt-in meeting-detection preference. Persists it and starts/stops
+/// Toggle the meeting-detection preference. Persists it and starts/stops
 /// the detector to match (starting only ever succeeds when the OS capability is
 /// present). Returns the resulting status.
 #[tauri::command]
