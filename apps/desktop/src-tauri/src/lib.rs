@@ -707,9 +707,10 @@ pub fn run() {
                 });
             }
 
-            // Opt-in meeting detection: only start when the user enabled it AND
-            // the OS capability is present. Off by default; failure to start
-            // (unavailable capability) is silent — the feature just stays dark.
+            // Meeting detection: on by default, so start it unless the user
+            // opted out in Settings AND only when the OS capability is
+            // present. Failure to start (unavailable capability) is silent —
+            // the feature just stays dark.
             let detection_enabled = app
                 .state::<AppState>()
                 .config

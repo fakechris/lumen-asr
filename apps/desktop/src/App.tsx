@@ -2400,7 +2400,10 @@ function SettingsPanel({
   const [soundsEnabledUi, setSoundsEnabledUi] = useState(true);
   const [savingSounds, setSavingSounds] = useState(false);
   const [detectionEnabled, setDetectionEnabled] = useState(false);
-  const [detectionCapable, setDetectionCapable] = useState(false);
+  // `null` until the first successful status lookup: a lookup that fails must
+  // not read as "device unsupported", which would disable the toggle and show
+  // the unsupported-device note on perfectly capable machines.
+  const [detectionCapable, setDetectionCapable] = useState<boolean | null>(null);
   const [meetingApps, setMeetingApps] = useState<MeetingAppCatalog | null>(null);
   const [meetingAppsSaving, setMeetingAppsSaving] = useState(false);
   // Meeting watchdog settings (silence auto-stop minutes, max-duration cap,
@@ -3371,7 +3374,7 @@ function SettingsPanel({
             启用会议自动检测（弹窗提示，不自动录制）
           </label>
         </div>
-        {!detectionCapable && (
+        {detectionCapable === false && (
           <p className="muted-text" style={{ fontSize: "0.85rem", marginTop: 8 }}>
             当前系统不支持会议检测所需的系统能力（需要较新的 macOS），此设备上检测不会运行。
           </p>
