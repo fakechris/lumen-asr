@@ -2373,6 +2373,24 @@ function MeetingDetailView({
     }
   }, [meetingId, onError]);
 
+  // Failed-meeting retry: rerun the offline pipeline with the current
+  // settings. `process_meeting_now` returns immediately; the status flips to
+  // processing, which re-arms the poll below, and the progress events stream
+  // as usual.
+  const [reprocessing, setReprocessing] = useState(false);
+  const retryProcessing = useCallback(async () => {
+    if (reprocessing) return;
+    setReprocessing(true);
+    try {
+      await api.processMeetingNow(meetingId);
+      await load();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setReprocessing(false);
+    }
+  }, [meetingId, load, onError, reprocessing]);
+
   useEffect(() => {
     setLoading(true);
     void load();
@@ -2790,6 +2808,8 @@ function MeetingDetailView({
               onSeek={seekTo}
               onSegmentEdited={applySegmentText}
               onError={onError}
+              onRetry={() => void retryProcessing()}
+              retrying={reprocessing}
             />
           </div>
           {audioSrc && (
@@ -2836,9 +2856,15 @@ function MeetingDetailView({
 function FailureNote({
   detail,
   kind,
+  onRetry,
+  retrying,
 }: {
   detail: MeetingDetail;
   kind: "summary" | "transcript";
+  /** Wired by the detail view: rerun the offline pipeline with the current
+   * settings (the retry the failure copy promises). */
+  onRetry?: () => void;
+  retrying?: boolean;
 }) {
   const reason = detail.meeting.failure_reason?.trim() || null;
   const guidance = diarGuidance(reason);
@@ -2854,7 +2880,7 @@ function FailureNote({
           <p className="meeting-fail-guide">
             说话人分离模型未安装。请将 <code>seg.onnx</code>、
             <code>emb.onnx</code> 和 <code>plda</code> 放入应用模型目录的{" "}
-            <code>diar/</code> 子目录（上面的路径即缺失位置），然后在“录音”里重试。
+            <code>diar/</code> 子目录（上面的路径即缺失位置），然后重新处理。
           </p>
         )}
         {guidance === "macos_only" && (
@@ -2863,7 +2889,20 @@ function FailureNote({
           </p>
         )}
         {!guidance && (
-          <p className="muted-text">可在“录音”里重试，或查看原始音频。</p>
+          <p className="muted-text">
+            已修改转写设置（如切换云端引擎、补填 API Key）后，可直接重新处理，或查看原始音频。
+          </p>
+        )}
+        {onRetry && (
+          <button
+            type="button"
+            className="btn"
+            disabled={retrying}
+            style={{ marginTop: 8 }}
+            onClick={onRetry}
+          >
+            {retrying ? "正在启动重新处理…" : "重新处理"}
+          </button>
         )}
       </div>
     </div>
@@ -2874,15 +2913,22 @@ function StatusNote({
   detail,
   kind,
   progress,
+  onRetry,
+  retrying,
 }: {
   detail: MeetingDetail;
   kind: "summary" | "transcript";
   /** Live offline-processing progress; drives the granular stage view when set. */
   progress?: ProcessingProgress | null;
+  /** See [FailureNote]. */
+  onRetry?: () => void;
+  retrying?: boolean;
 }) {
   const status = detail.meeting.status;
   if (status === "failed") {
-    return <FailureNote detail={detail} kind={kind} />;
+    return (
+      <FailureNote detail={detail} kind={kind} onRetry={onRetry} retrying={retrying} />
+    );
   }
   // A terminal (ready) meeting that simply has no content must not show a
   // "transcribing…" spinner — the pipeline is done, there is just nothing here.
@@ -3880,6 +3926,8 @@ function TranscriptView({
   onSeek,
   onSegmentEdited,
   onError,
+  onRetry,
+  retrying,
 }: {
   detail: MeetingDetail;
   jump: { seconds: number; token: number } | null;
@@ -3892,6 +3940,9 @@ function TranscriptView({
   onSeek: (seconds: number) => void;
   onSegmentEdited: (segmentId: string, text: string) => void;
   onError: (e: string | null) => void;
+  /** Rerun the offline pipeline (failed-meeting retry); see [FailureNote]. */
+  onRetry?: () => void;
+  retrying?: boolean;
 }) {
   const turns = useMemo(() => buildTurns(detail.segments), [detail.segments]);
   const speakerById = useMemo(() => {
@@ -3956,7 +4007,13 @@ function TranscriptView({
   if (turns.length === 0) {
     return (
       <div className="card meeting-empty">
-        <StatusNote detail={detail} kind="transcript" progress={progress} />
+        <StatusNote
+          detail={detail}
+          kind="transcript"
+          progress={progress}
+          onRetry={onRetry}
+          retrying={retrying}
+        />
       </div>
     );
   }
