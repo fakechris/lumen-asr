@@ -644,6 +644,13 @@ export const api = {
       transcribeEngine,
     }),
 
+  /** Manually (re)run the offline transcription + minutes pipeline for a
+   * recorded meeting — the retry entry for failed meetings. Returns
+   * immediately; the meeting advances through the lifecycle in the background
+   * and the detail view's polling picks the result up. */
+  processMeetingNow: (meetingId: string) =>
+    invoke<void>("process_meeting_now", { meetingId }),
+
   /** Read a meeting's mic audio as WAV bytes for playback. Opus tracks (the
    * default for new recordings) are decoded server-side because WKWebView
    * cannot play Ogg-Opus; WAV files are returned as-is. */
