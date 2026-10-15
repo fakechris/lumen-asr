@@ -20,6 +20,13 @@ test("explains granular context-integrity fallback reasons", () => {
   );
 });
 
+test("explains a truncated revision", () => {
+  assert.equal(
+    correctorFallbackNotice("output_truncated"),
+    "识别完成，校对未应用：修订结果超出长度上限被截断",
+  );
+});
+
 test("fallback notice says that the model revision was not used", () => {
   assert.equal(
     correctorFallbackNotice("timeout"),
