@@ -8,13 +8,23 @@
 //! - Do not `open -a` / activate unless our app accidentally became frontmost
 //! - Wait until Alt/Shift/Ctrl are physically up before synthesizing keys
 //!   (hotkey chord still held would turn ⌘V into ⌥⇧⌘V)
+//! - Clipboard restore snapshots every pasteboard item and type (images, rich
+//!   text, file URLs — not just plain text) and only restores while the
+//!   pasteboard still holds our write, so a copy made during the paste window
+//!   is never clobbered
 
 use async_trait::async_trait;
 use lumen_inject::{InjectError, TextInjectorBackend};
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
-use objc2_foundation::NSString;
+use objc2::runtime::ProtocolObject;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{
+    NSPasteboard, NSPasteboardItem, NSPasteboardType, NSPasteboardTypeString, NSPasteboardWriting,
+};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSArray, NSData, NSString};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,7 +49,7 @@ impl TextInjectorBackend for MacTextInjectorBackend {
     }
 
     async fn copy_only(&self, text: &str) -> Result<(), InjectError> {
-        set_clipboard(text)
+        set_clipboard(text).map(|_| ())
     }
 }
 
@@ -50,29 +60,147 @@ fn paste_with_restore_sync(text: &str, preserve: bool) -> Result<(), InjectError
 
     wait_hotkey_modifiers_clear(Duration::from_millis(400));
 
-    let previous = if preserve {
-        get_clipboard().unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let previous = preserve.then(ClipboardSnapshot::capture);
 
-    set_clipboard(text)?;
+    let our_change = set_clipboard(text)?;
     // Pasteboard readiness.
     thread::sleep(Duration::from_millis(40));
     simulate_cmd_v()?;
     // Give terminal/Electron time to consume pasteboard.
     thread::sleep(Duration::from_millis(350));
 
-    if preserve {
-        let _ = set_clipboard(&previous);
+    if let Some(previous) = previous {
+        match restore_decision(our_change, clipboard_change_count()) {
+            RestoreDecision::Restore => {
+                if let Err(e) = previous.restore() {
+                    tracing::warn!(error = %e, "clipboard restore failed");
+                }
+            }
+            RestoreDecision::KeepNewerContents => {
+                tracing::info!(
+                    "pasteboard changed by another writer during paste; keeping the newer contents"
+                );
+            }
+        }
     }
     Ok(())
 }
 
+/// Whether to put the user's previous clipboard back after our paste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreDecision {
+    /// The pasteboard still holds our write — restore the snapshot.
+    Restore,
+    /// Another writer (the user copying, a clipboard manager, another app)
+    /// replaced our contents during the paste window; restoring would destroy
+    /// that newer copy.
+    KeepNewerContents,
+}
+
+/// `our_change` is the pasteboard change count right after our own write;
+/// `current` is the count when the paste window closes. Any difference means
+/// someone else wrote in between.
+fn restore_decision(our_change: isize, current: isize) -> RestoreDecision {
+    if current == our_change {
+        RestoreDecision::Restore
+    } else {
+        RestoreDecision::KeepNewerContents
+    }
+}
+
+/// Every item on a pasteboard with the data of each of its types, so non-text
+/// contents (images, RTF, file URLs) survive a paste.
 #[cfg(target_os = "macos")]
-fn set_clipboard(text: &str) -> Result<(), InjectError> {
+struct ClipboardSnapshot {
+    items: Vec<Vec<(Retained<NSPasteboardType>, Retained<NSData>)>>,
+}
+
+#[cfg(target_os = "macos")]
+impl ClipboardSnapshot {
+    fn capture() -> Self {
+        Self::capture_from(&NSPasteboard::generalPasteboard())
+    }
+
+    fn capture_from(pasteboard: &NSPasteboard) -> Self {
+        let mut items = Vec::new();
+        if let Some(pb_items) = pasteboard.pasteboardItems() {
+            for item in pb_items.iter() {
+                let entries: Vec<_> = item
+                    .types()
+                    .iter()
+                    .filter_map(|ty| item.dataForType(&ty).map(|data| (ty, data)))
+                    .collect();
+                if !entries.is_empty() {
+                    items.push(entries);
+                }
+            }
+        }
+        Self { items }
+    }
+
+    fn restore(&self) -> Result<(), InjectError> {
+        self.restore_to(&NSPasteboard::generalPasteboard())
+    }
+
+    /// Replace the pasteboard contents with the snapshot; an empty snapshot
+    /// leaves it cleared, which is what the user had before the paste.
+    fn restore_to(&self, pasteboard: &NSPasteboard) -> Result<(), InjectError> {
+        pasteboard.clearContents();
+        if self.items.is_empty() {
+            return Ok(());
+        }
+        let writers: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = self
+            .items
+            .iter()
+            .map(|entries| {
+                let item = NSPasteboardItem::new();
+                for (ty, data) in entries {
+                    item.setData_forType(data, ty);
+                }
+                ProtocolObject::from_retained(item)
+            })
+            .collect();
+        if pasteboard.writeObjects(&NSArray::from_retained_slice(&writers)) {
+            Ok(())
+        } else {
+            Err(InjectError::Other(
+                "failed to write previous contents back to pasteboard".into(),
+            ))
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct ClipboardSnapshot;
+
+#[cfg(not(target_os = "macos"))]
+impl ClipboardSnapshot {
+    fn capture() -> Self {
+        Self
+    }
+
+    fn restore(&self) -> Result<(), InjectError> {
+        Err(InjectError::NotSupported("not macOS".into()))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clipboard_change_count() -> isize {
+    NSPasteboard::generalPasteboard().changeCount()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clipboard_change_count() -> isize {
+    0
+}
+
+/// Write `text` to the general pasteboard; returns the change count of our
+/// write so the caller can later tell whether anyone else wrote after us.
+#[cfg(target_os = "macos")]
+fn set_clipboard(text: &str) -> Result<isize, InjectError> {
     let pasteboard = NSPasteboard::generalPasteboard();
-    set_pasteboard_text(&pasteboard, text)
+    set_pasteboard_text(&pasteboard, text)?;
+    Ok(pasteboard.changeCount())
 }
 
 #[cfg(target_os = "macos")]
@@ -90,28 +218,8 @@ fn set_pasteboard_text(pasteboard: &NSPasteboard, text: &str) -> Result<(), Inje
 }
 
 #[cfg(not(target_os = "macos"))]
-fn set_clipboard(text: &str) -> Result<(), InjectError> {
+fn set_clipboard(text: &str) -> Result<isize, InjectError> {
     let _ = text;
-    Err(InjectError::NotSupported("not macOS".into()))
-}
-
-#[cfg(target_os = "macos")]
-fn get_clipboard() -> Result<String, InjectError> {
-    let pasteboard = NSPasteboard::generalPasteboard();
-    get_pasteboard_text(&pasteboard)
-}
-
-#[cfg(target_os = "macos")]
-fn get_pasteboard_text(pasteboard: &NSPasteboard) -> Result<String, InjectError> {
-    let string_type = unsafe { NSPasteboardTypeString };
-    pasteboard
-        .stringForType(string_type)
-        .map(|value| value.to_string())
-        .ok_or_else(|| InjectError::Other("pasteboard does not contain text".into()))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn get_clipboard() -> Result<String, InjectError> {
     Err(InjectError::NotSupported("not macOS".into()))
 }
 
@@ -241,9 +349,15 @@ fn post_unicode_chunk(
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::{get_pasteboard_text, set_pasteboard_text};
-    use objc2_app_kit::NSPasteboard;
+mod macos_tests {
+    use super::{set_pasteboard_text, ClipboardSnapshot};
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString};
+    use objc2_foundation::{NSData, NSString};
+
+    fn pasteboard_text(pasteboard: &NSPasteboard) -> Option<String> {
+        let string_type = unsafe { NSPasteboardTypeString };
+        pasteboard.stringForType(string_type).map(|v| v.to_string())
+    }
 
     #[test]
     fn clipboard_copy_preserves_unicode_for_native_consumers() {
@@ -251,8 +365,57 @@ mod tests {
         let expected = "中文剪贴板测试：你好，世界。🚀";
 
         set_pasteboard_text(&pasteboard, expected).expect("copy Unicode fixture");
-        let actual = get_pasteboard_text(&pasteboard).expect("read Unicode fixture");
 
-        assert_eq!(actual, expected);
+        assert_eq!(pasteboard_text(&pasteboard).as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn snapshot_restores_non_text_types_alongside_text() {
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        let png_type = unsafe { NSPasteboardTypePNG };
+        let string_type = unsafe { NSPasteboardTypeString };
+        let image_bytes = [0x89u8, b'P', b'N', b'G', 0, 1, 2, 3];
+        pasteboard.clearContents();
+        pasteboard.setData_forType(Some(&NSData::with_bytes(&image_bytes)), png_type);
+        pasteboard.setString_forType(&NSString::from_str("caption"), string_type);
+
+        let snapshot = ClipboardSnapshot::capture_from(&pasteboard);
+        set_pasteboard_text(&pasteboard, "dictated text").expect("overwrite");
+        snapshot.restore_to(&pasteboard).expect("restore");
+
+        let restored = pasteboard
+            .dataForType(png_type)
+            .expect("image data restored")
+            .to_vec();
+        assert_eq!(restored, image_bytes);
+        assert_eq!(pasteboard_text(&pasteboard).as_deref(), Some("caption"));
+    }
+
+    #[test]
+    fn empty_snapshot_restores_to_empty_pasteboard() {
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        pasteboard.clearContents();
+
+        let snapshot = ClipboardSnapshot::capture_from(&pasteboard);
+        set_pasteboard_text(&pasteboard, "dictated text").expect("overwrite");
+        snapshot.restore_to(&pasteboard).expect("restore");
+
+        assert_eq!(pasteboard_text(&pasteboard), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{restore_decision, RestoreDecision};
+
+    #[test]
+    fn restores_when_pasteboard_still_holds_our_write() {
+        assert_eq!(restore_decision(42, 42), RestoreDecision::Restore);
+    }
+
+    #[test]
+    fn keeps_contents_written_by_someone_else_during_paste() {
+        assert_eq!(restore_decision(42, 43), RestoreDecision::KeepNewerContents);
+        assert_eq!(restore_decision(42, 50), RestoreDecision::KeepNewerContents);
     }
 }
