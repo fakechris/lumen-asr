@@ -1466,7 +1466,12 @@ fn run_verifier(
             for v in norm_centroid.iter_mut() {
                 *v *= inv;
             }
-            let norm = norm_centroid.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+            let norm = norm_centroid
+                .iter()
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt()
+                .max(1e-6);
             for v in norm_centroid.iter_mut() {
                 *v /= norm;
             }
