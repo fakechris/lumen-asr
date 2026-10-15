@@ -123,17 +123,30 @@ impl ClipboardSnapshot {
 
     fn capture_from(pasteboard: &NSPasteboard) -> Self {
         let mut items = Vec::new();
+        let mut unreadable = 0usize;
         if let Some(pb_items) = pasteboard.pasteboardItems() {
             for item in pb_items.iter() {
-                let entries: Vec<_> = item
-                    .types()
-                    .iter()
-                    .filter_map(|ty| item.dataForType(&ty).map(|data| (ty, data)))
-                    .collect();
+                let mut entries = Vec::new();
+                for ty in item.types().iter() {
+                    match item.dataForType(&ty) {
+                        Some(data) => entries.push((ty, data)),
+                        None => unreadable += 1,
+                    }
+                }
                 if !entries.is_empty() {
                     items.push(entries);
                 }
             }
+        }
+        // A type can be unreadable when its data is provided lazily by an app
+        // that has since quit, or when the provider times out. Restoring the
+        // readable remainder still beats leaving the dictated text in place of
+        // the user's clipboard, but say so instead of dropping it silently.
+        if unreadable > 0 {
+            tracing::warn!(
+                unreadable,
+                "some pasteboard types could not be read; they will not be restored"
+            );
         }
         Self { items }
     }
@@ -149,17 +162,19 @@ impl ClipboardSnapshot {
         if self.items.is_empty() {
             return Ok(());
         }
-        let writers: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = self
-            .items
-            .iter()
-            .map(|entries| {
-                let item = NSPasteboardItem::new();
-                for (ty, data) in entries {
-                    item.setData_forType(data, ty);
+        let mut writers: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> =
+            Vec::with_capacity(self.items.len());
+        for entries in &self.items {
+            let item = NSPasteboardItem::new();
+            for (ty, data) in entries {
+                if !item.setData_forType(data, ty) {
+                    return Err(InjectError::Other(format!(
+                        "failed to rebuild pasteboard item type {ty}"
+                    )));
                 }
-                ProtocolObject::from_retained(item)
-            })
-            .collect();
+            }
+            writers.push(ProtocolObject::from_retained(item));
+        }
         if pasteboard.writeObjects(&NSArray::from_retained_slice(&writers)) {
             Ok(())
         } else {
@@ -198,18 +213,19 @@ fn clipboard_change_count() -> isize {
 /// write so the caller can later tell whether anyone else wrote after us.
 #[cfg(target_os = "macos")]
 fn set_clipboard(text: &str) -> Result<isize, InjectError> {
-    let pasteboard = NSPasteboard::generalPasteboard();
-    set_pasteboard_text(&pasteboard, text)?;
-    Ok(pasteboard.changeCount())
+    set_pasteboard_text(&NSPasteboard::generalPasteboard(), text)
 }
 
+/// Returns the change count taken from `clearContents`, i.e. the count that
+/// identifies our ownership. Reading `changeCount()` after the write instead
+/// would misattribute a copy another app made in between.
 #[cfg(target_os = "macos")]
-fn set_pasteboard_text(pasteboard: &NSPasteboard, text: &str) -> Result<(), InjectError> {
-    pasteboard.clearContents();
+fn set_pasteboard_text(pasteboard: &NSPasteboard, text: &str) -> Result<isize, InjectError> {
+    let ours = pasteboard.clearContents();
     let value = NSString::from_str(text);
     let string_type = unsafe { NSPasteboardTypeString };
     if pasteboard.setString_forType(&value, string_type) {
-        Ok(())
+        Ok(ours)
     } else {
         Err(InjectError::Other(
             "failed to write Unicode text to pasteboard".into(),
@@ -389,6 +405,13 @@ mod macos_tests {
             .to_vec();
         assert_eq!(restored, image_bytes);
         assert_eq!(pasteboard_text(&pasteboard).as_deref(), Some("caption"));
+    }
+
+    #[test]
+    fn write_reports_the_change_count_it_owns() {
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        let ours = set_pasteboard_text(&pasteboard, "dictated text").expect("write");
+        assert_eq!(ours, pasteboard.changeCount());
     }
 
     #[test]
