@@ -17,9 +17,11 @@
 //! (no models needed). The minutes leg is cross-platform (an LLM call behind the
 //! [`Corrector`] trait) and is skipped when no corrector is supplied.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use lumen_asr_engine::AsrEngine;
 use lumen_core::MeetingStatus;
@@ -36,7 +38,8 @@ use crate::minutes::{
 };
 use crate::pipeline::{diarize_wav, transcribe_turns, DiarModels, MeetingError, MeetingOptions};
 use crate::progress::{
-    ProcessingPlan, ProcessingProgress, ProcessingStage, ProcessingTrack, ProgressReporter,
+    format_stage_breakdown, ProcessingPlan, ProcessingProgress, ProcessingStage, ProcessingTrack,
+    ProgressReporter, StageTimer,
 };
 
 /// Failure of [`process_meeting`]. Whichever step fails, the meeting is left in
@@ -100,6 +103,8 @@ pub async fn process_meeting(
     opts: &MeetingOptions,
     progress: Option<&dyn Fn(ProcessingProgress)>,
 ) -> Result<(), ProcessError> {
+    let timer = StageTimer::new(Instant::now());
+    let audio_seconds = Cell::new(None);
     let result = run(
         store,
         meeting_id,
@@ -110,8 +115,11 @@ pub async fn process_meeting(
         minutes,
         opts,
         progress,
+        &timer,
+        &audio_seconds,
     )
     .await;
+    log_processing_summary(meeting_id, &timer, audio_seconds.get(), result.is_ok());
     if let Err(err) = &result {
         // Best-effort: never let a processing failure leave the meeting stuck in
         // an in-flight state. Record *why* it failed so the UI can surface an
@@ -123,6 +131,62 @@ pub async fn process_meeting(
         }
     }
     result
+}
+
+/// Stage boundary marker shared by the pipeline: closes the previous stage's
+/// wall-clock span (logged with its elapsed time) and forwards the boundary to
+/// the optional progress reporter, so per-stage timing is logged whether or not
+/// a UI sink is attached.
+struct StageMarks<'a> {
+    meeting_id: Uuid,
+    reporter: Option<&'a ProgressReporter<'a>>,
+    timer: &'a StageTimer,
+}
+
+impl StageMarks<'_> {
+    fn start(&self, stage: ProcessingStage, track: Option<ProcessingTrack>) {
+        let closed = self.timer.begin(stage, track, Instant::now());
+        log_stage_done(self.meeting_id, &closed);
+        if let Some(reporter) = self.reporter {
+            reporter.stage_start(stage, track);
+        }
+    }
+}
+
+fn log_stage_done(meeting_id: Uuid, span: &crate::progress::StageTiming) {
+    tracing::info!(
+        meeting_id = %meeting_id,
+        stage = span.stage,
+        track = span.track.map(ProcessingTrack::as_str).unwrap_or("-"),
+        elapsed_ms = span.elapsed.as_millis() as u64,
+        "meeting processing stage done"
+    );
+}
+
+/// Close the last stage and log one summary line: total wall time, the audio
+/// duration it processed (so per-stage real-time factors can be read off the
+/// log) and the `stage[:track]=ms` breakdown.
+fn log_processing_summary(
+    meeting_id: Uuid,
+    timer: &StageTimer,
+    audio_seconds: Option<f64>,
+    succeeded: bool,
+) {
+    let (last, total, spans) = timer.finish(Instant::now());
+    log_stage_done(meeting_id, &last);
+    let total_ms = total.as_millis() as u64;
+    let rtf = audio_seconds
+        .filter(|secs| *secs > 0.0)
+        .map(|secs| total.as_secs_f64() / secs);
+    tracing::info!(
+        meeting_id = %meeting_id,
+        succeeded,
+        total_ms,
+        audio_seconds = audio_seconds.unwrap_or(0.0),
+        rtf = rtf.unwrap_or(0.0),
+        breakdown = %format_stage_breakdown(&spans),
+        "meeting processing timing"
+    );
 }
 
 /// Apply a meeting's stored recording-time live annotations (L2) to its
@@ -176,20 +240,16 @@ async fn transcribe_track(
     diar_models: &DiarModels,
     asr_engine: Arc<dyn AsrEngine>,
     opts: &MeetingOptions,
-    reporter: Option<&ProgressReporter<'_>>,
+    stages: &StageMarks<'_>,
     track: ProcessingTrack,
 ) -> Result<(TrackTake, BTreeMap<u32, Vec<f32>>, u32, Option<f64>), ProcessError> {
     // Diarization (segmentation + per-speaker centroid voiceprints, both inside
     // `diarize_wav`): a single slow stage with no natural sub-progress. Report
     // it entering, then report `voiceprint` once its embeddings are ready — the
     // two ticks give the bar some movement before the per-turn ASR loop begins.
-    if let Some(reporter) = reporter {
-        reporter.stage_start(ProcessingStage::Diarize, Some(track));
-    }
+    stages.start(ProcessingStage::Diarize, Some(track));
     let diar = diarize_wav(wav, diar_models, opts)?;
-    if let Some(reporter) = reporter {
-        reporter.stage_start(ProcessingStage::Voiceprint, Some(track));
-    }
+    stages.start(ProcessingStage::Voiceprint, Some(track));
     let sample_rate = diar.sample_rate;
     let duration = (sample_rate > 0).then(|| diar.samples.len() as f64 / sample_rate as f64);
 
@@ -203,9 +263,7 @@ async fn transcribe_track(
     // `opts.turn_concurrency > 1` (cloud engines) turns run bounded-concurrent;
     // results are still delivered in turn order.
     let total_turns = diar.turns.len();
-    if let Some(reporter) = reporter {
-        reporter.stage_start(ProcessingStage::Transcribe, Some(track));
-    }
+    stages.start(ProcessingStage::Transcribe, Some(track));
     let results = transcribe_turns(
         asr_engine,
         Arc::clone(&diar.samples),
@@ -213,7 +271,7 @@ async fn transcribe_track(
         &diar.turns,
         opts,
         |done| {
-            if let Some(reporter) = reporter {
+            if let Some(reporter) = stages.reporter {
                 reporter.tick(ProcessingStage::Transcribe, Some(track), done, total_turns);
             }
         },
@@ -261,6 +319,8 @@ async fn run(
     minutes: Option<&MinutesConfig<'_>>,
     opts: &MeetingOptions,
     progress: Option<&dyn Fn(ProcessingProgress)>,
+    timer: &StageTimer,
+    audio_seconds: &Cell<Option<f64>>,
 ) -> Result<(), ProcessError> {
     // Fix the progress plan up front so the overall percent has a stable
     // denominator: which optional stages run is known here (dual track from the
@@ -275,7 +335,12 @@ async fn run(
         };
         ProgressReporter::new(plan, sink)
     });
-    let reporter = reporter.as_ref();
+    let stages = StageMarks {
+        meeting_id,
+        reporter: reporter.as_ref(),
+        timer,
+    };
+    let reporter = stages.reporter;
 
     // ── transcribing ────────────────────────────────────────────────
     store
@@ -321,7 +386,7 @@ async fn run(
         diar_models,
         Arc::clone(&asr_engine),
         opts,
-        reporter,
+        &stages,
         ProcessingTrack::Mic,
     )
     .await?;
@@ -346,7 +411,7 @@ async fn run(
             diar_models,
             Arc::clone(&asr_engine),
             opts,
-            reporter,
+            &stages,
             ProcessingTrack::System,
         )
         .await
@@ -523,9 +588,7 @@ async fn run(
     // corrected text. Engine-agnostic (runs for Paraformer and SenseVoice) and
     // cross-platform; a no-op when the dictionary is empty. Word-level timings are
     // preserved (see `correct_words`).
-    if let Some(reporter) = reporter {
-        reporter.stage_start(ProcessingStage::Correct, None);
-    }
+    stages.start(ProcessingStage::Correct, None);
     if !opts.correction.is_empty() {
         for text in &mut texts {
             *text = correct_segment(text, &opts.correction);
@@ -547,9 +610,7 @@ async fn run(
     // (beta trade-off, see `cleanup`), so click-to-seek is unaffected.
     if crate::cleanup::should_cleanup(opts.cleanup_transcript, minutes.is_some()) {
         if let Some(cfg) = minutes {
-            if let Some(reporter) = reporter {
-                reporter.stage_start(ProcessingStage::Cleanup, None);
-            }
+            stages.start(ProcessingStage::Cleanup, None);
             // Per-chunk progress: the cleanup loop calls this back with
             // `(chunk_done, chunk_total)`, which the reporter throttles like the
             // per-turn ASR ticks.
@@ -577,6 +638,7 @@ async fn run(
         }
     }
 
+    audio_seconds.set(duration);
     let mut assembled = assemble_meeting_with_channels(
         meeting_id,
         &turns,
@@ -593,9 +655,7 @@ async fn run(
     // speakers with too little voiced audio (`IDENTIFY_MIN_VOICED_MS`; the
     // merged turns share the merged engine-id space with `speaker_embeddings`).
     // No-op when `opts.identity_dir` is unset or no embeddings were produced.
-    if let Some(reporter) = reporter {
-        reporter.stage_start(ProcessingStage::Identify, None);
-    }
+    stages.start(ProcessingStage::Identify, None);
     let voiced_ms = crate::identify::speaker_voiced_ms(&turns);
     crate::identify::apply_auto_identification(
         &mut assembled.speakers,
@@ -690,9 +750,7 @@ async fn run(
         _ => Vec::new(),
     };
     if system_speaker_id_offset.is_some() {
-        if let Some(reporter) = reporter {
-            reporter.stage_start(ProcessingStage::Unify, None);
-        }
+        stages.start(ProcessingStage::Unify, None);
         let unified = crate::unify::unify_cross_track_speakers(
             &mut assembled.speakers,
             &mut assembled.segments,
@@ -787,9 +845,7 @@ async fn run(
         store
             .update_meeting_status(meeting_id, MeetingStatus::Summarizing)
             .map_err(ProcessError::Store)?;
-        if let Some(reporter) = reporter {
-            reporter.stage_start(ProcessingStage::Minutes, None);
-        }
+        stages.start(ProcessingStage::Minutes, None);
         let transcript = render_transcript_for_minutes(&assembled.segments, &assembled.speakers);
         // Fuse in the notes the user took during the meeting (Granola-style): the
         // minutes LLM sees both the transcript and the user's own highlights, so

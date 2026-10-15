@@ -27,6 +27,7 @@ mod meeting_cmd;
 mod meeting_detection;
 mod meeting_live;
 mod meeting_mic_aec;
+mod meeting_queue;
 mod meeting_system_audio;
 mod minimax_asr;
 mod mod_chord;

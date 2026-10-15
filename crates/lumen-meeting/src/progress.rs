@@ -301,10 +301,114 @@ impl<'a> ProgressReporter<'a> {
     }
 }
 
+/// One closed stage span measured by [`StageTimer`]. `stage` is the machine
+/// name ([`ProcessingStage::as_str`]) or `"prepare"` for the work before the
+/// first stage (opus decode, status update).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StageTiming {
+    pub stage: &'static str,
+    pub track: Option<ProcessingTrack>,
+    pub elapsed: Duration,
+}
+
+/// Wall-clock accounting of the offline pipeline, independent of the optional
+/// progress sink. A stage runs from its `begin` until the next `begin` (or
+/// `finish`), so the spans tile the whole run and sum to the total: work
+/// between two stage boundaries (persistence, assembly) is charged to the
+/// earlier stage. Callers pass `now` so the accounting is testable.
+pub struct StageTimer {
+    started: Instant,
+    open: Cell<(&'static str, Option<ProcessingTrack>, Instant)>,
+    closed: std::cell::RefCell<Vec<StageTiming>>,
+}
+
+impl StageTimer {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            open: Cell::new(("prepare", None, now)),
+            closed: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Close the open span at `now` and open `stage`. Returns the closed span.
+    pub fn begin(
+        &self,
+        stage: ProcessingStage,
+        track: Option<ProcessingTrack>,
+        now: Instant,
+    ) -> StageTiming {
+        let closed = self.close(now);
+        self.open.set((stage.as_str(), track, now));
+        closed
+    }
+
+    fn close(&self, now: Instant) -> StageTiming {
+        let (stage, track, since) = self.open.get();
+        let timing = StageTiming {
+            stage,
+            track,
+            elapsed: now.saturating_duration_since(since),
+        };
+        self.closed.borrow_mut().push(timing.clone());
+        timing
+    }
+
+    /// Close the last span and return `(last span, total, every span)`.
+    pub fn finish(&self, now: Instant) -> (StageTiming, Duration, Vec<StageTiming>) {
+        let last = self.close(now);
+        let total = now.saturating_duration_since(self.started);
+        (last, total, self.closed.borrow().clone())
+    }
+}
+
+/// `stage[:track]=ms` pairs for a one-line timing summary.
+pub fn format_stage_breakdown(spans: &[StageTiming]) -> String {
+    spans
+        .iter()
+        .map(|s| match s.track {
+            Some(track) => format!("{}:{}={}", s.stage, track.as_str(), s.elapsed.as_millis()),
+            None => format!("{}={}", s.stage, s.elapsed.as_millis()),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn stage_timer_tiles_the_run_and_sums_to_total() {
+        let t0 = Instant::now();
+        let timer = StageTimer::new(t0);
+        let prep = timer.begin(
+            ProcessingStage::Diarize,
+            Some(ProcessingTrack::Mic),
+            t0 + Duration::from_millis(100),
+        );
+        assert_eq!(prep.stage, "prepare");
+        assert_eq!(prep.elapsed, Duration::from_millis(100));
+        let diar = timer.begin(
+            ProcessingStage::Transcribe,
+            Some(ProcessingTrack::Mic),
+            t0 + Duration::from_millis(1100),
+        );
+        assert_eq!(diar.stage, "diarize");
+        assert_eq!(diar.track, Some(ProcessingTrack::Mic));
+        assert_eq!(diar.elapsed, Duration::from_millis(1000));
+        let (last, total, spans) = timer.finish(t0 + Duration::from_millis(4100));
+        assert_eq!(last.stage, "transcribe");
+        assert_eq!(last.elapsed, Duration::from_millis(3000));
+        assert_eq!(total, Duration::from_millis(4100));
+        let sum: Duration = spans.iter().map(|s| s.elapsed).sum();
+        assert_eq!(sum, total);
+        assert_eq!(
+            format_stage_breakdown(&spans),
+            "prepare=100 diarize:mic=1000 transcribe:mic=3000"
+        );
+    }
 
     fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-3
