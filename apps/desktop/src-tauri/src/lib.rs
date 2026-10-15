@@ -25,6 +25,7 @@ mod meeting_apps;
 mod meeting_asr;
 mod meeting_cmd;
 mod meeting_detection;
+mod meeting_draft;
 mod meeting_live;
 mod meeting_mic_aec;
 mod meeting_queue;
