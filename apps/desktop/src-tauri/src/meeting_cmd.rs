@@ -14,6 +14,7 @@
 //! (see the platform gating in `lumen-meeting`); on other platforms the pipeline
 //! reports `Unsupported` and the meeting is left `failed`.
 
+use crate::meeting_queue::{Enqueued, ProcessingQueue};
 use crate::mode_arbiter::HotkeyAction;
 use crate::AppState;
 use lumen_asr::{copy_pcm16_wav_range, live_tap_channel, WavRangeError, LIVE_TAP_CAPACITY};
@@ -31,7 +32,7 @@ use lumen_store::Store;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -2105,6 +2106,19 @@ pub fn process_meeting_now(
     // The system track is optional even when recorded: reprocess with it only
     // if the file is still on disk.
     let system_wav = system_audio_path.map(PathBuf::from).filter(|p| p.exists());
+    // Show the meeting as processing while it waits its turn on the serial
+    // queue (the pipeline itself only advances the status once it starts). Set
+    // it before enqueueing so it can never overwrite a status the worker has
+    // already advanced; a meeting already queued or running is left alone.
+    if processing_queue(&app).is_pending(id) {
+        tracing::info!(meeting_id = %id, "meeting processing already pending; request dropped");
+        return Ok(());
+    }
+    with_store(&state, |s| {
+        s.update_meeting_status(id, MeetingStatus::Processing)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })?;
     spawn_meeting_processing(app, id, PathBuf::from(audio_path), system_wav);
     Ok(())
 }
@@ -2199,61 +2213,117 @@ fn pick_meeting_audio_path(app: &AppHandle) -> Result<PathBuf, String> {
         .ok_or_else(|| "已取消导入".to_string())
 }
 
-/// Spawn the offline meeting pipeline off the IPC path so the caller returns
+/// One queued offline run: the tracks to process.
+struct ProcessingJob {
+    wav: PathBuf,
+    system_wav: Option<PathBuf>,
+}
+
+/// The app-wide serial processing queue. Its single worker starts on first use
+/// and holds jobs back while a meeting is recording.
+fn processing_queue(app: &AppHandle) -> &'static Arc<ProcessingQueue<ProcessingJob>> {
+    static QUEUE: OnceLock<Arc<ProcessingQueue<ProcessingJob>>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let queue = Arc::new(ProcessingQueue::default());
+        let gate_app = app.clone();
+        let run_app = app.clone();
+        if let Err(e) = queue.spawn_worker(
+            move || {
+                gate_app
+                    .try_state::<AppState>()
+                    .is_some_and(|state| state.capture.is_meeting_recording())
+            },
+            move |meeting_id, job: ProcessingJob| {
+                run_meeting_processing(&run_app, meeting_id, &job.wav, job.system_wav.as_deref())
+            },
+            |meeting_id| {
+                if let Err(e) = mark_meeting_failed(meeting_id, Some("meeting processing crashed"))
+                {
+                    tracing::warn!(meeting_id = %meeting_id, error = %e, "could not mark meeting failed");
+                }
+            },
+        ) {
+            tracing::warn!(error = %e, "could not start the meeting processing worker");
+        }
+        queue
+    })
+}
+
+/// Queue the offline meeting pipeline off the IPC path so the caller returns
 /// immediately. Transcription is slow (diarize + per-turn ASR + minutes LLM), so
 /// it must never block the stop command.
 ///
-/// It runs on a dedicated OS thread with its own **current-thread** Tokio
-/// runtime, not `tauri::async_runtime::spawn`: `process_meeting` holds a
-/// thread-affine SQLite connection (`&Store`, which is `!Send`) across `.await`s,
-/// so its future cannot run on a multi-thread executor (whose `spawn` requires
-/// `Send`). A private single-thread runtime keeps the connection and the future
-/// thread-local.
-///
-/// `process_meeting` advances the meeting status itself and marks it `failed` on
-/// any in-pipeline error; this wrapper additionally covers pre-flight failures
-/// (engine/model/config) that never reach it.
+/// Runs are serial — one meeting at a time, held back while another meeting is
+/// recording — and a meeting already queued or running is not queued twice
+/// (see [`crate::meeting_queue`]).
 fn spawn_meeting_processing(
     app: AppHandle,
     meeting_id: Uuid,
     wav: PathBuf,
     system_wav: Option<PathBuf>,
+) -> Enqueued {
+    let outcome = processing_queue(&app).enqueue(meeting_id, ProcessingJob { wav, system_wav });
+    match outcome {
+        Enqueued::Queued { ahead } => {
+            tracing::info!(meeting_id = %meeting_id, ahead, "meeting processing queued")
+        }
+        Enqueued::AlreadyQueued | Enqueued::AlreadyRunning => tracing::info!(
+            meeting_id = %meeting_id,
+            outcome = ?outcome,
+            "meeting processing already pending; request dropped"
+        ),
+    }
+    outcome
+}
+
+/// One offline run, on the queue worker's thread.
+///
+/// It gets its own **current-thread** Tokio runtime, not
+/// `tauri::async_runtime::spawn`: `process_meeting` holds a thread-affine SQLite
+/// connection (`&Store`, which is `!Send`) across `.await`s, so its future
+/// cannot run on a multi-thread executor (whose `spawn` requires `Send`).
+///
+/// `process_meeting` advances the meeting status itself and marks it `failed` on
+/// any in-pipeline error; this wrapper additionally covers pre-flight failures
+/// (engine/model/config) that never reach it.
+fn run_meeting_processing(
+    app: &AppHandle,
+    meeting_id: Uuid,
+    wav: &Path,
+    system_wav: Option<&Path>,
 ) {
-    std::thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(e) => {
-                tracing::warn!(meeting_id = %meeting_id, error = %e, "could not build meeting runtime");
-                if let Err(e) =
-                    mark_meeting_failed(meeting_id, Some("could not start meeting runtime"))
-                {
-                    tracing::warn!(meeting_id = %meeting_id, error = %e, "could not mark meeting failed");
-                }
-                return;
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::warn!(meeting_id = %meeting_id, error = %e, "could not build meeting runtime");
+            if let Err(e) = mark_meeting_failed(meeting_id, Some("could not start meeting runtime"))
+            {
+                tracing::warn!(meeting_id = %meeting_id, error = %e, "could not mark meeting failed");
             }
-        };
-        runtime.block_on(async move {
-            tracing::info!(meeting_id = %meeting_id, "meeting processing started");
-            match process_meeting_pipeline(&app, meeting_id, &wav, system_wav.as_deref()).await {
-                Ok(()) => tracing::info!(meeting_id = %meeting_id, "meeting processing finished"),
-                Err(reason) => {
-                    tracing::warn!(meeting_id = %meeting_id, error = %reason, "meeting processing failed");
-                    // `process_meeting` records the reason for in-pipeline
-                    // failures itself; this covers the pre-flight failures
-                    // (engine/model/config build) that never reach it.
-                    if let Err(e) = mark_meeting_failed(meeting_id, Some(&reason)) {
-                        tracing::warn!(
-                            meeting_id = %meeting_id,
-                            error = %e,
-                            "could not mark meeting failed"
-                        );
-                    }
+            return;
+        }
+    };
+    runtime.block_on(async move {
+        tracing::info!(meeting_id = %meeting_id, "meeting processing started");
+        match process_meeting_pipeline(app, meeting_id, wav, system_wav).await {
+            Ok(()) => tracing::info!(meeting_id = %meeting_id, "meeting processing finished"),
+            Err(reason) => {
+                tracing::warn!(meeting_id = %meeting_id, error = %reason, "meeting processing failed");
+                // `process_meeting` records the reason for in-pipeline
+                // failures itself; this covers the pre-flight failures
+                // (engine/model/config build) that never reach it.
+                if let Err(e) = mark_meeting_failed(meeting_id, Some(&reason)) {
+                    tracing::warn!(
+                        meeting_id = %meeting_id,
+                        error = %e,
+                        "could not mark meeting failed"
+                    );
                 }
             }
-        });
+        }
     });
 }
 
