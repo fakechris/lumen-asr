@@ -1,5 +1,6 @@
 mod app_notifications;
 mod asr_models;
+mod asr_prewarm;
 mod audio_convert;
 mod capsule;
 mod commands;

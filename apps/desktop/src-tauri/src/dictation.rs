@@ -453,6 +453,12 @@ fn record_capture_signal_issue(attempt: &mut DictationAttemptRecord, issue: Capt
         });
 }
 
+/// Providers that transcribe in the cloud (with a local fallback on network
+/// failure).
+const CLOUD_ASR_PROVIDERS: [&str; 4] = ["openai_audio", "custom", "volcengine", "minimax"];
+/// Providers with a preset endpoint but no client yet.
+const PRESET_ONLY_ASR_PROVIDERS: [&str; 4] = ["aliyun_qwen", "soniox", "stepfun", "mimo"];
+
 pub(crate) fn canonical_asr_provider(provider: &str) -> String {
     match provider.trim().to_ascii_lowercase().as_str() {
         "sensevoice" | "local_sensevoice" => "local_sensevoice".into(),
@@ -538,9 +544,12 @@ pub fn set_asr_engine(
 pub(crate) fn unload_qwen(state: &AppState) {
     // sherpa-onnx Qwen3-ASR: dropping the cached recognizer releases the model;
     // the next request reloads it lazily. False just means nothing was loaded.
+    // Every local engine replacement passes through here, so it also resets
+    // the prewarm bookkeeping.
     if let Ok(engine) = state.qwen.lock() {
         engine.unload();
     }
+    crate::asr_prewarm::invalidate();
 }
 
 #[tauri::command]
@@ -759,6 +768,7 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
         tracing::warn!(error = %e, "arbiter begin_dictation (meeting active?)");
     }
     drop(ducking);
+    prewarm_dictation_asr(state);
     let pane_observation_enabled = state
         .config
         .lock()
@@ -1784,16 +1794,13 @@ async fn run_asr(
     let provider = canonical_asr_provider(&asr_cfg.provider);
     let provider = provider.as_str();
 
-    if matches!(provider, "aliyun_qwen" | "soniox" | "stepfun" | "mimo") {
+    if PRESET_ONLY_ASR_PROVIDERS.contains(&provider) {
         return Err(format!(
             "ASR「{provider}」仅预置了 endpoint，完整流式客户端尚未接入。请改用本地 SenseVoice 或 OpenAI Audio。"
         ));
     }
 
-    if matches!(
-        provider,
-        "openai_audio" | "custom" | "volcengine" | "minimax"
-    ) {
+    if CLOUD_ASR_PROVIDERS.contains(&provider) {
         return run_cloud_asr_with_local_hedge(state, provider, asr_cfg, samples_16k, attempt)
             .await;
     }
@@ -1964,45 +1971,69 @@ pub(crate) fn build_cloud_asr_engine(
     }
 }
 
+/// The current local engine instance for `engine_kind`. Clones share the
+/// loaded recognizer, so the prewarm and the real transcription use the same
+/// model.
+fn local_asr_engine(
+    state: &AppState,
+    engine_kind: EngineKind,
+) -> Result<Arc<dyn AsrEngine>, String> {
+    fn poisoned<T>(_: T) -> String {
+        "asr lock poisoned".to_string()
+    }
+    Ok(match engine_kind {
+        EngineKind::Whisper => Arc::new(state.whisper.lock().map_err(poisoned)?.clone()),
+        EngineKind::Qwen => Arc::new(state.qwen.lock().map_err(poisoned)?.clone()),
+        _ => Arc::new(state.sensevoice.lock().map_err(poisoned)?.clone()),
+    })
+}
+
 async fn run_local_asr(
     state: &AppState,
     engine_kind: EngineKind,
     samples_16k: Vec<f32>,
 ) -> Result<AsrResult, String> {
-    if engine_kind == EngineKind::Whisper {
-        let eng = state
-            .whisper
-            .lock()
-            .map_err(|_| "asr lock poisoned".to_string())?
-            .clone();
-        return eng
-            .transcribe(AsrRequest::new(samples_16k, 16_000))
-            .await
-            .map_err(|e| e.to_string());
-    }
-
-    if engine_kind == EngineKind::Qwen {
-        let eng = state
-            .qwen
-            .lock()
-            .map_err(|_| "asr lock poisoned".to_string())?
-            .clone();
-        // sherpa-onnx Qwen3-ASR auto-detects the language and has no per-request
-        // hotword/shadow channel — a plain transcribe is the whole contract.
-        return eng
-            .transcribe(AsrRequest::new(samples_16k, 16_000))
-            .await
-            .map_err(|e| e.to_string());
-    }
-
-    let eng = state
-        .sensevoice
-        .lock()
-        .map_err(|_| "asr lock poisoned".to_string())?
-        .clone();
-    eng.transcribe(AsrRequest::new(samples_16k, 16_000))
+    // sherpa-onnx Qwen3-ASR auto-detects the language and has no per-request
+    // hotword/shadow channel — a plain transcribe is the whole contract for
+    // every local engine.
+    local_asr_engine(state, engine_kind)?
+        .transcribe(AsrRequest::new(samples_16k, 16_000))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Local engine a dictation with `provider` will transcribe on, mirroring
+/// [`run_asr`]; `None` for cloud and preset-only providers. The cloud path's
+/// local fallback is deliberately not covered: loading a model for every cloud
+/// dictation on the chance the network fails costs memory most sessions never
+/// use.
+fn dictation_local_engine_kind(provider: &str, engine_kind: EngineKind) -> Option<EngineKind> {
+    let provider = canonical_asr_provider(provider);
+    let provider = provider.as_str();
+    if CLOUD_ASR_PROVIDERS.contains(&provider) || PRESET_ONLY_ASR_PROVIDERS.contains(&provider) {
+        return None;
+    }
+    Some(engine_kind_for_provider(provider).unwrap_or(engine_kind))
+}
+
+/// Starts loading the local model the coming transcription will use while the
+/// user is still speaking. Off the hotkey path: only a lock-and-clone here.
+fn prewarm_dictation_asr(state: &AppState) {
+    let provider = match state.config.lock() {
+        Ok(config) => config.asr.provider.clone(),
+        Err(_) => return,
+    };
+    let engine_kind = *state.engine.lock().unwrap_or_else(|e| e.into_inner());
+    let kind = match dictation_local_engine_kind(&provider, engine_kind) {
+        Some(kind @ (EngineKind::Whisper | EngineKind::Qwen)) => kind,
+        // `local_asr_engine` serves every other kind from SenseVoice.
+        Some(_) => EngineKind::SenseVoice,
+        None => return,
+    };
+    match local_asr_engine(state, kind) {
+        Ok(engine) => crate::asr_prewarm::spawn(kind, engine),
+        Err(error) => tracing::debug!(%error, "skipping ASR prewarm"),
+    }
 }
 
 /// Capsule / hotkey lifecycle events for the UI.
@@ -2594,6 +2625,29 @@ mod attempt_metric_tests {
             asr_engine_hedge_label("openai_audio", EngineKind::SenseVoice),
             "openai_audio→sensevoice"
         );
+    }
+
+    #[test]
+    fn prewarm_targets_the_engine_the_local_path_will_run() {
+        assert_eq!(
+            dictation_local_engine_kind("qwen3_asr", EngineKind::SenseVoice),
+            Some(EngineKind::Qwen)
+        );
+        assert_eq!(
+            dictation_local_engine_kind("local", EngineKind::Whisper),
+            Some(EngineKind::Whisper),
+            "unrecognised local provider falls back to the selected engine, like run_asr"
+        );
+        for provider in CLOUD_ASR_PROVIDERS
+            .iter()
+            .chain(PRESET_ONLY_ASR_PROVIDERS.iter())
+        {
+            assert_eq!(
+                dictation_local_engine_kind(provider, EngineKind::SenseVoice),
+                None,
+                "{provider} does not transcribe locally"
+            );
+        }
     }
 
     #[test]
