@@ -287,6 +287,12 @@ pub struct ContextArtifactPath {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredContextCapture {
+    pub capture_id: Uuid,
+    pub manifest_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionArtifactBatch {
     pub artifacts: Vec<SessionArtifactPaths>,
     pub last_scanned_session_id: Option<String>,
@@ -1516,6 +1522,77 @@ impl Store {
             audio_path,
             context_artifacts,
         }))
+    }
+
+    /// Context captures whose newest revision was frozen before `cutoff` and
+    /// that still reference sealed payload files. Rows stay in the table after
+    /// expiry (metadata-only) so attempts keep resolving their context reference.
+    pub fn expired_context_capture_batch(
+        &self,
+        cutoff: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<ExpiredContextCapture>> {
+        let limit = limit.clamp(1, MAX_ATTEMPT_PAGE_SIZE);
+        let mut statement = self.conn.prepare(
+            r#"
+            WITH expired AS (
+              SELECT capture_id
+              FROM context_snapshots
+              GROUP BY capture_id
+              HAVING MAX(frozen_at) < ?1
+                 AND SUM(CASE WHEN manifest_path <> '' THEN 1 ELSE 0 END) > 0
+              ORDER BY capture_id
+              LIMIT ?2
+            )
+            SELECT context_snapshots.capture_id, context_snapshots.manifest_path
+            FROM context_snapshots
+            JOIN expired ON expired.capture_id = context_snapshots.capture_id
+            WHERE context_snapshots.manifest_path <> ''
+            ORDER BY context_snapshots.capture_id, context_snapshots.revision
+            "#,
+        )?;
+        let rows = statement.query_map(params![cutoff.to_rfc3339(), i64::from(limit)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut captures: Vec<ExpiredContextCapture> = Vec::new();
+        for row in rows {
+            let (capture_id_raw, manifest_path) = row?;
+            let Ok(capture_id) = Uuid::parse_str(&capture_id_raw) else {
+                tracing::warn!(
+                    capture_id = capture_id_raw,
+                    "skipping malformed expired context capture id"
+                );
+                continue;
+            };
+            match captures.last_mut() {
+                Some(capture) if capture.capture_id == capture_id => {
+                    capture.manifest_paths.push(manifest_path);
+                }
+                _ => captures.push(ExpiredContextCapture {
+                    capture_id,
+                    manifest_paths: vec![manifest_path],
+                }),
+            }
+        }
+        Ok(captures)
+    }
+
+    /// Mark captures whose sealed payloads were removed: the rows keep their
+    /// hashes and source status for provenance but no longer point at files.
+    pub fn mark_context_captures_expired(&self, capture_ids: &[Uuid]) -> Result<usize> {
+        if capture_ids.is_empty() {
+            return Ok(0);
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut updated = 0;
+        for capture_id in capture_ids {
+            updated += transaction.execute(
+                "UPDATE context_snapshots SET manifest_path='', status='expired' WHERE capture_id=?1",
+                params![capture_id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(updated)
     }
 
     pub fn add_edit_event(
@@ -2818,6 +2895,87 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(store.list_context_snapshots(hidden).unwrap().is_empty());
+    }
+
+    #[test]
+    fn expired_context_captures_keep_metadata_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("context-retention.sqlite")).unwrap();
+        let mut session = SessionRecord::new();
+        session.status = SessionStatus::Completed;
+        store.save_session(&session).unwrap();
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(40);
+        let snapshot = |capture_id: Uuid, revision: u64, frozen_at, manifest_path: &str| {
+            ContextSnapshotRecord {
+                capture_id,
+                session_id: session.id,
+                revision,
+                schema_version: 1,
+                profile: "visible".into(),
+                target_generation: 1,
+                started_at: frozen_at,
+                frozen_at,
+                completed_at: Some(frozen_at),
+                manifest_path: manifest_path.into(),
+                source_presence_bitmap: 1,
+                source_status_json: "{}".into(),
+                sanitized_hash: format!("hash-{revision}"),
+                encryption: "keychain".into(),
+                status: "complete".into(),
+            }
+        };
+        let expired = Uuid::new_v4();
+        let recent = Uuid::new_v4();
+        let unavailable = Uuid::new_v4();
+        // An old capture with a late archival revision that is also old.
+        store
+            .save_context_snapshot(&snapshot(expired, 1, old, "context/a/manifest.r0001"))
+            .unwrap();
+        store
+            .save_context_snapshot(&snapshot(expired, 2, old, "context/a/manifest.r0002"))
+            .unwrap();
+        // An old first revision with a recent archival revision is still live.
+        store
+            .save_context_snapshot(&snapshot(recent, 1, old, "context/b/manifest.r0001"))
+            .unwrap();
+        store
+            .save_context_snapshot(&snapshot(recent, 2, now, "context/b/manifest.r0002"))
+            .unwrap();
+        // Unavailable captures never had payload files.
+        store
+            .save_context_snapshot(&snapshot(unavailable, 1, old, ""))
+            .unwrap();
+
+        let cutoff = now - chrono::Duration::days(30);
+        let batch = store.expired_context_capture_batch(cutoff, 128).unwrap();
+        assert_eq!(
+            batch,
+            vec![ExpiredContextCapture {
+                capture_id: expired,
+                manifest_paths: vec![
+                    "context/a/manifest.r0001".into(),
+                    "context/a/manifest.r0002".into()
+                ],
+            }]
+        );
+
+        assert_eq!(store.mark_context_captures_expired(&[expired]).unwrap(), 2);
+        assert!(store
+            .expired_context_capture_batch(cutoff, 128)
+            .unwrap()
+            .is_empty());
+        let rows = store.list_context_snapshots(session.id).unwrap();
+        assert_eq!(rows.len(), 5);
+        for row in rows.iter().filter(|row| row.capture_id == expired) {
+            assert_eq!(row.manifest_path, "");
+            assert_eq!(row.status, "expired");
+            assert!(row.sanitized_hash.starts_with("hash-"));
+        }
+        assert!(rows
+            .iter()
+            .filter(|row| row.capture_id == recent)
+            .all(|row| row.status == "complete" && !row.manifest_path.is_empty()));
     }
 
     #[test]

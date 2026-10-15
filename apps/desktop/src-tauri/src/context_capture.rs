@@ -16,7 +16,8 @@ use lumen_context::{
 };
 use lumen_platform::default_data_dir;
 use lumen_store::{
-    ContextInputRef, ContextSnapshotRecord, ContextStageUsage, PipelineStage, Store,
+    ContextInputRef, ContextSnapshotRecord, ContextStageUsage, ExpiredContextCapture,
+    PipelineStage, Store,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -57,6 +58,46 @@ pub(crate) fn remove_context_manifest_artifact(
         return Ok(false);
     }
     remove_capture_dir(&root, capture_dir)
+}
+
+/// Remove an expired capture's sealed snapshot payloads (manifests and
+/// artifacts). Sealed stage projections under `usage/` are kept: they are the
+/// bounded record of what was actually sent to a provider and back retry replay.
+pub(crate) fn remove_expired_capture_payloads(
+    data_dir: &Path,
+    capture: &ExpiredContextCapture,
+) -> Result<(), String> {
+    let root = data_dir.join("context");
+    let capture_dir = root.join(capture.capture_id.to_string());
+    for manifest_path in &capture.manifest_paths {
+        if Path::new(manifest_path).parent() != Some(capture_dir.as_path()) {
+            return Err(format!(
+                "refused to expire context payload outside its capture directory: {manifest_path}"
+            ));
+        }
+    }
+    if !capture_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&capture_dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let sealed_payload = (name.starts_with("manifest.") || name.starts_with("artifact."))
+            && name.ends_with(".sealed.json");
+        if sealed_payload && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+        }
+    }
+    let now_empty = fs::read_dir(&capture_dir)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false);
+    if now_empty {
+        fs::remove_dir(&capture_dir).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn remove_capture_dir(root: &Path, capture_dir: &Path) -> Result<bool, String> {
