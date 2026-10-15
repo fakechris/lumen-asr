@@ -1390,8 +1390,9 @@ pub fn stop_meeting_recording(
     // above already dropped the audio fan-out sender, which ends the worker's
     // loop; this joins it (flushing the last live segment) so it never outlives
     // the recording. The authoritative transcript comes from the offline
-    // pipeline below, which replaces the live preview.
-    state.meeting_live.stop();
+    // pipeline below, which replaces the live preview. Its finalized segments
+    // feed the draft minutes once the meeting is handed to processing.
+    let live_lines = state.meeting_live.stop();
 
     // Unconditionally release the exclusive mode and restore the dictation
     // hotkey. If we bailed out on the `stop()` error above, `end_meeting` and
@@ -1502,6 +1503,9 @@ pub fn stop_meeting_recording(
     );
 
     // Kick off transcription in the background so the stop command returns now.
+    // Draft minutes from the live transcript run alongside, outside the
+    // processing pipeline, so the user has minutes long before it finishes.
+    crate::meeting_draft::spawn_draft_minutes(app.clone(), id, live_lines);
     spawn_meeting_processing(app, id, summary.wav_path.clone(), system_wav);
 
     let result = MeetingRecordingDto {
@@ -1842,7 +1846,7 @@ fn minutes_templates_dir() -> PathBuf {
 
 /// Resolve a configured template name against built-ins + user templates.
 /// Empty/unknown names fall back to the built-in default (never fatal).
-fn resolve_minutes_template(name: &str) -> lumen_meeting::MinutesTemplate {
+pub(crate) fn resolve_minutes_template(name: &str) -> lumen_meeting::MinutesTemplate {
     lumen_meeting::resolve_template(name, Some(&minutes_templates_dir()))
 }
 

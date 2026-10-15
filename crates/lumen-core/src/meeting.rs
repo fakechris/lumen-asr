@@ -382,6 +382,10 @@ pub enum SummaryKind {
     ActionItems,
     /// Extracted decisions.
     Decisions,
+    /// Provisional minutes generated from the live (recording-time) transcript
+    /// while the offline pipeline runs. Same JSON shape as [`Self::Summary`];
+    /// superseded (deleted) as soon as final minutes are saved.
+    MinutesDraft,
 }
 
 impl SummaryKind {
@@ -391,6 +395,7 @@ impl SummaryKind {
             Self::Summary => "summary",
             Self::ActionItems => "action_items",
             Self::Decisions => "decisions",
+            Self::MinutesDraft => "minutes_draft",
         }
     }
 
@@ -399,6 +404,7 @@ impl SummaryKind {
         match value {
             "action_items" => Self::ActionItems,
             "decisions" => Self::Decisions,
+            "minutes_draft" => Self::MinutesDraft,
             _ => Self::Summary,
         }
     }
@@ -549,6 +555,7 @@ mod tests {
             SummaryKind::Summary,
             SummaryKind::ActionItems,
             SummaryKind::Decisions,
+            SummaryKind::MinutesDraft,
         ] {
             assert_eq!(SummaryKind::from_str_or_summary(kind.as_str()), kind);
         }

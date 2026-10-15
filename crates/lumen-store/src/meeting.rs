@@ -11,7 +11,7 @@ use lumen_core::{
     LiveAnnotation, Meeting, MeetingDetail, MeetingStatus, MeetingSummary, SegmentChannel, Speaker,
     SummaryKind, TranscriptSegment,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use uuid::Uuid;
 
 use crate::{parse_dt, parse_u32_column, parse_uuid_column, Store};
@@ -405,6 +405,11 @@ impl Store {
     /// and summaries — so a reprocess/retry writes a fresh result instead of
     /// appending a duplicate set on top of the old one. The meeting row itself
     /// and its audio paths are kept.
+    ///
+    /// A [`SummaryKind::MinutesDraft`] survives: it is the only minutes the
+    /// user can see until the run calling this saves final minutes (which
+    /// supersede it, see [`Self::save_summary`]), and it must stay visible if
+    /// that run fails.
     pub fn clear_meeting_transcript(&self, meeting_id: Uuid) -> Result<()> {
         let id = meeting_id.to_string();
         let transaction = self.conn.unchecked_transaction()?;
@@ -414,8 +419,8 @@ impl Store {
         )?;
         transaction.execute("DELETE FROM speakers WHERE meeting_id=?1", params![id])?;
         transaction.execute(
-            "DELETE FROM meeting_summaries WHERE meeting_id=?1",
-            params![id],
+            "DELETE FROM meeting_summaries WHERE meeting_id=?1 AND kind<>?2",
+            params![id, SummaryKind::MinutesDraft.as_str()],
         )?;
         transaction.commit()?;
         Ok(())
@@ -848,22 +853,52 @@ impl Store {
     // ----- summaries --------------------------------------------------------
 
     /// Persist a generated summary.
+    ///
+    /// Saving final minutes ([`SummaryKind::Summary`]) also deletes any
+    /// [`SummaryKind::MinutesDraft`] for the meeting in the same transaction,
+    /// so a reader never sees both and a draft never outlives the real result.
     pub fn save_summary(&self, summary: &MeetingSummary) -> Result<()> {
-        self.conn.execute(
-            r#"
-            INSERT INTO meeting_summaries (id, meeting_id, kind, content, created_at, model)
-            VALUES (?1,?2,?3,?4,?5,?6)
-            "#,
-            params![
-                summary.id.to_string(),
-                summary.meeting_id.to_string(),
-                summary.kind.as_str(),
-                summary.content,
-                summary.created_at.to_rfc3339(),
-                summary.model,
-            ],
-        )?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        insert_summary(&transaction, summary)?;
+        if summary.kind == SummaryKind::Summary {
+            transaction.execute(
+                "DELETE FROM meeting_summaries WHERE meeting_id=?1 AND kind=?2",
+                params![
+                    summary.meeting_id.to_string(),
+                    SummaryKind::MinutesDraft.as_str()
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
+    }
+
+    /// Save draft minutes unless final minutes already exist.
+    ///
+    /// Returns `false` (and writes nothing) when a [`SummaryKind::Summary`] row
+    /// is present: the offline pipeline finished first, so the draft is stale.
+    /// An earlier draft for the meeting is replaced. The check and the write
+    /// share one immediate transaction, so a pipeline saving final minutes on
+    /// another connection cannot interleave between them.
+    pub fn save_minutes_draft_if_no_final(&self, draft: &MeetingSummary) -> Result<bool> {
+        debug_assert_eq!(draft.kind, SummaryKind::MinutesDraft);
+        let id = draft.meeting_id.to_string();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let has_final: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meeting_summaries WHERE meeting_id=?1 AND kind=?2)",
+            params![id, SummaryKind::Summary.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_final {
+            return Ok(false);
+        }
+        transaction.execute(
+            "DELETE FROM meeting_summaries WHERE meeting_id=?1 AND kind=?2",
+            params![id, SummaryKind::MinutesDraft.as_str()],
+        )?;
+        insert_summary(&transaction, draft)?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Get the most recent summary of a given kind for a meeting.
@@ -1062,6 +1097,23 @@ fn map_live_annotation(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveAnnotati
         unassigned: row.get::<_, i64>(7)? != 0,
         created_at: parse_dt(&row.get::<_, String>(8)?),
     })
+}
+
+fn insert_summary(conn: &Connection, summary: &MeetingSummary) -> rusqlite::Result<usize> {
+    conn.execute(
+        r#"
+        INSERT INTO meeting_summaries (id, meeting_id, kind, content, created_at, model)
+        VALUES (?1,?2,?3,?4,?5,?6)
+        "#,
+        params![
+            summary.id.to_string(),
+            summary.meeting_id.to_string(),
+            summary.kind.as_str(),
+            summary.content,
+            summary.created_at.to_rfc3339(),
+            summary.model,
+        ],
+    )
 }
 
 fn map_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<MeetingSummary> {
@@ -1698,6 +1750,100 @@ mod tests {
             .get_summary(meeting.id, SummaryKind::Decisions)
             .unwrap()
             .is_none());
+    }
+
+    fn draft(meeting_id: Uuid, content: &str) -> MeetingSummary {
+        MeetingSummary::new(meeting_id, SummaryKind::MinutesDraft, content)
+    }
+
+    fn kinds(store: &Store, meeting_id: Uuid) -> Vec<SummaryKind> {
+        let mut kinds: Vec<_> = store
+            .list_summaries(meeting_id)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.kind)
+            .collect();
+        kinds.sort_by_key(|k| k.as_str());
+        kinds
+    }
+
+    #[test]
+    fn draft_saved_before_final_is_superseded_by_final_minutes() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+
+        assert!(store
+            .save_minutes_draft_if_no_final(&draft(meeting.id, "draft"))
+            .unwrap());
+        assert_eq!(kinds(&store, meeting.id), vec![SummaryKind::MinutesDraft]);
+
+        store
+            .save_summary(&MeetingSummary::new(
+                meeting.id,
+                SummaryKind::Summary,
+                "final",
+            ))
+            .unwrap();
+        assert_eq!(kinds(&store, meeting.id), vec![SummaryKind::Summary]);
+    }
+
+    #[test]
+    fn draft_arriving_after_final_minutes_is_discarded() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        store
+            .save_summary(&MeetingSummary::new(
+                meeting.id,
+                SummaryKind::Summary,
+                "final",
+            ))
+            .unwrap();
+
+        assert!(!store
+            .save_minutes_draft_if_no_final(&draft(meeting.id, "late draft"))
+            .unwrap());
+        assert_eq!(kinds(&store, meeting.id), vec![SummaryKind::Summary]);
+    }
+
+    #[test]
+    fn newer_draft_replaces_older_one() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        store
+            .save_minutes_draft_if_no_final(&draft(meeting.id, "one"))
+            .unwrap();
+        store
+            .save_minutes_draft_if_no_final(&draft(meeting.id, "two"))
+            .unwrap();
+
+        let rows = store.list_summaries(meeting.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content, "two");
+    }
+
+    #[test]
+    fn clearing_the_transcript_keeps_the_draft_visible() {
+        // The pipeline clears derived rows before persisting its result; if
+        // the run then fails, the draft must still be there.
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        store
+            .save_minutes_draft_if_no_final(&draft(meeting.id, "draft"))
+            .unwrap();
+        store
+            .save_summary(&MeetingSummary::new(
+                meeting.id,
+                SummaryKind::Decisions,
+                "[]",
+            ))
+            .unwrap();
+
+        store.clear_meeting_transcript(meeting.id).unwrap();
+        assert_eq!(kinds(&store, meeting.id), vec![SummaryKind::MinutesDraft]);
     }
 
     #[test]

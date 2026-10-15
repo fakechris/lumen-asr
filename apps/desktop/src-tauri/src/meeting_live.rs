@@ -11,8 +11,9 @@
 //! - **After stop** — the existing offline pipeline
 //!   ([`lumen_meeting::process_meeting`]) re-transcribes with diarization and
 //!   word timestamps and produces the authoritative, speaker-attributed
-//!   transcript that *replaces* this live preview. The live text is never
-//!   persisted; it is a transient recording-time affordance only.
+//!   transcript that *replaces* this live preview. The live text itself is
+//!   never persisted; its finalized segments are handed back at stop only to
+//!   generate draft minutes ([`crate::meeting_draft`]) while that runs.
 //!
 //! ## Dual-stream: one model, two tracks
 //! The ~1 GB streaming Paraformer weights are loaded **once** as a
@@ -52,6 +53,8 @@ use lumen_asr::{
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
+
+use crate::meeting_draft::{LiveLine, LiveTranscriptLog};
 
 /// Sample rate the streaming Paraformer model expects. Each track captures at
 /// its own native rate, so chunks are resampled to this before decoding.
@@ -346,7 +349,8 @@ struct Worker {
     meeting_id: String,
     stop: Arc<AtomicBool>,
     notices: SyncSender<AnnotationNotice>,
-    handle: JoinHandle<()>,
+    /// Yields the finalized live segments when the worker exits.
+    handle: JoinHandle<Vec<LiveLine>>,
 }
 
 impl MeetingLive {
@@ -383,7 +387,7 @@ impl MeetingLive {
                     system,
                     notices_rx,
                     stop_worker,
-                );
+                )
             })
             .expect("spawn meeting live worker thread");
         if let Ok(mut guard) = self.inner.lock() {
@@ -425,12 +429,16 @@ impl MeetingLive {
     /// segment. Called from `stop_meeting_recording` after the recorder has
     /// been stopped (which drops the fan-out senders and naturally ends the
     /// worker loop); the explicit stop flag makes teardown prompt regardless.
-    pub fn stop(&self) {
+    ///
+    /// Returns the recording's finalized live segments (empty when no worker
+    /// ran or it failed to start) — the input for draft minutes.
+    pub fn stop(&self) -> Vec<LiveLine> {
         let worker = self.inner.lock().ok().and_then(|mut g| g.take());
-        if let Some(worker) = worker {
-            worker.stop.store(true, Ordering::SeqCst);
-            let _ = worker.handle.join();
-        }
+        let Some(worker) = worker else {
+            return Vec::new();
+        };
+        worker.stop.store(true, Ordering::SeqCst);
+        worker.handle.join().unwrap_or_default()
     }
 }
 
@@ -1685,7 +1693,8 @@ fn handle_annotation_notice(
 /// track, then round-robin drain → decode → emit until stopped. Exits when
 /// stopped or the mic's sender is dropped (recording ended), flushing any
 /// trailing text per track. A system-track failure mid-run degrades to
-/// mic-only; it never ends the worker.
+/// mic-only; it never ends the worker. Returns the finalized segments it
+/// emitted, in timeline order.
 fn run_worker(
     app: AppHandle,
     meeting_id: String,
@@ -1695,7 +1704,8 @@ fn run_worker(
     system: Option<LiveTrackFeed>,
     notices: Receiver<AnnotationNotice>,
     stop: Arc<AtomicBool>,
-) {
+) -> Vec<LiveLine> {
+    let mut log = LiveTranscriptLog::default();
     // Building the recognizer can fail (missing/corrupt model, non-`sherpa`
     // build). That must never break the recording: log and return, so the UI
     // simply shows no live text and the offline pipeline still runs at stop.
@@ -1707,7 +1717,7 @@ fn run_worker(
                 error = %e,
                 "live meeting transcript disabled: could not load streaming Paraformer"
             );
-            return;
+            return Vec::new();
         }
     };
 
@@ -1776,6 +1786,7 @@ fn run_worker(
         for track in &mut tracks {
             if let Some(update) = track.poll_result() {
                 track.maybe_enqueue_verification(&verifier, &update);
+                record_final(&mut log, track.tracker.track, &update);
                 emit(&app, &meeting_id, track.tracker.track, update, None);
             }
         }
@@ -1790,6 +1801,7 @@ fn run_worker(
         let clock = track.clock;
         if let Some(update) = track.tracker.on_endpoint(&text, clock) {
             track.maybe_enqueue_verification(&verifier, &update);
+            record_final(&mut log, track.tracker.track, &update);
             emit(&app, &meeting_id, track.tracker.track, update, None);
         }
     }
@@ -1799,6 +1811,20 @@ fn run_worker(
         verifier.finish();
     }
     tracing::info!("live meeting transcript stopped");
+    log.into_lines()
+}
+
+/// Keep finalized segments (and their retractions) for the draft minutes.
+fn record_final(log: &mut LiveTranscriptLog, track: &'static str, update: &SegmentUpdate) {
+    if update.is_final {
+        log.record_final(
+            track,
+            &update.segment_id,
+            update.start_seconds,
+            update.end_seconds.unwrap_or(update.start_seconds),
+            &update.text,
+        );
+    }
 }
 
 fn emit(

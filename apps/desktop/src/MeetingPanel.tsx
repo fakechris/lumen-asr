@@ -12,6 +12,7 @@ import {
 } from "./meetingModels";
 import { Icon } from "./Icons";
 import { diarGuidance, isNoLlmMarker } from "./meetingGuidance";
+import { draftMinutesLabel, pickMinutesRow } from "./meetingDraft";
 import { isMeaningfulMeetingTrim } from "./meetingTrim";
 import { buildSpeakerColorMap, colorForSpeaker } from "./speakerColors";
 import type {
@@ -145,20 +146,25 @@ function noLlmMinutes(detail: MeetingDetail): boolean {
   return row != null && isNoLlmMarker(row.content);
 }
 
-/** Parse the structured Minutes JSON out of the `summary`-kind row. Returns
+/** Parse the structured Minutes JSON to render: the final `summary`-kind row,
+ * or the live-transcript draft while there is none (`draft: true`). Returns
  * null for the no-LLM sentinel so it is never rendered as real minutes. */
-function parseMinutes(detail: MeetingDetail): Minutes | null {
-  const row = detail.summaries.find((s) => s.kind === "summary");
+function parseMinutes(
+  detail: MeetingDetail,
+): { minutes: Minutes; draft: boolean } | null {
+  const row = pickMinutesRow(detail.summaries);
   if (!row) return null;
-  if (isNoLlmMarker(row.content)) return null;
   try {
     const raw = JSON.parse(row.content) as Partial<Minutes>;
     return {
-      one_liner: raw.one_liner ?? "",
-      decisions: raw.decisions ?? [],
-      action_items: raw.action_items ?? [],
-      discussion: raw.discussion ?? [],
-      open_questions: raw.open_questions ?? [],
+      minutes: {
+        one_liner: raw.one_liner ?? "",
+        decisions: raw.decisions ?? [],
+        action_items: raw.action_items ?? [],
+        discussion: raw.discussion ?? [],
+        open_questions: raw.open_questions ?? [],
+      },
+      draft: row.draft,
     };
   } catch {
     return null;
@@ -2432,10 +2438,17 @@ function MeetingDetailView({
     if (status && !isInProgress(status)) setProgress(null);
   }, [status]);
 
-  const minutes = useMemo(
+  const parsedMinutes = useMemo(
     () => (detail ? parseMinutes(detail) : null),
     [detail],
   );
+  const minutes = parsedMinutes?.minutes ?? null;
+  // Draft minutes (from the live transcript) carry a label until the final
+  // minutes replace them; null when showing final minutes or none.
+  const minutesDraftLabel =
+    parsedMinutes?.draft && status
+      ? draftMinutesLabel(isInProgress(status))
+      : null;
 
   const jumpToSource = useCallback((src: SourceRef) => {
     // Transcript is already visible; just (re)scroll it to the source turn.
@@ -2792,6 +2805,7 @@ function MeetingDetailView({
               <MinutesIndex
                 detail={detail}
                 minutes={minutes}
+                draftLabel={minutesDraftLabel}
                 onJump={jumpToSource}
                 onNavigate={onNavigate}
                 onOpenFull={() => setFullOpen(true)}
@@ -2828,6 +2842,7 @@ function MeetingDetailView({
       {fullOpen && detail && minutes && (
         <MinutesFullModal
           minutes={minutes}
+          draftLabel={minutesDraftLabel}
           onJump={(src) => {
             setFullOpen(false);
             jumpToSource(src);
@@ -3064,6 +3079,7 @@ function actionSub(item: ActionItem): string {
 function MinutesIndex({
   detail,
   minutes,
+  draftLabel,
   onJump,
   onNavigate,
   onOpenFull,
@@ -3072,6 +3088,8 @@ function MinutesIndex({
 }: {
   detail: MeetingDetail;
   minutes: Minutes | null;
+  /** Set when `minutes` is the live-transcript draft, not the final minutes. */
+  draftLabel: string | null;
   onJump: (src: SourceRef) => void;
   onNavigate?: (tab: TabId) => void;
   onOpenFull: () => void;
@@ -3148,6 +3166,12 @@ function MinutesIndex({
       </div>
 
       {guide}
+
+      {hasMinutes && draftLabel && (
+        <p className="muted-text meeting-index-note meeting-draft-label">
+          {draftLabel}
+        </p>
+      )}
 
       {hasMinutes && (
         <>
@@ -3596,10 +3620,12 @@ function MeetingSideInfo({
  * chips still jump into the transcript behind it, closing the overlay first. */
 function MinutesFullModal({
   minutes,
+  draftLabel,
   onJump,
   onClose,
 }: {
   minutes: Minutes;
+  draftLabel: string | null;
   onJump: (src: SourceRef) => void;
   onClose: () => void;
 }) {
@@ -3637,6 +3663,9 @@ function MinutesFullModal({
           </button>
         </div>
         <div className="meeting-modal-body">
+          {draftLabel && (
+            <p className="muted-text meeting-draft-label">{draftLabel}</p>
+          )}
           {minutes.one_liner.trim() && (
             <section className="meeting-sec">
               <p className="meeting-oneliner">{minutes.one_liner}</p>

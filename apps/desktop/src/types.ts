@@ -542,7 +542,11 @@ export type TranscriptSegment = {
   channel?: "mic" | "system" | null;
 };
 
-export type SummaryKind = "summary" | "action_items" | "decisions";
+export type SummaryKind =
+  | "summary"
+  | "action_items"
+  | "decisions"
+  | "minutes_draft";
 
 /** A stored generated summary. For `kind === "summary"`, `content` is Minutes JSON. */
 export type MeetingSummary = {

@@ -2981,6 +2981,14 @@ html:has(.capsule-root) body {
   margin: 0 0 12px;
 }
 
+/* Draft minutes (from the live transcript) are provisional: say so plainly. */
+.meeting-draft-label {
+  font-size: 0.75rem;
+  margin: 0 0 12px;
+  padding-left: 8px;
+  border-left: 2px solid currentColor;
+}
+
 .meeting-index-oneliner {
   margin: 0 0 14px;
   font-size: 0.9rem;
