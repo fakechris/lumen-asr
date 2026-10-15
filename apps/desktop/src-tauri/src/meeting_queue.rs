@@ -1,9 +1,9 @@
 //! Serial queue for offline meeting processing.
 //!
-//! Every offline run (recording stop, file import, manual reprocess, crash
-//! recovery) loads the diarization, ASR and LLM stacks. Running several at once
-//! multiplies peak memory and makes each one slower, so they go through one
-//! FIFO worker that processes a single meeting at a time.
+//! Every offline run (recording stop, file import, manual reprocess, crash and
+//! startup recovery) loads the diarization, ASR and LLM stacks. Running several
+//! at once multiplies peak memory and makes each one slower, so they go through
+//! one FIFO worker that processes a single meeting at a time.
 //!
 //! * **Dedupe** — a meeting already queued or running is not queued again.
 //! * **Recording first** — while a meeting is recording the worker holds the
@@ -12,12 +12,18 @@
 //!   a stale "recording" flag cannot park the queue forever.
 //! * **Failure isolation** — a job that panics is reported to the caller's
 //!   `on_panic` and the worker moves on to the next one.
+//! * **Hung-job guard** — each job runs on its own thread while the worker
+//!   waits up to the job's budget ([`job_budget`]). A job past its budget is
+//!   logged and left running detached (a pipeline thread cannot be killed
+//!   safely); the worker moves on. A detached job still counts as running for
+//!   dedupe, and its result is saved whenever it finishes.
 //!
 //! The queue is generic over the job payload so its semantics are unit-tested
 //! with a fake runner; the desktop wiring lives in `meeting_cmd`.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,6 +34,19 @@ pub const GATE_POLL: Duration = Duration::from_secs(5);
 /// Longest the worker holds a job back for a recording. Above the longest
 /// meetings seen in practice (~7 h); past it the job runs anyway.
 pub const GATE_MAX_WAIT: Duration = Duration::from_secs(8 * 60 * 60);
+/// Floor of a job's budget before the worker stops waiting for it.
+pub const JOB_BUDGET_FLOOR: Duration = Duration::from_secs(30 * 60);
+
+/// How long the worker waits for one job before moving on: twice the audio
+/// duration (processing normally takes ~15–20 % of it), never under
+/// [`JOB_BUDGET_FLOOR`]. Unknown duration gets the floor.
+pub fn job_budget(audio_seconds: Option<f64>) -> Duration {
+    let scaled = audio_seconds
+        .filter(|secs| secs.is_finite() && *secs > 0.0)
+        .map(|secs| Duration::from_secs_f64(secs * 2.0))
+        .unwrap_or(Duration::ZERO);
+    scaled.max(JOB_BUDGET_FLOOR)
+}
 
 /// Result of [`ProcessingQueue::enqueue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,13 +55,22 @@ pub enum Enqueued {
     Queued { ahead: usize },
     /// The meeting is already waiting in the queue; the request is dropped.
     AlreadyQueued,
-    /// The meeting is being processed right now; the request is dropped.
+    /// The meeting is being processed right now (possibly a detached job past
+    /// its budget); the request is dropped.
     AlreadyRunning,
 }
 
 struct State<J> {
     pending: VecDeque<(Uuid, J)>,
     running: Option<Uuid>,
+    /// Jobs past their budget that are still running on their own thread.
+    detached: HashSet<Uuid>,
+}
+
+impl<J> State<J> {
+    fn is_running(&self, id: Uuid) -> bool {
+        self.running == Some(id) || self.detached.contains(&id)
+    }
 }
 
 pub struct ProcessingQueue<J> {
@@ -56,16 +84,20 @@ impl<J> Default for ProcessingQueue<J> {
             state: Mutex::new(State {
                 pending: VecDeque::new(),
                 running: None,
+                detached: HashSet::new(),
             }),
             ready: Condvar::new(),
         }
     }
 }
 
+type Runner<J> = Arc<dyn Fn(Uuid, J) + Send + Sync>;
+type PanicHandler = Arc<dyn Fn(Uuid) + Send + Sync>;
+
 impl<J: Send + 'static> ProcessingQueue<J> {
     pub fn enqueue(&self, id: Uuid, job: J) -> Enqueued {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.running == Some(id) {
+        if state.is_running(id) {
             return Enqueued::AlreadyRunning;
         }
         if state.pending.iter().any(|(queued, _)| *queued == id) {
@@ -80,7 +112,7 @@ impl<J: Send + 'static> ProcessingQueue<J> {
     /// Whether the meeting is waiting in the queue or running now.
     pub fn is_pending(&self, id: Uuid) -> bool {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.running == Some(id) || state.pending.iter().any(|(queued, _)| *queued == id)
+        state.is_running(id) || state.pending.iter().any(|(queued, _)| *queued == id)
     }
 
     /// Block until a job is available, then hold it back while `gate` reports a
@@ -119,40 +151,88 @@ impl<J: Send + 'static> ProcessingQueue<J> {
         (id, job)
     }
 
-    fn finish(&self) {
+    /// The job for `id` ended (normally, by panic, or after being detached).
+    fn finish(&self, id: Uuid) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.running = None;
+        if state.running == Some(id) {
+            state.running = None;
+        }
+        state.detached.remove(&id);
+    }
+
+    /// The worker stops waiting for `id`: it stays "running" for dedupe until
+    /// its thread calls [`Self::finish`], but no longer blocks the queue.
+    fn detach(&self, id: Uuid) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.running == Some(id) {
+            state.running = None;
+            state.detached.insert(id);
+        }
     }
 
     /// Start the single worker thread. `run` processes one job; a panic inside
-    /// it is passed to `on_panic` and the worker continues with the next job.
+    /// it is passed to `on_panic`. `budget` bounds how long the worker waits for
+    /// one job before moving on (see the module docs).
     pub fn spawn_worker(
         self: &Arc<Self>,
         gate: impl Fn() -> bool + Send + 'static,
-        run: impl Fn(Uuid, J) + Send + 'static,
-        on_panic: impl Fn(Uuid) + Send + 'static,
+        budget: impl Fn(Uuid) -> Duration + Send + 'static,
+        run: impl Fn(Uuid, J) + Send + Sync + 'static,
+        on_panic: impl Fn(Uuid) + Send + Sync + 'static,
     ) -> std::io::Result<()> {
-        self.spawn_worker_with(gate, run, on_panic, GATE_POLL, GATE_MAX_WAIT)
+        self.spawn_worker_with(gate, budget, run, on_panic, GATE_POLL, GATE_MAX_WAIT)
     }
 
     fn spawn_worker_with(
         self: &Arc<Self>,
         gate: impl Fn() -> bool + Send + 'static,
-        run: impl Fn(Uuid, J) + Send + 'static,
-        on_panic: impl Fn(Uuid) + Send + 'static,
+        budget: impl Fn(Uuid) -> Duration + Send + 'static,
+        run: impl Fn(Uuid, J) + Send + Sync + 'static,
+        on_panic: impl Fn(Uuid) + Send + Sync + 'static,
         poll: Duration,
         max_wait: Duration,
     ) -> std::io::Result<()> {
         let queue = Arc::clone(self);
+        let run: Runner<J> = Arc::new(run);
+        let on_panic: PanicHandler = Arc::new(on_panic);
         std::thread::Builder::new()
             .name("meeting-processing".into())
             .spawn(move || loop {
                 let (id, job) = queue.take_next(&gate, poll, max_wait);
-                if catch_unwind(AssertUnwindSafe(|| run(id, job))).is_err() {
-                    tracing::warn!(meeting_id = %id, "meeting processing job panicked");
+                let limit = budget(id);
+                let (done_tx, done_rx) = mpsc::channel::<()>();
+                let job_queue = Arc::clone(&queue);
+                let job_run = Arc::clone(&run);
+                let job_on_panic = Arc::clone(&on_panic);
+                let body = move || {
+                    if catch_unwind(AssertUnwindSafe(|| job_run(id, job))).is_err() {
+                        tracing::warn!(meeting_id = %id, "meeting processing job panicked");
+                        job_on_panic(id);
+                    }
+                    job_queue.finish(id);
+                    let _ = done_tx.send(());
+                };
+                let spawned = std::thread::Builder::new()
+                    .name("meeting-processing-job".into())
+                    .spawn(body);
+                if let Err(e) = spawned {
+                    // The body (and its job) is gone with the failed spawn.
+                    tracing::warn!(meeting_id = %id, error = %e, "could not start meeting processing job");
                     on_panic(id);
+                    queue.finish(id);
+                    continue;
                 }
-                queue.finish();
+                match done_rx.recv_timeout(limit) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        tracing::warn!(
+                            meeting_id = %id,
+                            budget_s = limit.as_secs(),
+                            "meeting processing job exceeded its budget; leaving it running and moving on"
+                        );
+                        queue.detach(id);
+                    }
+                }
             })
             .map(|_| ())
     }
@@ -162,10 +242,22 @@ impl<J: Send + 'static> ProcessingQueue<J> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
 
     fn id(n: u128) -> Uuid {
         Uuid::from_u128(n)
+    }
+
+    const GENEROUS: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn budget_is_twice_the_audio_with_a_floor() {
+        assert_eq!(job_budget(None), JOB_BUDGET_FLOOR);
+        assert_eq!(job_budget(Some(60.0)), JOB_BUDGET_FLOOR);
+        assert_eq!(job_budget(Some(f64::NAN)), JOB_BUDGET_FLOOR);
+        assert_eq!(
+            job_budget(Some(2.0 * 3600.0)),
+            Duration::from_secs(4 * 3600)
+        );
     }
 
     #[test]
@@ -185,16 +277,32 @@ mod tests {
         assert_eq!(queue.enqueue(id(1), 0), Enqueued::AlreadyRunning);
         assert_eq!(queue.enqueue(id(2), 0), Enqueued::Queued { ahead: 1 });
         assert!(queue.is_pending(id(1)) && queue.is_pending(id(2)));
-        queue.finish();
+        queue.finish(id(1));
         assert!(!queue.is_pending(id(1)));
         assert_eq!(queue.enqueue(id(1), 0), Enqueued::Queued { ahead: 1 });
+    }
+
+    #[test]
+    fn a_detached_meeting_stays_deduped_until_it_finishes() {
+        let queue = ProcessingQueue::<u32>::default();
+        queue.enqueue(id(1), 0);
+        queue.take_next(&|| false, Duration::ZERO, Duration::ZERO);
+        queue.detach(id(1));
+        assert_eq!(queue.enqueue(id(1), 0), Enqueued::AlreadyRunning);
+        assert!(queue.is_pending(id(1)));
+        // The worker is free: the next job does not count the detached one.
+        assert_eq!(queue.enqueue(id(2), 0), Enqueued::Queued { ahead: 0 });
+        queue.finish(id(1));
+        assert!(!queue.is_pending(id(1)));
     }
 
     #[test]
     fn jobs_run_one_at_a_time_in_fifo_order_and_survive_a_panic() {
         let queue = Arc::new(ProcessingQueue::<u32>::default());
         let (done_tx, done_rx) = mpsc::channel();
+        let done_tx = Mutex::new(done_tx);
         let (panic_tx, panic_rx) = mpsc::channel();
+        let panic_tx = Mutex::new(panic_tx);
         let busy = Arc::new(AtomicBool::new(false));
         // Queue everything before the worker starts so ordering is deterministic.
         for n in 1..=4 {
@@ -204,6 +312,7 @@ mod tests {
         queue
             .spawn_worker_with(
                 || false,
+                |_| GENEROUS,
                 move |meeting, payload| {
                     assert!(!busy_in_job.swap(true, Ordering::SeqCst), "jobs overlapped");
                     std::thread::sleep(Duration::from_millis(5));
@@ -211,9 +320,9 @@ mod tests {
                     if payload == 2 {
                         panic!("job 2 fails");
                     }
-                    done_tx.send(meeting).unwrap();
+                    done_tx.lock().unwrap().send(meeting).unwrap();
                 },
-                move |meeting| panic_tx.send(meeting).unwrap(),
+                move |meeting| panic_tx.lock().unwrap().send(meeting).unwrap(),
                 Duration::ZERO,
                 Duration::ZERO,
             )
@@ -224,6 +333,51 @@ mod tests {
             .collect();
         assert_eq!(done, vec![id(1), id(3), id(4)]);
         assert_eq!(panic_rx.recv_timeout(wait).unwrap(), id(2));
+    }
+
+    #[test]
+    fn a_job_past_its_budget_does_not_block_the_next_one() {
+        let queue = Arc::new(ProcessingQueue::<u32>::default());
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let (done_tx, done_rx) = mpsc::channel();
+        let done_tx = Mutex::new(done_tx);
+        queue.enqueue(id(1), 1);
+        queue.enqueue(id(2), 2);
+        queue
+            .spawn_worker_with(
+                || false,
+                |meeting| {
+                    if meeting == Uuid::from_u128(1) {
+                        Duration::from_millis(20)
+                    } else {
+                        GENEROUS
+                    }
+                },
+                move |meeting, payload| {
+                    if payload == 1 {
+                        // Hangs until the test releases it.
+                        release_rx.lock().unwrap().recv().unwrap();
+                    }
+                    done_tx.lock().unwrap().send(meeting).unwrap();
+                },
+                |_| {},
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap();
+        let wait = Duration::from_secs(5);
+        // Job 2 completes while job 1 is still hung.
+        assert_eq!(done_rx.recv_timeout(wait).unwrap(), id(2));
+        assert_eq!(queue.enqueue(id(1), 1), Enqueued::AlreadyRunning);
+        // When the hung job eventually finishes, its result still lands.
+        release_tx.send(()).unwrap();
+        assert_eq!(done_rx.recv_timeout(wait).unwrap(), id(1));
+        let deadline = Instant::now() + wait;
+        while queue.is_pending(id(1)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!queue.is_pending(id(1)));
     }
 
     #[test]
