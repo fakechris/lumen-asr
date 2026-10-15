@@ -15,14 +15,19 @@
 use crate::minutes_template::MinutesTemplate;
 use lumen_core::{MeetingSummary, Speaker, SummaryKind, TranscriptSegment};
 use lumen_corrector::{CorrectRequest, Corrector, DictionaryContext};
-use lumen_prompts::{build_minutes_system_prompt_with_template, minutes_user_message_with_notes};
+use lumen_prompts::{
+    build_minutes_merge_system_prompt_with_template, build_minutes_system_prompt_with_template,
+    minutes_merge_user_message, minutes_retry_user_message, minutes_user_message_with_notes,
+    minutes_window_user_message,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Default output-token budget for the minutes LLM call. Larger than the
-/// dictation default (1024) so a structured document is not truncated.
-pub const DEFAULT_MINUTES_MAX_TOKENS: u32 = 2048;
+/// Default output-token budget for the final minutes document. Well above the
+/// dictation default (1024): a long meeting's structured document can run past
+/// 2k tokens, and a cut-off JSON object cannot be parsed at all.
+pub const DEFAULT_MINUTES_MAX_TOKENS: u32 = 4096;
 
 /// A time range (seconds from media start) pointing at the transcript span a
 /// minutes item was grounded in. Mirrors a segment's `[start, end)`.
@@ -124,15 +129,76 @@ fn extract_json_object(raw: &str) -> Option<&str> {
     (end > start).then(|| &raw[start..=end])
 }
 
-/// Parse (and lightly tolerate) raw LLM output into [`Minutes`].
+/// Best-effort repair of the two JSON mistakes models make most often in
+/// Chinese minutes: an ASCII `"` used as a quotation mark *inside* a string
+/// value (`"讨论"灰度"方案"`), and a trailing comma before `}` / `]`.
 ///
-/// Strips surrounding prose / code fences, then deserializes. Missing arrays
-/// default to empty; unknown fields are ignored. Returns [`MinutesError::NoJson`]
-/// when there is no object at all and [`MinutesError::Parse`] when the object is
-/// malformed.
+/// A `"` inside a string is treated as the closing quote only when the next
+/// non-whitespace character can follow a string (`,` `}` `]` `:` or the end);
+/// otherwise it is escaped as content. Only applied after a strict parse has
+/// failed, so valid output is never touched.
+fn repair_json(json: &str) -> String {
+    let chars: Vec<char> = json.chars().collect();
+    let mut out = String::with_capacity(json.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+                out.push(c);
+            } else if c == '\\' {
+                escaped = true;
+                out.push(c);
+            } else if c == '"' {
+                let next = chars[i + 1..].iter().find(|ch| !ch.is_whitespace());
+                if matches!(next, None | Some(',' | '}' | ']' | ':')) {
+                    in_string = false;
+                    out.push(c);
+                } else {
+                    out.push_str("\\\"");
+                }
+            } else {
+                out.push(c);
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if c == ',' {
+            let next = chars[i + 1..].iter().find(|ch| !ch.is_whitespace());
+            if !matches!(next, Some('}' | ']')) {
+                out.push(c);
+            }
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Parse (and tolerate) raw LLM output into [`Minutes`].
+///
+/// Tries, in order: the first JSON value starting at the first `{` (so trailing
+/// prose or a closing fence is ignored); the first-`{`-to-last-`}` slice; and
+/// that slice after [`repair_json`]. Missing arrays default to empty; unknown
+/// fields are ignored. Returns [`MinutesError::NoJson`] when there is no object
+/// at all and [`MinutesError::Parse`] (with the strict parser's error) when no
+/// attempt yields a valid object.
 pub fn parse_minutes(raw: &str) -> Result<Minutes, MinutesError> {
+    let start = raw.find('{').ok_or(MinutesError::NoJson)?;
+    let mut stream = serde_json::Deserializer::from_str(&raw[start..]);
+    let strict_error = match Minutes::deserialize(&mut stream) {
+        Ok(minutes) => return Ok(minutes),
+        Err(e) => e.to_string(),
+    };
     let json = extract_json_object(raw).ok_or(MinutesError::NoJson)?;
-    serde_json::from_str(json).map_err(|e| MinutesError::Parse(e.to_string()))
+    if let Ok(minutes) = serde_json::from_str(json) {
+        return Ok(minutes);
+    }
+    serde_json::from_str(&repair_json(json)).map_err(|_| MinutesError::Parse(strict_error))
 }
 
 /// Render a meeting's segments as the timestamped, speaker-attributed transcript
@@ -207,6 +273,17 @@ pub fn minutes_summaries(
 /// [`crate::minutes_template`]): its body is interpolated into the system
 /// prompt as an advisory section. `None` (or a template with an empty body, as
 /// the built-in default has) produces the exact pre-template prompt.
+///
+/// A transcript longer than [`SINGLE_PASS_MAX_CHARS`] is summarized window by
+/// window (about [`WINDOW_CHARS`] each, split on line boundaries) and the
+/// partial minutes are then merged — hierarchically when the partials
+/// themselves are too long — so a long meeting never depends on one huge
+/// prompt fitting the provider's context. Transcript lines carry absolute
+/// timestamps, so every window's `source` ranges stay valid in the result.
+///
+/// Every LLM step is retried once: a failed call is repeated with a doubled
+/// output budget (covers truncation as well as transient network errors), and
+/// unparseable output is re-asked with a strict JSON-only reminder.
 pub async fn generate_minutes(
     corrector: &dyn Corrector,
     transcript: &str,
@@ -214,19 +291,233 @@ pub async fn generate_minutes(
     max_tokens: Option<u32>,
     template: Option<&MinutesTemplate>,
 ) -> Result<Minutes, MinutesError> {
-    let request = CorrectRequest {
-        text: minutes_user_message_with_notes(transcript, notes),
+    let template_body = template.map(|t| t.body.as_str());
+    let final_budget = max_tokens.unwrap_or(DEFAULT_MINUTES_MAX_TOKENS);
+    if transcript.chars().count() <= SINGLE_PASS_MAX_CHARS {
+        return minutes_step(
+            corrector,
+            build_minutes_system_prompt_with_template(template_body),
+            minutes_user_message_with_notes(transcript, notes),
+            final_budget,
+        )
+        .await;
+    }
+
+    let windows = split_lines_into_windows(transcript, WINDOW_CHARS);
+    let total = windows.len();
+    let mut partials = Vec::with_capacity(total);
+    for (index, window) in windows.iter().enumerate() {
+        let partial = minutes_step(
+            corrector,
+            build_minutes_system_prompt_with_template(None),
+            minutes_window_user_message(window, index + 1, total, notes),
+            WINDOW_MINUTES_MAX_TOKENS,
+        )
+        .await?;
+        if !partial.is_empty() {
+            partials.push(partial);
+        }
+    }
+    tracing::info!(
+        windows = total,
+        partials = partials.len(),
+        "long meeting minutes: windows summarized, merging"
+    );
+    merge_partials(corrector, partials, notes, template_body, final_budget).await
+}
+
+/// Transcripts up to this many characters are summarized in one LLM call.
+pub const SINGLE_PASS_MAX_CHARS: usize = 16_000;
+
+/// Target size of one transcript window for long meetings.
+pub const WINDOW_CHARS: usize = 12_000;
+
+/// Output budget for one window's partial minutes (they cover a fraction of
+/// the meeting, so they are smaller than the final document).
+const WINDOW_MINUTES_MAX_TOKENS: u32 = 2048;
+
+/// The merge input (serialized partials) is grouped so one merge call never
+/// receives more than this many characters.
+const MERGE_INPUT_MAX_CHARS: usize = 16_000;
+
+/// Upper bound on hierarchical merge rounds; past it the remaining partials
+/// are combined without the LLM.
+const MAX_MERGE_ROUNDS: usize = 4;
+
+/// Ceiling for the doubled output budget of a retried call.
+const RETRY_MAX_TOKENS_CEILING: u32 = 8192;
+
+/// One minutes LLM step with a single retry (see [`generate_minutes`]).
+async fn minutes_step(
+    corrector: &dyn Corrector,
+    system_prompt: String,
+    user_message: String,
+    max_tokens: u32,
+) -> Result<Minutes, MinutesError> {
+    let request = |text: String, max_tokens: u32| CorrectRequest {
+        text,
         dictionary: DictionaryContext::default(),
         context_json: None,
-        system_prompt: build_minutes_system_prompt_with_template(template.map(|t| t.body.as_str())),
+        system_prompt: system_prompt.clone(),
         temperature: 0.2,
-        max_tokens: Some(max_tokens.unwrap_or(DEFAULT_MINUTES_MAX_TOKENS)),
+        max_tokens: Some(max_tokens),
     };
-    let result = corrector
-        .correct(request)
+    let raw = match corrector
+        .correct(request(user_message.clone(), max_tokens))
+        .await
+    {
+        Ok(result) => result.text,
+        Err(first) => {
+            let retry_budget = max_tokens.saturating_mul(2).min(RETRY_MAX_TOKENS_CEILING);
+            tracing::warn!(error = %first, retry_budget, "minutes llm call failed; retrying once");
+            corrector
+                .correct(request(user_message.clone(), retry_budget))
+                .await
+                .map_err(|e| MinutesError::Llm(e.to_string()))?
+                .text
+        }
+    };
+    let error = match parse_minutes(&raw) {
+        Ok(minutes) => return Ok(minutes),
+        Err(error) => error,
+    };
+    // Lengths only: the output is meeting content and stays out of the log.
+    tracing::warn!(error = %error, output_chars = raw.chars().count(), "minutes output did not parse; re-asking once");
+    let retry = corrector
+        .correct(request(
+            minutes_retry_user_message(&user_message, &error.to_string()),
+            max_tokens,
+        ))
         .await
         .map_err(|e| MinutesError::Llm(e.to_string()))?;
-    parse_minutes(&result.text)
+    parse_minutes(&retry.text)
+}
+
+/// Merge partial minutes into one document, in rounds of at most
+/// [`MERGE_INPUT_MAX_CHARS`] of serialized input per call.
+async fn merge_partials(
+    corrector: &dyn Corrector,
+    mut partials: Vec<Minutes>,
+    notes: Option<&str>,
+    template_body: Option<&str>,
+    final_budget: u32,
+) -> Result<Minutes, MinutesError> {
+    if partials.is_empty() {
+        return Ok(Minutes::default());
+    }
+    for _ in 0..MAX_MERGE_ROUNDS {
+        if partials.len() == 1 {
+            return Ok(partials.remove(0));
+        }
+        let serialized: Vec<String> = partials
+            .iter()
+            .map(|p| serde_json::to_string(p).map_err(|e| MinutesError::Parse(e.to_string())))
+            .collect::<Result<_, _>>()?;
+        let groups = group_by_chars(&serialized, MERGE_INPUT_MAX_CHARS);
+        if groups.len() == 1 {
+            return minutes_step(
+                corrector,
+                build_minutes_merge_system_prompt_with_template(template_body),
+                minutes_merge_user_message(&serialized, notes),
+                final_budget,
+            )
+            .await;
+        }
+        let mut merged = Vec::with_capacity(groups.len());
+        for range in groups {
+            if range.len() == 1 {
+                merged.push(partials[range.start].clone());
+                continue;
+            }
+            merged.push(
+                minutes_step(
+                    corrector,
+                    build_minutes_merge_system_prompt_with_template(None),
+                    minutes_merge_user_message(&serialized[range], notes),
+                    WINDOW_MINUTES_MAX_TOKENS,
+                )
+                .await?,
+            );
+        }
+        partials = merged;
+    }
+    tracing::warn!(
+        partials = partials.len(),
+        "minutes merge did not converge; combining partials directly"
+    );
+    Ok(concat_partials(partials))
+}
+
+/// Combine partial minutes without the LLM: arrays are concatenated in time
+/// order with exact-duplicate texts dropped, and the one-liners are joined.
+fn concat_partials(partials: Vec<Minutes>) -> Minutes {
+    let mut out = Minutes::default();
+    let one_liners: Vec<String> = partials
+        .iter()
+        .map(|p| p.one_liner.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    out.one_liner = one_liners.join("；");
+    for p in partials {
+        for d in p.decisions {
+            if !out.decisions.iter().any(|x| x.text == d.text) {
+                out.decisions.push(d);
+            }
+        }
+        for a in p.action_items {
+            if !out.action_items.iter().any(|x| x.text == a.text) {
+                out.action_items.push(a);
+            }
+        }
+        for t in p.discussion {
+            if !out.discussion.iter().any(|x| x.topic == t.topic) {
+                out.discussion.push(t);
+            }
+        }
+        for q in p.open_questions {
+            if !out.open_questions.iter().any(|x| x.text == q.text) {
+                out.open_questions.push(q);
+            }
+        }
+    }
+    out
+}
+
+/// Split a rendered transcript into windows of about `budget` characters on
+/// line boundaries. A single line longer than the budget forms its own window.
+fn split_lines_into_windows(transcript: &str, budget: usize) -> Vec<String> {
+    let lines: Vec<&str> = transcript.lines().collect();
+    let sizes: Vec<usize> = lines.iter().map(|l| l.chars().count() + 1).collect();
+    group_sizes(&sizes, budget)
+        .into_iter()
+        .map(|range| lines[range].join("\n"))
+        .collect()
+}
+
+/// Group serialized items into consecutive ranges of at most `budget` chars.
+fn group_by_chars(items: &[String], budget: usize) -> Vec<std::ops::Range<usize>> {
+    let sizes: Vec<usize> = items.iter().map(|s| s.chars().count() + 1).collect();
+    group_sizes(&sizes, budget)
+}
+
+/// Greedy consecutive grouping: each range's total size stays within `budget`
+/// unless a single item alone exceeds it.
+fn group_sizes(sizes: &[usize], budget: usize) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (i, &size) in sizes.iter().enumerate() {
+        if i > start && used + size > budget {
+            groups.push(start..i);
+            start = i;
+            used = 0;
+        }
+        used += size;
+    }
+    if start < sizes.len() {
+        groups.push(start..sizes.len());
+    }
+    groups
 }
 
 #[cfg(test)]
@@ -422,6 +713,233 @@ mod tests {
             .unwrap();
         let sent = corrector.0.lock().unwrap().clone().unwrap();
         assert!(!sent.text.contains("USER_NOTES_BEGIN"));
+    }
+
+    #[test]
+    fn repairs_ascii_quotes_inside_strings_and_trailing_commas() {
+        // The failure class seen on real long meetings: a quotation mark used
+        // inside a Chinese string value breaks the JSON mid-line.
+        let raw = r#"{"one_liner": "讨论"灰度发布"方案", "decisions": [ {"text": "先发 10%",}, ], "discussion": []}"#;
+        assert!(serde_json::from_str::<Minutes>(raw).is_err());
+        let m = parse_minutes(raw).unwrap();
+        assert_eq!(m.one_liner, "讨论\"灰度发布\"方案");
+        assert_eq!(m.decisions[0].text, "先发 10%");
+    }
+
+    #[test]
+    fn ignores_trailing_prose_that_contains_braces() {
+        let raw = format!("{SAMPLE_JSON}\n以上纪要基于 {{转录}} 生成。");
+        let m = parse_minutes(&raw).unwrap();
+        assert_eq!(m.decisions.len(), 1);
+    }
+
+    #[test]
+    fn windows_split_on_line_boundaries_within_budget() {
+        let transcript = (0..10)
+            .map(|i| format!("[{i}.0-{}.0] S1：{}", i + 1, "字".repeat(40)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let windows = split_lines_into_windows(&transcript, 120);
+        assert!(windows.len() > 1);
+        assert_eq!(windows.join("\n"), transcript);
+        for w in &windows {
+            assert!(w.chars().count() <= 120 || !w.contains('\n'));
+        }
+        // An oversized single line is kept whole, in its own window.
+        let long = "长".repeat(500);
+        assert_eq!(split_lines_into_windows(&long, 120), vec![long.clone()]);
+    }
+
+    /// Corrector that replays scripted replies in order and records every
+    /// request, so a test can assert the call sequence.
+    struct ScriptedCorrector {
+        replies: std::sync::Mutex<std::collections::VecDeque<Result<String, ()>>>,
+        seen: std::sync::Mutex<Vec<CorrectRequest>>,
+    }
+
+    impl ScriptedCorrector {
+        fn new(replies: Vec<Result<String, ()>>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn seen(&self) -> Vec<CorrectRequest> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Corrector for ScriptedCorrector {
+        fn id(&self) -> CorrectorEngineId {
+            CorrectorEngineId::OpenAiCompatible
+        }
+        async fn correct(&self, req: CorrectRequest) -> Result<CorrectResult, CorrectorError> {
+            self.seen.lock().unwrap().push(req);
+            match self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unscripted call")
+            {
+                Ok(text) => Ok(CorrectResult {
+                    text,
+                    engine: CorrectorEngineId::OpenAiCompatible,
+                    model_applied: true,
+                    fallback_reason: None,
+                }),
+                Err(()) => Err(CorrectorError::Timeout),
+            }
+        }
+    }
+
+    fn partial(one_liner: &str, decision: &str, start: f64) -> String {
+        format!(
+            r#"{{"one_liner":"{one_liner}","decisions":[{{"text":"{decision}","source":{{"start":{start},"end":{}}}}}]}}"#,
+            start + 5.0
+        )
+    }
+
+    fn long_transcript(lines: usize) -> String {
+        (0..lines)
+            .map(|i| {
+                format!(
+                    "[{}.0-{}.0] S1：{}",
+                    i * 10,
+                    i * 10 + 9,
+                    "讨论内容".repeat(30)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn short_transcript_stays_single_pass() {
+        let corrector = ScriptedCorrector::new(vec![Ok(SAMPLE_JSON.to_string())]);
+        generate_minutes(&corrector, "[0-2] S1：你好", None, None, None)
+            .await
+            .unwrap();
+        let seen = corrector.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].max_tokens, Some(DEFAULT_MINUTES_MAX_TOKENS));
+        assert!(seen[0].text.contains("TRANSCRIPT_BEGIN"));
+        assert!(!seen[0].text.contains("切分后的第"));
+    }
+
+    #[tokio::test]
+    async fn long_transcript_maps_windows_then_merges() {
+        let transcript = long_transcript(150); // ~19k chars → 2 windows
+        assert!(transcript.chars().count() > SINGLE_PASS_MAX_CHARS);
+        let windows = split_lines_into_windows(&transcript, WINDOW_CHARS).len();
+        let mut replies: Vec<Result<String, ()>> = (0..windows)
+            .map(|i| {
+                Ok(partial(
+                    &format!("第{i}段"),
+                    &format!("决定{i}"),
+                    i as f64 * 100.0,
+                ))
+            })
+            .collect();
+        replies.push(Ok(SAMPLE_JSON.to_string()));
+        let corrector = ScriptedCorrector::new(replies);
+
+        let minutes = generate_minutes(&corrector, &transcript, Some("关注预算"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(minutes.one_liner, "决定下周发布 beta。");
+        let seen = corrector.seen();
+        assert_eq!(seen.len(), windows + 1);
+        for (i, req) in seen[..windows].iter().enumerate() {
+            assert!(req.text.contains(&format!("第 {}/{windows} 段", i + 1)));
+            assert!(req.text.chars().count() < WINDOW_CHARS + 1_000);
+        }
+        let merge = &seen[windows];
+        assert!(merge.system_prompt.contains("会议纪要合并器"));
+        assert!(merge.text.contains("PARTIALS_BEGIN"));
+        assert!(merge.text.contains("决定0") && merge.text.contains("决定1"));
+        assert!(merge.text.contains("关注预算"));
+        assert_eq!(merge.max_tokens, Some(DEFAULT_MINUTES_MAX_TOKENS));
+    }
+
+    #[tokio::test]
+    async fn unparseable_output_is_reasked_once_with_a_strict_reminder() {
+        let corrector = ScriptedCorrector::new(vec![
+            Ok(r#"{"one_liner": "x", "decisions": [ {"text": } ]}"#.to_string()),
+            Ok(format!("```json\n{SAMPLE_JSON}\n```")),
+        ]);
+        let minutes = generate_minutes(&corrector, "[0-2] S1：你好", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(minutes.decisions.len(), 1);
+        let seen = corrector.seen();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].text.contains("无法解析为合法 JSON"));
+        assert!(seen[1].text.contains("TRANSCRIPT_BEGIN"));
+    }
+
+    #[tokio::test]
+    async fn failed_call_is_retried_once_with_a_larger_budget() {
+        let corrector = ScriptedCorrector::new(vec![Err(()), Ok(SAMPLE_JSON.to_string())]);
+        generate_minutes(&corrector, "[0-2] S1：你好", None, None, None)
+            .await
+            .unwrap();
+        let seen = corrector.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].max_tokens, Some(DEFAULT_MINUTES_MAX_TOKENS * 2));
+
+        // Two failures in a row surface as an LLM error.
+        let corrector = ScriptedCorrector::new(vec![Err(()), Err(())]);
+        assert!(matches!(
+            generate_minutes(&corrector, "x", None, None, None).await,
+            Err(MinutesError::Llm(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn merge_groups_large_partial_sets_hierarchically() {
+        // Many windows whose partials together exceed one merge call's input.
+        let big = "要点".repeat(2_000);
+        let partials: Vec<Minutes> = (0..6)
+            .map(|i| {
+                parse_minutes(&partial(
+                    &format!("{big}{i}"),
+                    &format!("决定{i}"),
+                    i as f64,
+                ))
+                .unwrap()
+            })
+            .collect();
+        // Round 1 merges two groups of three; round 2 merges the two results.
+        let replies = vec![
+            Ok(partial("组1", "决定A", 0.0)),
+            Ok(partial("组2", "决定B", 50.0)),
+            Ok(SAMPLE_JSON.to_string()),
+        ];
+        let corrector = ScriptedCorrector::new(replies);
+        let minutes = merge_partials(&corrector, partials, None, None, DEFAULT_MINUTES_MAX_TOKENS)
+            .await
+            .unwrap();
+        assert_eq!(minutes.one_liner, "决定下周发布 beta。");
+        let seen = corrector.seen();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[2].text.contains("组1") && seen[2].text.contains("组2"));
+        for req in &seen {
+            assert!(req.text.chars().count() < MERGE_INPUT_MAX_CHARS + 1_000);
+        }
+    }
+
+    #[test]
+    fn concat_fallback_keeps_items_in_order_without_duplicates() {
+        let a = parse_minutes(&partial("上半场", "发布 beta", 1.0)).unwrap();
+        let b = parse_minutes(&partial("下半场", "发布 beta", 2.0)).unwrap();
+        let c = parse_minutes(&partial("", "定价", 3.0)).unwrap();
+        let m = concat_partials(vec![a, b, c]);
+        assert_eq!(m.one_liner, "上半场；下半场");
+        let texts: Vec<&str> = m.decisions.iter().map(|d| d.text.as_str()).collect();
+        assert_eq!(texts, vec!["发布 beta", "定价"]);
+        assert_eq!(m.decisions[0].source.unwrap().start, 1.0);
     }
 
     #[tokio::test]
