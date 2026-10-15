@@ -13,6 +13,41 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 
+/// Floor of the output-token budget: enough for any short dictation.
+const MIN_OUTPUT_TOKENS: u32 = 1024;
+/// Ceiling of the derived budget; an explicit `CorrectRequest::max_tokens` is
+/// not capped by it.
+const MAX_OUTPUT_TOKENS: u32 = 8192;
+/// Tokens allowed per input character. A CJK character costs about one to two
+/// tokens on common tokenizers, so two per character covers cleanup (output
+/// close to input length) and translation with headroom.
+const OUTPUT_TOKENS_PER_INPUT_CHAR: u32 = 2;
+/// Fixed headroom on top of the per-character estimate (punctuation, line
+/// breaks, residual thinking tags the provider could not suppress).
+const OUTPUT_TOKEN_HEADROOM: u32 = 256;
+/// Context window requested from Ollama for short requests.
+const OLLAMA_MIN_CTX: u32 = 4096;
+/// Upper bound on the Ollama context window we request.
+const OLLAMA_MAX_CTX: u32 = 32768;
+
+/// Output-token budget for an input transcript when the caller sets none:
+/// `chars * 2 + 256`, clamped to `[1024, 8192]`.
+pub fn output_token_budget(input: &str) -> u32 {
+    let chars = u32::try_from(input.chars().count()).unwrap_or(u32::MAX);
+    chars
+        .saturating_mul(OUTPUT_TOKENS_PER_INPUT_CHAR)
+        .saturating_add(OUTPUT_TOKEN_HEADROOM)
+        .clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)
+}
+
+/// Ollama `num_ctx` that fits the prompt plus `max_tokens` of output; the
+/// prompt is estimated at the same size as the output budget.
+fn ollama_num_ctx(max_tokens: u32) -> u32 {
+    max_tokens
+        .saturating_mul(2)
+        .clamp(OLLAMA_MIN_CTX, OLLAMA_MAX_CTX)
+}
+
 /// Strip common model thinking wrappers (+ unclosed Qwen-style think blocks).
 static THINKING_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -65,6 +100,10 @@ struct ChatCompletionResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: Message,
+    /// `"stop"` on a complete answer, `"length"` when the provider hit the
+    /// output-token limit. Missing on some gateways; treated as complete.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,9 +138,11 @@ impl Corrector for OpenAiCompatCorrector {
         let base = self.config.base_url.trim_end_matches('/');
         let url = format!("{base}/chat/completions");
 
-        // Competitor defaults: temperature ~0.3, max_tokens for short dictation
-        // outputs; long-form callers (minutes) raise it via `req.max_tokens`.
-        let max_tokens = req.max_tokens.unwrap_or(1024);
+        // Size the output budget from the transcript so long dictation is not
+        // cut off; long-form callers (minutes) set `req.max_tokens` explicitly.
+        let max_tokens = req
+            .max_tokens
+            .unwrap_or_else(|| output_token_budget(&req.text));
         let mut body = json!({
             "model": self.config.model,
             "temperature": temperature.clamp(0.01, 1.0),
@@ -112,7 +153,7 @@ impl Corrector for OpenAiCompatCorrector {
             ]
         });
 
-        inject_no_thinking_params(&self.config, &mut body);
+        inject_no_thinking_params(&self.config, &mut body, max_tokens);
 
         let mut builder = self.client.post(&url).json(&body);
         if !self.config.api_key.is_empty() {
@@ -136,9 +177,14 @@ impl Corrector for OpenAiCompatCorrector {
             .await
             .map_err(|_| CorrectorError::MalformedResponse)?;
 
-        let text = parsed
-            .choices
-            .first()
+        let choice = parsed.choices.first();
+        // A length stop means the answer is only a prefix; inserting it would
+        // drop the end of what the user said.
+        if choice.and_then(|c| c.finish_reason.as_deref()) == Some("length") {
+            return Err(CorrectorError::OutputTruncated);
+        }
+
+        let text = choice
             .and_then(|c| c.message.content.clone())
             .map(|s| strip_fences(&s))
             .map(|s| strip_thinking_tags(&s))
@@ -172,15 +218,21 @@ fn is_local_ollama(cfg: &OpenAiCompatConfig) -> bool {
 /// - Gemini: thinkingBudget 0 / thinkingConfig
 /// - MiniMax-M3 (OpenAI path): `thinking: {type:disabled}` — works (dictation default)
 /// - MiniMax-M2.x / `*-highspeed`: cannot fully disable CoT; prefer M3 for cleanup
-fn inject_no_thinking_params(cfg: &OpenAiCompatConfig, body: &mut serde_json::Value) {
+fn inject_no_thinking_params(
+    cfg: &OpenAiCompatConfig,
+    body: &mut serde_json::Value,
+    max_tokens: u32,
+) {
     let url = cfg.base_url.to_ascii_lowercase();
     let model = cfg.model.to_ascii_lowercase();
 
     if is_local_ollama(cfg) {
         body["think"] = json!(false);
+        // Ollama applies `options.num_predict` over the OpenAI `max_tokens`, so
+        // both carry the same budget.
         body["options"] = json!({
-            "num_ctx": 4096,
-            "num_predict": 1024,
+            "num_ctx": ollama_num_ctx(max_tokens),
+            "num_predict": max_tokens,
         });
         return;
     }
@@ -241,6 +293,21 @@ fn dict_block_opt(d: &DictionaryContext) -> Option<String> {
     }
 }
 
+fn strip_fences(s: &str) -> String {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        let rest = rest
+            .strip_prefix("text")
+            .or_else(|| rest.strip_prefix("markdown"))
+            .unwrap_or(rest);
+        let rest = rest.trim_start_matches('\n');
+        if let Some(idx) = rest.rfind("```") {
+            return rest[..idx].trim().to_string();
+        }
+    }
+    t.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,19 +330,168 @@ Hello world."#;
         let raw = "<thinking>plan</thinking>final";
         assert_eq!(strip_thinking_tags(raw), "final");
     }
-}
 
-fn strip_fences(s: &str) -> String {
-    let t = s.trim();
-    if let Some(rest) = t.strip_prefix("```") {
-        let rest = rest
-            .strip_prefix("text")
-            .or_else(|| rest.strip_prefix("markdown"))
-            .unwrap_or(rest);
-        let rest = rest.trim_start_matches('\n');
-        if let Some(idx) = rest.rfind("```") {
-            return rest[..idx].trim().to_string();
+    #[test]
+    fn output_budget_scales_with_input_and_is_clamped() {
+        assert_eq!(output_token_budget(""), MIN_OUTPUT_TOKENS);
+        assert_eq!(output_token_budget(&"字".repeat(100)), MIN_OUTPUT_TOKENS);
+        assert_eq!(output_token_budget(&"字".repeat(1000)), 2256);
+        assert_eq!(output_token_budget(&"字".repeat(10_000)), MAX_OUTPUT_TOKENS);
+        assert_eq!(ollama_num_ctx(1024), OLLAMA_MIN_CTX);
+        assert_eq!(ollama_num_ctx(8192), 16384);
+        assert_eq!(ollama_num_ctx(u32::MAX), OLLAMA_MAX_CTX);
+    }
+
+    /// Serves one canned chat-completions response on loopback and returns
+    /// the base URL plus a handle yielding the raw request it received.
+    fn serve_once(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let length = text[..head_end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (base, handle)
+    }
+
+    fn corrector_for(base_url: String, engine_id: CorrectorEngineId) -> OpenAiCompatCorrector {
+        OpenAiCompatCorrector::new(OpenAiCompatConfig {
+            base_url,
+            api_key: String::new(),
+            model: "test-model".into(),
+            engine_id,
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap()
+    }
+
+    fn request(text: &str, max_tokens: Option<u32>) -> CorrectRequest {
+        CorrectRequest {
+            text: text.into(),
+            dictionary: DictionaryContext::default(),
+            context_json: None,
+            system_prompt: String::new(),
+            temperature: 0.3,
+            max_tokens,
         }
     }
-    t.to_string()
+
+    fn request_json(raw: &str) -> serde_json::Value {
+        let body = raw.split_once("\r\n\r\n").unwrap().1;
+        serde_json::from_str(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn length_finish_reason_is_reported_as_truncation() {
+        let (base, server) = serve_once(
+            r#"{"choices":[{"message":{"content":"half of the"},"finish_reason":"length"}]}"#,
+        );
+        let corrector = corrector_for(base, CorrectorEngineId::OpenAiCompatible);
+
+        let err = corrector
+            .correct(request("half of the sentence", None))
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(err, CorrectorError::OutputTruncated));
+        assert_eq!(
+            err.fallback_reason(),
+            crate::CorrectorFallbackReason::OutputTruncated
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_finish_reason_returns_text() {
+        let (base, server) = serve_once(
+            r#"{"choices":[{"message":{"content":"Hello world."},"finish_reason":"stop"}]}"#,
+        );
+        let corrector = corrector_for(base, CorrectorEngineId::OpenAiCompatible);
+
+        let result = corrector
+            .correct(request("hello world", None))
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result.text, "Hello world.");
+        assert!(result.model_applied);
+    }
+
+    #[tokio::test]
+    async fn missing_finish_reason_is_treated_as_complete() {
+        let (base, server) = serve_once(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        let corrector = corrector_for(base, CorrectorEngineId::OpenAiCompatible);
+
+        let result = corrector.correct(request("ok", None)).await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result.text, "ok");
+    }
+
+    #[tokio::test]
+    async fn derived_budget_is_sent_to_cloud_and_ollama() {
+        let long_input = "字".repeat(2000);
+
+        let (base, server) = serve_once(r#"{"choices":[{"message":{"content":"x"}}]}"#);
+        corrector_for(base, CorrectorEngineId::OpenAiCompatible)
+            .correct(request(&long_input, None))
+            .await
+            .unwrap();
+        let cloud = request_json(&server.join().unwrap());
+        assert_eq!(cloud["max_tokens"], 4256);
+        assert!(cloud.get("options").is_none());
+
+        let (base, server) = serve_once(r#"{"choices":[{"message":{"content":"x"}}]}"#);
+        corrector_for(base, CorrectorEngineId::Ollama)
+            .correct(request(&long_input, None))
+            .await
+            .unwrap();
+        let ollama = request_json(&server.join().unwrap());
+        assert_eq!(ollama["max_tokens"], 4256);
+        assert_eq!(ollama["options"]["num_predict"], 4256);
+        assert_eq!(ollama["options"]["num_ctx"], 8512);
+    }
+
+    #[tokio::test]
+    async fn explicit_budget_overrides_the_derived_one() {
+        let (base, server) = serve_once(r#"{"choices":[{"message":{"content":"x"}}]}"#);
+        corrector_for(base, CorrectorEngineId::Ollama)
+            .correct(request("short", Some(12_000)))
+            .await
+            .unwrap();
+        let body = request_json(&server.join().unwrap());
+        assert_eq!(body["max_tokens"], 12_000);
+        assert_eq!(body["options"]["num_predict"], 12_000);
+    }
 }

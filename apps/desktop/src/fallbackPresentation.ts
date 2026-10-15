@@ -9,6 +9,7 @@ const FALLBACK_REASON_LABELS: Record<string, string> = {
   malformed_response: "AI 服务返回格式异常",
   empty_output: "AI 服务返回了空结果",
   empty_after_sanitization: "修订结果清理后为空",
+  output_truncated: "修订结果超出长度上限被截断",
   context_protected_token_mismatch: "数字或编号保护检查未通过",
   context_safety_marker_mismatch: "关键动作或否定含义检查未通过",
   context_unicode_separator: "修订结果包含不安全换行符",

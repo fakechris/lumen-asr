@@ -6,7 +6,7 @@
 mod openai_compat;
 mod preprocess;
 
-pub use openai_compat::{OpenAiCompatConfig, OpenAiCompatCorrector};
+pub use openai_compat::{output_token_budget, OpenAiCompatConfig, OpenAiCompatCorrector};
 pub use preprocess::preprocess;
 
 use async_trait::async_trait;
@@ -28,6 +28,11 @@ pub enum CorrectorError {
     EmptyOutput,
     #[error("filtered by provider")]
     Filtered,
+    /// The provider stopped at its output-token limit (`finish_reason:
+    /// "length"`), so the text is a prefix of the intended answer and must not
+    /// be inserted.
+    #[error("model output truncated at the token limit")]
+    OutputTruncated,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -45,6 +50,7 @@ pub enum CorrectorFallbackReason {
     MalformedResponse,
     EmptyOutput,
     EmptyAfterSanitization,
+    OutputTruncated,
     ContextProtectedTokenMismatch,
     ContextSafetyMarkerMismatch,
     ContextUnicodeSeparator,
@@ -73,6 +79,7 @@ impl CorrectorFallbackReason {
             Self::MalformedResponse => "malformed_response",
             Self::EmptyOutput => "empty_output",
             Self::EmptyAfterSanitization => "empty_after_sanitization",
+            Self::OutputTruncated => "output_truncated",
             Self::ContextProtectedTokenMismatch => "context_protected_token_mismatch",
             Self::ContextSafetyMarkerMismatch => "context_safety_marker_mismatch",
             Self::ContextUnicodeSeparator => "context_unicode_separator",
@@ -103,6 +110,7 @@ impl CorrectorError {
             Self::MalformedResponse => CorrectorFallbackReason::MalformedResponse,
             Self::EmptyOutput => CorrectorFallbackReason::EmptyOutput,
             Self::Filtered => CorrectorFallbackReason::ProviderRejected,
+            Self::OutputTruncated => CorrectorFallbackReason::OutputTruncated,
             Self::Other(_) => CorrectorFallbackReason::Other,
         }
     }
@@ -128,9 +136,10 @@ pub struct CorrectRequest {
     /// Sampling temperature hint for the provider.
     #[serde(default = "default_temperature")]
     pub temperature: f32,
-    /// Max output tokens. `None` uses the dictation-sized default (1024).
-    /// Long-form callers (e.g. meeting minutes) raise this so structured JSON
-    /// output is not truncated mid-document.
+    /// Max output tokens. `None` sizes the budget from the input text (see
+    /// [`output_token_budget`]). Long-form callers (e.g. meeting
+    /// minutes) set this so structured JSON output is not truncated
+    /// mid-document.
     #[serde(default)]
     pub max_tokens: Option<u32>,
 }
@@ -687,6 +696,40 @@ mod tests {
         async fn correct(&self, _req: CorrectRequest) -> Result<CorrectResult, CorrectorError> {
             Err(CorrectorError::Timeout)
         }
+    }
+
+    struct TruncatingCorrector;
+
+    #[async_trait]
+    impl Corrector for TruncatingCorrector {
+        fn id(&self) -> CorrectorEngineId {
+            CorrectorEngineId::OpenAiCompatible
+        }
+
+        async fn correct(&self, _req: CorrectRequest) -> Result<CorrectResult, CorrectorError> {
+            Err(CorrectorError::OutputTruncated)
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_output_falls_back_to_the_full_transcript() {
+        let result = correct_or_fallback(
+            &TruncatingCorrector,
+            "the whole sentence",
+            DictionaryContext::default(),
+        )
+        .await;
+
+        assert!(!result.model_applied);
+        assert_eq!(result.text, "the whole sentence");
+        assert_eq!(
+            result.fallback_reason,
+            Some(CorrectorFallbackReason::OutputTruncated)
+        );
+        assert_eq!(
+            CorrectorFallbackReason::OutputTruncated.as_str(),
+            serde_json::to_value(CorrectorFallbackReason::OutputTruncated).unwrap()
+        );
     }
 
     struct ContextRequiredCorrector;
