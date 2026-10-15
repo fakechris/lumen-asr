@@ -7,7 +7,9 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use lumen_store::{ContextInputRef, ContextStageUsage, PipelineStage, Store};
+use lumen_store::{
+    ContextInputRef, ContextStageUsage, ExpiredContextCapture, PipelineStage, Store,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -23,6 +25,13 @@ pub(crate) fn remove_context_manifest_artifact(
     _manifest_path: &str,
 ) -> Result<bool, String> {
     Ok(false)
+}
+
+pub(crate) fn remove_expired_capture_payloads(
+    _data_dir: &Path,
+    _capture: &ExpiredContextCapture,
+) -> Result<(), String> {
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]

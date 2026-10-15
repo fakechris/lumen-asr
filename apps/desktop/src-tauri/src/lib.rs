@@ -233,6 +233,93 @@ fn schedule_legacy_short_silent_session_purge(app: tauri::AppHandle) {
     });
 }
 
+/// How often a long-running app re-checks context retention after startup.
+const CONTEXT_RETENTION_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Remove sealed context payloads older than `cutoff`, keeping their snapshot
+/// rows as metadata-only provenance. The store lock is released while files are
+/// removed; a capture whose files cannot be removed keeps its row and is
+/// retried on the next run.
+fn expire_context_payloads(
+    store: &Mutex<Option<Store>>,
+    data_dir: &Path,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> Result<usize, String> {
+    let mut expired_count = 0;
+    loop {
+        let batch = {
+            let guard = store
+                .lock()
+                .map_err(|_| "store lock poisoned during context retention".to_owned())?;
+            let Some(store) = guard.as_ref() else {
+                return Ok(expired_count);
+            };
+            store
+                .expired_context_capture_batch(cutoff, 128)
+                .map_err(|error| error.to_string())?
+        };
+        if batch.is_empty() {
+            return Ok(expired_count);
+        }
+        let mut removed = Vec::new();
+        for capture in &batch {
+            match context_capture::remove_expired_capture_payloads(data_dir, capture) {
+                Ok(()) => removed.push(capture.capture_id),
+                Err(error) => tracing::warn!(
+                    capture_id = %capture.capture_id,
+                    %error,
+                    "context retention cleanup will retry later"
+                ),
+            }
+        }
+        if removed.is_empty() {
+            return Ok(expired_count);
+        }
+        let guard = store
+            .lock()
+            .map_err(|_| "store lock poisoned while expiring context rows".to_owned())?;
+        let Some(store) = guard.as_ref() else {
+            return Ok(expired_count);
+        };
+        store
+            .mark_context_captures_expired(&removed)
+            .map_err(|error| error.to_string())?;
+        expired_count += removed.len();
+    }
+}
+
+fn schedule_context_retention(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let retention_days = app
+                .state::<AppState>()
+                .config
+                .lock()
+                .map(|config| config.context.retention_days)
+                .unwrap_or(0);
+            if retention_days > 0 {
+                let handle = app.clone();
+                let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(retention_days));
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    let state = handle.state::<AppState>();
+                    expire_context_payloads(&state.store, &default_data_dir(), cutoff)
+                })
+                .await;
+                match result {
+                    Ok(Ok(count)) if count > 0 => {
+                        tracing::info!(count, retention_days, "expired sealed context payloads");
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::warn!(%error, "context retention cleanup failed"),
+                    Err(error) => tracing::warn!(%error, "context retention task failed"),
+                }
+            }
+            tokio::time::sleep(CONTEXT_RETENTION_INTERVAL).await;
+        }
+    });
+}
+
 pub(crate) fn delete_session_with_artifacts(
     store: &Store,
     data_dir: &Path,
@@ -689,6 +776,7 @@ pub fn run() {
             // mark it failed — off the launch path so the UI never blocks.
             meeting_cmd::recover_interrupted_meetings(app.handle().clone());
             schedule_legacy_short_silent_session_purge(app.handle().clone());
+            schedule_context_retention(app.handle().clone());
 
             // Register the imminent-sleep observer once, on the main thread
             // (Tauri setup runs on the main thread). It fires whenever the system
@@ -871,6 +959,107 @@ mod tests {
         assert!(store.get_session(missing_id).unwrap().is_none());
         assert!(store.get_session(refused_id).unwrap().is_some());
         assert!(outside_dir.exists());
+    }
+
+    #[test]
+    fn context_retention_removes_old_payloads_but_keeps_rows_and_sent_projections() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let store = Store::open(directory.path().join("history.sqlite")).unwrap();
+        let mut session = SessionRecord::new();
+        session.status = SessionStatus::Completed;
+        session.asr_raw = Some("kept history".into());
+        store.save_session(&session).unwrap();
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(45);
+        let save = |capture_id: Uuid, frozen_at, manifest_path: &Path| {
+            store
+                .save_context_snapshot(&ContextSnapshotRecord {
+                    capture_id,
+                    session_id: session.id,
+                    revision: 1,
+                    schema_version: 1,
+                    profile: "visible".into(),
+                    target_generation: 1,
+                    started_at: frozen_at,
+                    frozen_at,
+                    completed_at: Some(frozen_at),
+                    manifest_path: manifest_path.display().to_string(),
+                    source_presence_bitmap: 1,
+                    source_status_json: "{}".into(),
+                    sanitized_hash: "hash".into(),
+                    encryption: "keychain".into(),
+                    status: "complete".into(),
+                })
+                .unwrap();
+        };
+
+        let expired_id = Uuid::new_v4();
+        let expired_dir = data_dir.join("context").join(expired_id.to_string());
+        let expired_manifest = expired_dir.join("manifest.r0001.v1.sealed.json");
+        let expired_artifact = expired_dir.join("artifact.r0001-editor.sealed.json");
+        let sent_projection = expired_dir
+            .join("usage")
+            .join(Uuid::new_v4().to_string())
+            .join("corrector-0123456789abcdef.sealed.json");
+        std::fs::create_dir_all(sent_projection.parent().unwrap()).unwrap();
+        for path in [&expired_manifest, &expired_artifact, &sent_projection] {
+            std::fs::write(path, b"sealed").unwrap();
+        }
+        save(expired_id, old, &expired_manifest);
+
+        let payload_only_id = Uuid::new_v4();
+        let payload_only_dir = data_dir.join("context").join(payload_only_id.to_string());
+        let payload_only_manifest = payload_only_dir.join("manifest.r0001.v1.sealed.json");
+        std::fs::create_dir_all(&payload_only_dir).unwrap();
+        std::fs::write(&payload_only_manifest, b"sealed").unwrap();
+        save(payload_only_id, old, &payload_only_manifest);
+
+        let recent_id = Uuid::new_v4();
+        let recent_dir = data_dir.join("context").join(recent_id.to_string());
+        let recent_manifest = recent_dir.join("manifest.r0001.v1.sealed.json");
+        std::fs::create_dir_all(&recent_dir).unwrap();
+        std::fs::write(&recent_manifest, b"sealed").unwrap();
+        save(recent_id, now, &recent_manifest);
+
+        let refused_id = Uuid::new_v4();
+        let outside_manifest = directory
+            .path()
+            .join("outside/manifest.r0001.v1.sealed.json");
+        std::fs::create_dir_all(outside_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&outside_manifest, b"sealed").unwrap();
+        save(refused_id, old, &outside_manifest);
+
+        let store = Mutex::new(Some(store));
+        let cutoff = now - chrono::Duration::days(30);
+        assert_eq!(
+            expire_context_payloads(&store, &data_dir, cutoff).unwrap(),
+            2
+        );
+
+        assert!(!expired_manifest.exists());
+        assert!(!expired_artifact.exists());
+        assert!(sent_projection.exists());
+        assert!(!payload_only_dir.exists());
+        assert!(recent_manifest.exists());
+        assert!(outside_manifest.exists());
+
+        let guard = store.lock().unwrap();
+        let store = guard.as_ref().unwrap();
+        assert!(store.get_session(session.id).unwrap().is_some());
+        let rows = store.list_context_snapshots(session.id).unwrap();
+        assert_eq!(rows.len(), 4);
+        let status = |capture_id: Uuid| {
+            let row = rows
+                .iter()
+                .find(|row| row.capture_id == capture_id)
+                .unwrap();
+            (row.status.clone(), row.manifest_path.is_empty())
+        };
+        assert_eq!(status(expired_id), ("expired".to_owned(), true));
+        assert_eq!(status(payload_only_id), ("expired".to_owned(), true));
+        assert_eq!(status(recent_id), ("complete".to_owned(), false));
+        assert_eq!(status(refused_id), ("complete".to_owned(), false));
     }
 
     #[test]

@@ -251,6 +251,11 @@ pub struct ContextCaptureConfig {
     pub max_chars: usize,
     pub freeze_deadline_ms: u64,
     pub late_deadline_ms: u64,
+    /// Days to keep sealed context payloads before they are removed. Snapshot
+    /// metadata rows remain for provenance. `0` (the default) keeps payloads
+    /// indefinitely; retention is opt-in so existing captures are never
+    /// deleted by an upgrade.
+    pub retention_days: u32,
 }
 
 impl Default for ContextCaptureConfig {
@@ -261,6 +266,7 @@ impl Default for ContextCaptureConfig {
             max_chars: 200_000,
             freeze_deadline_ms: 500,
             late_deadline_ms: 5_000,
+            retention_days: 0,
         }
     }
 }
@@ -1558,6 +1564,7 @@ provider = "local_qwen"
 
         assert!(config.context.enabled);
         assert_eq!(config.context.profile, "visible");
+        assert_eq!(config.context.retention_days, 0);
     }
 
     #[test]
