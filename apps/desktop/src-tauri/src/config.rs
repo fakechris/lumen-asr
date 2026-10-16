@@ -1,6 +1,8 @@
 //! App settings persisted as TOML under Application Support.
 
 use lumen_platform::default_config_path;
+
+use crate::secret_store::{self, LoadOutcome, SecretSlot, SecretStore, SecretSync};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -25,6 +27,10 @@ pub struct AppConfig {
     pub context: ContextCaptureConfig,
     /// Meeting recording / processing options.
     pub meeting: MeetingConfig,
+    /// Last value synced to the platform credential store for each API key.
+    /// Never serialized; see [`crate::secret_store`].
+    #[serde(skip)]
+    pub secrets: SecretSync,
 }
 
 impl Default for AppConfig {
@@ -42,6 +48,7 @@ impl Default for AppConfig {
             asr: AsrServiceConfig::default(),
             context: ContextCaptureConfig::default(),
             meeting: MeetingConfig::default(),
+            secrets: SecretSync::default(),
         }
     }
 }
@@ -998,15 +1005,20 @@ impl AppConfig {
     }
 
     pub fn load() -> Self {
-        let path = default_config_path();
-        Self::load_from(&path)
+        Self::load_with(&default_config_path(), secret_store::platform_store())
     }
 
+    /// Load without a credential store: API keys stay exactly as written in
+    /// the file. Used by tests and anything that must not touch the Keychain.
     pub fn load_from(path: &PathBuf) -> Self {
+        Self::load_with(path, None)
+    }
+
+    fn load_with(path: &PathBuf, store: Option<&dyn SecretStore>) -> Self {
         if !path.exists() {
             let mut cfg = Self::default();
             cfg.apply_platform_fallbacks();
-            if let Err(e) = cfg.save_to(path) {
+            if let Err(e) = cfg.save_with(path, store) {
                 tracing::warn!(error = %e, "failed to write default config");
             }
             return cfg;
@@ -1016,9 +1028,13 @@ impl AppConfig {
                 Ok(mut c) => {
                     ensure_default_intents(&mut c.hotkey);
                     c.asr.migrate_legacy_model_dir();
-                    if c.apply_platform_fallbacks() {
-                        if let Err(error) = c.save_to(path) {
-                            tracing::warn!(%error, "failed to persist platform fallbacks");
+                    let mut needs_save = c.apply_platform_fallbacks();
+                    if let Some(store) = store {
+                        needs_save |= c.load_secrets(store);
+                    }
+                    if needs_save {
+                        if let Err(error) = c.save_with(path, store) {
+                            tracing::warn!(%error, "failed to persist config migrations");
                         }
                     }
                     c
@@ -1035,17 +1051,115 @@ impl AppConfig {
         }
     }
 
-    pub fn save(&self) -> Result<(), String> {
-        self.save_to(&default_config_path())
+    fn secret_value(&self, slot: SecretSlot) -> &str {
+        match slot {
+            SecretSlot::AsrApiKey => &self.asr.api_key,
+            SecretSlot::CorrectorApiKey => &self.corrector.api_key,
+        }
     }
 
+    fn secret_field(&mut self, slot: SecretSlot) -> &mut String {
+        match slot {
+            SecretSlot::AsrApiKey => &mut self.asr.api_key,
+            SecretSlot::CorrectorApiKey => &mut self.corrector.api_key,
+        }
+    }
+
+    /// Fill API keys from the store, moving any plaintext key into it.
+    /// Returns `true` when the file should be rewritten without plaintext.
+    fn load_secrets(&mut self, store: &dyn SecretStore) -> bool {
+        let sync = self.secrets.clone();
+        let mut migrated = false;
+        for slot in SecretSlot::ALL {
+            let field = self.secret_field(slot);
+            migrated |= secret_store::load_slot(store, &sync, slot, field) == LoadOutcome::Migrated;
+        }
+        migrated
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        self.save_with(&default_config_path(), secret_store::platform_store())
+    }
+
+    /// Save without a credential store (API keys written as-is).
     pub fn save_to(&self, path: &PathBuf) -> Result<(), String> {
+        self.save_with(path, None)
+    }
+
+    fn save_with(&self, path: &PathBuf, store: Option<&dyn SecretStore>) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(path, s).map_err(|e| e.to_string())
+        let Some(store) = store else {
+            let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+            return write_private(path, s.as_bytes());
+        };
+        // Write the file first, without keys: if that fails the Keychain is
+        // left untouched, so a stale plaintext key in the old file can never
+        // be migrated over a newer Keychain value on the next load.
+        let mut on_disk = self.clone();
+        for slot in SecretSlot::ALL {
+            on_disk.secret_field(slot).clear();
+        }
+        let s = toml::to_string_pretty(&on_disk).map_err(|e| e.to_string())?;
+        write_private(path, s.as_bytes())?;
+
+        // Then sync the Keychain; any key it refuses goes back into the file so
+        // it is never lost.
+        let mut kept_plaintext = false;
+        for slot in SecretSlot::ALL {
+            let mut value = self.secret_value(slot).to_owned();
+            if !secret_store::save_slot(store, &self.secrets, slot, &value) {
+                std::mem::swap(on_disk.secret_field(slot), &mut value);
+                kept_plaintext = true;
+            }
+        }
+        if kept_plaintext {
+            let s = toml::to_string_pretty(&on_disk).map_err(|e| e.to_string())?;
+            write_private(path, s.as_bytes())?;
+        }
+        Ok(())
     }
+}
+
+/// Write the config file readable only by the current user: it may still hold
+/// API keys where no credential store is available.
+fn write_private(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
+    // Write a sibling temp file and rename it over the config, so a failure at
+    // any step leaves the previous file intact instead of a truncated one.
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("config path has no file name: {}", path.display()))?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let written = write_new_private(&tmp, contents)
+        .and_then(|()| fs::rename(&tmp, path).map_err(|e| e.to_string()));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn write_new_private(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        // `mode` only applies on creation; a leftover temp file may be wider.
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    file.write_all(contents).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1068,6 +1182,102 @@ mod tests {
         assert_eq!(loaded.corrector.model, "test-model");
         assert_eq!(loaded.asr.model_dir, "/models/custom-sensevoice");
         assert_eq!(loaded.asr.sensevoice_model_dir, "/models/custom-sensevoice");
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_config_path(tag: &str) -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("lumen-cfg-{tag}-{n}.toml"))
+    }
+
+    #[test]
+    fn plaintext_api_keys_move_into_store_and_out_of_file() {
+        use crate::secret_store::tests::FakeStore;
+        let store = FakeStore::default();
+        let path = temp_config_path("secrets");
+        let mut cfg = AppConfig::default();
+        cfg.asr.api_key = "sk-asr".into();
+        cfg.corrector.api_key = "sk-llm".into();
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_with(&path, Some(&store));
+        assert_eq!(loaded.asr.api_key, "sk-asr");
+        assert_eq!(loaded.corrector.api_key, "sk-llm");
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("sk-asr"), "{on_disk}");
+        assert!(!on_disk.contains("sk-llm"), "{on_disk}");
+
+        // A later launch reads the keys back from the store.
+        let reloaded = AppConfig::load_with(&path, Some(&store));
+        assert_eq!(reloaded.asr.api_key, "sk-asr");
+        assert_eq!(reloaded.corrector.api_key, "sk-llm");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unavailable_store_keeps_api_keys_in_file() {
+        use crate::secret_store::tests::FakeStore;
+        let store = FakeStore::default();
+        *store.fail.lock() = true;
+        let path = temp_config_path("secrets-fail");
+        let mut cfg = AppConfig::default();
+        cfg.corrector.api_key = "sk-llm".into();
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_with(&path, Some(&store));
+        assert_eq!(loaded.corrector.api_key, "sk-llm");
+        loaded.save_with(&path, Some(&store)).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("sk-llm"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_config_write_leaves_keychain_untouched() {
+        use crate::secret_store::tests::FakeStore;
+        let store = FakeStore::default();
+        // A directory at the config path makes the final rename fail.
+        let path = temp_config_path("write-fails");
+        fs::create_dir_all(&path).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.corrector.api_key = "sk-new".into();
+
+        assert!(cfg.save_with(&path, Some(&store)).is_err());
+        assert!(store.items.lock().is_empty());
+        assert_eq!(*store.writes.lock(), 0);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn failed_config_write_keeps_the_previous_file() {
+        let path = temp_config_path("keep-previous");
+        AppConfig::default().save_to(&path).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        // Block the temp file so the write fails before touching the config.
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.meeting.detection_enabled = !cfg.meeting.detection_enabled;
+
+        assert!(cfg.save_to(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_is_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_config_path("mode");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        AppConfig::default().save_to(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = fs::remove_file(path);
     }
 

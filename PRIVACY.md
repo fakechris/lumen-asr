@@ -19,8 +19,10 @@ Depending on the features you use, Lumen ASR processes:
   recognition or correction providers.
 
 Dictation history, audio, models, configuration, and diagnostics are stored in
-local application-data directories. macOS context snapshots are sealed before
-they are retained. Windows context capture is currently disabled and uses a
+local application-data directories. On macOS, provider API keys are kept in the
+login Keychain rather than in the configuration file; on other platforms they
+remain in the configuration file in the user's application-data directory.
+macOS context snapshots are sealed before they are retained. Windows context capture is currently disabled and uses a
 fail-closed adapter.
 
 Lumen ASR does not automatically upload locally stored history, raw context

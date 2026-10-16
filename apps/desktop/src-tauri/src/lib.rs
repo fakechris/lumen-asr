@@ -39,6 +39,7 @@ mod pane_observer;
 mod permissions_cmd;
 mod pipeline_attempt;
 mod provider_presets;
+mod secret_store;
 mod session_debug;
 mod ui_cmd;
 mod volcengine_asr;
