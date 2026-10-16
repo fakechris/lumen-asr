@@ -1051,6 +1051,13 @@ impl AppConfig {
         }
     }
 
+    fn secret_value(&self, slot: SecretSlot) -> &str {
+        match slot {
+            SecretSlot::AsrApiKey => &self.asr.api_key,
+            SecretSlot::CorrectorApiKey => &self.corrector.api_key,
+        }
+    }
+
     fn secret_field(&mut self, slot: SecretSlot) -> &mut String {
         match slot {
             SecretSlot::AsrApiKey => &mut self.asr.api_key,
@@ -1083,43 +1090,76 @@ impl AppConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        let Some(store) = store else {
+            let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+            return write_private(path, s.as_bytes());
+        };
+        // Write the file first, without keys: if that fails the Keychain is
+        // left untouched, so a stale plaintext key in the old file can never
+        // be migrated over a newer Keychain value on the next load.
         let mut on_disk = self.clone();
-        if let Some(store) = store {
-            for slot in SecretSlot::ALL {
-                let field = on_disk.secret_field(slot);
-                if secret_store::save_slot(store, &self.secrets, slot, field) {
-                    field.clear();
-                }
-            }
+        for slot in SecretSlot::ALL {
+            on_disk.secret_field(slot).clear();
         }
         let s = toml::to_string_pretty(&on_disk).map_err(|e| e.to_string())?;
-        write_private(path, s.as_bytes())
+        write_private(path, s.as_bytes())?;
+
+        // Then sync the Keychain; any key it refuses goes back into the file so
+        // it is never lost.
+        let mut kept_plaintext = false;
+        for slot in SecretSlot::ALL {
+            let mut value = self.secret_value(slot).to_owned();
+            if !secret_store::save_slot(store, &self.secrets, slot, &value) {
+                std::mem::swap(on_disk.secret_field(slot), &mut value);
+                kept_plaintext = true;
+            }
+        }
+        if kept_plaintext {
+            let s = toml::to_string_pretty(&on_disk).map_err(|e| e.to_string())?;
+            write_private(path, s.as_bytes())?;
+        }
+        Ok(())
     }
 }
 
 /// Write the config file readable only by the current user: it may still hold
 /// API keys where no credential store is available.
 fn write_private(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
+    // Write a sibling temp file and rename it over the config, so a failure at
+    // any step leaves the previous file intact instead of a truncated one.
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("config path has no file name: {}", path.display()))?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let written = write_new_private(&tmp, contents)
+        .and_then(|()| fs::rename(&tmp, path).map_err(|e| e.to_string()));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn write_new_private(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| e.to_string())?;
-        // `mode` only applies on creation; tighten files written by older builds.
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        // `mode` only applies on creation; a leftover temp file may be wider.
+        use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|e| e.to_string())?;
-        file.write_all(contents).map_err(|e| e.to_string())
     }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, contents).map_err(|e| e.to_string())
-    }
+    file.write_all(contents).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1192,6 +1232,40 @@ mod tests {
         loaded.save_with(&path, Some(&store)).unwrap();
         assert!(fs::read_to_string(&path).unwrap().contains("sk-llm"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_config_write_leaves_keychain_untouched() {
+        use crate::secret_store::tests::FakeStore;
+        let store = FakeStore::default();
+        // A directory at the config path makes the final rename fail.
+        let path = temp_config_path("write-fails");
+        fs::create_dir_all(&path).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.corrector.api_key = "sk-new".into();
+
+        assert!(cfg.save_with(&path, Some(&store)).is_err());
+        assert!(store.items.lock().is_empty());
+        assert_eq!(*store.writes.lock(), 0);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn failed_config_write_keeps_the_previous_file() {
+        let path = temp_config_path("keep-previous");
+        AppConfig::default().save_to(&path).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        // Block the temp file so the write fails before touching the config.
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.meeting.detection_enabled = !cfg.meeting.detection_enabled;
+
+        assert!(cfg.save_to(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_file(&path);
     }
 
     #[cfg(unix)]
