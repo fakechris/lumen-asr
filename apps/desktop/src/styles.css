@@ -2563,6 +2563,14 @@ html:has(.capsule-root) body {
   min-width: 0;
 }
 
+.capsule-hint {
+  flex-shrink: 0;
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: rgba(243, 236, 226, 0.55);
+  white-space: nowrap;
+}
+
 .capsule-btn {
   -webkit-app-region: no-drag;
   border: 1px solid rgba(255, 255, 255, 0.22);

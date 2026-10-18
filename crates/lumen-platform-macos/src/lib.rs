@@ -8,6 +8,7 @@
 mod ax_drag;
 mod calendar;
 mod edit_surface;
+mod esc_hotkey;
 mod focused_field;
 mod inject;
 mod input_transport;
@@ -24,6 +25,7 @@ pub use calendar::{
     CalendarEventInfo, CALENDAR_LOOKBACK_MINUTES,
 };
 pub use edit_surface::MacAccessibilitySurfaceAdapter;
+pub use esc_hotkey::{esc_cancel_supported, set_esc_cancel_active, set_esc_cancel_handler};
 pub use focused_field::{focused_text_field_snapshot, FocusedTextFieldSnapshot};
 pub use inject::MacTextInjectorBackend;
 pub use input_transport::{input_device_transports, InputDeviceTransport, InputTransport};

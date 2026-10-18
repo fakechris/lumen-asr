@@ -771,6 +771,10 @@ pub fn run() {
             // Log AX status only — wizard/settings open System Settings on demand.
             permissions_cmd::bootstrap_permissions();
 
+            // Esc is only grabbed while a dictation is active; this just wires
+            // the press to the cancel path.
+            dictation::install_esc_cancel(app.handle());
+
             if let Err(e) = hotkey::setup_hotkeys(app.handle()) {
                 tracing::warn!(error = %e, "hotkey setup failed");
             }

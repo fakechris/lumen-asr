@@ -101,6 +101,160 @@ static PHASE: AtomicU8 = AtomicU8::new(PHASE_IDLE);
 static UI_NOTICE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static UI_TRANSITION: Mutex<()> = Mutex::new(());
 static RECORD_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
+static PROCESSING_CANCEL: Mutex<ProcessingCancel> = Mutex::new(ProcessingCancel::new());
+
+/// Cancellation point for the processing stage (ASR → correction → output).
+///
+/// A cancel is accepted only before the pipeline commits to output; once the
+/// paste/copy has been committed it can no longer be retracted, so a late Esc
+/// is ignored rather than leaving a half-reported insertion behind.
+struct ProcessingCancel {
+    session: Option<ProcessingSession>,
+}
+
+struct ProcessingSession {
+    cancelled: bool,
+    committed: bool,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl ProcessingCancel {
+    const fn new() -> Self {
+        Self { session: None }
+    }
+
+    /// Start a processing session; the returned notify fires on cancel.
+    fn arm(&mut self) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.session = Some(ProcessingSession {
+            cancelled: false,
+            committed: false,
+            notify: notify.clone(),
+        });
+        notify
+    }
+
+    /// True when the cancel was accepted (output not committed yet).
+    fn request_cancel(&mut self) -> bool {
+        match self.session.as_mut() {
+            Some(session) if !session.committed => {
+                session.cancelled = true;
+                // notify_one keeps a permit, so a cancel that lands before the
+                // waiter is polled is not lost.
+                session.notify.notify_one();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Commit to producing output. False means the session was cancelled and
+    /// nothing may be pasted or copied. Unarmed callers (UI-driven stop) are
+    /// never cancellable and always commit.
+    fn commit_output(&mut self) -> bool {
+        match self.session.as_mut() {
+            Some(session) if session.cancelled => false,
+            Some(session) => {
+                session.committed = true;
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// End the session; returns whether it was cancelled.
+    fn disarm(&mut self) -> bool {
+        self.session.take().is_some_and(|session| session.cancelled)
+    }
+}
+
+fn processing_cancel() -> std::sync::MutexGuard<'static, ProcessingCancel> {
+    PROCESSING_CANCEL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+const DICTATION_CANCELLED: &str = "dictation cancelled";
+
+/// Esc is grabbed exactly while a dictation is recording or processing.
+fn esc_cancel_wanted(phase: u8) -> bool {
+    phase != PHASE_IDLE
+}
+
+/// Converge the global Esc grab on the current phase. Runs on the main thread
+/// and re-reads the phase there, so out-of-order requests still settle on the
+/// latest state.
+fn sync_esc_cancel(app: &AppHandle) {
+    let result = app.run_on_main_thread(|| {
+        let active = esc_cancel_wanted(PHASE.load(Ordering::SeqCst));
+        if let Err(error) = lumen_platform_macos::set_esc_cancel_active(active) {
+            tracing::warn!(%error, active, "esc cancel hotkey sync failed");
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not schedule esc cancel hotkey sync");
+    }
+}
+
+fn set_phase_idle(app: &AppHandle) {
+    PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+    sync_esc_cancel(app);
+}
+
+/// Wire the global Esc to [`cancel_active_dictation`]. Call once at startup.
+pub fn install_esc_cancel(app: &AppHandle) {
+    let app = app.clone();
+    lumen_platform_macos::set_esc_cancel_handler(move || {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            cancel_active_dictation(&app);
+        });
+    });
+}
+
+/// Cancel the current dictation (Esc). Recording audio is discarded; a
+/// processing pipeline is abandoned before it pastes or copies anything.
+/// Returns false when there was nothing cancellable.
+pub fn cancel_active_dictation(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    {
+        let _transition = UI_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match PHASE.load(Ordering::SeqCst) {
+            PHASE_RECORDING => {
+                if let Err(error) = cancel_recording_inner(&state) {
+                    tracing::warn!(%error, "cancel recording failed");
+                }
+                let _ = take_session_intent();
+                tracing::info!("dictation cancelled while recording (Esc)");
+            }
+            PHASE_PROCESSING => {
+                if !processing_cancel().request_cancel() {
+                    tracing::info!("Esc ignored: dictation output already committed");
+                    return false;
+                }
+                state
+                    .edit_learning
+                    .clear_pending("dictation_cancelled_before_insertion");
+                cancel_pane_target_discovery();
+                tracing::info!("dictation cancelled while processing (Esc)");
+            }
+            _ => return false,
+        }
+        if let Ok(mut started) = RECORD_STARTED.lock() {
+            *started = None;
+        }
+        clear_ui_intent();
+        UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst);
+        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        emit_dictation(app, DictationUiEvent::Cancelled);
+        emit_dictation(app, DictationUiEvent::Idle);
+        crate::capsule::set_capsule_visible(app, false, "cancelled");
+    }
+    sync_esc_cancel(app);
+    true
+}
 
 /// Only discard as bounce if shorter than this *and* almost no audio.
 const BOUNCE_MS: u128 = 80;
@@ -1214,6 +1368,13 @@ pub async fn stop_and_transcribe_inner(
         ));
     }
 
+    // Last point an Esc cancel can win: after this the text may be pasted or
+    // copied, so a cancelled session must stop here without any output.
+    if !processing_cancel().commit_output() {
+        clear_unconsumed_edit_target();
+        return Err(DICTATION_CANCELLED.into());
+    }
+
     // Discovery started with recording. Join it before insertion so the
     // post-insert anchor itself is never delayed by provider probing.
     let mut pane_target = if cfg.inject.auto_insert
@@ -2044,7 +2205,13 @@ fn prewarm_dictation_asr(state: &AppState) {
 
 /// Capsule / hotkey lifecycle events for the UI.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "phase")]
+/// Variant names and their fields are both camelCase (`rename_all` alone only
+/// renames variants, which left `target_language` unreadable by the capsule).
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "phase"
+)]
 pub enum DictationUiEvent {
     Idle,
     Listening {
@@ -2053,11 +2220,14 @@ pub enum DictationUiEvent {
         intent: String,
         /// e.g. "en" when translating
         target_language: Option<String>,
+        /// Global Esc cancels this dictation (capsule shows the hint).
+        esc_cancel: bool,
     },
     Processing {
         message: String,
         intent: String,
         target_language: Option<String>,
+        esc_cancel: bool,
     },
     Done {
         outcome: TranscribeOutcome,
@@ -2140,7 +2310,7 @@ fn finish_with_transient_error(app: &AppHandle, message: String) {
         let _transition = UI_TRANSITION
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        set_phase_idle(app);
         let notice_epoch = UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
         crate::capsule::set_capsule_visible(app, true, "error");
         emit_dictation(app, DictationUiEvent::Error { message });
@@ -2168,7 +2338,7 @@ fn finish_with_transient_fallback(app: &AppHandle, outcome: TranscribeOutcome) {
         let _transition = UI_TRANSITION
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        set_phase_idle(app);
         let notice_epoch = UI_NOTICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
         crate::capsule::set_capsule_visible(app, true, "fallback");
         emit_dictation(app, DictationUiEvent::Done { outcome });
@@ -2315,6 +2485,14 @@ pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> 
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if PHASE.load(Ordering::SeqCst) != PHASE_RECORDING || !state.audio.is_recording() {
+                if PHASE.load(Ordering::SeqCst) == PHASE_IDLE && state.audio.is_recording() {
+                    // Esc landed while capture was still starting: nobody else
+                    // will stop this capture, so discard it here.
+                    tracing::info!("dictation cancelled during start; discarding capture");
+                    if let Err(error) = cancel_recording_inner(&state) {
+                        tracing::warn!(%error, "discarding cancelled capture failed");
+                    }
+                }
                 tracing::debug!("recording ended before start feedback was published");
                 return Ok(());
             }
@@ -2332,8 +2510,10 @@ pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> 
                     message: format!("按住·{intent_label}"),
                     intent: intent_kind,
                     target_language: target_lang,
+                    esc_cancel: lumen_platform_macos::esc_cancel_supported(),
                 },
             );
+            sync_esc_cancel(&app);
             spawn_vad_autostop(&app);
             Ok(())
         }
@@ -2384,7 +2564,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
         if let Ok(mut g) = RECORD_STARTED.lock() {
             *g = None;
         }
-        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        set_phase_idle(&app);
         emit_dictation(&app, DictationUiEvent::Idle);
         return Ok(());
     }
@@ -2394,7 +2574,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
         if let Ok(mut g) = RECORD_STARTED.lock() {
             *g = None;
         }
-        PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+        set_phase_idle(&app);
         return Ok(());
     }
 
@@ -2416,12 +2596,26 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
             message: processing_msg,
             intent: intent_kind,
             target_language: target_lang,
+            esc_cancel: lumen_platform_macos::esc_cancel_supported(),
         },
     );
     // Keep capsule visible during processing so user sees work in progress.
     crate::capsule::set_capsule_visible(&app, true, "processing");
 
-    let result = stop_and_transcribe_inner(&state, true, Some(&app)).await;
+    // Esc stays grabbed through processing (no-op if listening already did it).
+    sync_esc_cancel(&app);
+    let cancelled = processing_cancel().arm();
+    let result = tokio::select! {
+        result = stop_and_transcribe_inner(&state, true, Some(&app)) => Some(result),
+        _ = cancelled.notified() => None,
+    };
+    // A cancel accepted while the pipeline was finishing still wins: its UI and
+    // phase were already reset, and a new dictation may own them by now.
+    let was_cancelled = processing_cancel().disarm();
+    let Some(result) = result.filter(|_| !was_cancelled) else {
+        tracing::info!("dictation processing cancelled; output discarded");
+        return Ok(());
+    };
     if let Ok(mut g) = RECORD_STARTED.lock() {
         *g = None;
     }
@@ -2435,7 +2629,7 @@ pub async fn dictation_stop(app: AppHandle) -> Result<(), String> {
                 crate::capsule::set_capsule_visible(&app, false, "idle");
                 emit_dictation(&app, DictationUiEvent::Done { outcome });
                 emit_dictation(&app, DictationUiEvent::Idle);
-                PHASE.store(PHASE_IDLE, Ordering::SeqCst);
+                set_phase_idle(&app);
             }
             Ok(())
         }
@@ -2461,6 +2655,98 @@ pub async fn toggle_dictation(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn toggle_dictation_cmd(app: AppHandle) -> Result<(), String> {
     toggle_dictation(app).await
+}
+
+#[cfg(test)]
+mod esc_cancel_tests {
+    use super::*;
+
+    #[test]
+    fn esc_is_grabbed_only_while_recording_or_processing() {
+        assert!(!esc_cancel_wanted(PHASE_IDLE));
+        assert!(esc_cancel_wanted(PHASE_RECORDING));
+        assert!(esc_cancel_wanted(PHASE_PROCESSING));
+    }
+
+    #[test]
+    fn cancel_before_commit_blocks_output_and_wakes_the_pipeline() {
+        let mut gate = ProcessingCancel::new();
+        let notify = gate.arm();
+        assert!(gate.request_cancel());
+        assert!(
+            !gate.commit_output(),
+            "a cancelled session must never paste"
+        );
+        assert!(gate.disarm());
+        // The stored permit resolves immediately even though nobody was waiting.
+        let woke = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_millis(50), notify.notified())
+                    .await
+                    .is_ok()
+            });
+        assert!(woke);
+    }
+
+    #[test]
+    fn cancel_after_commit_is_rejected_and_output_proceeds() {
+        let mut gate = ProcessingCancel::new();
+        gate.arm();
+        assert!(gate.commit_output());
+        assert!(!gate.request_cancel());
+        assert!(!gate.disarm());
+    }
+
+    #[test]
+    fn unarmed_gate_ignores_cancel_and_always_commits() {
+        let mut gate = ProcessingCancel::new();
+        assert!(!gate.request_cancel());
+        assert!(gate.commit_output());
+        assert!(!gate.disarm());
+    }
+
+    #[test]
+    fn rearming_starts_a_fresh_uncancelled_session() {
+        let mut gate = ProcessingCancel::new();
+        gate.arm();
+        assert!(gate.request_cancel());
+        assert!(gate.disarm());
+        gate.arm();
+        assert!(gate.commit_output());
+        assert!(!gate.disarm());
+    }
+
+    #[test]
+    fn active_phase_events_advertise_esc_cancel() {
+        let value = serde_json::to_value(DictationUiEvent::Listening {
+            message: "按住·整理".into(),
+            intent: "default".into(),
+            target_language: None,
+            esc_cancel: true,
+        })
+        .unwrap();
+        assert_eq!(value["phase"], "listening");
+        assert_eq!(value["escCancel"], true);
+        let value = serde_json::to_value(DictationUiEvent::Cancelled).unwrap();
+        assert_eq!(value["phase"], "cancelled");
+    }
+
+    #[test]
+    fn ui_event_fields_are_camel_case_for_the_capsule() {
+        let value = serde_json::to_value(DictationUiEvent::Processing {
+            message: "翻译中".into(),
+            intent: "translate".into(),
+            target_language: Some("en".into()),
+            esc_cancel: false,
+        })
+        .unwrap();
+        assert_eq!(value["phase"], "processing");
+        assert_eq!(value["targetLanguage"], "en");
+        assert!(value.get("target_language").is_none());
+    }
 }
 
 #[cfg(test)]
