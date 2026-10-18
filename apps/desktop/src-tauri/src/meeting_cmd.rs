@@ -2565,13 +2565,24 @@ async fn process_meeting_pipeline(
         store
             .save_summary(&marker)
             .map_err(|e| format!("save no-llm marker: {e}"))?;
+        // A deterministic, keyword-extracted recap (decisions / commitments
+        // quoted with speaker and time, or opening and closing excerpts) so
+        // the 纪要 column is not empty. Saved after the marker: the marker is a
+        // `summary` row, and saving one supersedes any local recap. Real
+        // minutes replace it the same way once an LLM is configured and the
+        // meeting is reprocessed. Best-effort: the transcript is already
+        // stored, so a recap failure is logged only.
+        if let Err(error) = save_local_recap(&store, meeting_id) {
+            tracing::warn!(meeting_id = %meeting_id, %error, "local recap not saved");
+        }
     }
 
     // Completion heads-up (best-effort — never affects the pipeline outcome):
     // stash the meeting id so a later macOS dock / notification click can
     // navigate the front-end back here, and post a system notification with
-    // the resulting stats (duration / transcript / minutes, 豆包-style). The
-    // no-LLM sentinel marker is not real minutes, so it is not counted.
+    // the resulting stats (duration / transcript / minutes). The
+    // no-LLM sentinel marker and the local recap are not real minutes, so
+    // neither is counted.
     let stored = store.get_meeting(meeting_id).ok().flatten();
     let transcript_chars = store
         .list_segments(meeting_id)
@@ -2603,6 +2614,22 @@ async fn process_meeting_pipeline(
         }
     }
     crate::app_notifications::notify_minutes_ready(app, &stats);
+    Ok(())
+}
+
+/// Build and store the local recap for a transcript-only meeting.
+fn save_local_recap(store: &Store, meeting_id: Uuid) -> Result<(), String> {
+    let segments = store
+        .list_segments(meeting_id)
+        .map_err(|e| format!("list segments: {e}"))?;
+    let speakers = store
+        .list_speakers(meeting_id)
+        .map_err(|e| format!("list speakers: {e}"))?;
+    if let Some(recap) = lumen_meeting::local_recap_summary(meeting_id, &segments, &speakers) {
+        store
+            .save_summary(&recap)
+            .map_err(|e| format!("save local recap: {e}"))?;
+    }
     Ok(())
 }
 
