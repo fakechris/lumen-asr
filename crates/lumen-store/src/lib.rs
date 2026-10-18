@@ -219,8 +219,16 @@ pub struct PipelineIdentity {
     pub temperature: Option<f64>,
     pub dictionary_context_hash: Option<String>,
     pub dictionary_context_hash_algorithm: Option<String>,
+    /// Terms injected into the corrector prompt (covered by the hash).
     pub dictionary_term_count: u32,
+    /// Replacement rules injected into the corrector prompt (covered by the hash).
     pub dictionary_replacement_count: u32,
+    /// Confirmed terms available before the prompt budget selected a subset.
+    /// Zero on records written before the budget existed.
+    pub dictionary_total_term_count: u32,
+    /// Confirmed replacement rules available before the prompt budget.
+    /// Zero on records written before the budget existed.
+    pub dictionary_total_replacement_count: u32,
     pub enhancement_mode: EnhancementMode,
 }
 
@@ -242,6 +250,8 @@ impl Default for PipelineIdentity {
             dictionary_context_hash_algorithm: None,
             dictionary_term_count: 0,
             dictionary_replacement_count: 0,
+            dictionary_total_term_count: 0,
+            dictionary_total_replacement_count: 0,
             enhancement_mode: EnhancementMode::None,
         }
     }

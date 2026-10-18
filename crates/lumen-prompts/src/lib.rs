@@ -758,17 +758,34 @@ pub fn transcript_cleanup_user_message(nonce: &str, marked_segments: &str) -> St
     )
 }
 
+/// Label that opens the term line of the rendered dictionary block.
+pub const DICTIONARY_TERMS_LABEL: &str = "术语（优先使用标准写法）：";
+/// Separator between terms on the term line.
+pub const DICTIONARY_TERM_SEPARATOR: &str = "、";
+/// Label that opens the replacement line of the rendered dictionary block.
+pub const DICTIONARY_REPLACEMENTS_LABEL: &str = "替换规则：";
+/// Arrow between `from` and `to` inside one replacement rule.
+pub const DICTIONARY_REPLACEMENT_ARROW: &str = "→";
+/// Separator between replacement rules on the replacement line.
+pub const DICTIONARY_REPLACEMENT_SEPARATOR: &str = "；";
+
 pub fn format_dictionary_block(terms: &[String], replacements: &[(String, String)]) -> String {
     let mut parts = Vec::new();
     if !terms.is_empty() {
-        parts.push(format!("术语（优先使用标准写法）：{}", terms.join("、")));
+        parts.push(format!(
+            "{DICTIONARY_TERMS_LABEL}{}",
+            terms.join(DICTIONARY_TERM_SEPARATOR)
+        ));
     }
     if !replacements.is_empty() {
         let pairs: Vec<String> = replacements
             .iter()
-            .map(|(f, t)| format!("{f}→{t}"))
+            .map(|(f, t)| format!("{f}{DICTIONARY_REPLACEMENT_ARROW}{t}"))
             .collect();
-        parts.push(format!("替换规则：{}", pairs.join("；")));
+        parts.push(format!(
+            "{DICTIONARY_REPLACEMENTS_LABEL}{}",
+            pairs.join(DICTIONARY_REPLACEMENT_SEPARATOR)
+        ));
     }
     parts.join("\n")
 }
