@@ -857,18 +857,27 @@ impl Store {
     /// Saving final minutes ([`SummaryKind::Summary`]) also deletes any
     /// [`SummaryKind::MinutesDraft`] for the meeting in the same transaction,
     /// so a reader never sees both and a draft never outlives the real result.
+    /// It deletes any [`SummaryKind::LocalRecap`] the same way.
+    ///
+    /// Saving a [`SummaryKind::LocalRecap`] replaces an earlier one.
+    ///
+    /// The no-LLM sentinel is also a `Summary` row, so a caller writing both
+    /// the sentinel and a local recap must save the sentinel first.
     pub fn save_summary(&self, summary: &MeetingSummary) -> Result<()> {
+        let meeting_id = summary.meeting_id.to_string();
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        insert_summary(&transaction, summary)?;
-        if summary.kind == SummaryKind::Summary {
+        let superseded: &[SummaryKind] = match summary.kind {
+            SummaryKind::Summary => &[SummaryKind::MinutesDraft, SummaryKind::LocalRecap],
+            SummaryKind::LocalRecap => &[SummaryKind::LocalRecap],
+            _ => &[],
+        };
+        for kind in superseded {
             transaction.execute(
                 "DELETE FROM meeting_summaries WHERE meeting_id=?1 AND kind=?2",
-                params![
-                    summary.meeting_id.to_string(),
-                    SummaryKind::MinutesDraft.as_str()
-                ],
+                params![meeting_id, kind.as_str()],
             )?;
         }
+        insert_summary(&transaction, summary)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1844,6 +1853,84 @@ mod tests {
 
         store.clear_meeting_transcript(meeting.id).unwrap();
         assert_eq!(kinds(&store, meeting.id), vec![SummaryKind::MinutesDraft]);
+    }
+
+    fn local_recap(meeting_id: Uuid, content: &str) -> MeetingSummary {
+        MeetingSummary::new(meeting_id, SummaryKind::LocalRecap, content)
+    }
+
+    #[test]
+    fn final_minutes_replace_a_local_recap() {
+        // No LLM at first: the sentinel, then the recap. After the user
+        // configures an LLM, final minutes supersede the recap.
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        store
+            .save_summary(&MeetingSummary::new(
+                meeting.id,
+                SummaryKind::Summary,
+                r#"{"skipped_no_llm":true}"#,
+            ))
+            .unwrap();
+        store
+            .save_summary(&local_recap(meeting.id, "recap"))
+            .unwrap();
+        assert_eq!(
+            kinds(&store, meeting.id),
+            vec![SummaryKind::LocalRecap, SummaryKind::Summary]
+        );
+
+        store
+            .save_summary(&MeetingSummary::new(
+                meeting.id,
+                SummaryKind::Summary,
+                "final",
+            ))
+            .unwrap();
+        let rows = store.list_summaries(meeting.id).unwrap();
+        assert!(rows.iter().all(|r| r.kind != SummaryKind::LocalRecap));
+        assert!(rows.iter().any(|r| r.content == "final"));
+    }
+
+    #[test]
+    fn newer_local_recap_replaces_older_one_and_keeps_other_rows() {
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        store
+            .save_summary(&MeetingSummary::new(
+                meeting.id,
+                SummaryKind::Summary,
+                r#"{"skipped_no_llm":true}"#,
+            ))
+            .unwrap();
+        store.save_summary(&local_recap(meeting.id, "one")).unwrap();
+        store.save_summary(&local_recap(meeting.id, "two")).unwrap();
+
+        let recap = store
+            .get_summary(meeting.id, SummaryKind::LocalRecap)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recap.content, "two");
+        assert_eq!(
+            kinds(&store, meeting.id),
+            vec![SummaryKind::LocalRecap, SummaryKind::Summary]
+        );
+    }
+
+    #[test]
+    fn clearing_the_transcript_drops_the_local_recap() {
+        // A reprocess regenerates the recap (or real minutes) from the new
+        // transcript; a stale recap must not survive the clear.
+        let (_dir, store) = open_store();
+        let meeting = Meeting::new();
+        store.create_meeting(&meeting).unwrap();
+        store
+            .save_summary(&local_recap(meeting.id, "recap"))
+            .unwrap();
+        store.clear_meeting_transcript(meeting.id).unwrap();
+        assert!(kinds(&store, meeting.id).is_empty());
     }
 
     #[test]

@@ -37,6 +37,7 @@ mod pipeline;
 mod preflight;
 mod process;
 mod progress;
+pub mod recap;
 #[cfg(all(target_os = "macos", feature = "diarize"))]
 mod self_enroll;
 mod spread;
@@ -84,6 +85,7 @@ pub use progress::{
     overall_percent, ProcessingPlan, ProcessingProgress, ProcessingStage, ProcessingTrack,
     ProgressReporter,
 };
+pub use recap::{build_local_recap, local_recap_summary};
 #[cfg(all(target_os = "macos", feature = "diarize"))]
 pub use self_enroll::embed_voiced_region;
 pub use spread::{

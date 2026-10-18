@@ -549,7 +549,8 @@ export type SummaryKind =
   | "summary"
   | "action_items"
   | "decisions"
-  | "minutes_draft";
+  | "minutes_draft"
+  | "local_recap";
 
 /** A stored generated summary. For `kind === "summary"`, `content` is Minutes JSON. */
 export type MeetingSummary = {

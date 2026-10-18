@@ -121,19 +121,38 @@ fn range_hint(start: f64, end: f64) -> String {
 
 // ── 会议纪要.md ───────────────────────────────────────────────────────
 
+/// Heading note for an exported local recap (no LLM configured).
+const LOCAL_RECAP_EXPORT_NOTE: &str =
+    "> 本地摘要（未配置 AI）：按关键词从逐字稿中摘录，并非 AI 生成的会议纪要。\n\n";
+
 fn render_minutes_md(detail: &MeetingDetail) -> String {
     let title = detail.meeting.title.as_deref().unwrap_or("未命名会议");
     let mut out = format!("# {title}\n\n");
 
-    let minutes: Option<Minutes> = detail
-        .summaries
-        .iter()
-        .find(|s| s.kind == SummaryKind::Summary)
-        .and_then(|s| parse_minutes(&s.content).ok());
-
-    let Some(minutes) = minutes else {
-        out.push_str("> 暂无纪要（尚未生成或生成失败）。\n");
-        return out;
+    // Real minutes win. Without them (none generated, or only the no-LLM
+    // sentinel, which parses as an empty document) a local recap is exported
+    // in their place, clearly labelled — it is all the meeting has, and the
+    // label keeps it from passing for AI minutes.
+    let parsed = |kind: SummaryKind| -> Option<Minutes> {
+        detail
+            .summaries
+            .iter()
+            .find(|s| s.kind == kind)
+            .and_then(|s| parse_minutes(&s.content).ok())
+            .filter(|m| !m.is_empty())
+    };
+    let minutes = match parsed(SummaryKind::Summary) {
+        Some(minutes) => minutes,
+        None => match parsed(SummaryKind::LocalRecap) {
+            Some(recap) => {
+                out.push_str(LOCAL_RECAP_EXPORT_NOTE);
+                recap
+            }
+            None => {
+                out.push_str("> 暂无纪要（尚未生成或生成失败）。\n");
+                return out;
+            }
+        },
     };
 
     if !minutes.one_liner.trim().is_empty() {
@@ -377,6 +396,52 @@ mod tests {
     fn minutes_md_without_summary_notes_absence() {
         let mut detail = fixture();
         detail.summaries.clear();
+        let out = export_meeting(&detail, ExportPreset::MinutesMd).unwrap();
+        assert!(out.content.contains("暂无纪要"));
+    }
+
+    fn recap_row(mid: Uuid) -> MeetingSummary {
+        MeetingSummary::new(
+            mid,
+            SummaryKind::LocalRecap,
+            r#"{"decisions":[{"text":"S2：决定发布 beta。","source":{"start":6.0,"end":9.0}}]}"#,
+        )
+    }
+
+    #[test]
+    fn minutes_md_prefers_real_minutes_over_a_local_recap() {
+        let mut detail = fixture();
+        let mid = detail.meeting.id;
+        detail.summaries.insert(0, recap_row(mid));
+        let out = export_meeting(&detail, ExportPreset::MinutesMd).unwrap();
+        assert!(out.content.contains("- 发布 beta  `00:03–00:06`"));
+        assert!(!out.content.contains("本地摘要"));
+        assert!(!out.content.contains("S2：决定发布 beta。"));
+    }
+
+    #[test]
+    fn minutes_md_exports_a_labelled_local_recap_when_no_minutes_exist() {
+        let mut detail = fixture();
+        let mid = detail.meeting.id;
+        detail.summaries = vec![
+            MeetingSummary::new(mid, SummaryKind::Summary, r#"{"skipped_no_llm":true}"#),
+            recap_row(mid),
+        ];
+        let out = export_meeting(&detail, ExportPreset::MinutesMd).unwrap();
+        assert!(out.content.contains("本地摘要（未配置 AI）"));
+        assert!(out.content.contains("- S2：决定发布 beta。  `00:06–00:09`"));
+        assert!(!out.content.contains("暂无纪要"));
+    }
+
+    #[test]
+    fn minutes_md_with_only_the_no_llm_sentinel_notes_absence() {
+        let mut detail = fixture();
+        let mid = detail.meeting.id;
+        detail.summaries = vec![MeetingSummary::new(
+            mid,
+            SummaryKind::Summary,
+            r#"{"skipped_no_llm":true}"#,
+        )];
         let out = export_meeting(&detail, ExportPreset::MinutesMd).unwrap();
         assert!(out.content.contains("暂无纪要"));
     }

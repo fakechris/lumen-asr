@@ -12,7 +12,11 @@ import {
 } from "./meetingModels";
 import { Icon } from "./Icons";
 import { diarGuidance, isNoLlmMarker } from "./meetingGuidance";
-import { draftMinutesLabel, pickMinutesRow } from "./meetingDraft";
+import {
+  minutesOriginLabel,
+  pickMinutesRow,
+  type MinutesOrigin,
+} from "./meetingDraft";
 import { isMeaningfulMeetingTrim } from "./meetingTrim";
 import { buildSpeakerColorMap, colorForSpeaker } from "./speakerColors";
 import type {
@@ -147,11 +151,11 @@ function noLlmMinutes(detail: MeetingDetail): boolean {
 }
 
 /** Parse the structured Minutes JSON to render: the final `summary`-kind row,
- * or the live-transcript draft while there is none (`draft: true`). Returns
- * null for the no-LLM sentinel so it is never rendered as real minutes. */
+ * else the live-transcript draft, else the local recap (see `pickMinutesRow`
+ * for the order). The no-LLM sentinel is never rendered as real minutes. */
 function parseMinutes(
   detail: MeetingDetail,
-): { minutes: Minutes; draft: boolean } | null {
+): { minutes: Minutes; origin: MinutesOrigin } | null {
   const row = pickMinutesRow(detail.summaries);
   if (!row) return null;
   try {
@@ -164,7 +168,7 @@ function parseMinutes(
         discussion: raw.discussion ?? [],
         open_questions: raw.open_questions ?? [],
       },
-      draft: row.draft,
+      origin: row.origin,
     };
   } catch {
     return null;
@@ -2443,12 +2447,15 @@ function MeetingDetailView({
     [detail],
   );
   const minutes = parsedMinutes?.minutes ?? null;
-  // Draft minutes (from the live transcript) carry a label until the final
-  // minutes replace them; null when showing final minutes or none.
-  const minutesDraftLabel =
-    parsedMinutes?.draft && status
-      ? draftMinutesLabel(isInProgress(status))
+  // Draft minutes (from the live transcript) and the local recap (no LLM
+  // configured) carry a label until final minutes replace them; null when
+  // showing final minutes or none.
+  const minutesOrigin = parsedMinutes?.origin ?? null;
+  const minutesLabel =
+    minutesOrigin && status
+      ? minutesOriginLabel(minutesOrigin, isInProgress(status))
       : null;
+  const localRecap = minutesOrigin === "local_recap";
 
   const jumpToSource = useCallback((src: SourceRef) => {
     // Transcript is already visible; just (re)scroll it to the source turn.
@@ -2805,7 +2812,8 @@ function MeetingDetailView({
               <MinutesIndex
                 detail={detail}
                 minutes={minutes}
-                draftLabel={minutesDraftLabel}
+                originLabel={minutesLabel}
+                localRecap={localRecap}
                 onJump={jumpToSource}
                 onNavigate={onNavigate}
                 onOpenFull={() => setFullOpen(true)}
@@ -2842,7 +2850,8 @@ function MeetingDetailView({
       {fullOpen && detail && minutes && (
         <MinutesFullModal
           minutes={minutes}
-          draftLabel={minutesDraftLabel}
+          originLabel={minutesLabel}
+          localRecap={localRecap}
           onJump={(src) => {
             setFullOpen(false);
             jumpToSource(src);
@@ -3079,7 +3088,8 @@ function actionSub(item: ActionItem): string {
 function MinutesIndex({
   detail,
   minutes,
-  draftLabel,
+  originLabel,
+  localRecap,
   onJump,
   onNavigate,
   onOpenFull,
@@ -3088,8 +3098,11 @@ function MinutesIndex({
 }: {
   detail: MeetingDetail;
   minutes: Minutes | null;
-  /** Set when `minutes` is the live-transcript draft, not the final minutes. */
-  draftLabel: string | null;
+  /** Set when `minutes` is the live-transcript draft or the local recap, not
+   * the final minutes. */
+  originLabel: string | null;
+  /** `minutes` is the keyword-extracted local recap (no LLM configured). */
+  localRecap: boolean;
   onJump: (src: SourceRef) => void;
   onNavigate?: (tab: TabId) => void;
   onOpenFull: () => void;
@@ -3167,10 +3180,27 @@ function MinutesIndex({
 
       {guide}
 
-      {hasMinutes && draftLabel && (
+      {hasMinutes && originLabel && (
         <p className="muted-text meeting-index-note meeting-draft-label">
-          {draftLabel}
+          {originLabel}
         </p>
+      )}
+
+      {hasMinutes && localRecap && (
+        <div className="meeting-index-note">
+          <p className="muted-text">
+            以下内容按关键词从逐字稿中摘录，并非 AI 总结。配置语言模型并重新处理后，将替换为会议纪要。
+          </p>
+          {onNavigate && (
+            <button
+              type="button"
+              className="btn small meeting-config-llm"
+              onClick={() => onNavigate("settings")}
+            >
+              去设置配置 LLM
+            </button>
+          )}
+        </div>
       )}
 
       {hasMinutes && (
@@ -3203,7 +3233,7 @@ function MinutesIndex({
                   <IndexItem
                     key={i}
                     text={a.text}
-                    sub={actionSub(a)}
+                    sub={localRecap ? undefined : actionSub(a)}
                     source={a.source}
                     onJump={onJump}
                   />
@@ -3214,7 +3244,9 @@ function MinutesIndex({
 
           {minutes!.discussion.length > 0 && (
             <section className="meeting-index-sec">
-              <h4 className="meeting-index-title">关键讨论</h4>
+              <h4 className="meeting-index-title">
+                {localRecap ? "原文摘录" : "关键讨论"}
+              </h4>
               <ul className="meeting-index-list">
                 {minutes!.discussion.map((d, i) => (
                   <IndexItem
@@ -3620,12 +3652,14 @@ function MeetingSideInfo({
  * chips still jump into the transcript behind it, closing the overlay first. */
 function MinutesFullModal({
   minutes,
-  draftLabel,
+  originLabel,
+  localRecap,
   onJump,
   onClose,
 }: {
   minutes: Minutes;
-  draftLabel: string | null;
+  originLabel: string | null;
+  localRecap: boolean;
   onJump: (src: SourceRef) => void;
   onClose: () => void;
 }) {
@@ -3663,8 +3697,8 @@ function MinutesFullModal({
           </button>
         </div>
         <div className="meeting-modal-body">
-          {draftLabel && (
-            <p className="muted-text meeting-draft-label">{draftLabel}</p>
+          {originLabel && (
+            <p className="muted-text meeting-draft-label">{originLabel}</p>
           )}
           {minutes.one_liner.trim() && (
             <section className="meeting-sec">
@@ -3694,7 +3728,7 @@ function MinutesFullModal({
                   <li key={i} className="meeting-item">
                     <div className="meeting-item-body">
                       <span className="meeting-item-text">{a.text}</span>
-                      <ActionMeta item={a} />
+                      {!localRecap && <ActionMeta item={a} />}
                     </div>
                     <SourceChip source={a.source} onJump={onJump} />
                   </li>
@@ -3705,7 +3739,9 @@ function MinutesFullModal({
 
           {minutes.discussion.length > 0 && (
             <section className="meeting-sec">
-              <h3 className="meeting-sec-title">关键讨论</h3>
+              <h3 className="meeting-sec-title">
+                {localRecap ? "原文摘录" : "关键讨论"}
+              </h3>
               <ul className="meeting-itemlist">
                 {minutes.discussion.map((d, i) => (
                   <li key={i} className="meeting-item">

@@ -386,6 +386,11 @@ pub enum SummaryKind {
     /// while the offline pipeline runs. Same JSON shape as [`Self::Summary`];
     /// superseded (deleted) as soon as final minutes are saved.
     MinutesDraft,
+    /// Keyword-extracted recap built locally when no LLM is configured (quoted
+    /// decision / commitment sentences, or opening and closing excerpts). Same
+    /// JSON shape as [`Self::Summary`]; superseded (deleted) as soon as final
+    /// minutes are saved. Never counted as minutes for notifications.
+    LocalRecap,
 }
 
 impl SummaryKind {
@@ -396,6 +401,7 @@ impl SummaryKind {
             Self::ActionItems => "action_items",
             Self::Decisions => "decisions",
             Self::MinutesDraft => "minutes_draft",
+            Self::LocalRecap => "local_recap",
         }
     }
 
@@ -405,6 +411,7 @@ impl SummaryKind {
             "action_items" => Self::ActionItems,
             "decisions" => Self::Decisions,
             "minutes_draft" => Self::MinutesDraft,
+            "local_recap" => Self::LocalRecap,
             _ => Self::Summary,
         }
     }
@@ -556,6 +563,7 @@ mod tests {
             SummaryKind::ActionItems,
             SummaryKind::Decisions,
             SummaryKind::MinutesDraft,
+            SummaryKind::LocalRecap,
         ] {
             assert_eq!(SummaryKind::from_str_or_summary(kind.as_str()), kind);
         }
