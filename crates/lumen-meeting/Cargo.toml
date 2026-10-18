@@ -17,6 +17,8 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 lumen-core = { workspace = true }
+# Local-date handling for "ask past meetings" (relative dates, created-at range).
+chrono = { workspace = true }
 lumen-store = { workspace = true }
 lumen-transcript = { workspace = true }
 # Speaker-identity library (voiceprint enroll/match). Pure logic + local JSON
@@ -57,5 +59,3 @@ diarize = ["dep:diar-rs"]
 [dev-dependencies]
 lumen-asr-engine = { workspace = true }
 async-trait = { workspace = true }
-# Deterministic `created_at` stamps in the annotation-reconciliation tests.
-chrono = { workspace = true }

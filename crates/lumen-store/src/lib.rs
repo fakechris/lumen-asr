@@ -6,7 +6,8 @@ mod schema;
 
 pub use meeting::{EnrollConflictRecord, NewEnrollConflict};
 pub use meeting_search::{
-    MeetingSearchField, MeetingSearchHit, SEARCH_SNIPPET_MARK_END, SEARCH_SNIPPET_MARK_START,
+    MeetingRecallHit, MeetingSearchField, MeetingSearchHit, RECALL_MAX_SEGMENTS,
+    SEARCH_SNIPPET_MARK_END, SEARCH_SNIPPET_MARK_START,
 };
 
 use anyhow::{Context, Result};

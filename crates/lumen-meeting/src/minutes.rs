@@ -123,7 +123,7 @@ pub enum MinutesError {
 /// Tolerant on purpose: models wrap JSON in prose or ```json fences. Taking the
 /// first `{` through the last `}` recovers the object in the common cases
 /// without a streaming parser.
-fn extract_json_object(raw: &str) -> Option<&str> {
+pub(crate) fn extract_json_object(raw: &str) -> Option<&str> {
     let start = raw.find('{')?;
     let end = raw.rfind('}')?;
     (end > start).then(|| &raw[start..=end])
@@ -137,7 +137,7 @@ fn extract_json_object(raw: &str) -> Option<&str> {
 /// non-whitespace character can follow a string (`,` `}` `]` `:` or the end);
 /// otherwise it is escaped as content. Only applied after a strict parse has
 /// failed, so valid output is never touched.
-fn repair_json(json: &str) -> String {
+pub(crate) fn repair_json(json: &str) -> String {
     let chars: Vec<char> = json.chars().collect();
     let mut out = String::with_capacity(json.len() + 16);
     let mut in_string = false;

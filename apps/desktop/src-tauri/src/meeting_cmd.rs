@@ -3050,6 +3050,43 @@ pub fn search_meetings(
     })
 }
 
+/// Ask a question across past meetings ("问会议"). With an LLM configured
+/// (the same gate and client as the minutes step), the question is turned into
+/// keywords and a local date range, the best matching meetings are recalled,
+/// and the answer cites `[[m:<meeting_id>@<ms>]]` markers. Without one, the
+/// heuristic recall is returned with `used_llm = false` instead of an error.
+#[tauri::command]
+pub async fn ask_meetings(
+    state: State<'_, AppState>,
+    question: String,
+) -> Result<lumen_meeting::ask::AskResult, String> {
+    let corrector_cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?
+        .corrector
+        .clone();
+    let corrector = if corrector_cfg.enabled && corrector_cfg.provider != "none" {
+        Some(crate::corrector_svc::build_corrector(&corrector_cfg)?)
+    } else {
+        None
+    };
+    let corrector: Option<&dyn lumen_corrector::Corrector> = match &corrector {
+        Some(boxed) => Some(boxed.as_ref()),
+        None => None,
+    };
+    let now = chrono::Local::now();
+    // The store lock is held only inside the synchronous recall, never across
+    // an LLM call.
+    lumen_meeting::ask::ask_meetings(corrector, &question, &now, |query| {
+        with_store(&state, |s| {
+            lumen_meeting::ask::load_materials(s, query, lumen_meeting::ask::ASK_MAX_MEETINGS)
+                .map_err(|e| e.to_string())
+        })
+    })
+    .await
+}
+
 /// Read one meeting with its speakers, `seq`-ordered segments, and summaries.
 #[tauri::command]
 pub fn get_meeting_detail(
