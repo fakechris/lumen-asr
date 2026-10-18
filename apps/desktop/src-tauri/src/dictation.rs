@@ -465,6 +465,23 @@ fn copied_toast_notice() -> String {
     "已复制".into()
 }
 
+/// The paste verifiably did not reach the focused field, so the text was left
+/// on the clipboard. Unlike a plain copy, the user has to act on this.
+fn paste_not_landed_notice() -> String {
+    "未能插入，已复制到剪贴板".into()
+}
+
+/// Notice for an insert that returned an outcome (not an error).
+fn insert_outcome_notice(outcome: &lumen_inject::InsertOutcome) -> Option<String> {
+    if outcome.paste_not_landed {
+        Some(paste_not_landed_notice())
+    } else if insertion_outcome_for_strategy(outcome.strategy) == InsertionOutcome::Copied {
+        Some(copied_toast_notice())
+    } else {
+        None
+    }
+}
+
 fn copy_only_fallback_notice(clipboard_copied: bool) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -1483,8 +1500,19 @@ pub async fn stop_and_transcribe_inner(
                     insert_strategy = out.strategy;
                     insertion_outcome = insertion_outcome_for_strategy(insert_strategy);
                     did_insert = insertion_outcome == InsertionOutcome::Inserted;
-                    if insertion_outcome == InsertionOutcome::Copied {
-                        insert_notice = Some(copied_toast_notice());
+                    insert_notice = insert_outcome_notice(&out);
+                    if out.paste_not_landed {
+                        let message =
+                            "paste did not reach the focused field after one retry; text left on clipboard";
+                        notes.push(message.into());
+                        attempt
+                            .pipeline_metrics
+                            .stage_issues
+                            .push(PipelineStageIssue {
+                                stage: PipelineStage::Insert,
+                                kind: PipelineIssueKind::InjectionFailure,
+                                message: message.into(),
+                            });
                     }
                     tracing::info!(
                         ?insert_strategy,
@@ -2850,6 +2878,31 @@ mod attempt_metric_tests {
         assert_eq!(
             insertion_outcome_for_strategy(InsertStrategy::None),
             InsertionOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn paste_that_did_not_land_tells_the_user_it_was_copied() {
+        let outcome = |strategy, paste_not_landed| lumen_inject::InsertOutcome {
+            strategy,
+            restored_clipboard: false,
+            paste_not_landed,
+        };
+        assert_eq!(
+            insert_outcome_notice(&outcome(InsertStrategy::CopyOnly, true)).as_deref(),
+            Some("未能插入，已复制到剪贴板")
+        );
+        assert_eq!(
+            insert_outcome_notice(&outcome(InsertStrategy::CopyOnly, false)).as_deref(),
+            Some("已复制")
+        );
+        assert_eq!(
+            insert_outcome_notice(&outcome(InsertStrategy::Paste, false)),
+            None
+        );
+        assert_eq!(
+            insertion_outcome_for_strategy(InsertStrategy::CopyOnly),
+            InsertionOutcome::Copied
         );
     }
 

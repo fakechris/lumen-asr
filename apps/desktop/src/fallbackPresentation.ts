@@ -51,9 +51,14 @@ export function dictationDoneNotice(opts: {
   return parts.length > 0 ? parts.join(" ") : null;
 }
 
+/** Shown when a paste verifiably did not land and the text stayed on the clipboard. */
+export const PASTE_NOT_LANDED_NOTICE = "未能插入，已复制到剪贴板";
+
 /** Floating overlay copy confirmation. Longer insert help stays on the capsule. */
 export function copyToastLabel(insertNotice?: string | null): string | null {
   if (!insertNotice?.includes("已复制")) return null;
+  // A failed insert must not read like a successful copy-only result.
+  if (insertNotice.startsWith(PASTE_NOT_LANDED_NOTICE)) return PASTE_NOT_LANDED_NOTICE;
   return "已复制";
 }
 

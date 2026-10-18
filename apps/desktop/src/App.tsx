@@ -20,6 +20,7 @@ import {
 } from "./microphoneConsent";
 import {
   copyToastLabel,
+  PASTE_NOT_LANDED_NOTICE,
   correctorFallbackNotice,
   correctorFallbackReasonLabel,
   formatAsrEngineLabel,
@@ -2000,6 +2001,7 @@ function RecordPanel({
         (meta ? meta + " · " : "") +
           `insert ${out.strategy}${out.restoredClipboard ? " (clipboard restored)" : ""}`
       );
+      if (out.pasteNotLanded) onError(PASTE_NOT_LANDED_NOTICE);
     } catch (e) {
       onError(String(e));
     } finally {

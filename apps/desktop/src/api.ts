@@ -344,7 +344,11 @@ export const api = {
     autoInsert?: boolean;
   }) => invoke("save_inject_config", { input }),
   insertText: (text: string) =>
-    invoke<{ strategy: string; restoredClipboard: boolean }>("insert_text", {
+    invoke<{
+      strategy: string;
+      restoredClipboard: boolean;
+      pasteNotLanded: boolean;
+    }>("insert_text", {
       text,
     }),
 

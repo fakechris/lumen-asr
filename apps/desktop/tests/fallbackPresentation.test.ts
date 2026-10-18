@@ -7,6 +7,7 @@ import {
   correctorFallbackReasonLabel,
   dictationDoneNotice,
   formatAsrEngineLabel,
+  PASTE_NOT_LANDED_NOTICE,
 } from "../src/fallbackPresentation.ts";
 
 test("explains granular context-integrity fallback reasons", () => {
@@ -57,6 +58,14 @@ test("copy toast is the short confirmation, not the full insert help", () => {
   assert.equal(copyToastLabel("已复制"), "已复制");
   assert.equal(copyToastLabel("已复制 · 请开启辅助功能后可自动插入"), "已复制");
   assert.equal(copyToastLabel("未能插入，也无法写入剪贴板。请从历史记录复制结果。"), null);
+});
+
+test("a paste that did not land is not shown as a plain copy", () => {
+  assert.equal(copyToastLabel(PASTE_NOT_LANDED_NOTICE), "未能插入，已复制到剪贴板");
+  assert.equal(
+    dictationDoneNotice({ insertNotice: PASTE_NOT_LANDED_NOTICE }),
+    "未能插入，已复制到剪贴板",
+  );
 });
 
 test("history labels the local engine when cloud ASR timed out", () => {

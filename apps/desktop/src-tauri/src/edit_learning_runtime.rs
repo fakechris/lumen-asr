@@ -297,6 +297,7 @@ impl DesktopEditLearning {
                         insertion: InsertOutcome {
                             strategy: lumen_core::InsertStrategy::CopyOnly,
                             restored_clipboard: false,
+                            paste_not_landed: false,
                         },
                         observation_started: false,
                     })
