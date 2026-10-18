@@ -1014,7 +1014,7 @@ fn add_segment_on(conn: &Connection, segment: &TranscriptSegment) -> Result<()> 
     Ok(())
 }
 
-fn map_meeting(row: &rusqlite::Row<'_>) -> rusqlite::Result<Meeting> {
+pub(crate) fn map_meeting(row: &rusqlite::Row<'_>) -> rusqlite::Result<Meeting> {
     Ok(Meeting {
         id: parse_uuid_column(row, 0)?,
         created_at: parse_dt(&row.get::<_, String>(1)?),

@@ -23,6 +23,7 @@ import type {
   Meeting,
   MeetingDetail,
   MeetingRecordingResult,
+  MeetingSearchHit,
   MeetingStatus,
   SessionRecord,
   TranscribeOutcome,
@@ -541,6 +542,18 @@ export const api = {
     invoke<Meeting[]>("list_meetings", {
       status: opts?.status ?? null,
       query: opts?.query ?? null,
+      limit: opts?.limit ?? null,
+    }),
+
+  /** Full-text search over meeting titles, notes, transcripts and minutes,
+   * ordered by relevance then recency. A blank query returns no hits. */
+  searchMeetings: (
+    query: string,
+    opts?: { status?: MeetingStatus; limit?: number },
+  ) =>
+    invoke<MeetingSearchHit[]>("search_meetings", {
+      query,
+      status: opts?.status ?? null,
       limit: opts?.limit ?? null,
     }),
 

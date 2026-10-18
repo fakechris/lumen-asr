@@ -27,9 +27,12 @@ pub(crate) const DEFAULT_EDIT_ATTRIBUTION_JSON: &str = r#"{"schema_version":1,"a
 /// `enroll_conflicts` queue (same-voice/different-name auto-enroll conflicts);
 /// v17 recreates it with the `speaker_id` foreign key; v18 adds durable
 /// observed-insertion sessions, append-only edit revisions, learning proposals,
-/// and the feedback outbox; v19 indexes per-session feedback replacement.
+/// and the feedback outbox; v19 indexes per-session feedback replacement; v20
+/// adds the `meeting_search` full-text index (FTS5, trigram tokenizer) over
+/// meeting titles, notes, transcript segments and final minutes, kept in sync
+/// by triggers and backfilled once for existing meetings.
 #[cfg(test)]
-pub(crate) const SCHEMA_VERSION: i64 = 19;
+pub(crate) const SCHEMA_VERSION: i64 = 20;
 
 pub(crate) const HISTORY_TEXT_WHITESPACE: &str =
     "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}";
@@ -673,8 +676,211 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (19)",
         [],
     )?;
+
+    // v20: meeting full-text search. The index tables and triggers are
+    // idempotent DDL; the one-time backfill of meetings that predate the
+    // triggers is gated on the migration marker and shares one transaction
+    // with it, so a crash mid-backfill leaves no marker and the next launch
+    // rebuilds the index from scratch.
+    let has_v20: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=20)",
+        [],
+        |row| row.get(0),
+    )?;
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute_batch(MEETING_SEARCH_SCHEMA_V20)?;
+    if !has_v20 {
+        transaction.execute_batch(MEETING_SEARCH_BACKFILL_V20)?;
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (20)",
+        [],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
+
+/// Plain text indexed for one `meeting_summaries.content` value. Minutes are
+/// stored as JSON, so only its string values are indexed (keys such as
+/// `one_liner` would otherwise match every meeting); non-JSON content is
+/// indexed as-is. `json_valid` guards `json_tree`, which errors on bad JSON,
+/// so a malformed row can never make its INSERT fail.
+macro_rules! summary_search_text {
+    ($content:literal) => {
+        concat!(
+            "CASE WHEN json_valid(",
+            $content,
+            ") THEN coalesce((SELECT group_concat(value, char(10)) FROM json_tree(",
+            $content,
+            ") WHERE type = 'text'), '') ELSE ",
+            $content,
+            " END"
+        )
+    };
+}
+
+/// v20 full-text index for the meeting library.
+///
+/// `meeting_search` is an FTS5 table with the trigram tokenizer (substring
+/// matching that works for CJK text without word segmentation) holding one
+/// row per indexed source: a meeting's title, its notes, each transcript
+/// segment, and each non-draft summary. `meeting_search_docs` maps every FTS
+/// rowid to its meeting, field and source row; its `INTEGER PRIMARY KEY` is the
+/// FTS rowid, which (unlike an implicit rowid) survives `VACUUM`.
+///
+/// Triggers on the source tables keep both in sync, so every write path —
+/// including foreign-key cascades and future ones — updates the index without
+/// the store having to remember. Draft minutes (`minutes_draft`) are never
+/// indexed: they are provisional and replaced by the final minutes.
+const MEETING_SEARCH_SCHEMA_V20: &str = concat!(
+    r#"
+    CREATE VIRTUAL TABLE IF NOT EXISTS meeting_search USING fts5(
+      body,
+      tokenize = 'trigram'
+    );
+
+    CREATE TABLE IF NOT EXISTS meeting_search_docs (
+      id INTEGER PRIMARY KEY,
+      meeting_id TEXT NOT NULL,
+      field TEXT NOT NULL CHECK (field IN ('title', 'notes', 'segment', 'summary')),
+      source_id TEXT NOT NULL,
+      UNIQUE(field, source_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_meeting_search_docs_meeting
+      ON meeting_search_docs(meeting_id);
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_docs_ad
+    AFTER DELETE ON meeting_search_docs BEGIN
+      DELETE FROM meeting_search WHERE rowid = old.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_meetings_ai
+    AFTER INSERT ON meetings BEGIN
+      INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+        SELECT new.id, 'title', new.id WHERE trim(coalesce(new.title, '')) <> '';
+      INSERT INTO meeting_search (rowid, body)
+        SELECT id, new.title FROM meeting_search_docs
+        WHERE field = 'title' AND source_id = new.id;
+      INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+        SELECT new.id, 'notes', new.id WHERE trim(coalesce(new.notes, '')) <> '';
+      INSERT INTO meeting_search (rowid, body)
+        SELECT id, new.notes FROM meeting_search_docs
+        WHERE field = 'notes' AND source_id = new.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_meetings_au_title
+    AFTER UPDATE OF title ON meetings WHEN old.title IS NOT new.title BEGIN
+      DELETE FROM meeting_search_docs WHERE field = 'title' AND source_id = old.id;
+      INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+        SELECT new.id, 'title', new.id WHERE trim(coalesce(new.title, '')) <> '';
+      INSERT INTO meeting_search (rowid, body)
+        SELECT id, new.title FROM meeting_search_docs
+        WHERE field = 'title' AND source_id = new.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_meetings_au_notes
+    AFTER UPDATE OF notes ON meetings WHEN old.notes IS NOT new.notes BEGIN
+      DELETE FROM meeting_search_docs WHERE field = 'notes' AND source_id = old.id;
+      INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+        SELECT new.id, 'notes', new.id WHERE trim(coalesce(new.notes, '')) <> '';
+      INSERT INTO meeting_search (rowid, body)
+        SELECT id, new.notes FROM meeting_search_docs
+        WHERE field = 'notes' AND source_id = new.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_meetings_ad
+    AFTER DELETE ON meetings BEGIN
+      DELETE FROM meeting_search_docs WHERE meeting_id = old.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_segments_ai
+    AFTER INSERT ON transcript_segments BEGIN
+      INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+        VALUES (new.meeting_id, 'segment', new.id);
+      INSERT INTO meeting_search (rowid, body)
+        SELECT id, new.text FROM meeting_search_docs
+        WHERE field = 'segment' AND source_id = new.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_segments_au
+    AFTER UPDATE OF text ON transcript_segments WHEN old.text IS NOT new.text BEGIN
+      DELETE FROM meeting_search_docs WHERE field = 'segment' AND source_id = old.id;
+      INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+        VALUES (new.meeting_id, 'segment', new.id);
+      INSERT INTO meeting_search (rowid, body)
+        SELECT id, new.text FROM meeting_search_docs
+        WHERE field = 'segment' AND source_id = new.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_segments_ad
+    AFTER DELETE ON transcript_segments BEGIN
+      DELETE FROM meeting_search_docs WHERE field = 'segment' AND source_id = old.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_summaries_ai
+    AFTER INSERT ON meeting_summaries WHEN new.kind <> 'minutes_draft' BEGIN
+      INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+        VALUES (new.meeting_id, 'summary', new.id);
+      INSERT INTO meeting_search (rowid, body)
+        SELECT id, "#,
+    summary_search_text!("new.content"),
+    r#" FROM meeting_search_docs
+        WHERE field = 'summary' AND source_id = new.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_summaries_au
+    AFTER UPDATE ON meeting_summaries BEGIN
+      DELETE FROM meeting_search_docs WHERE field = 'summary' AND source_id = old.id;
+      INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+        SELECT new.meeting_id, 'summary', new.id WHERE new.kind <> 'minutes_draft';
+      INSERT INTO meeting_search (rowid, body)
+        SELECT id, "#,
+    summary_search_text!("new.content"),
+    r#" FROM meeting_search_docs
+        WHERE field = 'summary' AND source_id = new.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS meeting_search_summaries_ad
+    AFTER DELETE ON meeting_summaries BEGIN
+      DELETE FROM meeting_search_docs WHERE field = 'summary' AND source_id = old.id;
+    END;
+"#
+);
+
+/// One-time v20 rebuild of the meeting search index from the source tables.
+/// Starts from empty so a partially built index can never be duplicated.
+const MEETING_SEARCH_BACKFILL_V20: &str = concat!(
+    r#"
+    DELETE FROM meeting_search_docs;
+    DELETE FROM meeting_search;
+
+    INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+      SELECT id, 'title', id FROM meetings WHERE trim(coalesce(title, '')) <> '';
+    INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+      SELECT id, 'notes', id FROM meetings WHERE trim(coalesce(notes, '')) <> '';
+    INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+      SELECT meeting_id, 'segment', id FROM transcript_segments;
+    INSERT INTO meeting_search_docs (meeting_id, field, source_id)
+      SELECT meeting_id, 'summary', id FROM meeting_summaries
+      WHERE kind <> 'minutes_draft';
+
+    INSERT INTO meeting_search (rowid, body)
+      SELECT d.id, m.title FROM meeting_search_docs d
+      JOIN meetings m ON m.id = d.source_id WHERE d.field = 'title';
+    INSERT INTO meeting_search (rowid, body)
+      SELECT d.id, m.notes FROM meeting_search_docs d
+      JOIN meetings m ON m.id = d.source_id WHERE d.field = 'notes';
+    INSERT INTO meeting_search (rowid, body)
+      SELECT d.id, t.text FROM meeting_search_docs d
+      JOIN transcript_segments t ON t.id = d.source_id WHERE d.field = 'segment';
+    INSERT INTO meeting_search (rowid, body)
+      SELECT d.id, "#,
+    summary_search_text!("s.content"),
+    r#" FROM meeting_search_docs d
+      JOIN meeting_summaries s ON s.id = d.source_id WHERE d.field = 'summary';
+"#
+);
 
 const EDIT_LEARNING_SCHEMA_V18: &str = r#"
     CREATE TABLE IF NOT EXISTS edit_sessions (
@@ -1880,7 +2086,9 @@ mod tests {
                 CREATE TABLE meetings (
                   id TEXT PRIMARY KEY NOT NULL,
                   created_at TEXT NOT NULL,
-                  status TEXT NOT NULL DEFAULT 'recording'
+                  title TEXT,
+                  status TEXT NOT NULL DEFAULT 'recording',
+                  notes TEXT NOT NULL DEFAULT ''
                 );
                 INSERT INTO meetings (id, created_at, status)
                 VALUES ('m1', '2026-07-29T00:00:00Z', 'ready');

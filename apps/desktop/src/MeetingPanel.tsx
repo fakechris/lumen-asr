@@ -18,6 +18,13 @@ import {
   type MinutesOrigin,
 } from "./meetingDraft";
 import { isMeaningfulMeetingTrim } from "./meetingTrim";
+import {
+  detailEscapeGoesBack,
+  libraryKeyAction,
+  moveCursor,
+  searchFieldLabel,
+  splitSnippet,
+} from "./meetingSearch";
 import { buildSpeakerColorMap, colorForSpeaker } from "./speakerColors";
 import type {
   ActionItem,
@@ -26,6 +33,7 @@ import type {
   LiveAnnotation,
   Meeting,
   MeetingDetail,
+  MeetingSearchHit,
   MeetingStatus,
   Minutes,
   Speaker,
@@ -252,6 +260,33 @@ function matchesFilter(status: MeetingStatus, filter: FilterId): boolean {
   }
 }
 
+/** Where a search hit matched, shown under the row title. */
+type RowMatch = Pick<MeetingSearchHit, "field" | "snippet">;
+
+/** Dialogs and menus that own the keyboard while open; list shortcuts and the
+ * detail view's Esc-to-go-back stay out of their way. */
+const KEYBOARD_OVERLAY_SELECTOR = [
+  ".meeting-modal-overlay",
+  '[aria-modal="true"]',
+  '[role="menu"]',
+  ".meeting-live-annotate-menu",
+].join(", ");
+
+function keyboardOverlayOpen(): boolean {
+  return document.querySelector(KEYBOARD_OVERLAY_SELECTOR) !== null;
+}
+
+/** True for elements that consume typing (inputs, textareas, editables). */
+function isTextField(el: Element | null): boolean {
+  if (!el) return false;
+  if (el instanceof HTMLElement && el.isContentEditable) return true;
+  return (
+    el instanceof HTMLInputElement ||
+    el instanceof HTMLTextAreaElement ||
+    el instanceof HTMLSelectElement
+  );
+}
+
 function MeetingLibrary({
   onOpen,
   onError,
@@ -262,8 +297,20 @@ function MeetingLibrary({
   models: MeetingModels;
 }) {
   const [meetings, setMeetings] = useState<Meeting[]>([]);
+  // Per-meeting match info while a search is active (`null` = plain list).
+  const [matches, setMatches] = useState<Record<string, RowMatch> | null>(
+    null,
+  );
   const [filter, setFilter] = useState<FilterId>("all");
   const [query, setQuery] = useState("");
+  // Keyboard cursor (↑/↓ + Enter); a row id, not an index, so it survives
+  // polling reloads that reorder or insert rows.
+  const [cursor, setCursor] = useState<string | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  // Only the latest refresh may write results: a slow search for an older
+  // query must not overwrite the newer one.
+  const refreshSeq = useRef(0);
   const [loading, setLoading] = useState(false);
   // Local recording handle set on start; `null` when idle. Kept alongside the
   // list-derived recording row so the recording bar keeps an accurate start
@@ -278,15 +325,29 @@ function MeetingLibrary({
 
   const refresh = useCallback(
     async (q: string) => {
+      const seq = ++refreshSeq.current;
       try {
         const trimmed = q.trim();
-        const rows = await api.listMeetings({
-          query: trimmed || undefined,
-          limit: 200,
-        });
-        setMeetings(rows);
+        if (trimmed) {
+          const hits = await api.searchMeetings(trimmed, { limit: 200 });
+          if (seq !== refreshSeq.current) return;
+          setMeetings(hits.map((h) => h.meeting));
+          setMatches(
+            Object.fromEntries(
+              hits.map((h) => [
+                h.meeting.id,
+                { field: h.field, snippet: h.snippet },
+              ]),
+            ),
+          );
+        } else {
+          const rows = await api.listMeetings({ limit: 200 });
+          if (seq !== refreshSeq.current) return;
+          setMeetings(rows);
+          setMatches(null);
+        }
       } catch (e) {
-        onError(String(e));
+        if (seq === refreshSeq.current) onError(String(e));
       }
     },
     [onError],
@@ -448,15 +509,93 @@ function MeetingLibrary({
     }
   }, [pendingDelete, refresh, query, onError]);
 
-  const visible = meetings.filter((m) => matchesFilter(m.status, filter));
+  // Search results keep the backend's relevance order in one flat group;
+  // the plain list is grouped by day, preserving its newest-first order.
+  const groups = useMemo(() => {
+    const visible = meetings.filter((m) => matchesFilter(m.status, filter));
+    const out: { key: string; label: string; items: Meeting[] }[] = [];
+    if (matches) {
+      if (visible.length > 0) {
+        out.push({ key: "results", label: "搜索结果", items: visible });
+      }
+      return out;
+    }
+    for (const key of ["today", "yesterday", "earlier"] as const) {
+      const items = visible.filter((m) => dayGroup(m.created_at) === key);
+      if (items.length > 0) out.push({ key, label: GROUP_LABEL[key], items });
+    }
+    return out;
+  }, [meetings, matches, filter]);
+  const rowIds = useMemo(
+    () => groups.flatMap((g) => g.items.map((m) => m.id)),
+    [groups],
+  );
 
-  // Group by day, preserving the newest-first order the backend returns.
-  const groups: { key: "today" | "yesterday" | "earlier"; items: Meeting[] }[] =
-    [];
-  for (const key of ["today", "yesterday", "earlier"] as const) {
-    const items = visible.filter((m) => dayGroup(m.created_at) === key);
-    if (items.length > 0) groups.push({ key, items });
-  }
+  // Keep the cursor on a visible row: a search lands it on the top hit (so
+  // Enter opens it straight from the search box); the plain list drops it
+  // when its row disappears.
+  useEffect(() => {
+    setCursor((current) => {
+      if (current !== null && rowIds.includes(current)) return current;
+      return matches && rowIds.length > 0 ? rowIds[0] : null;
+    });
+  }, [rowIds, matches]);
+
+  useEffect(() => {
+    if (!cursor) return;
+    listRef.current
+      ?.querySelector(`[data-meeting-id="${cursor}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [cursor]);
+
+  // Library keyboard shortcuts: ⌘F search, ↑/↓ move, Enter open, Esc clear.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing) return;
+      const active = document.activeElement;
+      const inSearch = active === searchRef.current;
+      const action = libraryKeyAction({
+        key: e.key,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        inSearch,
+        inOtherField: !inSearch && isTextField(active),
+        overlayOpen: pendingDelete !== null || keyboardOverlayOpen(),
+        hasQuery: query.trim().length > 0,
+        hasCursor: cursor !== null,
+      });
+      if (action === null) return;
+      // A focused button (row, filter, action) already opens on Enter.
+      if (action === "open" && active instanceof HTMLButtonElement) return;
+      e.preventDefault();
+      switch (action) {
+        case "focus-search":
+          searchRef.current?.focus();
+          searchRef.current?.select();
+          break;
+        case "down":
+        case "up":
+          setCursor((current) =>
+            moveCursor(rowIds, current, action === "down" ? 1 : -1),
+          );
+          break;
+        case "open":
+          if (cursor) onOpen(cursor);
+          break;
+        case "clear-search":
+          setQuery("");
+          break;
+        case "blur-search":
+          searchRef.current?.blur();
+          break;
+      }
+    };
+    // Capture phase: decide while a dialog closing on the same Esc is still
+    // in the DOM.
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [rowIds, cursor, query, pendingDelete, onOpen]);
 
   return (
     <div className="split meeting-layout">
@@ -477,10 +616,12 @@ function MeetingLibrary({
         <label className="meeting-search">
           <Icon name="search" size={15} />
           <input
+            ref={searchRef}
             className="meeting-search-input"
             type="search"
             value={query}
-            placeholder="搜索标题…"
+            placeholder="搜索标题、逐字稿、纪要、笔记（⌘F）"
+            aria-label="搜索会议"
             onChange={(e) => setQuery(e.target.value)}
           />
         </label>
@@ -549,27 +690,29 @@ function MeetingLibrary({
           )}
         </div>
         <MeetingModelSetup models={models} />
-        {visible.length === 0 ? (
+        {rowIds.length === 0 ? (
           <div className="meeting-empty">
             <p className="empty-history-title">
               {loading ? "正在加载…" : "没有会议"}
             </p>
             <p className="muted-text">
               {query.trim()
-                ? "没有匹配的会议标题。"
+                ? "标题、逐字稿、纪要和笔记中都没有匹配的内容。"
                 : "点上方“开始会议”录一场，或“导入文件”选择 wav / mp3 / m4a / mp4 / opus / ogg。也可把文件拖到这里。"}
             </p>
           </div>
         ) : (
-          <div className="meeting-groups">
+          <div className="meeting-groups" ref={listRef}>
             {groups.map((g) => (
               <div key={g.key} className="meeting-group">
-                <div className="meeting-group-head">{GROUP_LABEL[g.key]}</div>
+                <div className="meeting-group-head">{g.label}</div>
                 <ul className="meeting-rows">
                   {g.items.map((m) => (
-                    <li key={m.id}>
+                    <li key={m.id} data-meeting-id={m.id}>
                       <MeetingRow
                         meeting={m}
+                        match={matches?.[m.id]}
+                        cursor={cursor === m.id}
                         onOpen={() => onOpen(m.id)}
                         onRename={(title) => renameMeeting(m.id, title)}
                         onRevealAudio={() => revealMeetingAudio(m.id)}
@@ -1835,12 +1978,18 @@ function StatusBadge({
 
 function MeetingRow({
   meeting,
+  match,
+  cursor,
   onOpen,
   onRename,
   onRevealAudio,
   onRequestDelete,
 }: {
   meeting: Meeting;
+  /** Where the active search matched this meeting (absent when not searching). */
+  match?: RowMatch;
+  /** Highlighted by the library's keyboard cursor. */
+  cursor: boolean;
   onOpen: () => void;
   /** Persist a new title. Resolves when the backend write + refresh finish. */
   onRename: (title: string) => Promise<void>;
@@ -1922,8 +2071,13 @@ function MeetingRow({
   }
 
   return (
-    <div className="meeting-row">
-      <button type="button" className="meeting-row-open" onClick={onOpen}>
+    <div className={`meeting-row${cursor ? " cursor" : ""}`}>
+      <button
+        type="button"
+        className="meeting-row-open"
+        aria-current={cursor ? "true" : undefined}
+        onClick={onOpen}
+      >
         <div className="meeting-row-main">
           <span className="meeting-row-title">{meetingTitle(meeting)}</span>
           <span className="meeting-row-meta">
@@ -1937,6 +2091,20 @@ function MeetingRow({
               </>
             ) : null}
           </span>
+          {match && match.field !== "title" && (
+            <span className="meeting-row-snippet">
+              <span className="meeting-row-snippet-field">
+                {searchFieldLabel(match.field)}
+              </span>
+              {splitSnippet(match.snippet).map((part, i) =>
+                part.hit ? (
+                  <mark key={i}>{part.text}</mark>
+                ) : (
+                  <span key={i}>{part.text}</span>
+                ),
+              )}
+            </span>
+          )}
         </div>
         <StatusBadge
           status={meeting.status}
@@ -2405,6 +2573,26 @@ function MeetingDetailView({
     setLoading(true);
     void load();
   }, [load]);
+
+  // Esc returns to the library when nothing else wants it. Capture phase, so
+  // this runs before an open dialog's own Esc handler can close it (and a
+  // single Esc never both closes the dialog and leaves the meeting).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing) return;
+      const goBack = detailEscapeGoesBack({
+        key: e.key,
+        defaultPrevented: e.defaultPrevented,
+        inField: isTextField(document.activeElement),
+        overlayOpen: keyboardOverlayOpen(),
+      });
+      if (!goBack) return;
+      e.preventDefault();
+      onBack();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onBack]);
 
   const status = detail?.meeting.status;
   useEffect(() => {

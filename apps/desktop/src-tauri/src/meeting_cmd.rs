@@ -3030,6 +3030,26 @@ pub fn list_meetings(
     })
 }
 
+/// Full-text search of the meeting library (title, notes, transcript and
+/// final minutes), optionally filtered by lifecycle `status`. Results are
+/// ordered by relevance then recency; each carries the matched field and a
+/// short snippet with the match wrapped in `\u{2}`…`\u{3}`. A blank `query`
+/// returns no hits. `limit` defaults to 200.
+#[tauri::command]
+pub fn search_meetings(
+    state: State<'_, AppState>,
+    query: String,
+    status: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<lumen_store::MeetingSearchHit>, String> {
+    let status = status.as_deref().and_then(parse_status_filter);
+    let limit = limit.unwrap_or(200);
+    with_store(&state, |s| {
+        s.search_meetings(status, &query, limit)
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// Read one meeting with its speakers, `seq`-ordered segments, and summaries.
 #[tauri::command]
 pub fn get_meeting_detail(
