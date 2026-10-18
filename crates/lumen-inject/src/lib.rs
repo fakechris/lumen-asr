@@ -18,6 +18,12 @@ pub enum InjectError {
     PermissionDenied(String),
     #[error("partial input delivered: {0}")]
     PartialInput(String),
+    /// The paste was sent but the focused field verifiably did not change,
+    /// even after a retry. The backend left the text on the clipboard so the
+    /// user can paste it by hand; trying another strategy now could insert
+    /// the text twice if the field updates late.
+    #[error("paste did not land: {0}")]
+    NotLanded(String),
     #[error("{0}")]
     Other(String),
 }
@@ -57,6 +63,10 @@ impl Default for InsertPolicy {
 pub struct InsertOutcome {
     pub strategy: InsertStrategy,
     pub restored_clipboard: bool,
+    /// The paste verifiably did not reach the focused field; the text was
+    /// left on the clipboard instead (`strategy` is then `CopyOnly`).
+    #[serde(default)]
+    pub paste_not_landed: bool,
 }
 
 /// Platform-specific insert primitives.
@@ -88,6 +98,7 @@ impl<B: TextInjectorBackend> TextInjector<B> {
             return Ok(InsertOutcome {
                 strategy: InsertStrategy::None,
                 restored_clipboard: false,
+                paste_not_landed: false,
             });
         }
 
@@ -97,6 +108,7 @@ impl<B: TextInjectorBackend> TextInjector<B> {
                 Ok(InsertOutcome {
                     strategy: InsertStrategy::CopyOnly,
                     restored_clipboard: false,
+                    paste_not_landed: false,
                 })
             }
             InjectMode::Paste => self.try_paste(text).await,
@@ -145,13 +157,26 @@ impl<B: TextInjectorBackend> TextInjector<B> {
     }
 
     async fn try_paste(&self, text: &str) -> Result<InsertOutcome, InjectError> {
-        self.backend
+        match self
+            .backend
             .paste_with_restore(text, self.policy.preserve_clipboard)
-            .await?;
-        Ok(InsertOutcome {
-            strategy: InsertStrategy::Paste,
-            restored_clipboard: self.policy.preserve_clipboard,
-        })
+            .await
+        {
+            Ok(()) => Ok(InsertOutcome {
+                strategy: InsertStrategy::Paste,
+                restored_clipboard: self.policy.preserve_clipboard,
+                paste_not_landed: false,
+            }),
+            Err(InjectError::NotLanded(reason)) => {
+                tracing::warn!(%reason, "paste did not land; text left on the clipboard");
+                Ok(InsertOutcome {
+                    strategy: InsertStrategy::CopyOnly,
+                    restored_clipboard: false,
+                    paste_not_landed: true,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn try_ax(&self, text: &str) -> Result<InsertOutcome, InjectError> {
@@ -159,6 +184,7 @@ impl<B: TextInjectorBackend> TextInjector<B> {
         Ok(InsertOutcome {
             strategy: InsertStrategy::Ax,
             restored_clipboard: false,
+            paste_not_landed: false,
         })
     }
 
@@ -167,6 +193,7 @@ impl<B: TextInjectorBackend> TextInjector<B> {
         Ok(InsertOutcome {
             strategy: InsertStrategy::Type,
             restored_clipboard: false,
+            paste_not_landed: false,
         })
     }
 }
@@ -239,12 +266,55 @@ mod tests {
         }
     }
 
+    struct NotLandedPasteBackend;
+
+    #[async_trait]
+    impl TextInjectorBackend for NotLandedPasteBackend {
+        async fn paste_with_restore(
+            &self,
+            _text: &str,
+            _preserve: bool,
+        ) -> Result<(), InjectError> {
+            Err(InjectError::NotLanded("field unchanged after retry".into()))
+        }
+
+        async fn ax_insert(&self, _text: &str) -> Result<(), InjectError> {
+            panic!("a paste that did not land must not fall back")
+        }
+
+        async fn type_unicode(&self, _text: &str) -> Result<(), InjectError> {
+            panic!("a paste that did not land must not fall back")
+        }
+
+        async fn copy_only(&self, _text: &str) -> Result<(), InjectError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn paste_that_did_not_land_reports_clipboard_copy_without_fallback() {
+        for mode in [InjectMode::Auto, InjectMode::Paste] {
+            let inj = TextInjector::new(
+                NotLandedPasteBackend,
+                InsertPolicy {
+                    mode,
+                    ..InsertPolicy::default()
+                },
+            );
+            let o = inj.insert("hi").await.unwrap();
+            assert_eq!(o.strategy, InsertStrategy::CopyOnly);
+            assert!(o.paste_not_landed);
+            assert!(!o.restored_clipboard);
+        }
+    }
+
     #[tokio::test]
     async fn auto_paste_first_succeeds_by_default() {
         let inj = TextInjector::new(StubInjectorBackend::default(), InsertPolicy::default());
         let o = inj.insert("hi").await.unwrap();
         assert_eq!(o.strategy, InsertStrategy::Paste);
         assert!(o.restored_clipboard);
+        assert!(!o.paste_not_landed);
     }
 
     #[tokio::test]

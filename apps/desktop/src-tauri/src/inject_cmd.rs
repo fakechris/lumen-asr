@@ -35,6 +35,8 @@ pub struct InjectConfigInput {
 pub struct InsertTextOutcome {
     pub strategy: String,
     pub restored_clipboard: bool,
+    /// The paste did not reach the focused field; the text is on the clipboard.
+    pub paste_not_landed: bool,
 }
 
 fn strategy_str(s: InsertStrategy) -> &'static str {
@@ -121,6 +123,7 @@ pub async fn insert_text(
     Ok(InsertTextOutcome {
         strategy: strategy_str(out.strategy).into(),
         restored_clipboard: out.restored_clipboard,
+        paste_not_landed: out.paste_not_landed,
     })
 }
 
@@ -129,6 +132,7 @@ pub async fn insert_with_config(cfg: &InjectConfig, text: &str) -> Result<Insert
         return Ok(InsertOutcome {
             strategy: InsertStrategy::None,
             restored_clipboard: false,
+            paste_not_landed: false,
         });
     }
     #[cfg(target_os = "windows")]

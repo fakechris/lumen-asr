@@ -12,7 +12,14 @@
 //!   text, file URLs — not just plain text) and only restores while the
 //!   pasteboard still holds our write, so a copy made during the paste window
 //!   is never clobbered
+//! - When the focused field exposes its contents through Accessibility, check
+//!   that the paste changed it; retry once, and if it still did not land leave
+//!   the text on the clipboard (no restore) and report `NotLanded`. Fields
+//!   that cannot be read keep the old behavior: unknown is not failed
 
+#[cfg(target_os = "macos")]
+use crate::paste_landing::FocusedField;
+use crate::paste_landing::{next_paste_step, Landing, PasteStep};
 use async_trait::async_trait;
 use lumen_inject::{InjectError, TextInjectorBackend};
 #[cfg(target_os = "macos")]
@@ -65,9 +72,46 @@ fn paste_with_restore_sync(text: &str, preserve: bool) -> Result<(), InjectError
     let our_change = set_clipboard(text)?;
     // Pasteboard readiness.
     thread::sleep(Duration::from_millis(40));
-    simulate_cmd_v()?;
+    // Read the focused field right before the paste so the comparison sees
+    // only what the paste changed.
+    let field = FocusedField::capture();
+    simulate_cmd_v(PasteRoute::Hid)?;
     // Give terminal/Electron time to consume pasteboard.
-    thread::sleep(Duration::from_millis(350));
+    thread::sleep(PASTE_SETTLE);
+
+    if let Some(field) = field.as_ref() {
+        let mut retried = false;
+        loop {
+            let landing = await_landing(field);
+            let clipboard_ours = clipboard_change_count() == our_change;
+            match next_paste_step(landing, clipboard_ours, retried) {
+                PasteStep::Finish => {
+                    tracing::debug!(?landing, retried, "paste landing check done");
+                    break;
+                }
+                PasteStep::Retry => {
+                    retried = true;
+                    // The HID post can be swallowed (secure input, a modifier
+                    // the OS still considers down); post straight to the app
+                    // that owns the field instead.
+                    let route = field.pid().map_or(PasteRoute::Hid, PasteRoute::Pid);
+                    tracing::warn!(
+                        ?route,
+                        "paste did not change the focused field; retrying once"
+                    );
+                    simulate_cmd_v(route)?;
+                    thread::sleep(PASTE_SETTLE);
+                }
+                PasteStep::KeepTextOnClipboard => {
+                    // Restoring now would erase the only copy of the dictation
+                    // outside our history; the user can paste it by hand.
+                    return Err(InjectError::NotLanded(
+                        "focused field unchanged after paste and one retry".into(),
+                    ));
+                }
+            }
+        }
+    }
 
     if let Some(previous) = previous {
         match restore_decision(our_change, clipboard_change_count()) {
@@ -84,6 +128,43 @@ fn paste_with_restore_sync(text: &str, preserve: bool) -> Result<(), InjectError
         }
     }
     Ok(())
+}
+
+/// Time for the target app to consume the pasteboard after ⌘V.
+const PASTE_SETTLE: Duration = Duration::from_millis(350);
+/// Extra time some apps take to publish the change through Accessibility.
+/// Declaring "not landed" too early would paste twice on the retry.
+const LANDING_GRACE: Duration = Duration::from_millis(300);
+const LANDING_POLL: Duration = Duration::from_millis(50);
+
+/// Poll the field until it shows the paste or the grace period runs out.
+fn await_landing(field: &FocusedField) -> Landing {
+    let deadline = Instant::now() + LANDING_GRACE;
+    loop {
+        let landing = field.check();
+        if landing != Landing::NotLanded || Instant::now() >= deadline {
+            return landing;
+        }
+        thread::sleep(LANDING_POLL);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct FocusedField;
+
+#[cfg(not(target_os = "macos"))]
+impl FocusedField {
+    fn capture() -> Option<Self> {
+        None
+    }
+
+    fn check(&self) -> Landing {
+        Landing::Unknown
+    }
+
+    fn pid(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// Whether to put the user's previous clipboard back after our paste.
@@ -278,8 +359,17 @@ fn wait_hotkey_modifiers_clear(timeout: Duration) {
     }
 }
 
+/// Where a synthetic ⌘V is delivered.
+#[derive(Debug, Clone, Copy)]
+enum PasteRoute {
+    /// The HID event tap: reaches whatever has key focus.
+    Hid,
+    /// Directly to one process.
+    Pid(i32),
+}
+
 /// Simulate ⌘V via CGEvent (requires Accessibility).
-fn simulate_cmd_v() -> Result<(), InjectError> {
+fn simulate_cmd_v(route: PasteRoute) -> Result<(), InjectError> {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
@@ -291,22 +381,28 @@ fn simulate_cmd_v() -> Result<(), InjectError> {
             .or_else(|_| CGEventSource::new(CGEventSourceStateID::HIDSystemState))
             .map_err(|_| InjectError::Other("CGEventSource failed".into()))?;
 
+        let post = |event: &CGEvent| match route {
+            PasteRoute::Hid => event.post(CGEventTapLocation::HID),
+            PasteRoute::Pid(pid) => event.post_to_pid(pid),
+        };
+
         let down = CGEvent::new_keyboard_event(source.clone(), KEY_V, true)
             .map_err(|_| InjectError::Other("key down failed".into()))?;
         down.set_flags(CGEventFlags::CGEventFlagCommand);
-        down.post(CGEventTapLocation::HID);
+        post(&down);
 
         thread::sleep(Duration::from_millis(8));
 
         let up = CGEvent::new_keyboard_event(source, KEY_V, false)
             .map_err(|_| InjectError::Other("key up failed".into()))?;
         up.set_flags(CGEventFlags::CGEventFlagCommand);
-        up.post(CGEventTapLocation::HID);
+        post(&up);
 
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = route;
         Err(InjectError::NotSupported("not macOS".into()))
     }
 }

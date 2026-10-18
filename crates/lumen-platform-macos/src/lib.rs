@@ -14,6 +14,7 @@ mod inject;
 mod input_transport;
 mod meeting_activity;
 mod output_ducking;
+mod paste_landing;
 pub use output_ducking::AudioDuckingGuard;
 
 pub use ax_drag::{
