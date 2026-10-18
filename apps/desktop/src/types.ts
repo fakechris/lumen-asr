@@ -419,6 +419,15 @@ export type Meeting = {
   notes: string;
 };
 
+/** One `search_meetings` result: the meeting, where it matched, and a short
+ * excerpt whose matched text is wrapped in `\u0002`…`\u0003` (see
+ * `splitSnippet` in `meetingSearch.ts`). */
+export type MeetingSearchHit = {
+  meeting: Meeting;
+  field: "title" | "notes" | "segment" | "summary";
+  snippet: string;
+};
+
 /** Result of `stop_meeting_recording` (camelCase DTO). */
 export type MeetingRecordingResult = {
   id: string;

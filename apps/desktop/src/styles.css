@@ -2795,6 +2795,35 @@ html:has(.capsule-root) body {
   color: var(--muted);
 }
 
+/* Keyboard cursor (↑/↓ in the library). */
+.meeting-row.cursor {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* Search hit excerpt: which field matched, then the text around the match. */
+.meeting-row-snippet {
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.meeting-row-snippet-field {
+  margin-right: 6px;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  font-size: 0.72rem;
+}
+
+.meeting-row-snippet mark {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--text);
+  border-radius: 2px;
+}
+
 .dotsep {
   margin: 0 6px;
   opacity: 0.6;

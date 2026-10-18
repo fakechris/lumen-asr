@@ -1,9 +1,13 @@
 //! SQLite store for Lumen ASR.
 
 mod meeting;
+mod meeting_search;
 mod schema;
 
 pub use meeting::{EnrollConflictRecord, NewEnrollConflict};
+pub use meeting_search::{
+    MeetingSearchField, MeetingSearchHit, SEARCH_SNIPPET_MARK_END, SEARCH_SNIPPET_MARK_START,
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
