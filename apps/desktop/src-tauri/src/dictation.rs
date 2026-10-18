@@ -742,6 +742,12 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
         .unwrap_or_else(|e| e.into_inner())
         .audio
         .clone();
+    state
+        .audio
+        .set_device(crate::input_device::effective_input_device(
+            &audio_config,
+            "dictation",
+        ));
     let guard = if audio_config.duck_output {
         match lumen_platform_macos::AudioDuckingGuard::acquire(audio_config.duck_volume) {
             Ok(guard) => Some(guard),

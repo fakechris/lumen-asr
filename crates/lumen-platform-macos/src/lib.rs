@@ -10,6 +10,7 @@ mod calendar;
 mod edit_surface;
 mod focused_field;
 mod inject;
+mod input_transport;
 mod meeting_activity;
 mod output_ducking;
 pub use output_ducking::AudioDuckingGuard;
@@ -25,6 +26,7 @@ pub use calendar::{
 pub use edit_surface::MacAccessibilitySurfaceAdapter;
 pub use focused_field::{focused_text_field_snapshot, FocusedTextFieldSnapshot};
 pub use inject::MacTextInjectorBackend;
+pub use input_transport::{input_device_transports, InputDeviceTransport, InputTransport};
 pub use meeting_activity::{
     capability_available as meeting_detection_capability_available, ActiveInput, DetectorSignal,
     MeetingActivityDetector, DEFAULT_POLL as MEETING_DETECTION_DEFAULT_POLL,

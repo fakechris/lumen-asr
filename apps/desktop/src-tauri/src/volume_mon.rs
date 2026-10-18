@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,6 +208,16 @@ where
 
 #[tauri::command]
 pub fn start_volume_monitoring_cmd(app: AppHandle, device: Option<String>) -> Result<(), String> {
+    // Meter the same microphone a recording would open.
+    let mut audio = app
+        .state::<crate::AppState>()
+        .config
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .audio
+        .clone();
+    audio.device_name = device;
+    let device = crate::input_device::effective_input_device(&audio, "level_meter");
     start_volume_monitoring(app, device)
 }
 

@@ -21,6 +21,7 @@ mod headless;
 mod hotkey;
 mod hotkey_validate;
 mod inject_cmd;
+mod input_device;
 mod learning;
 mod meeting_apps;
 mod meeting_asr;
