@@ -134,6 +134,9 @@ export type PipelineIdentity = {
   dictionary_context_hash_algorithm?: string | null;
   dictionary_term_count: number;
   dictionary_replacement_count: number;
+  /** Confirmed entries before the corrector prompt budget; absent on older records. */
+  dictionary_total_term_count?: number;
+  dictionary_total_replacement_count?: number;
   enhancement_mode: EnhancementMode;
 };
 

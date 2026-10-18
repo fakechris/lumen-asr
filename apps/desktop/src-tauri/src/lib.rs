@@ -15,6 +15,7 @@ mod corrector_probe;
 mod corrector_svc;
 mod detection_stats;
 mod dictation;
+mod dictionary_budget;
 mod edit_learning_runtime;
 mod headless;
 mod hotkey;

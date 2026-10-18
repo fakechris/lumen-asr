@@ -49,6 +49,8 @@ pub(crate) fn build_pipeline_identity(
         dictionary_context_hash_algorithm: None,
         dictionary_term_count: 0,
         dictionary_replacement_count: 0,
+        dictionary_total_term_count: 0,
+        dictionary_total_replacement_count: 0,
         enhancement_mode: EnhancementMode::None,
     }
 }
@@ -197,7 +199,9 @@ pub(crate) async fn run_corrector_stage(
             (Vec::new(), Some("dictionary unavailable".to_string()))
         }
     };
-    let projected_dictionary = dictionary_context(&entries);
+    // Bounded to the prompt budget and ranked against this utterance; the
+    // persisted projection is exactly what the provider can receive.
+    let projected_dictionary = dictionary_context(&entries, enhanced_text);
     let dictionary_requested =
         !projected_dictionary.terms.is_empty() || !projected_dictionary.replacements.is_empty();
     let dictionary_projection =
@@ -335,12 +339,15 @@ pub(crate) async fn run_corrector_stage(
     } else {
         &[]
     };
-    let dictionary = dictionary_run_identity(effective_entries);
+    let dictionary = dictionary_run_identity(effective_entries, enhanced_text);
     attempt.pipeline_identity.dictionary_context_hash = Some(dictionary.hash);
     attempt.pipeline_identity.dictionary_context_hash_algorithm =
         Some(dictionary.hash_algorithm.into());
     attempt.pipeline_identity.dictionary_term_count = dictionary.term_count;
     attempt.pipeline_identity.dictionary_replacement_count = dictionary.replacement_count;
+    attempt.pipeline_identity.dictionary_total_term_count = dictionary.total_term_count;
+    attempt.pipeline_identity.dictionary_total_replacement_count =
+        dictionary.total_replacement_count;
 
     let corrector_started = Instant::now();
     let result = run_correct_with_intent_and_context(

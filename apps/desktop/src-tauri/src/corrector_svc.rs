@@ -1,13 +1,16 @@
 //! Build corrector instances and apply correction with dictionary context.
 
 use crate::config::{AppConfig, CorrectorConfig};
+use crate::dictionary_budget::{
+    select_for_prompt, DictionarySelection, DICTIONARY_PROMPT_BUDGET_CHARS,
+};
 use lumen_core::CorrectorEngineId;
 use lumen_corrector::{
     correct_or_fallback_with_context, preprocess_only, CorrectResult, Corrector,
     CorrectorFallbackReason, DictionaryContext, NullCorrector, OpenAiCompatConfig,
     OpenAiCompatCorrector,
 };
-use lumen_dictionary::{split_for_injection, DictionaryEntry};
+use lumen_dictionary::DictionaryEntry;
 use lumen_prompts::{build_system_prompt_from, effective_cleanup, IntentSpec, PromptBuildInput};
 use std::time::Duration;
 
@@ -76,24 +79,39 @@ pub fn corrector_outcome_identity(
     }
 }
 
-pub fn dictionary_context(entries: &[DictionaryEntry]) -> DictionaryContext {
-    let (terms, replacements) = split_for_injection(entries);
-    DictionaryContext {
-        terms,
-        replacements,
-    }
+/// Dictionary context injected for `asr_text`: every confirmed entry while the
+/// rendered block fits the prompt budget, otherwise the most relevant entries
+/// (see [`crate::dictionary_budget`]).
+pub fn dictionary_context(entries: &[DictionaryEntry], asr_text: &str) -> DictionaryContext {
+    dictionary_selection(entries, asr_text).context
+}
+
+fn dictionary_selection(entries: &[DictionaryEntry], asr_text: &str) -> DictionarySelection {
+    select_for_prompt(entries, asr_text, DICTIONARY_PROMPT_BUDGET_CHARS)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DictionaryRunIdentity {
     pub hash: String,
     pub hash_algorithm: &'static str,
+    /// Terms actually injected (what `hash` covers).
     pub term_count: u32,
+    /// Replacement rules actually injected (what `hash` covers).
     pub replacement_count: u32,
+    /// Confirmed terms available before the prompt budget was applied.
+    pub total_term_count: u32,
+    /// Confirmed replacement rules available before the prompt budget was applied.
+    pub total_replacement_count: u32,
 }
 
-pub fn dictionary_run_identity(entries: &[DictionaryEntry]) -> DictionaryRunIdentity {
-    let context = dictionary_context(entries);
+/// Identity of the dictionary context injected for `asr_text`. The hash covers
+/// only the injected entries, so it changes whenever the selection does.
+pub fn dictionary_run_identity(
+    entries: &[DictionaryEntry],
+    asr_text: &str,
+) -> DictionaryRunIdentity {
+    let selection = dictionary_selection(entries, asr_text);
+    let context = &selection.context;
     let mut canonical = Vec::new();
     for term in &context.terms {
         canonical.extend_from_slice(&(term.len() as u64).to_le_bytes());
@@ -111,6 +129,8 @@ pub fn dictionary_run_identity(entries: &[DictionaryEntry]) -> DictionaryRunIden
         hash_algorithm: "blake3",
         term_count: context.terms.len() as u32,
         replacement_count: context.replacements.len() as u32,
+        total_term_count: selection.total_terms as u32,
+        total_replacement_count: selection.total_replacements as u32,
     }
 }
 
@@ -192,7 +212,7 @@ pub async fn run_correct_with_intent_and_context(
     intent: IntentSpec,
     context_json: Option<&str>,
 ) -> CorrectResult {
-    let dict = dictionary_context(entries);
+    let dict = dictionary_context(entries, text);
     let input: PromptBuildInput = app.corrector_prompt_input(intent);
     let level = effective_cleanup(&input);
 
@@ -236,6 +256,10 @@ pub fn engine_label(app: &AppConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context_capture::{
+        CorrectorBrowserProjection, CorrectorContextProjection, CorrectorEditorProjection,
+        CorrectorTargetProjection,
+    };
 
     #[test]
     fn run_identity_uses_effective_model_and_stable_prompt_hash() {
@@ -338,14 +362,171 @@ mod tests {
         same_context.hit_count = 99;
         let changed = DictionaryEntry::replacement("cortex", "Codex");
 
-        let first_identity = dictionary_run_identity(&[first]);
-        let same_identity = dictionary_run_identity(&[same_context]);
-        let changed_identity = dictionary_run_identity(&[changed]);
+        let first_identity = dictionary_run_identity(&[first], "cotex");
+        let same_identity = dictionary_run_identity(&[same_context], "cotex");
+        let changed_identity = dictionary_run_identity(&[changed], "cotex");
 
         assert_eq!(first_identity, same_identity);
         assert_ne!(first_identity.hash, changed_identity.hash);
         assert_eq!(first_identity.term_count, 0);
         assert_eq!(first_identity.replacement_count, 1);
+    }
+
+    /// Upper bound, in characters, on everything the dictation corrector sends
+    /// besides the ASR text itself (system prompt + user message framing,
+    /// captured context, dictionary). Each input is capped at its source: the
+    /// custom instruction (500), the translate style (200), the captured-context
+    /// projection fields (`context_capture` limits) and the dictionary block
+    /// ([`DICTIONARY_PROMPT_BUDGET_CHARS`]). Replacement rules that fire on the
+    /// utterance may exceed the dictionary budget; they are bounded by the ASR
+    /// text they match rather than by this ceiling.
+    const CORRECTOR_PROMPT_OVERHEAD_CEILING_CHARS: usize = 12_000;
+
+    fn repeat_to(seed: &str, chars: usize) -> String {
+        seed.chars().cycle().take(chars).collect()
+    }
+
+    /// Projection with every field filled to its `context_capture` limit. The
+    /// capture only fills cursor *or* nearby *or* field text, and browser text
+    /// only without editor text; this fills the largest valid combination
+    /// (selection + cursor before/after) and the browser metadata.
+    fn maximal_context_projection() -> CorrectorContextProjection {
+        const TARGET: usize = 256;
+        const SELECTED: usize = 1_000;
+        const CURSOR: usize = 1_500;
+        let text = |chars| Some(repeat_to("上下文参考文本", chars));
+        CorrectorContextProjection {
+            schema_version: 1,
+            target: Some(CorrectorTargetProjection {
+                app_name: text(TARGET),
+                bundle_id: text(TARGET),
+                window_title: text(TARGET),
+                document_url: text(TARGET),
+            }),
+            editor: Some(CorrectorEditorProjection {
+                role: text(TARGET),
+                title: text(TARGET),
+                label: text(TARGET),
+                placeholder: text(TARGET),
+                selected_text: text(SELECTED),
+                cursor_before: text(CURSOR),
+                cursor_after: text(CURSOR),
+                nearby_before: None,
+                nearby_after: None,
+                field_text: None,
+            }),
+            browser: Some(CorrectorBrowserProjection {
+                title: text(TARGET),
+                domain: text(TARGET),
+                page_language: text(TARGET),
+                selection_text: None,
+                nearby_before: None,
+                nearby_after: None,
+            }),
+            visible_text: Vec::new(),
+            truncated: true,
+        }
+    }
+
+    #[test]
+    fn full_corrector_prompt_stays_under_the_overhead_ceiling() {
+        let mut app = AppConfig::default();
+        app.corrector.enabled = true;
+        app.corrector.provider = "minimax".into();
+        app.corrector.model = "test-corrector-model".into();
+        app.output.cleanup = "strong".into();
+        app.output.qwen_cleanup = "strong".into();
+        app.output.style = "formal".into();
+        app.output.polish = lumen_prompts::PolishRule::all()
+            .iter()
+            .map(|rule| rule.as_str().to_owned())
+            .collect();
+        app.output.custom_enabled = true;
+        app.output.custom_instruction = repeat_to("自定义整理要求", 4_000);
+        let intent = IntentSpec::Translate {
+            target_language: "简体中文（中国大陆）".into(),
+            style: Some(repeat_to("翻译风格要求", 4_000)),
+        };
+
+        let asr_text = repeat_to("今天我们讨论一下 Lumen 语音输入的词典策略。", 300);
+        let mut entries: Vec<DictionaryEntry> = (0..1_000)
+            .map(|index| DictionaryEntry::term(format!("专业术语{index:04}")))
+            .collect();
+        entries.extend(
+            (0..200).map(|index| DictionaryEntry::replacement(format!("误识{index}"), "Lumen")),
+        );
+        let dictionary = dictionary_context(&entries, &asr_text);
+        let block =
+            lumen_prompts::format_dictionary_block(&dictionary.terms, &dictionary.replacements);
+        let block_chars = block.chars().count();
+        assert!(block_chars <= DICTIONARY_PROMPT_BUDGET_CHARS);
+        assert!(
+            block_chars > DICTIONARY_PROMPT_BUDGET_CHARS - 20,
+            "dictionary should be filled to the budget, got {block_chars}"
+        );
+
+        // Translate never sends captured context at runtime; combining both
+        // here is a strict upper bound on either real prompt.
+        let mut system = build_system_prompt_from(&app.corrector_prompt_input(intent));
+        system.push_str("\n\n");
+        system.push_str(lumen_prompts::context_safety_system_instruction());
+        let context_json = maximal_context_projection().to_model_json().unwrap();
+        let user = lumen_prompts::corrector_user_message_with_context(
+            &asr_text,
+            Some(&block),
+            Some(&context_json),
+        );
+
+        let total = system.chars().count() + user.chars().count();
+        let overhead = total - asr_text.chars().count();
+        assert!(
+            overhead <= CORRECTOR_PROMPT_OVERHEAD_CEILING_CHARS,
+            "prompt overhead {overhead} chars exceeds ceiling {CORRECTOR_PROMPT_OVERHEAD_CEILING_CHARS}"
+        );
+        eprintln!(
+            "corrector prompt overhead: {overhead} chars (system {}, context {}, dictionary {block_chars})",
+            system.chars().count(),
+            context_json.chars().count()
+        );
+    }
+
+    #[test]
+    fn dictionary_identity_hashes_only_injected_entries() {
+        let mut entries: Vec<DictionaryEntry> = (0..400)
+            .map(|index| DictionaryEntry::term(format!("填充术语{index:04}")))
+            .collect();
+        // Oldest entry: only relevance, not recency, can select it.
+        let mut relevant = DictionaryEntry::term("Kubernetes");
+        relevant.updated_at -= chrono::Duration::days(1);
+        entries.insert(0, relevant);
+
+        let first = dictionary_run_identity(&entries, "部署 kubernetes 集群");
+        let other_text = dictionary_run_identity(&entries, "完全无关");
+        let injected = dictionary_context(&entries, "部署 kubernetes 集群");
+
+        assert_eq!(first.total_term_count, 401);
+        assert_eq!(first.term_count as usize, injected.terms.len());
+        assert!(first.term_count < first.total_term_count);
+        assert!(injected.terms.contains(&"Kubernetes".to_owned()));
+        // A different selection must not share the identity of the first one.
+        assert!(!dictionary_context(&entries, "完全无关")
+            .terms
+            .contains(&"Kubernetes".to_owned()));
+        assert_ne!(first.hash, other_text.hash);
+    }
+
+    #[test]
+    fn small_dictionary_identity_counts_every_entry() {
+        let entries = [
+            DictionaryEntry::term("Codex"),
+            DictionaryEntry::replacement("cotex", "Codex"),
+        ];
+        let identity = dictionary_run_identity(&entries, "unrelated");
+
+        assert_eq!(identity.term_count, 1);
+        assert_eq!(identity.total_term_count, 1);
+        assert_eq!(identity.replacement_count, 1);
+        assert_eq!(identity.total_replacement_count, 1);
     }
 
     #[tokio::test]
