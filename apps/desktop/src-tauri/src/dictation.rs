@@ -2205,7 +2205,13 @@ fn prewarm_dictation_asr(state: &AppState) {
 
 /// Capsule / hotkey lifecycle events for the UI.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "phase")]
+/// Variant names and their fields are both camelCase (`rename_all` alone only
+/// renames variants, which left `target_language` unreadable by the capsule).
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "phase"
+)]
 pub enum DictationUiEvent {
     Idle,
     Listening {
@@ -2215,15 +2221,12 @@ pub enum DictationUiEvent {
         /// e.g. "en" when translating
         target_language: Option<String>,
         /// Global Esc cancels this dictation (capsule shows the hint).
-        /// Variant-level `rename_all` does not reach fields, so name it here.
-        #[serde(rename = "escCancel")]
         esc_cancel: bool,
     },
     Processing {
         message: String,
         intent: String,
         target_language: Option<String>,
-        #[serde(rename = "escCancel")]
         esc_cancel: bool,
     },
     Done {
@@ -2729,6 +2732,20 @@ mod esc_cancel_tests {
         assert_eq!(value["escCancel"], true);
         let value = serde_json::to_value(DictationUiEvent::Cancelled).unwrap();
         assert_eq!(value["phase"], "cancelled");
+    }
+
+    #[test]
+    fn ui_event_fields_are_camel_case_for_the_capsule() {
+        let value = serde_json::to_value(DictationUiEvent::Processing {
+            message: "翻译中".into(),
+            intent: "translate".into(),
+            target_language: Some("en".into()),
+            esc_cancel: false,
+        })
+        .unwrap();
+        assert_eq!(value["phase"], "processing");
+        assert_eq!(value["targetLanguage"], "en");
+        assert!(value.get("target_language").is_none());
     }
 }
 
