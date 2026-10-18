@@ -12,12 +12,14 @@ type DictationEvent =
       message: string;
       intent?: string;
       targetLanguage?: string | null;
+      escCancel?: boolean;
     }
   | {
       phase: "processing";
       message: string;
       intent?: string;
       targetLanguage?: string | null;
+      escCancel?: boolean;
     }
   | {
       phase: "done";
@@ -37,6 +39,7 @@ export default function Capsule() {
   const [seconds, setSeconds] = useState(0);
   const [intent, setIntent] = useState("default");
   const [targetLang, setTargetLang] = useState<string | null>(null);
+  const [escCancel, setEscCancel] = useState(false);
 
   useEffect(() => {
     let un: (() => void) | undefined;
@@ -47,6 +50,7 @@ export default function Capsule() {
         setMessage(p.message || "录音中");
         setIntent(p.intent || "default");
         setTargetLang(p.targetLanguage ?? null);
+        setEscCancel(p.escCancel === true);
         setSeconds(0);
       } else if (p.phase === "processing") {
         setPhase("processing");
@@ -54,6 +58,7 @@ export default function Capsule() {
         // Prefer payload intent; keep previous if missing so translate stays visible.
         if (p.intent) setIntent(p.intent);
         if (p.targetLanguage != null) setTargetLang(p.targetLanguage);
+        setEscCancel(p.escCancel === true);
       } else if (p.phase === "error") {
         setPhase("error");
         setMessage(p.message);
@@ -161,6 +166,9 @@ export default function Capsule() {
         {badge}
       </span>
       <span className="capsule-text">{label}</span>
+      {escCancel && (phase === "listening" || phase === "processing") && (
+        <span className="capsule-hint">Esc 取消</span>
+      )}
       {phase === "listening" && (
         <button type="button" className="capsule-btn" onClick={() => void stop()}>
           停止
