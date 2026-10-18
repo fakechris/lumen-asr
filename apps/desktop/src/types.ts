@@ -428,6 +428,43 @@ export type MeetingSearchHit = {
   snippet: string;
 };
 
+/** A validated citation in an `ask_meetings` answer. */
+export type AskCitation = {
+  meeting_id: string;
+  title?: string | null;
+  created_at: string;
+  /** Offset into the meeting, in milliseconds. */
+  ms: number;
+};
+
+/** A meeting recalled for an `ask_meetings` question. */
+export type AskMeeting = {
+  meeting_id: string;
+  title?: string | null;
+  created_at: string;
+  matched_keywords: string[];
+  /** Best matching transcript text (or the minutes one-liner). */
+  snippet?: string | null;
+  /** Start (ms) of the snippet's segment, when it came from the transcript. */
+  snippet_ms?: number | null;
+};
+
+/** Result of `ask_meetings` ("问会议"). `answer` carries
+ * `[[m:<meeting_id>@<ms>]]` markers matching `citations` (see `splitAnswer`
+ * in `meetingAsk.ts`); with `used_llm = false` it is empty and only
+ * `meetings_considered` (the keyword recall) is meaningful. */
+export type AskMeetingsResult = {
+  answer: string;
+  citations: AskCitation[];
+  meetings_considered: AskMeeting[];
+  used_llm: boolean;
+  keywords: string[];
+  date_from?: string | null;
+  date_to?: string | null;
+  /** Why the AI answer failed, when it did (the recall still stands). */
+  llm_error?: string | null;
+};
+
 /** Result of `stop_meeting_recording` (camelCase DTO). */
 export type MeetingRecordingResult = {
   id: string;
