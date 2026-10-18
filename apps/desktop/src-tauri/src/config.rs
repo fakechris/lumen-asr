@@ -695,12 +695,17 @@ pub struct AudioConfig {
     pub duck_volume: f32,
     /// Empty = system default input.
     pub device_name: Option<String>,
+    /// With no explicit device, record from the built-in mic when the system
+    /// default input is Bluetooth, so headsets keep their high-quality
+    /// playback profile.
+    pub prefer_builtin_over_bluetooth: bool,
 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             device_name: None,
+            prefer_builtin_over_bluetooth: true,
             duck_output: false,
             duck_volume: 0.15,
         }
@@ -1828,5 +1833,15 @@ mod ducking_config_tests {
         assert_eq!(enabled.duck_volume, 0.0);
         let roundtrip: AudioConfig = toml::from_str(&toml::to_string(&enabled).unwrap()).unwrap();
         assert!(roundtrip.duck_output);
+    }
+
+    #[test]
+    fn bluetooth_fallback_defaults_on_and_can_be_turned_off() {
+        let old: AudioConfig = toml::from_str("device_name = 'Microphone'").unwrap();
+        assert!(old.prefer_builtin_over_bluetooth);
+        let off: AudioConfig = toml::from_str("prefer_builtin_over_bluetooth = false").unwrap();
+        assert!(!off.prefer_builtin_over_bluetooth);
+        let roundtrip: AudioConfig = toml::from_str(&toml::to_string(&off).unwrap()).unwrap();
+        assert!(!roundtrip.prefer_builtin_over_bluetooth);
     }
 }

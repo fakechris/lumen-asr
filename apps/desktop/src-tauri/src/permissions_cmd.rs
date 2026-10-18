@@ -402,6 +402,18 @@ pub async fn request_microphone_access(
     if state.audio.is_recording() {
         mark_microphone_capture_started();
     } else {
+        let audio = state
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .audio
+            .clone();
+        state
+            .audio
+            .set_device(crate::input_device::effective_input_device(
+                &audio,
+                "microphone_probe",
+            ));
         match state.audio.start() {
             Ok(()) => {
                 mark_microphone_capture_started();

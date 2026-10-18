@@ -199,13 +199,8 @@ fn apply_hotkey_action(app: &AppHandle, action: HotkeyAction) {
 }
 
 fn preferred_device(state: &State<'_, AppState>) -> Option<String> {
-    let guard = state.config.lock().ok()?;
-    guard
-        .audio
-        .device_name
-        .as_ref()
-        .filter(|n| !n.is_empty())
-        .cloned()
+    let audio = state.config.lock().ok()?.audio.clone();
+    crate::input_device::effective_input_device(&audio, "meeting")
 }
 
 /// Serialized meeting recording result returned to the UI.
