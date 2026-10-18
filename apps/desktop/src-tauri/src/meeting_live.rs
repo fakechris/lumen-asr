@@ -11,9 +11,12 @@
 //! - **After stop** — the existing offline pipeline
 //!   ([`lumen_meeting::process_meeting`]) re-transcribes with diarization and
 //!   word timestamps and produces the authoritative, speaker-attributed
-//!   transcript that *replaces* this live preview. The live text itself is
-//!   never persisted; its finalized segments are handed back at stop only to
-//!   generate draft minutes ([`crate::meeting_draft`]) while that runs.
+//!   transcript that *replaces* this live preview. Its finalized segments are
+//!   handed back at stop to generate draft minutes ([`crate::meeting_draft`])
+//!   while that runs. They are also appended, with periodic checkpoints of the
+//!   unfinished partials, to a crash-safe journal
+//!   ([`crate::meeting_journal`]) so a crash mid-meeting does not lose the
+//!   live text; the journal is deleted once the final transcript is saved.
 //!
 //! ## Dual-stream: one model, two tracks
 //! The ~1 GB streaming Paraformer weights are loaded **once** as a
@@ -44,7 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lumen_asr::{
     default_paraformer_streaming_dir, paraformer_streaming_ready, resample_linear, LiveAudioPacket,
@@ -55,6 +58,7 @@ use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
 use crate::meeting_draft::{LiveLine, LiveTranscriptLog};
+use crate::meeting_journal::{JournalPartial, JournalWriter, CHECKPOINT_INTERVAL};
 
 /// Sample rate the streaming Paraformer model expects. Each track captures at
 /// its own native rate, so chunks are resampled to this before decoding.
@@ -510,6 +514,18 @@ impl SegmentTracker {
             end_seconds: None,
             text: text.to_string(),
             is_final: false,
+        })
+    }
+
+    /// The announced, not yet finalized segment: `(segment_id, start, text)`.
+    /// `None` between utterances.
+    fn current_partial(&self) -> Option<(String, f64, &str)> {
+        (self.revision > 0 && !self.last_text.trim().is_empty()).then(|| {
+            (
+                self.segment_id(),
+                self.start_seconds.unwrap_or(0.0),
+                self.last_text.as_str(),
+            )
         })
     }
 
@@ -1726,6 +1742,19 @@ fn run_worker(
         }
     };
 
+    // Crash-safe journal next to the recording. Best-effort: without it the
+    // live preview and draft minutes work as before, only crash recovery has
+    // no live text to draft from.
+    let mut journal = out_path.parent().and_then(|dir| {
+        let path = crate::meeting_journal::journal_path(dir, &meeting_id);
+        JournalWriter::open(&path)
+            .map_err(|e| {
+                tracing::warn!(path = %path.display(), error = %e, "live transcript journal disabled")
+            })
+            .ok()
+    });
+    let mut last_checkpoint = Instant::now();
+
     // L3: live speaker verification (macOS + diar embedding model + non-empty
     // identity library, otherwise `None` and everything below degrades to the
     // exact L1/L2 behaviour — no ring buffers, no jobs, no speaker events).
@@ -1791,8 +1820,14 @@ fn run_worker(
         for track in &mut tracks {
             if let Some(update) = track.poll_result() {
                 track.maybe_enqueue_verification(&verifier, &update);
-                record_final(&mut log, track.tracker.track, &update);
+                record_final(&mut log, &mut journal, track.tracker.track, &update);
                 emit(&app, &meeting_id, track.tracker.track, update, None);
+            }
+        }
+        if last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
+            last_checkpoint = Instant::now();
+            if let Some(journal) = &mut journal {
+                journal.checkpoint(current_partials(&tracks));
             }
         }
     }
@@ -1806,9 +1841,13 @@ fn run_worker(
         let clock = track.clock;
         if let Some(update) = track.tracker.on_endpoint(&text, clock) {
             track.maybe_enqueue_verification(&verifier, &update);
-            record_final(&mut log, track.tracker.track, &update);
+            record_final(&mut log, &mut journal, track.tracker.track, &update);
             emit(&app, &meeting_id, track.tracker.track, update, None);
         }
+    }
+    // Every segment is final now; make sure the journal holds them on disk.
+    if let Some(journal) = journal {
+        journal.finish();
     }
     // Close the job queue and wait for in-flight verifications so a trailing
     // attribution still reaches the UI before the worker reports done.
@@ -1819,17 +1858,51 @@ fn run_worker(
     log.into_lines()
 }
 
-/// Keep finalized segments (and their retractions) for the draft minutes.
-fn record_final(log: &mut LiveTranscriptLog, track: &'static str, update: &SegmentUpdate) {
+/// Keep finalized segments (and their retractions) for the draft minutes,
+/// and journal them for crash recovery.
+fn record_final(
+    log: &mut LiveTranscriptLog,
+    journal: &mut Option<JournalWriter>,
+    track: &'static str,
+    update: &SegmentUpdate,
+) {
     if update.is_final {
+        let end_seconds = update.end_seconds.unwrap_or(update.start_seconds);
         log.record_final(
             track,
             &update.segment_id,
             update.start_seconds,
-            update.end_seconds.unwrap_or(update.start_seconds),
+            end_seconds,
             &update.text,
         );
+        if let Some(journal) = journal {
+            journal.record_final(
+                track,
+                &update.segment_id,
+                update.start_seconds,
+                end_seconds,
+                &update.text,
+            );
+        }
     }
+}
+
+/// Each track's unfinished segment, for a journal checkpoint. The partial
+/// ends at the audio fed so far on that track.
+fn current_partials(tracks: &[TrackState]) -> Vec<JournalPartial> {
+    tracks
+        .iter()
+        .filter_map(|t| {
+            let (segment_id, start, text) = t.tracker.current_partial()?;
+            Some(JournalPartial::new(
+                t.tracker.track,
+                &segment_id,
+                start,
+                t.clock.max(start),
+                text,
+            ))
+        })
+        .collect()
 }
 
 fn emit(
@@ -1973,6 +2046,20 @@ mod tests {
         // And its id is burned — the next utterance gets a new one.
         tracker.note_audio(2.0);
         assert_eq!(tracker.on_partial("好").unwrap().segment_id, "mic-1");
+    }
+
+    #[test]
+    fn current_partial_tracks_the_unfinished_segment_only() {
+        let mut tracker = SegmentTracker::new(TRACK_SYSTEM);
+        assert_eq!(tracker.current_partial(), None);
+        tracker.note_audio(1.5);
+        tracker.on_partial("正在说").unwrap();
+        assert_eq!(
+            tracker.current_partial(),
+            Some(("system-0".to_string(), 1.5, "正在说"))
+        );
+        tracker.on_endpoint("正在说的话", 3.0).unwrap();
+        assert_eq!(tracker.current_partial(), None);
     }
 
     #[test]

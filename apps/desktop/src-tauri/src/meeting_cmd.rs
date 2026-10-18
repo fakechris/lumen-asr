@@ -851,7 +851,8 @@ fn start_meeting_recording_with_targets(
         .map(|cfg| cfg.meeting.audio_format())
         .unwrap_or(lumen_asr::MeetingAudioFormat::Opus);
     let dir = default_data_dir().join("meetings");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    // Recordings and their live journal are private: owner-only directory.
+    if let Err(e) = crate::meeting_journal::create_private_dir(&dir) {
         state.capture.force_idle();
         let reason = format!("could not create meetings dir: {e}");
         let _ = with_store(&state, |s| {
@@ -2320,7 +2321,15 @@ fn run_meeting_processing(
     runtime.block_on(async move {
         tracing::info!(meeting_id = %meeting_id, "meeting processing started");
         match process_meeting_pipeline(app, meeting_id, wav, system_wav).await {
-            Ok(()) => tracing::info!(meeting_id = %meeting_id, "meeting processing finished"),
+            Ok(()) => {
+                tracing::info!(meeting_id = %meeting_id, "meeting processing finished");
+                // The final transcript is saved, so the crash-recovery copy of
+                // the live text is no longer needed. A failed run keeps it.
+                crate::meeting_journal::remove_journal(
+                    &default_data_dir().join("meetings"),
+                    &meeting_id.to_string(),
+                );
+            }
             Err(reason) => {
                 tracing::warn!(meeting_id = %meeting_id, error = %reason, "meeting processing failed");
                 // `process_meeting` records the reason for in-pipeline
@@ -2815,6 +2824,19 @@ fn recover_one_meeting(app: &AppHandle, store: &Store, meeting: &Meeting) {
                 "crash recovery: salvaged recording → processing"
             );
             emit_recovery(app, meeting, "recovered", Some(duration_seconds), None);
+            // Draft minutes from the live-transcript journal right away; the
+            // reprocessed final minutes replace the draft as after a normal stop.
+            let journal = crate::meeting_journal::journal_path(
+                &default_data_dir().join("meetings"),
+                &id.to_string(),
+            );
+            let live_lines = crate::meeting_journal::load_journal(&journal);
+            tracing::info!(
+                meeting_id = %id,
+                live_segments = live_lines.len(),
+                "crash recovery: live transcript journal loaded"
+            );
+            crate::meeting_draft::spawn_draft_minutes(app.clone(), id, live_lines);
             spawn_meeting_processing(app.clone(), id, wav, system_wav);
         }
         // Header-only WAV / empty Opus: a valid 0-length take — no audio to keep.
@@ -3297,6 +3319,7 @@ pub async fn delete_meeting(
     let Some((audio_path, system_audio_path)) = deleted_paths else {
         return Ok(false);
     };
+    crate::meeting_journal::remove_journal(&default_data_dir().join("meetings"), &id.to_string());
     if let Some(mic) = audio_path.as_deref() {
         match owned_meeting_wav(mic) {
             Ok(owned) => remove_mic_audio_artifacts(&owned),
