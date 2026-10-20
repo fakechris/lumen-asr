@@ -1,8 +1,10 @@
 import type {
   ChangeEvent,
+  Dispatch,
   KeyboardEvent as ReactKeyboardEvent,
   MutableRefObject,
   ReactNode,
+  SetStateAction,
 } from "react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -216,6 +218,11 @@ export function MeetingPanel({
   onOpenMeetingConsumed?: () => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // 问会议 state lives here, not in the library: opening a citation unmounts
+  // the library, and checking citations one by one must not lose the answer.
+  const [askMode, setAskMode] = useState(false);
+  const [askQuestion, setAskQuestion] = useState("");
+  const [askResult, setAskResult] = useState<AskMeetingsResult | null>(null);
   // Where to land in the opened meeting (seconds), e.g. from a 问会议 citation.
   const [openSeek, setOpenSeek] = useState<number | null>(null);
   const openFromLibrary = useCallback((id: string, seekSeconds?: number) => {
@@ -257,6 +264,12 @@ export function MeetingPanel({
       onOpen={openFromLibrary}
       onError={onError}
       models={models}
+      askMode={askMode}
+      setAskMode={setAskMode}
+      askQuestion={askQuestion}
+      setAskQuestion={setAskQuestion}
+      askResult={askResult}
+      setAskResult={setAskResult}
     />
   );
 }
@@ -316,14 +329,25 @@ function MeetingLibrary({
   onOpen,
   onError,
   models,
+  askMode,
+  setAskMode,
+  askQuestion,
+  setAskQuestion,
+  askResult,
+  setAskResult,
 }: {
   onOpen: (id: string, seekSeconds?: number) => void;
   onError: (e: string | null) => void;
   models: MeetingModels;
+  /** 问会议: the list pane shows the question box and answer instead of rows. */
+  askMode: boolean;
+  setAskMode: Dispatch<SetStateAction<boolean>>;
+  askQuestion: string;
+  setAskQuestion: (q: string) => void;
+  askResult: AskMeetingsResult | null;
+  setAskResult: (r: AskMeetingsResult | null) => void;
 }) {
   const [meetings, setMeetings] = useState<Meeting[]>([]);
-  // 问会议: the list pane shows the question box and answer instead of rows.
-  const [askMode, setAskMode] = useState(false);
   // Per-meeting match info while a search is active (`null` = plain list).
   const [matches, setMatches] = useState<Record<string, RowMatch> | null>(
     null,
@@ -743,6 +767,10 @@ function MeetingLibrary({
             onOpen={onOpen}
             onExit={() => setAskMode(false)}
             onError={onError}
+            question={askQuestion}
+            setQuestion={setAskQuestion}
+            result={askResult}
+            setResult={setAskResult}
           />
         ) : rowIds.length === 0 ? (
           <div className="meeting-empty">
@@ -801,14 +829,21 @@ function MeetingAsk({
   onOpen,
   onExit,
   onError,
+  question,
+  setQuestion,
+  result,
+  setResult,
 }: {
   onOpen: (id: string, seekSeconds?: number) => void;
   onExit: () => void;
   onError: (e: string | null) => void;
+  /** Owned by `MeetingPanel` so they survive opening a cited meeting. */
+  question: string;
+  setQuestion: (q: string) => void;
+  result: AskMeetingsResult | null;
+  setResult: (r: AskMeetingsResult | null) => void;
 }) {
-  const [question, setQuestion] = useState("");
   const [running, setRunning] = useState(false);
-  const [result, setResult] = useState<AskMeetingsResult | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   // Only the latest question may write results; cancelling bumps it so a
   // late answer is ignored (the backend call itself cannot be aborted).
@@ -833,7 +868,7 @@ function MeetingAsk({
     } finally {
       if (seq === askSeq.current) setRunning(false);
     }
-  }, [question, onError]);
+  }, [question, onError, setResult]);
 
   const cancel = useCallback(() => {
     askSeq.current += 1;

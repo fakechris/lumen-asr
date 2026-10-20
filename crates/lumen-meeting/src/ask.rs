@@ -927,7 +927,33 @@ pub fn finalize_answer(raw: &str, materials: &[MeetingMaterial]) -> (String, Vec
         }
     }
     answer.push_str(&raw[last..]);
-    (answer.trim().to_string(), citations)
+    (strip_stray_markers(&answer).trim().to_string(), citations)
+}
+
+/// Drop every `[[m:…]]` span that is not a canonical marker (malformed id or
+/// ms), so the answer holds only the validated markers the UI renders as chips.
+fn strip_stray_markers(text: &str) -> String {
+    let valid: Vec<_> = parse_citation_markers(text)
+        .into_iter()
+        .map(|m| m.range)
+        .collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(offset) = text[i..].find("[[m:") {
+        let start = i + offset;
+        out.push_str(&text[i..start]);
+        if let Some(range) = valid.iter().find(|r| r.start == start) {
+            out.push_str(&text[range.clone()]);
+            i = range.end;
+        } else if let Some(close) = text[start..].find("]]") {
+            i = start + close + 2;
+        } else {
+            out.push_str(&text[start..]);
+            i = text.len();
+        }
+    }
+    out.push_str(&text[i..]);
+    out
 }
 
 #[cfg(test)]
@@ -1218,7 +1244,7 @@ mod tests {
         let (answer, citations) = finalize_answer(&raw, &[known]);
         assert_eq!(
             answer,
-            format!("预算砍半[[m:{id}@12500]][[m:{id}@12500]]。另一个，坏的[[m:nope@1]]和[[m:{id}@-3]]，再[[m:{id}@0]]")
+            format!("预算砍半[[m:{id}@12500]][[m:{id}@12500]]。另一个，坏的和，再[[m:{id}@0]]")
         );
         assert_eq!(
             citations.iter().map(|c| c.ms).collect::<Vec<_>>(),

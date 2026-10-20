@@ -3066,8 +3066,16 @@ pub async fn ask_meetings(
         .map_err(|_| "config lock poisoned".to_string())?
         .corrector
         .clone();
+    // A misconfigured LLM (e.g. a missing API key) degrades to keyword recall
+    // with `used_llm = false`, as documented, instead of failing the command.
     let corrector = if corrector_cfg.enabled && corrector_cfg.provider != "none" {
-        Some(crate::corrector_svc::build_corrector(&corrector_cfg)?)
+        match crate::corrector_svc::build_corrector(&corrector_cfg) {
+            Ok(corrector) => Some(corrector),
+            Err(error) => {
+                tracing::warn!(%error, "ask_meetings: LLM unavailable; keyword recall only");
+                None
+            }
+        }
     } else {
         None
     };
