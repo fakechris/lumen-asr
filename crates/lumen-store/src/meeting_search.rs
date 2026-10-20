@@ -6,11 +6,15 @@
 //! shorter term cannot be matched by a trigram index, so it falls back to a
 //! case-insensitive `LIKE` substring check over the same indexed text.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use lumen_core::{Meeting, MeetingStatus};
 use rusqlite::params_from_iter;
 use rusqlite::types::Value;
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::meeting::map_meeting;
 use crate::Store;
@@ -58,6 +62,33 @@ pub struct MeetingSearchHit {
     /// Short excerpt around the match; matched text is wrapped in
     /// [`SEARCH_SNIPPET_MARK_START`] / [`SEARCH_SNIPPET_MARK_END`].
     pub snippet: String,
+}
+
+/// One meeting recalled by [`Store::recall_meetings`] (any-keyword search).
+#[derive(Debug, Clone, Serialize)]
+pub struct MeetingRecallHit {
+    pub meeting: Meeting,
+    /// The query keywords that occur somewhere in this meeting, in query order.
+    pub matched_keywords: Vec<String>,
+    /// Sum over matched keywords of each keyword's best BM25 score in this
+    /// meeting (lower is more relevant; `0.0` for keywords matched by `LIKE`).
+    pub score: f64,
+    /// Transcript segments that contain a keyword: segments matching more
+    /// keywords first, then by relevance; at most [`RECALL_MAX_SEGMENTS`].
+    pub matched_segment_ids: Vec<Uuid>,
+}
+
+/// Most matched segment ids kept per recalled meeting.
+pub const RECALL_MAX_SEGMENTS: usize = 24;
+
+/// Per-meeting accumulator for [`Store::recall_meetings`].
+#[derive(Default)]
+struct RecallAccumulator {
+    created_at: String,
+    /// Best (lowest) score of each matched keyword, by keyword index.
+    keyword_scores: HashMap<usize, f64>,
+    /// Segment id -> (keywords matched, best score).
+    segments: HashMap<String, (usize, f64)>,
 }
 
 /// Columns `map_meeting` expects, prefixed with `m.`.
@@ -161,6 +192,171 @@ impl Store {
                 meeting,
                 field: MeetingSearchField::from_token(&field),
                 snippet: match_snippet(&body, &terms),
+            });
+        }
+        Ok(hits)
+    }
+}
+
+impl Store {
+    /// Recall meetings that contain **any** of `keywords` (in their title,
+    /// notes, transcript or final minutes), optionally restricted to meetings
+    /// created in `[created_from, created_before)`.
+    ///
+    /// Unlike [`Store::search_meetings`] (every term in the same text, for the
+    /// library search box), keywords are independent here: a meeting ranks
+    /// higher the more distinct keywords it contains anywhere, then by summed
+    /// BM25, then by recency. Keywords of three or more characters use the
+    /// trigram index; shorter ones fall back to `LIKE` (score `0.0`). With no
+    /// usable keyword, the meetings in the date range are listed newest first
+    /// (and nothing is returned when there is no range either).
+    pub fn recall_meetings(
+        &self,
+        keywords: &[&str],
+        created_from: Option<DateTime<Utc>>,
+        created_before: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> Result<Vec<MeetingRecallHit>> {
+        let mut terms: Vec<&str> = Vec::new();
+        for keyword in keywords.iter().map(|k| k.trim()) {
+            if !keyword.is_empty() && !terms.contains(&keyword) {
+                terms.push(keyword);
+            }
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Stored `created_at` values are RFC 3339 UTC strings written by
+        // `to_rfc3339`, so bounds in the same format compare lexically.
+        let from = created_from.map_or(Value::Null, |t| Value::Text(t.to_rfc3339()));
+        let before = created_before.map_or(Value::Null, |t| Value::Text(t.to_rfc3339()));
+        if terms.is_empty() {
+            if created_from.is_none() && created_before.is_none() {
+                return Ok(Vec::new());
+            }
+            return self.meetings_in_range(from, before, limit);
+        }
+
+        let mut by_meeting: HashMap<String, RecallAccumulator> = HashMap::new();
+        for (index, term) in terms.iter().enumerate() {
+            let (condition, score, pattern) = if term.chars().count() >= MIN_FTS_TERM_CHARS {
+                (
+                    "meeting_search MATCH ?1",
+                    "bm25(meeting_search)",
+                    fts_match_expression(&[*term]),
+                )
+            } else {
+                (
+                    "s.body LIKE ?1 ESCAPE '\\'",
+                    "0.0",
+                    format!("%{}%", escape_like(term)),
+                )
+            };
+            let sql = format!(
+                r#"
+                SELECT d.meeting_id, d.field, d.source_id, {score}, m.created_at
+                FROM meeting_search s
+                JOIN meeting_search_docs d ON d.id = s.rowid
+                JOIN meetings m ON m.id = d.meeting_id
+                WHERE {condition}
+                  AND (?2 IS NULL OR m.created_at >= ?2)
+                  AND (?3 IS NULL OR m.created_at < ?3)
+                "#
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(
+                params_from_iter([Value::Text(pattern), from.clone(), before.clone()]),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (meeting_id, field, source_id, score, created_at) = row?;
+                let entry = by_meeting.entry(meeting_id).or_default();
+                entry.created_at = created_at;
+                let best = entry.keyword_scores.entry(index).or_insert(score);
+                *best = best.min(score);
+                if field == "segment" {
+                    let seg = entry.segments.entry(source_id).or_insert((0, score));
+                    seg.0 += 1;
+                    seg.1 = seg.1.min(score);
+                }
+            }
+        }
+
+        let mut ranked: Vec<(String, RecallAccumulator, f64)> = by_meeting
+            .into_iter()
+            .map(|(id, acc)| {
+                let score = acc.keyword_scores.values().sum();
+                (id, acc, score)
+            })
+            .collect();
+        ranked.sort_by(|(_, a, a_score), (_, b, b_score)| {
+            b.keyword_scores
+                .len()
+                .cmp(&a.keyword_scores.len())
+                .then(a_score.total_cmp(b_score))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        });
+
+        let mut hits = Vec::new();
+        for (id, acc, score) in ranked.into_iter().take(limit as usize) {
+            let Some(meeting) = self.get_meeting(Uuid::parse_str(&id)?)? else {
+                continue;
+            };
+            let mut keyword_indices: Vec<usize> = acc.keyword_scores.keys().copied().collect();
+            keyword_indices.sort_unstable();
+            let mut segments: Vec<(String, (usize, f64))> = acc.segments.into_iter().collect();
+            segments.sort_by(|(a_id, (a_n, a_s)), (b_id, (b_n, b_s))| {
+                b_n.cmp(a_n).then(a_s.total_cmp(b_s)).then(a_id.cmp(b_id))
+            });
+            hits.push(MeetingRecallHit {
+                meeting,
+                matched_keywords: keyword_indices
+                    .into_iter()
+                    .map(|i| terms[i].to_string())
+                    .collect(),
+                score,
+                matched_segment_ids: segments
+                    .into_iter()
+                    .take(RECALL_MAX_SEGMENTS)
+                    .filter_map(|(id, _)| Uuid::parse_str(&id).ok())
+                    .collect(),
+            });
+        }
+        Ok(hits)
+    }
+
+    /// Meetings created within the (already formatted) bounds, newest first.
+    fn meetings_in_range(
+        &self,
+        from: Value,
+        before: Value,
+        limit: u32,
+    ) -> Result<Vec<MeetingRecallHit>> {
+        let sql = format!(
+            "SELECT {MEETING_COLUMNS} FROM meetings m \
+             WHERE (?1 IS NULL OR m.created_at >= ?1) AND (?2 IS NULL OR m.created_at < ?2) \
+             ORDER BY m.created_at DESC LIMIT ?3"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(
+            params_from_iter([from, before, Value::Integer(i64::from(limit))]),
+            map_meeting,
+        )?;
+        let mut hits = Vec::new();
+        for meeting in rows {
+            hits.push(MeetingRecallHit {
+                meeting: meeting?,
+                matched_keywords: Vec::new(),
+                score: 0.0,
+                matched_segment_ids: Vec::new(),
             });
         }
         Ok(hits)
@@ -589,6 +785,106 @@ mod tests {
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(index_rows(&store), 4);
+    }
+
+    fn recall(
+        store: &Store,
+        keywords: &[&str],
+        from_days_ago: Option<i64>,
+        before_days_ago: Option<i64>,
+    ) -> Vec<super::MeetingRecallHit> {
+        let at = |days: i64| Utc::now() - Duration::days(days) + Duration::hours(12);
+        store
+            .recall_meetings(keywords, from_days_ago.map(at), before_days_ago.map(at), 10)
+            .unwrap()
+    }
+
+    #[test]
+    fn recall_matches_any_keyword_and_ranks_by_keywords_then_bm25_then_recency() {
+        let (_dir, store) = open_store();
+        let both = meeting(&store, Some("周会"), 6);
+        let both_seg = segment(&store, both.id, 0, "预算要砍一半");
+        segment(&store, both.id, 1, "无关的闲聊");
+        let both_seg2 = segment(&store, both.id, 2, "招聘计划推迟");
+        let budget_old = meeting(&store, Some("budget review"), 5);
+        let budget_new = meeting(&store, Some("budget review"), 1);
+        let unrelated = meeting(&store, Some("Lunch"), 0);
+        segment(&store, unrelated.id, 0, "nothing here");
+
+        let hits = recall(&store, &["预算", "招聘计划", "budget"], None, None);
+        // Two keywords beat one; equal single-keyword title hits: newest first.
+        assert_eq!(ids_of(&hits), vec![both.id, budget_new.id, budget_old.id]);
+        assert_eq!(hits[0].matched_keywords, vec!["预算", "招聘计划"]);
+        assert_eq!(hits[1].matched_keywords, vec!["budget"]);
+        let mut segs = hits[0].matched_segment_ids.clone();
+        segs.sort();
+        let mut expected = vec![both_seg.id, both_seg2.id];
+        expected.sort();
+        assert_eq!(segs, expected);
+        // The AND search would find nothing for the same terms.
+        assert!(search(&store, "预算 招聘计划 budget").is_empty());
+    }
+
+    #[test]
+    fn recall_prefers_stronger_bm25_among_equal_keyword_counts() {
+        let (_dir, store) = open_store();
+        let weak = meeting(&store, Some("misc"), 0);
+        segment(
+            &store,
+            weak.id,
+            0,
+            "a long rambling segment that eventually mentions the roadmap once among many \
+             other unrelated words about lunch travel hiring and weather",
+        );
+        let strong = meeting(&store, Some("roadmap"), 3);
+        let hits = recall(&store, &["roadmap"], None, None);
+        assert_eq!(ids_of(&hits), vec![strong.id, weak.id]);
+    }
+
+    #[test]
+    fn recall_filters_by_created_at_range_and_lists_range_without_keywords() {
+        let (_dir, store) = open_store();
+        let old = meeting(&store, Some("budget old"), 10);
+        let mid = meeting(&store, Some("budget mid"), 5);
+        let mid2 = meeting(&store, Some("other mid"), 4);
+        let new = meeting(&store, Some("budget new"), 1);
+
+        // [7 days ago, 3 days ago): only the middle meetings.
+        assert_eq!(
+            ids_of(&recall(&store, &["budget"], Some(7), Some(3))),
+            vec![mid.id]
+        );
+        assert_eq!(
+            ids_of(&recall(&store, &["budget"], Some(2), None)),
+            vec![new.id]
+        );
+        assert_eq!(
+            ids_of(&recall(&store, &["budget"], None, Some(8))),
+            vec![old.id]
+        );
+        // No keyword: the range alone, newest first; no range either: nothing.
+        assert_eq!(
+            ids_of(&recall(&store, &[], Some(7), Some(3))),
+            vec![mid2.id, mid.id]
+        );
+        assert_eq!(
+            ids_of(&recall(&store, &["  "], Some(7), Some(3))),
+            vec![mid2.id, mid.id]
+        );
+        assert!(recall(&store, &[], None, None).is_empty());
+    }
+
+    #[test]
+    fn recall_treats_keywords_literally() {
+        let (_dir, store) = open_store();
+        meeting(&store, Some("Design review"), 1);
+        assert!(recall(&store, &["design\" OR \"x"], None, None).is_empty());
+        assert!(recall(&store, &["%"], None, None).is_empty());
+        assert_eq!(recall(&store, &["design", "design"], None, None).len(), 1);
+    }
+
+    fn ids_of(hits: &[super::MeetingRecallHit]) -> Vec<Uuid> {
+        hits.iter().map(|hit| hit.meeting.id).collect()
     }
 
     #[test]

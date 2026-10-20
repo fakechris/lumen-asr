@@ -24,6 +24,7 @@ import type {
   MeetingDetail,
   MeetingRecordingResult,
   MeetingSearchHit,
+  AskMeetingsResult,
   MeetingStatus,
   SessionRecord,
   TranscribeOutcome,
@@ -556,6 +557,11 @@ export const api = {
       status: opts?.status ?? null,
       limit: opts?.limit ?? null,
     }),
+
+  /** Ask a question across past meetings ("问会议"). Without an LLM
+   * configured this resolves with `used_llm: false` and the keyword recall. */
+  askMeetings: (question: string) =>
+    invoke<AskMeetingsResult>("ask_meetings", { question }),
 
   // ---- Meeting detection (opt-in, capability-gated) ---------------------
 

@@ -1,4 +1,11 @@
-import type { ChangeEvent, MutableRefObject, ReactNode } from "react";
+import type {
+  ChangeEvent,
+  Dispatch,
+  KeyboardEvent as ReactKeyboardEvent,
+  MutableRefObject,
+  ReactNode,
+  SetStateAction,
+} from "react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -25,8 +32,16 @@ import {
   searchFieldLabel,
   splitSnippet,
 } from "./meetingSearch";
+import {
+  askKeyAction,
+  citationLabel,
+  formatCitationTime,
+  formatMeetingDate,
+  splitAnswer,
+} from "./meetingAsk";
 import { buildSpeakerColorMap, colorForSpeaker } from "./speakerColors";
 import type {
+  AskMeetingsResult,
   ActionItem,
   EnrolledSpeaker,
   ExportTarget,
@@ -203,6 +218,17 @@ export function MeetingPanel({
   onOpenMeetingConsumed?: () => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // 问会议 state lives here, not in the library: opening a citation unmounts
+  // the library, and checking citations one by one must not lose the answer.
+  const [askMode, setAskMode] = useState(false);
+  const [askQuestion, setAskQuestion] = useState("");
+  const [askResult, setAskResult] = useState<AskMeetingsResult | null>(null);
+  // Where to land in the opened meeting (seconds), e.g. from a 问会议 citation.
+  const [openSeek, setOpenSeek] = useState<number | null>(null);
+  const openFromLibrary = useCallback((id: string, seekSeconds?: number) => {
+    setOpenSeek(seekSeconds ?? null);
+    setSelectedId(id);
+  }, []);
   // App-level model state (from MeetingModelsProvider at the App root). It is
   // not tied to this panel's lifetime, so a running (~1GB) download's
   // progress/cancel survive switching tabs away and back, and the library and
@@ -214,6 +240,7 @@ export function MeetingPanel({
   // clicking the same meeting's notification again later still re-opens it.
   useEffect(() => {
     if (openMeeting) {
+      setOpenSeek(null);
       setSelectedId(openMeeting.id);
       onOpenMeetingConsumed?.();
     }
@@ -223,6 +250,7 @@ export function MeetingPanel({
     return (
       <MeetingDetailView
         meetingId={selectedId}
+        initialSeekSeconds={openSeek}
         onBack={() => setSelectedId(null)}
         onError={onError}
         onNavigate={onNavigate}
@@ -232,7 +260,17 @@ export function MeetingPanel({
     );
   }
   return (
-    <MeetingLibrary onOpen={setSelectedId} onError={onError} models={models} />
+    <MeetingLibrary
+      onOpen={openFromLibrary}
+      onError={onError}
+      models={models}
+      askMode={askMode}
+      setAskMode={setAskMode}
+      askQuestion={askQuestion}
+      setAskQuestion={setAskQuestion}
+      askResult={askResult}
+      setAskResult={setAskResult}
+    />
   );
 }
 
@@ -291,10 +329,23 @@ function MeetingLibrary({
   onOpen,
   onError,
   models,
+  askMode,
+  setAskMode,
+  askQuestion,
+  setAskQuestion,
+  askResult,
+  setAskResult,
 }: {
-  onOpen: (id: string) => void;
+  onOpen: (id: string, seekSeconds?: number) => void;
   onError: (e: string | null) => void;
   models: MeetingModels;
+  /** 问会议: the list pane shows the question box and answer instead of rows. */
+  askMode: boolean;
+  setAskMode: Dispatch<SetStateAction<boolean>>;
+  askQuestion: string;
+  setAskQuestion: (q: string) => void;
+  askResult: AskMeetingsResult | null;
+  setAskResult: (r: AskMeetingsResult | null) => void;
 }) {
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   // Per-meeting match info while a search is active (`null` = plain list).
@@ -554,6 +605,15 @@ function MeetingLibrary({
       if (e.isComposing) return;
       const active = document.activeElement;
       const inSearch = active === searchRef.current;
+      // The ask pane owns its keys; ⌘F still returns to the search box.
+      if (askMode) {
+        if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "f") {
+          e.preventDefault();
+          setAskMode(false);
+          window.setTimeout(() => searchRef.current?.focus(), 0);
+        }
+        return;
+      }
       const action = libraryKeyAction({
         key: e.key,
         metaKey: e.metaKey,
@@ -595,7 +655,7 @@ function MeetingLibrary({
     // in the DOM.
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [rowIds, cursor, query, pendingDelete, onOpen]);
+  }, [rowIds, cursor, query, pendingDelete, onOpen, askMode]);
 
   return (
     <div className="split meeting-layout">
@@ -622,9 +682,21 @@ function MeetingLibrary({
             value={query}
             placeholder="搜索标题、逐字稿、纪要、笔记（⌘F）"
             aria-label="搜索会议"
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setAskMode(false);
+            }}
           />
         </label>
+        <button
+          type="button"
+          className={`meeting-filter meeting-ask-toggle ${askMode ? "active" : ""}`}
+          aria-pressed={askMode}
+          onClick={() => setAskMode((v) => !v)}
+        >
+          <span>问会议</span>
+          <span className="meeting-filter-count">AI</span>
+        </button>
         <nav className="meeting-filter-list" aria-label="会议过滤">
           {FILTERS.map((f) => (
             <button
@@ -690,7 +762,17 @@ function MeetingLibrary({
           )}
         </div>
         <MeetingModelSetup models={models} />
-        {rowIds.length === 0 ? (
+        {askMode ? (
+          <MeetingAsk
+            onOpen={onOpen}
+            onExit={() => setAskMode(false)}
+            onError={onError}
+            question={askQuestion}
+            setQuestion={setAskQuestion}
+            result={askResult}
+            setResult={setAskResult}
+          />
+        ) : rowIds.length === 0 ? (
           <div className="meeting-empty">
             <p className="empty-history-title">
               {loading ? "正在加载…" : "没有会议"}
@@ -736,6 +818,217 @@ function MeetingLibrary({
           onConfirm={() => void confirmDelete()}
           onCancel={() => setPendingDelete(null)}
         />
+      )}
+    </div>
+  );
+}
+
+// ---- 问会议 (ask past meetings) -----------------------------------------
+
+function MeetingAsk({
+  onOpen,
+  onExit,
+  onError,
+  question,
+  setQuestion,
+  result,
+  setResult,
+}: {
+  onOpen: (id: string, seekSeconds?: number) => void;
+  onExit: () => void;
+  onError: (e: string | null) => void;
+  /** Owned by `MeetingPanel` so they survive opening a cited meeting. */
+  question: string;
+  setQuestion: (q: string) => void;
+  result: AskMeetingsResult | null;
+  setResult: (r: AskMeetingsResult | null) => void;
+}) {
+  const [running, setRunning] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  // Only the latest question may write results; cancelling bumps it so a
+  // late answer is ignored (the backend call itself cannot be aborted).
+  const askSeq = useRef(0);
+
+  useEffect(() => {
+    if (!running) inputRef.current?.focus();
+  }, [running]);
+
+  const ask = useCallback(async () => {
+    const q = question.trim();
+    if (!q) return;
+    const seq = ++askSeq.current;
+    setRunning(true);
+    setResult(null);
+    onError(null);
+    try {
+      const r = await api.askMeetings(q);
+      if (seq === askSeq.current) setResult(r);
+    } catch (e) {
+      if (seq === askSeq.current) onError(String(e));
+    } finally {
+      if (seq === askSeq.current) setRunning(false);
+    }
+  }, [question, onError, setResult]);
+
+  const cancel = useCallback(() => {
+    askSeq.current += 1;
+    setRunning(false);
+  }, []);
+
+  // The input is disabled while running, so Esc-to-cancel listens globally.
+  useEffect(() => {
+    if (!running) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || keyboardOverlayOpen()) return;
+      e.preventDefault();
+      cancel();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [running, cancel]);
+
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    const action = askKeyAction({
+      key: e.key,
+      isComposing: e.nativeEvent.isComposing,
+      running,
+      hasText: question.trim().length > 0,
+      hasResult: result !== null,
+    });
+    if (action === null) return;
+    e.preventDefault();
+    if (action === "submit") void ask();
+    else if (action === "cancel") cancel();
+    else if (action === "clear") {
+      setQuestion("");
+      setResult(null);
+    } else onExit();
+  };
+
+  const open = (id: string, ms?: number | null) =>
+    onOpen(id, ms == null ? undefined : ms / 1000);
+
+  return (
+    <div className="meeting-ask">
+      <form
+        className="meeting-ask-form"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void ask();
+        }}
+      >
+        <input
+          ref={inputRef}
+          className="meeting-ask-input"
+          type="text"
+          value={question}
+          disabled={running}
+          placeholder="问过去的会议，例如：上周二关于预算定了什么？"
+          aria-label="问会议"
+          onChange={(e) => setQuestion(e.target.value)}
+          onKeyDown={onKeyDown}
+        />
+        <button
+          type="submit"
+          className="btn meeting-start-btn"
+          disabled={running || !question.trim()}
+        >
+          {running && <span className="mtg-spinner" aria-hidden />}
+          {running ? "正在查找…" : "提问"}
+        </button>
+      </form>
+      <p className="muted-text meeting-ask-hint">
+        {running
+          ? "正在检索会议并整理回答，按 Esc 取消。"
+          : "Enter 提问，Esc 取消或清空。回答只依据会议库中的记录，并标注出处。"}
+      </p>
+      {result && <MeetingAskResult result={result} onOpen={open} />}
+    </div>
+  );
+}
+
+function MeetingAskResult({
+  result,
+  onOpen,
+}: {
+  result: AskMeetingsResult;
+  onOpen: (id: string, ms?: number | null) => void;
+}) {
+  const parts = useMemo(
+    () => splitAnswer(result.answer, result.citations),
+    [result.answer, result.citations],
+  );
+  const meetings = result.meetings_considered;
+  return (
+    <div className="meeting-ask-result">
+      {result.used_llm ? (
+        <div className="meeting-ask-answer">
+          {parts.map((part, i) =>
+            part.kind === "text" ? (
+              <span key={i}>{part.text}</span>
+            ) : (
+              <button
+                key={i}
+                type="button"
+                className="meeting-source meeting-ask-cite"
+                title="打开会议并跳到这里"
+                onClick={() => onOpen(part.citation.meeting_id, part.citation.ms)}
+              >
+                {citationLabel(part.citation)}
+              </button>
+            ),
+          )}
+        </div>
+      ) : (
+        <p className="meeting-ask-notice">
+          {result.llm_error
+            ? `AI 回答失败（${result.llm_error}），以下为相关会议`
+            : "未配置 AI，以下为相关会议"}
+        </p>
+      )}
+      {meetings.length > 0 ? (
+        <div className="meeting-ask-meetings">
+          <div className="meeting-group-head">
+            {result.used_llm ? "参考的会议" : "相关会议"}
+          </div>
+          <ul className="meeting-rows">
+            {meetings.map((m) => (
+              <li key={m.meeting_id}>
+                <button
+                  type="button"
+                  className="meeting-row-open meeting-ask-meeting"
+                  onClick={() => onOpen(m.meeting_id, m.snippet_ms)}
+                >
+                  <span className="meeting-row-title">
+                    {m.title?.trim() || "未命名会议"}
+                  </span>
+                  <span className="meeting-row-meta">
+                    {formatMeetingDate(m.created_at)}
+                    {m.snippet_ms != null && (
+                      <>
+                        <span className="dotsep">·</span>
+                        {formatCitationTime(m.snippet_ms)}
+                      </>
+                    )}
+                    {m.matched_keywords.length > 0 && (
+                      <>
+                        <span className="dotsep">·</span>
+                        命中 {m.matched_keywords.join("、")}
+                      </>
+                    )}
+                  </span>
+                  {m.snippet && (
+                    <span className="meeting-row-snippet">{m.snippet}</span>
+                  )}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        !result.used_llm && (
+          <p className="muted-text">没有找到相关会议。</p>
+        )
       )}
     </div>
   );
@@ -2508,6 +2801,7 @@ function MeetingTrimDialog({
 
 function MeetingDetailView({
   meetingId,
+  initialSeekSeconds,
   onBack,
   onError,
   onNavigate,
@@ -2515,6 +2809,9 @@ function MeetingDetailView({
   models,
 }: {
   meetingId: string;
+  /** Scroll the transcript to (and park the player at) this many seconds
+   * once the meeting has loaded — a 问会议 citation open. */
+  initialSeekSeconds?: number | null;
   onBack: () => void;
   onError: (e: string | null) => void;
   onNavigate?: (tab: TabId) => void;
@@ -2699,6 +2996,33 @@ function MeetingDetailView({
   // this component instance, so state would otherwise carry over).
   useEffect(() => {
     setCurrentTime(0);
+  }, [audioSrc]);
+
+  // A citation open: scroll the transcript once the detail has loaded, and
+  // move the playhead (without auto-playing) once the audio is ready.
+  const pendingSeek = useRef<number | null>(initialSeekSeconds ?? null);
+  const pendingScroll = useRef<number | null>(initialSeekSeconds ?? null);
+  useEffect(() => {
+    const seconds = pendingScroll.current;
+    if (seconds == null || !detail) return;
+    pendingScroll.current = null;
+    setJump({ seconds, token: Date.now() });
+  }, [detail]);
+  useEffect(() => {
+    const seconds = pendingSeek.current;
+    const el = audioRef.current;
+    if (seconds == null || !audioSrc || !el) return;
+    const apply = () => {
+      pendingSeek.current = null;
+      el.currentTime = seconds;
+      setCurrentTime(seconds);
+    };
+    if (el.readyState >= 1) {
+      apply();
+      return;
+    }
+    el.addEventListener("loadedmetadata", apply, { once: true });
+    return () => el.removeEventListener("loadedmetadata", apply);
   }, [audioSrc]);
 
   const seekTo = useCallback((seconds: number) => {

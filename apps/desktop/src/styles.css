@@ -2631,6 +2631,90 @@ html:has(.capsule-root) body {
   outline: none;
 }
 
+/* 问会议 (ask past meetings) */
+.meeting-ask-toggle {
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.meeting-ask {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.meeting-ask-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.meeting-ask-input {
+  flex: 1;
+  min-height: var(--control-h);
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card-soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.meeting-ask-input:disabled {
+  opacity: 0.7;
+}
+
+.meeting-ask-form .mtg-spinner {
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+
+.meeting-ask-hint {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+.meeting-ask-result {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.meeting-ask-answer {
+  white-space: pre-wrap;
+  line-height: 1.7;
+  font-size: 0.92rem;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card-soft);
+}
+
+.meeting-ask-cite {
+  display: inline;
+  margin: 0 3px;
+  white-space: nowrap;
+  vertical-align: 1px;
+}
+
+.meeting-ask-notice {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--warn);
+}
+
+.meeting-ask-meeting {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  width: 100%;
+}
+
+.meeting-ask-meeting:hover {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
 .meeting-filter-list {
   display: flex;
   flex-direction: column;

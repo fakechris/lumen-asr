@@ -687,6 +687,7 @@ pub fn run() {
             meeting_cmd::import_meeting_file,
             meeting_cmd::list_meetings,
             meeting_cmd::search_meetings,
+            meeting_cmd::ask_meetings,
             meeting_cmd::get_meeting_detail,
             meeting_cmd::save_meeting_notes,
             meeting_cmd::rename_meeting,

@@ -21,6 +21,7 @@
 
 mod align;
 mod annotate;
+pub mod ask;
 mod assemble;
 mod cleanup;
 pub mod compact;
