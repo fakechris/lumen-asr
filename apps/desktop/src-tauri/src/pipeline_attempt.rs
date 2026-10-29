@@ -63,7 +63,7 @@ fn active_asr_model_identity(
     let provider = canonical_asr_provider(&config.provider);
     if !provider.starts_with("local_") {
         let model = match provider.as_str() {
-            "openai_audio" | "custom" if config.model.trim().is_empty() => "whisper-1",
+            "openai_audio" | "custom" if config.model.trim().is_empty() => "gpt-transcribe",
             _ => config.model.trim(),
         };
         return ((!model.is_empty()).then(|| model.to_owned()), None);

@@ -2095,7 +2095,7 @@ function RecordPanel({
             <option value="local_whisper">
               本地 Whisper {status?.whisper.ready ? "✓" : "（模型未就绪）"}
             </option>
-            <option value="openai_audio">OpenAI Audio / Whisper（在线）</option>
+            <option value="openai_audio">OpenAI Audio（在线，gpt-transcribe / 4o）</option>
             <option value="volcengine">火山 ASR（极速版，在线）</option>
             <option value="minimax">MiniMax ASR（在线）</option>
             <option value="aliyun_qwen" disabled>

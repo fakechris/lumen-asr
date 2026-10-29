@@ -704,7 +704,7 @@ pub fn set_asr_engine(
                 cfg.asr.base_url = "https://api.openai.com/v1".into();
             }
             if cfg.asr.model.is_empty() {
-                cfg.asr.model = "whisper-1".into();
+                cfg.asr.model = "gpt-transcribe".into();
             }
         }
         let _ = cfg.save();
@@ -2143,7 +2143,7 @@ pub(crate) fn build_cloud_asr_engine(
                 },
                 api_key: asr_cfg.api_key.clone(),
                 model: if asr_cfg.model.trim().is_empty() {
-                    "whisper-1".into()
+                    "gpt-transcribe".into()
                 } else {
                     asr_cfg.model.clone()
                 },
