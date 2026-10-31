@@ -771,7 +771,12 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         "local_sensevoice" => sv.ready,
         "local_qwen" => qwen.ready,
         "local_whisper" => wh.ready,
-        "openai_audio" | "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
+        // openai_audio always needs its key; a base_url alone would leave
+        // cloud dictation and cloud meetings disagreeing with the UI badge.
+        "openai_audio" => !asr_cfg.api_key.is_empty(),
+        // A custom endpoint may be an auth-free gateway; a base_url alone is
+        // enough to try.
+        "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
         // volcengine / minimax: ready once the API key (volcengine 新版控制台
         // APP Key 亦填在这里) is set.
         "volcengine" | "minimax" => !asr_cfg.api_key.is_empty(),
@@ -1996,7 +2001,13 @@ async fn run_asr(
     }
 
     if CLOUD_ASR_PROVIDERS.contains(&provider) {
-        return run_cloud_asr_with_local_hedge(state, provider, asr_cfg, samples_16k, attempt)
+        // Refresh the snapshot from the keychain when its key is missing (a
+        // startup read may have timed out on the macOS access prompt).
+        let mut asr_cfg = asr_cfg.clone();
+        if cloud_asr_requires_key(provider) && asr_cfg.api_key.trim().is_empty() {
+            asr_cfg.api_key = recover_asr_key_sync(state);
+        }
+        return run_cloud_asr_with_local_hedge(state, provider, &asr_cfg, samples_16k, attempt)
             .await;
     }
 
@@ -2008,6 +2019,41 @@ async fn run_asr(
     })
 }
 
+/// Cloud providers whose endpoints always reject a request without a key.
+/// `custom` is deliberately absent: a user-entered gateway may be auth-free.
+fn cloud_asr_requires_key(provider: &str) -> bool {
+    matches!(provider, "openai_audio" | "minimax" | "volcengine")
+}
+
+/// One bounded keychain retry (the store caps reads at 3 s) for the ASR key.
+/// The in-memory config can predate a successful read: startup keychain
+/// reads can time out on the macOS access prompt and leave the key empty for
+/// the session. Fills the live config and returns the key when one appears;
+/// empty when nothing was recovered (or the user deliberately cleared it).
+pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
+    let slot = crate::secret_store::SecretSlot::AsrApiKey;
+    let Some(key) = crate::secret_store::platform_store()
+        .and_then(|store| store.get(slot).ok().flatten())
+        .filter(|k| !k.trim().is_empty())
+    else {
+        return String::new();
+    };
+    let mut cfg = state
+        .config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cfg.set_secret_from_retry(slot, &key) {
+        tracing::warn!(
+            account = slot.account(),
+            "cloud ASR key recovered from keychain after a failed startup read"
+        );
+        return key;
+    }
+    // The slot was not Unknown — typically the startup retry won the race and
+    // filled it while we held a keyless snapshot. The live key is the answer.
+    cfg.asr.api_key.clone()
+}
+
 async fn run_cloud_asr_with_local_hedge(
     state: &AppState,
     provider: &str,
@@ -2015,6 +2061,12 @@ async fn run_cloud_asr_with_local_hedge(
     samples_16k: Vec<f32>,
     attempt: &mut DictationAttemptRecord,
 ) -> Result<AsrRun, String> {
+    // A provider that needs a key and still has none fails here with an
+    // actionable message — sending the request anyway just gets a confusing
+    // provider-side 401 ("You didn't provide an API key").
+    if cloud_asr_requires_key(provider) && asr_cfg.api_key.trim().is_empty() {
+        return Err("在线 ASR 的 API Key 未加载（钥匙串读取超时或未配置）。若 macOS 弹出钥匙串访问确认，请选择「始终允许」；或在「设置 → 语音识别」重新保存 API Key。".into());
+    }
     let local_kind = local_hedge_engine_kind(state);
     let configured = Duration::from_secs(asr_cfg.timeout_secs.max(30));
     let deadline = cloud_asr_hedge_deadline(configured, local_kind.is_some());
@@ -2966,6 +3018,16 @@ mod attempt_metric_tests {
         assert_eq!(generic, "已复制");
         let both_failed = insert_failure_notice("paste failed", false);
         assert!(both_failed.contains("历史记录"));
+    }
+
+    #[test]
+    fn keyed_cloud_providers_fail_fast_without_a_key() {
+        for provider in ["openai_audio", "minimax", "volcengine"] {
+            assert!(cloud_asr_requires_key(provider), "{provider}");
+        }
+        // A custom gateway may be auth-free; local engines never reach here.
+        assert!(!cloud_asr_requires_key("custom"));
+        assert!(!cloud_asr_requires_key("local_sensevoice"));
     }
 
     #[test]

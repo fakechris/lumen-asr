@@ -53,13 +53,20 @@ pub(crate) fn build_meeting_transcribe_engine(
 
     let provider = crate::dictation::canonical_asr_provider(&asr_cfg.provider);
     let provider = provider.as_str();
+    // A startup keychain read can time out on the macOS access prompt and
+    // leave the key empty in memory; try once more before declaring cloud
+    // mode unconfigured.
+    let mut asr_cfg = asr_cfg;
+    if asr_cfg.api_key.trim().is_empty() {
+        asr_cfg.api_key = crate::dictation::recover_asr_key_sync(state);
+    }
     // Mirror `asr_status_from`'s readiness rules so an unconfigured cloud
     // selection fails here — loudly — instead of silently degrading turn by turn.
     let cloud_ready = match provider {
-        "volcengine" | "minimax" => !asr_cfg.api_key.trim().is_empty(),
-        "openai_audio" | "custom" => {
-            !asr_cfg.api_key.trim().is_empty() || !asr_cfg.base_url.trim().is_empty()
-        }
+        "volcengine" | "minimax" | "openai_audio" => !asr_cfg.api_key.trim().is_empty(),
+        // A custom endpoint may be an auth-free gateway; a configured
+        // base_url alone is enough to try.
+        "custom" => !asr_cfg.api_key.trim().is_empty() || !asr_cfg.base_url.trim().is_empty(),
         _ => false,
     };
     if !cloud_ready {
