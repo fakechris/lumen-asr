@@ -175,12 +175,15 @@ fn purge_legacy_short_silent_sessions(store: &Store, data_dir: &Path) -> Result<
 /// Allow"), a later retry recovers the key without an app restart.
 fn schedule_secret_retry(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        for delay in [
-            std::time::Duration::from_secs(15),
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(180),
-        ] {
-            tokio::time::sleep(delay).await;
+        // Deadlines are measured from launch, not from the previous retry,
+        // so the three attempts land at 15/60/180 s even when a keychain
+        // read blocks on the access prompt for its full 3 s budget.
+        let start = tokio::time::Instant::now();
+        for deadline_secs in [15u64, 60, 180] {
+            let deadline = start + std::time::Duration::from_secs(deadline_secs);
+            if deadline > tokio::time::Instant::now() {
+                tokio::time::sleep_until(deadline).await;
+            }
             let unknown: Vec<crate::secret_store::SecretSlot> = {
                 let state = app.state::<AppState>();
                 let Ok(config) = state.config.lock() else {
@@ -189,7 +192,9 @@ fn schedule_secret_retry(app: tauri::AppHandle) {
                 crate::secret_store::SecretSlot::ALL
                     .iter()
                     .copied()
-                    .filter(|slot| config.secrets.get(*slot) == crate::secret_store::SlotSync::Unknown)
+                    .filter(|slot| {
+                        config.secrets.get(*slot) == crate::secret_store::SlotSync::Unknown
+                    })
                     .collect()
             };
             if unknown.is_empty() {

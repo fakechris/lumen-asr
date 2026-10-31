@@ -771,7 +771,12 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         "local_sensevoice" => sv.ready,
         "local_qwen" => qwen.ready,
         "local_whisper" => wh.ready,
-        "openai_audio" | "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
+        // openai_audio always needs its key; a base_url alone would leave
+        // cloud dictation and cloud meetings disagreeing with the UI badge.
+        "openai_audio" => !asr_cfg.api_key.is_empty(),
+        // A custom endpoint may be an auth-free gateway; a base_url alone is
+        // enough to try.
+        "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
         // volcengine / minimax: ready once the API key (volcengine 新版控制台
         // APP Key 亦填在这里) is set.
         "volcengine" | "minimax" => !asr_cfg.api_key.is_empty(),
@@ -2042,10 +2047,11 @@ pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
             account = slot.account(),
             "cloud ASR key recovered from keychain after a failed startup read"
         );
-        key
-    } else {
-        String::new()
+        return key;
     }
+    // The slot was not Unknown — typically the startup retry won the race and
+    // filled it while we held a keyless snapshot. The live key is the answer.
+    cfg.asr.api_key.clone()
 }
 
 async fn run_cloud_asr_with_local_hedge(

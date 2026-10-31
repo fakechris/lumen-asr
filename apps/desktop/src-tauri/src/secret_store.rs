@@ -140,15 +140,20 @@ pub fn save_slot(
     if value.is_empty() {
         // Only delete an item we have seen; an unknown state may hide a key
         // that a failed read could not surface.
-        if let SlotSync::Known(_) = previous {
-            match store.delete(slot) {
+        match previous {
+            SlotSync::Known(_) => match store.delete(slot) {
                 Ok(()) => sync.set(slot, SlotSync::Known(String::new())),
                 Err(error) => tracing::warn!(
                     account = slot.account(),
                     %error,
                     "keychain delete failed; the old key may reappear on next launch"
                 ),
-            }
+            },
+            // The stored value is unknown, so nothing is deleted — but the
+            // user's clear must still stick for this session: recording
+            // Known(empty) keeps a later retry read from resurrecting the
+            // hidden key (next launch re-reads the store as before).
+            SlotSync::Unknown => sync.set(slot, SlotSync::Known(String::new())),
         }
         return true;
     }
@@ -375,6 +380,29 @@ pub(crate) mod tests {
         load_slot(&store, &sync, SecretSlot::AsrApiKey, &mut value);
         assert!(save_slot(&store, &sync, SecretSlot::AsrApiKey, ""));
         assert!(store.items.lock().get("asr-api-key").is_none());
+    }
+
+    #[test]
+    fn clearing_while_unknown_keeps_the_clear_for_the_session() {
+        // Startup read failed (store down), so the slot is Unknown and the
+        // item still holds an old key. The user clears the field: nothing is
+        // deleted, but the clear must stick — a later retry read must not
+        // resurrect the hidden key.
+        let store = FakeStore::default();
+        *store.fail.lock() = true;
+        store.items.lock().insert("asr-api-key", "sk-hidden".into());
+        let mut cfg = crate::config::AppConfig::default();
+        let sync = cfg.secrets.clone();
+        let mut value = String::new();
+        load_slot(&store, &sync, SecretSlot::AsrApiKey, &mut value); // read fails → Unknown
+        assert!(save_slot(&store, &sync, SecretSlot::AsrApiKey, ""));
+        *store.fail.lock() = false;
+        assert!(!cfg.set_secret_from_retry(SecretSlot::AsrApiKey, "sk-hidden"));
+        assert_eq!(cfg.asr.api_key, "");
+        assert_eq!(
+            sync.get(SecretSlot::AsrApiKey),
+            SlotSync::Known(String::new())
+        );
     }
 
     #[test]
