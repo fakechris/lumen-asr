@@ -2092,6 +2092,21 @@ async fn transcribe_cloud_asr(
         .map_err(|e| e.to_string())
 }
 
+/// OpenAI diarize models are whole-file, multi-speaker transcribers. Every
+/// engine this app builds sends short single-speaker audio — one dictation
+/// utterance, or one diarized ≤20 s meeting turn — so a model whose name
+/// contains "diarize" would switch the shared engine to
+/// `response_format=diarized_json` and only lose punctuation, prefix "A:" to
+/// the text, and slow the request down. Substitute the recommended plain
+/// model instead (2026-10 replay evaluation).
+fn openai_diarize_model_override(model: &str) -> Option<String> {
+    if model.contains("diarize") {
+        Some("gpt-transcribe".into())
+    } else {
+        None
+    }
+}
+
 /// Build the online ASR engine for a wired cloud provider, honoring the
 /// per-provider endpoint/model defaults plus the shared language hint and
 /// timeout. Shared by dictation and the cloud meeting-transcription mode.
@@ -2135,6 +2150,18 @@ pub(crate) fn build_cloud_asr_engine(
             Ok(Arc::new(eng))
         }
         "openai_audio" | "custom" => {
+            let model = match openai_diarize_model_override(&asr_cfg.model) {
+                Some(model) => {
+                    tracing::warn!(
+                        from = %asr_cfg.model,
+                        to = %model,
+                        "openai_audio: diarize model replaced with the plain short-audio model"
+                    );
+                    model
+                }
+                None if asr_cfg.model.trim().is_empty() => "gpt-transcribe".into(),
+                None => asr_cfg.model.clone(),
+            };
             let eng = OpenAiAudioAsr::new(OpenAiAudioConfig {
                 base_url: if asr_cfg.base_url.trim().is_empty() {
                     "https://api.openai.com/v1".into()
@@ -2142,11 +2169,7 @@ pub(crate) fn build_cloud_asr_engine(
                     asr_cfg.base_url.clone()
                 },
                 api_key: asr_cfg.api_key.clone(),
-                model: if asr_cfg.model.trim().is_empty() {
-                    "gpt-transcribe".into()
-                } else {
-                    asr_cfg.model.clone()
-                },
+                model,
                 timeout,
                 language: if asr_cfg.language.trim().is_empty() {
                     None
@@ -2949,6 +2972,27 @@ mod attempt_metric_tests {
             cloud_asr_hedge_deadline(Duration::from_secs(5), true),
             Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn openai_diarize_models_swap_to_the_plain_short_audio_model() {
+        assert_eq!(
+            openai_diarize_model_override("gpt-4o-transcribe-diarize"),
+            Some("gpt-transcribe".into())
+        );
+        assert_eq!(
+            openai_diarize_model_override("my-vendor-diarize-v2"),
+            Some("gpt-transcribe".into())
+        );
+        // Everything else — including the empty "use the default" case, which
+        // the engine arm resolves separately — passes through untouched.
+        assert_eq!(openai_diarize_model_override("gpt-transcribe"), None);
+        assert_eq!(
+            openai_diarize_model_override("gpt-4o-mini-transcribe"),
+            None
+        );
+        assert_eq!(openai_diarize_model_override("whisper-1"), None);
+        assert_eq!(openai_diarize_model_override(""), None);
     }
 
     #[test]

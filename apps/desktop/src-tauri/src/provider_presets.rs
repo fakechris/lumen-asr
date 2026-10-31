@@ -301,7 +301,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             ],
             needs_api_key: true,
             status: "wired".into(),
-            notes: "POST /audio/transcriptions；推荐新一代 gpt-transcribe（性价比最高）或 gpt-4o-mini-transcribe，会议亦可选 gpt-4o-transcribe-diarize".into(),
+            notes: "POST /audio/transcriptions；推荐新一代 gpt-transcribe（性价比最高）或 gpt-4o-mini-transcribe；gpt-4o-transcribe-diarize 仅适合整文件多说话人批式（单次上限约 23 分钟），App 内听写/云端会议为逐句短音频，会议转写会自动改用 gpt-transcribe".into(),
         },
         AsrProviderPreset {
             id: "aliyun_qwen".into(),
