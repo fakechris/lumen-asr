@@ -2098,7 +2098,9 @@ async fn transcribe_cloud_asr(
 /// contains "diarize" would switch the shared engine to
 /// `response_format=diarized_json` and only lose punctuation, prefix "A:" to
 /// the text, and slow the request down. Substitute the recommended plain
-/// model instead (2026-10 replay evaluation).
+/// model instead (2026-10 replay evaluation). Applied only to the curated
+/// `openai_audio` preset: a `custom` endpoint's model names are the user's
+/// contract with that vendor and pass through untouched.
 fn openai_diarize_model_override(model: &str) -> Option<String> {
     if model.contains("diarize") {
         Some("gpt-transcribe".into())
@@ -2150,17 +2152,23 @@ pub(crate) fn build_cloud_asr_engine(
             Ok(Arc::new(eng))
         }
         "openai_audio" | "custom" => {
-            let model = match openai_diarize_model_override(&asr_cfg.model) {
-                Some(model) => {
-                    tracing::warn!(
-                        from = %asr_cfg.model,
-                        to = %model,
-                        "openai_audio: diarize model replaced with the plain short-audio model"
-                    );
-                    model
+            let model = if provider == "openai_audio" {
+                match openai_diarize_model_override(&asr_cfg.model) {
+                    Some(model) => {
+                        tracing::warn!(
+                            from = %asr_cfg.model,
+                            to = %model,
+                            "openai_audio: diarize model replaced with the plain short-audio model"
+                        );
+                        model
+                    }
+                    None if asr_cfg.model.trim().is_empty() => "gpt-transcribe".into(),
+                    None => asr_cfg.model.clone(),
                 }
-                None if asr_cfg.model.trim().is_empty() => "gpt-transcribe".into(),
-                None => asr_cfg.model.clone(),
+            } else if asr_cfg.model.trim().is_empty() {
+                "gpt-transcribe".into()
+            } else {
+                asr_cfg.model.clone()
             };
             let eng = OpenAiAudioAsr::new(OpenAiAudioConfig {
                 base_url: if asr_cfg.base_url.trim().is_empty() {
@@ -2980,12 +2988,10 @@ mod attempt_metric_tests {
             openai_diarize_model_override("gpt-4o-transcribe-diarize"),
             Some("gpt-transcribe".into())
         );
-        assert_eq!(
-            openai_diarize_model_override("my-vendor-diarize-v2"),
-            Some("gpt-transcribe".into())
-        );
         // Everything else — including the empty "use the default" case, which
-        // the engine arm resolves separately — passes through untouched.
+        // the engine arm resolves separately — passes through untouched. The
+        // swap itself only runs for the curated `openai_audio` provider; a
+        // `custom` endpoint keeps whatever model name the user entered.
         assert_eq!(openai_diarize_model_override("gpt-transcribe"), None);
         assert_eq!(
             openai_diarize_model_override("gpt-4o-mini-transcribe"),
