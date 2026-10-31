@@ -2,7 +2,9 @@
 
 use lumen_platform::default_config_path;
 
-use crate::secret_store::{self, LoadOutcome, SecretSlot, SecretStore, SecretSync};
+use crate::secret_store::{
+    self, LoadOutcome, SecretSlot, SecretStore, SecretSync, SlotSync,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -1070,6 +1072,24 @@ impl AppConfig {
         }
     }
 
+    /// Fill one credential from a retried keychain read. Only a slot whose
+    /// stored value is still unknown can be filled: `Known(empty)` means the
+    /// user cleared the key on purpose, and a retried read must not resurrect
+    /// it. Returns `true` when the key was applied.
+    pub fn set_secret_from_retry(&mut self, slot: SecretSlot, value: &str) -> bool {
+        if value.is_empty() || self.secrets.get(slot) != SlotSync::Unknown {
+            return false;
+        }
+        *self.secret_field(slot) = value.to_owned();
+        self.secrets.set(slot, SlotSync::Known(value.to_owned()));
+        true
+    }
+
+    #[cfg(test)]
+    fn set_secret_sync(&mut self, slot: SecretSlot, state: SlotSync) {
+        self.secrets.set(slot, state);
+    }
+
     /// Fill API keys from the store, moving any plaintext key into it.
     /// Returns `true` when the file should be rewritten without plaintext.
     fn load_secrets(&mut self, store: &dyn SecretStore) -> bool {
@@ -1196,6 +1216,32 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("lumen-cfg-{tag}-{n}.toml"))
+    }
+
+    #[test]
+    fn retried_secret_read_fills_only_unknown_slots() {
+        use crate::secret_store::SlotSync;
+        let mut cfg = AppConfig::default();
+
+        // Unknown (a startup read timed out on the keychain prompt): the
+        // retried key is applied and remembered.
+        assert!(cfg.set_secret_from_retry(SecretSlot::AsrApiKey, "sk-recovered"));
+        assert_eq!(cfg.asr.api_key, "sk-recovered");
+
+        // A later retry of the same slot no longer applies (state is Known).
+        assert!(!cfg.set_secret_from_retry(SecretSlot::AsrApiKey, "sk-other"));
+        assert_eq!(cfg.asr.api_key, "sk-recovered");
+
+        // Known(empty) — the user cleared the key on purpose — must not be
+        // resurrected by a retry.
+        let mut cleared = AppConfig::default();
+        cleared.set_secret_sync(SecretSlot::CorrectorApiKey, SlotSync::Known(String::new()));
+        assert!(!cleared.set_secret_from_retry(SecretSlot::CorrectorApiKey, "sk-ghost"));
+        assert_eq!(cleared.corrector.api_key, "");
+
+        // An empty recovery value never writes anything.
+        let mut empty = AppConfig::default();
+        assert!(!empty.set_secret_from_retry(SecretSlot::AsrApiKey, ""));
     }
 
     #[test]
