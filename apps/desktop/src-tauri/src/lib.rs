@@ -199,42 +199,26 @@ fn schedule_secret_retry(app: tauri::AppHandle) {
         if unknown.is_empty() {
             return;
         }
-        // Park one untimed read per unknown slot. The blocking call lives on
-        // a blocking thread for as long as the prompt is unanswered; the
-        // spawned task resolves only when every read has actually returned.
+        // One blocking task per unknown slot: each patient read parks on its
+        // own prompt, and a recovered key is applied the moment ITS read
+        // returns — not after every prompt has been answered (the second
+        // prompt may stay up for hours).
         let store = crate::secret_store::platform_store();
-        let outcomes = tauri::async_runtime::spawn_blocking(move || {
-            unknown
-                .into_iter()
-                .filter_map(|slot| {
-                    let store = store?;
-                    match store.get_patient(slot) {
-                        Ok(Some(key)) if !key.is_empty() => Some((slot, Outcome::Recovered(key))),
-                        // The store answered and holds nothing: settled.
-                        Ok(_) => Some((slot, Outcome::Absent)),
-                        // Denied or failed: give up for this session — never
-                        // re-prompt on a timer.
-                        Err(error) => {
-                            tracing::warn!(
-                                account = slot.account(),
-                                error,
-                                "keychain recovery read failed; giving up for this session"
-                            );
-                            None
-                        }
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_default();
-        let state = app.state::<AppState>();
-        let Ok(mut config) = state.config.lock() else {
-            return;
-        };
-        for (slot, outcome) in outcomes {
+        let mut tasks = tokio::task::JoinSet::new();
+        for slot in unknown {
+            let Some(store) = store else { continue };
+            tasks.spawn_blocking(move || (slot, store.get_patient(slot)));
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((slot, outcome)) = joined else {
+                continue;
+            };
+            let state = app.state::<AppState>();
+            let Ok(mut config) = state.config.lock() else {
+                return;
+            };
             match outcome {
-                Outcome::Recovered(key) => {
+                Ok(Some(key)) if !key.is_empty() => {
                     if config.set_secret_from_retry(slot, &key) {
                         tracing::info!(
                             account = slot.account(),
@@ -242,16 +226,18 @@ fn schedule_secret_retry(app: tauri::AppHandle) {
                         );
                     }
                 }
-                Outcome::Absent => config.mark_secret_absent(slot),
+                // The store answered and holds nothing: settled.
+                Ok(_) => config.mark_secret_absent(slot),
+                // Denied or failed: give up for this session — never
+                // re-prompt on a timer.
+                Err(error) => tracing::warn!(
+                    account = slot.account(),
+                    error = %error,
+                    "keychain recovery read failed; giving up for this session"
+                ),
             }
         }
     });
-}
-
-/// One patient keychain read outcome for the recovery task above.
-enum Outcome {
-    Recovered(String),
-    Absent,
 }
 
 fn schedule_legacy_short_silent_session_purge(app: tauri::AppHandle) {
