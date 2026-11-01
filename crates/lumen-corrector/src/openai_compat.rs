@@ -146,6 +146,26 @@ impl OpenAiCompatCorrector {
             .map_err(|e| CorrectorError::Http(e.to_string()))?;
         Ok(Self { client, config })
     }
+
+    /// POST one chat-completions payload; timeouts stay `Timeout` and
+    /// transport failures carry their message.
+    async fn post_json(
+        &self,
+        url: &str,
+        payload: serde_json::Value,
+    ) -> Result<reqwest::Response, CorrectorError> {
+        let mut builder = self.client.post(url).json(&payload);
+        if !self.config.api_key.is_empty() {
+            builder = builder.bearer_auth(&self.config.api_key);
+        }
+        builder.send().await.map_err(|error| {
+            if error.is_timeout() {
+                CorrectorError::Timeout
+            } else {
+                CorrectorError::Http(error.to_string())
+            }
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,23 +229,59 @@ impl Corrector for OpenAiCompatCorrector {
             ]
         });
 
-        inject_no_thinking_params(&self.config, &mut body, max_tokens);
-
-        let mut builder = self.client.post(&url).json(&body);
-        if !self.config.api_key.is_empty() {
-            builder = builder.bearer_auth(&self.config.api_key);
-        }
-
-        let resp = builder.send().await.map_err(|error| {
-            if error.is_timeout() {
-                CorrectorError::Timeout
-            } else {
-                CorrectorError::Http(error.to_string())
+        let suppression = inject_no_thinking_params(&self.config, &mut body, max_tokens);
+        // Pre-injection copy: the retry body when a provider rejects the
+        // suppression params.
+        let plain_body = if suppression.is_empty() {
+            None
+        } else {
+            let mut plain = body.clone();
+            for key in &suppression {
+                plain.as_object_mut().unwrap().remove(*key);
             }
-        })?;
+            Some(plain)
+        };
+
+        let mut resp = self.post_json(&url, body).await?;
 
         if !resp.status().is_success() {
-            return Err(CorrectorError::ProviderRejected(resp.status().as_u16()));
+            let status = resp.status().as_u16();
+            let error_body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status,
+                model = %self.config.model,
+                body = %error_body.chars().take(300).collect::<String>(),
+                "corrector request rejected"
+            );
+            // A provider that rejects the thinking-suppression params with a
+            // 400 (adaptive-thinking models such as MiniMax M3.1) gets one
+            // retry without them; anything else — and a failed retry — is the
+            // caller's error to report.
+            if status == 400 {
+                if let Some(plain) = plain_body {
+                    resp = self.post_json(&url, plain).await?;
+                    if resp.status().is_success() {
+                        tracing::info!(
+                            model = %self.config.model,
+                            "corrector succeeded without thinking suppression (adaptive thinking model)"
+                        );
+                    } else {
+                        let retry_status = resp.status().as_u16();
+                        let retry_body = resp.text().await.unwrap_or_default();
+                        tracing::warn!(
+                            status = retry_status,
+                            model = %self.config.model,
+                            body = %retry_body.chars().take(300).collect::<String>(),
+                            "corrector retry without thinking suppression also rejected"
+                        );
+                        return Err(CorrectorError::ProviderRejected(retry_status));
+                    }
+                } else {
+                    return Err(CorrectorError::ProviderRejected(status));
+                }
+            } else {
+                return Err(CorrectorError::ProviderRejected(status));
+            }
         }
 
         let parsed: ChatCompletionResponse = resp
@@ -274,13 +330,20 @@ fn is_local_ollama(cfg: &OpenAiCompatConfig) -> bool {
 /// - Gemini: thinkingBudget 0 / thinkingConfig
 /// - MiniMax-M3 (OpenAI path): `thinking: {type:disabled}` — works (dictation default)
 /// - MiniMax-M2.x / `*-highspeed`: cannot fully disable CoT; prefer M3 for cleanup
+/// Inject provider-specific "don't think, answer directly" parameters.
+/// Returns the top-level keys it injected (`thinking`/`enable_thinking`/`think`),
+/// so a request rejected with 400 can be retried once without them — newer
+/// adaptive-thinking models (e.g. MiniMax M3.1, API error 2013: "requires
+/// adaptive thinking; thinking.type=disabled is not allowed") forbid the
+/// suppression outright.
 fn inject_no_thinking_params(
     cfg: &OpenAiCompatConfig,
     body: &mut serde_json::Value,
     max_tokens: u32,
-) {
+) -> Vec<&'static str> {
     let url = cfg.base_url.to_ascii_lowercase();
     let model = cfg.model.to_ascii_lowercase();
+    let mut injected: Vec<&'static str> = Vec::new();
 
     if is_local_ollama(cfg) {
         body["think"] = json!(false);
@@ -300,29 +363,35 @@ fn inject_no_thinking_params(
             "num_ctx": num_ctx,
             "num_predict": max_tokens,
         });
-        return;
+        // Ollama would emit thinking output without the flag; no retry.
+        return injected;
     }
 
     // DashScope / Qwen3 compatible mode.
     if url.contains("dashscope") || model.contains("qwen3") || model.starts_with("qwen") {
         body["enable_thinking"] = json!(false);
         body["think"] = json!(false);
+        injected.extend(["enable_thinking", "think"]);
     }
 
     // DeepSeek reasoner / thinking models.
     if model.contains("reasoner") || model.contains("r1") || model.contains("thinking") {
         body["thinking"] = json!({ "type": "disabled" });
+        injected.push("thinking");
     }
 
     // MiniMax (OpenAI-compatible Chat Completions).
     // M3: on this path omit ⇒ thinking ON — must send disabled explicitly.
     // M2.x: official docs say thinking cannot be fully disabled (param ignored);
     // we still send disabled for forward-compat + strip residual tags.
+    // M3.1+ adaptive-thinking models reject the flag with 400; the caller
+    // retries without it (see `correct`).
     let is_minimax = url.contains("minimax") || model.contains("minimax");
     if is_minimax {
         body["thinking"] = json!({ "type": "disabled" });
         // Prefer split fields so answer stays in `content` when gateway supports it.
         body["reasoning_split"] = json!(true);
+        injected.push("thinking");
     }
 
     // Gemini OpenAI-compat: some builds honor thinkingBudget 0.
@@ -338,6 +407,10 @@ fn inject_no_thinking_params(
     if url.contains("openrouter") {
         body["reasoning"] = json!({ "effort": "none", "exclude": true });
     }
+
+    injected.sort_unstable();
+    injected.dedup();
+    injected
 }
 
 /// Response-side strip of thinking tags. Always run for dictation safety.
@@ -392,6 +465,98 @@ Hello world."#;
     }
 
     #[test]
+    fn minimax_injection_reports_the_suppression_keys_for_retry() {
+        let mut body = json!({ "model": "MiniMax-M3.1-Flash", "messages": [] });
+        let cfg = OpenAiCompatConfig {
+            base_url: "https://api.minimaxi.com/v1".into(),
+            api_key: String::new(),
+            model: "MiniMax-M3.1-Flash".into(),
+            engine_id: CorrectorEngineId::OpenAiCompatible,
+            timeout: Duration::from_secs(5),
+        };
+        let injected = inject_no_thinking_params(&cfg, &mut body, 256);
+        assert_eq!(injected, vec!["thinking"]);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["reasoning_split"], json!(true));
+
+        // A plain OpenAI-compatible endpoint injects nothing.
+        let mut plain = json!({ "model": "x", "messages": [] });
+        let plain_cfg = OpenAiCompatConfig {
+            base_url: "https://api.example.com/v1".into(),
+            api_key: String::new(),
+            model: "gpt-x".into(),
+            engine_id: CorrectorEngineId::OpenAiCompatible,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(inject_no_thinking_params(&plain_cfg, &mut plain, 256).is_empty());
+    }
+
+    #[tokio::test]
+    async fn thinking_suppression_rejection_retries_once_without_it() {
+        // First response mirrors MiniMax M3.1's adaptive-thinking rejection
+        // (400, error 2013); the retry without the suppression succeeds.
+        let (base, server) = serve_sequence(vec![
+            (
+                400,
+                r#"{"type":"error","error":{"message":"invalid params, model requires adaptive thinking; thinking.type=\"disabled\" is not allowed (2013)"}}"#,
+            ),
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"fixed text"},"finish_reason":"stop"}]}"#,
+            ),
+        ]);
+        let corrector = OpenAiCompatCorrector::new(OpenAiCompatConfig {
+            base_url: base,
+            api_key: String::new(),
+            model: "MiniMax-M3.1-Flash".into(),
+            engine_id: CorrectorEngineId::OpenAiCompatible,
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+
+        let result = corrector
+            .correct(request("fix me", Some(64)))
+            .await
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(result.text, "fixed text");
+        assert!(result.model_applied);
+
+        let first = request_json(&requests[0]);
+        let second = request_json(&requests[1]);
+        assert_eq!(first["thinking"]["type"], "disabled");
+        assert!(
+            second.get("thinking").is_none(),
+            "retry drops the suppression"
+        );
+        assert_eq!(second["reasoning_split"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn thinking_suppression_retry_failure_reports_the_retry_status() {
+        let (base, server) = serve_sequence(vec![
+            (400, r#"{"error":"requires adaptive thinking"}"#),
+            (400, r#"{"error":"still bad"}"#),
+        ]);
+        let corrector = OpenAiCompatCorrector::new(OpenAiCompatConfig {
+            base_url: base,
+            api_key: String::new(),
+            model: "MiniMax-M3.1-Flash".into(),
+            engine_id: CorrectorEngineId::OpenAiCompatible,
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+
+        let err = corrector
+            .correct(request("fix me", Some(64)))
+            .await
+            .unwrap_err();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(err, CorrectorError::ProviderRejected(400)));
+    }
+
+    #[test]
     fn strips_thinking_xml() {
         let raw = "<thinking>plan</thinking>final";
         assert_eq!(strip_thinking_tags(raw), "final");
@@ -434,41 +599,56 @@ Hello world."#;
     /// Serves one canned chat-completions response on loopback and returns
     /// the base URL plus a handle yielding the raw request it received.
     fn serve_once(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        let (base, handle) = serve_sequence(vec![(200, body)]);
+        let joined = std::thread::spawn(move || handle.join().unwrap().remove(0));
+        (base, joined)
+    }
+
+    /// Serves one canned response per connection, in order, and yields every
+    /// raw request received — for retry-path tests.
+    fn serve_sequence(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = stream.read(&mut buf).unwrap();
-                request.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&request);
-                if let Some(head_end) = text.find("\r\n\r\n") {
-                    let length = text[..head_end]
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())?
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= head_end + 4 + length {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(head_end) = text.find("\r\n\r\n") {
+                        let length = text[..head_end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= head_end + 4 + length {
+                            break;
+                        }
+                    }
+                    if n == 0 {
                         break;
                     }
                 }
-                if n == 0 {
-                    break;
-                }
+                let reason = if status == 200 { "OK" } else { "Bad Request" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                requests.push(String::from_utf8_lossy(&request).into_owned());
             }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8_lossy(&request).into_owned()
+            requests
         });
         (base, handle)
     }
