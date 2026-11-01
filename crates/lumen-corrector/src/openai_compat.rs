@@ -391,6 +391,11 @@ fn inject_no_thinking_params(
         body["thinking"] = json!({ "type": "disabled" });
         // Prefer split fields so answer stays in `content` when gateway supports it.
         body["reasoning_split"] = json!(true);
+        // Cap the reasoning budget: dictation correction needs a quick pass,
+        // not deep thought (measured 2026-11: ~1.5 s stable at low vs
+        // 1.8–12 s with full adaptive). Older models ignore the param; it is
+        // NOT a suppression key, so the 400-retry keeps it.
+        body["reasoning_effort"] = json!("low");
         injected.push("thinking");
     }
 
@@ -478,6 +483,7 @@ Hello world."#;
         assert_eq!(injected, vec!["thinking"]);
         assert_eq!(body["thinking"]["type"], "disabled");
         assert_eq!(body["reasoning_split"], json!(true));
+        assert_eq!(body["reasoning_effort"], json!("low"));
 
         // A plain OpenAI-compatible endpoint injects nothing.
         let mut plain = json!({ "model": "x", "messages": [] });
@@ -530,6 +536,8 @@ Hello world."#;
             "retry drops the suppression"
         );
         assert_eq!(second["reasoning_split"], json!(true));
+        // The low reasoning budget survives the retry — that is the point.
+        assert_eq!(second["reasoning_effort"], json!("low"));
     }
 
     #[tokio::test]
