@@ -40,6 +40,16 @@ impl SecretSlot {
 /// real Keychain.
 pub trait SecretStore: Send + Sync {
     fn get(&self, slot: SecretSlot) -> Result<Option<String>, String>;
+
+    /// A read with no client-side timeout. On macOS a read can block on the
+    /// keychain access prompt for as long as the user takes to answer it —
+    /// minutes or hours — and the point of this variant is to observe that
+    /// very completion instead of polling (each new poll risks another
+    /// prompt). The default matches `get` for backends that never block.
+    fn get_patient(&self, slot: SecretSlot) -> Result<Option<String>, String> {
+        self.get(slot)
+    }
+
     fn set(&self, slot: SecretSlot, value: &str) -> Result<(), String>;
     fn delete(&self, slot: SecretSlot) -> Result<(), String>;
 }
@@ -223,19 +233,29 @@ mod macos {
         }
     }
 
+    /// Read one credential item; shared by the timed and the patient path.
+    fn read_keychain_item(slot: SecretSlot) -> Result<Option<String>, String> {
+        use security_framework::passwords::get_generic_password;
+        use security_framework_sys::base::errSecItemNotFound;
+        match get_generic_password(KEYCHAIN_SERVICE, slot.account()) {
+            Ok(bytes) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| "keychain item is not valid UTF-8".to_owned()),
+            Err(error) if error.code() == errSecItemNotFound => Ok(None),
+            Err(error) => Err(format!("keychain lookup failed: {error}")),
+        }
+    }
+
     impl SecretStore for KeychainStore {
         fn get(&self, slot: SecretSlot) -> Result<Option<String>, String> {
-            with_timeout(move || {
-                use security_framework::passwords::get_generic_password;
-                use security_framework_sys::base::errSecItemNotFound;
-                match get_generic_password(KEYCHAIN_SERVICE, slot.account()) {
-                    Ok(bytes) => String::from_utf8(bytes)
-                        .map(Some)
-                        .map_err(|_| "keychain item is not valid UTF-8".to_owned()),
-                    Err(error) if error.code() == errSecItemNotFound => Ok(None),
-                    Err(error) => Err(format!("keychain lookup failed: {error}")),
-                }
-            })
+            with_timeout(move || read_keychain_item(slot))
+        }
+
+        /// Untimed: blocks on the access prompt until the user answers it —
+        /// however long that takes — so the caller observes the prompt's
+        /// actual outcome instead of re-reading (and risking another prompt).
+        fn get_patient(&self, slot: SecretSlot) -> Result<Option<String>, String> {
+            read_keychain_item(slot)
         }
 
         fn set(&self, slot: SecretSlot, value: &str) -> Result<(), String> {

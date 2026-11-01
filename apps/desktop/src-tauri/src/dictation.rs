@@ -2007,8 +2007,31 @@ async fn run_asr(
         if cloud_asr_requires_key(provider) && asr_cfg.api_key.trim().is_empty() {
             asr_cfg.api_key = recover_asr_key_sync(state);
         }
-        return run_cloud_asr_with_local_hedge(state, provider, &asr_cfg, samples_16k, attempt)
-            .await;
+        let outcome =
+            run_cloud_asr_with_local_hedge(state, provider, &asr_cfg, samples_16k.clone(), attempt)
+                .await;
+        // One extra cycle on the missing-key failure: the user may have just
+        // answered the keychain prompt (or unlocked the keychain) while the
+        // first attempt was failing — re-read once and try once more before
+        // surfacing the error.
+        if let Err(error) = outcome {
+            if error == CLOUD_ASR_MISSING_KEY {
+                let mut retry_cfg = asr_cfg;
+                retry_cfg.api_key = recover_asr_key_sync(state);
+                if !retry_cfg.api_key.trim().is_empty() {
+                    return run_cloud_asr_with_local_hedge(
+                        state,
+                        provider,
+                        &retry_cfg,
+                        samples_16k,
+                        attempt,
+                    )
+                    .await;
+                }
+            }
+            return Err(error);
+        }
+        return outcome;
     }
 
     let selected_local_engine = engine_kind_for_provider(provider).unwrap_or(engine_kind);
@@ -2054,6 +2077,10 @@ pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
     cfg.asr.api_key.clone()
 }
 
+/// Surfaced (and matched for the one extra retry cycle in `run_asr`) when a
+/// keyed cloud provider would be asked to transcribe without a key.
+const CLOUD_ASR_MISSING_KEY: &str = "在线 ASR 的 API Key 未加载（钥匙串读取超时或未配置）。若 macOS 弹出钥匙串访问确认，请选择「始终允许」；或在「设置 → 语音识别」重新保存 API Key。";
+
 async fn run_cloud_asr_with_local_hedge(
     state: &AppState,
     provider: &str,
@@ -2065,7 +2092,7 @@ async fn run_cloud_asr_with_local_hedge(
     // actionable message — sending the request anyway just gets a confusing
     // provider-side 401 ("You didn't provide an API key").
     if cloud_asr_requires_key(provider) && asr_cfg.api_key.trim().is_empty() {
-        return Err("在线 ASR 的 API Key 未加载（钥匙串读取超时或未配置）。若 macOS 弹出钥匙串访问确认，请选择「始终允许」；或在「设置 → 语音识别」重新保存 API Key。".into());
+        return Err(CLOUD_ASR_MISSING_KEY.into());
     }
     let local_kind = local_hedge_engine_kind(state);
     let configured = Duration::from_secs(asr_cfg.timeout_secs.max(30));
@@ -3028,6 +3055,14 @@ mod attempt_metric_tests {
         // A custom gateway may be auth-free; local engines never reach here.
         assert!(!cloud_asr_requires_key("custom"));
         assert!(!cloud_asr_requires_key("local_sensevoice"));
+    }
+
+    #[test]
+    fn missing_key_error_is_stable_for_the_retry_cycle_match() {
+        // run_asr matches this exact string to trigger its one extra
+        // re-read-and-retry cycle, so it must stay a compile-time constant.
+        assert!(!CLOUD_ASR_MISSING_KEY.is_empty());
+        assert!(CLOUD_ASR_MISSING_KEY.contains("API Key"));
     }
 
     #[test]
