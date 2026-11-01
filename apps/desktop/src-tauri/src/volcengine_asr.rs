@@ -127,13 +127,17 @@ fn parse_response(
         Some(SUCCESS_CODE) => {
             let value: serde_json::Value = serde_json::from_str(body)
                 .map_err(|_| AsrError::Inference("malformed provider response".into()))?;
-            Ok(value
-                .get("result")
-                .and_then(|r| r.get("text"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string())
+            // A success body without a string `result.text` is an error, not
+            // an empty transcript: silently storing "" would hide a broken
+            // response (and, in cloud meeting mode, skip the local
+            // per-turn fallback). An explicit empty string stays valid
+            // (silent audio), matching the MiniMax engine's contract.
+            match value.get("result").and_then(|r| r.get("text")) {
+                Some(serde_json::Value::String(text)) => Ok(text.trim().to_string()),
+                _ => Err(AsrError::Inference(
+                    "malformed provider response: missing result.text field".into(),
+                )),
+            }
         }
         Some(code) => Err(AsrError::Inference(api_error_message(
             code,
@@ -327,9 +331,35 @@ mod tests {
     }
 
     #[test]
-    fn success_response_with_missing_text_yields_empty_string() {
-        let text = parse_response(reqwest::StatusCode::OK, Some("20000000"), None, "{}").unwrap();
+    fn success_response_with_empty_text_is_valid_but_missing_text_is_an_error() {
+        // Silence: an explicit empty string is a valid transcript.
+        let text = parse_response(
+            reqwest::StatusCode::OK,
+            Some("20000000"),
+            None,
+            r#"{"result":{"text":""}}"#,
+        )
+        .unwrap();
         assert_eq!(text, "");
+        // Missing / non-string result.text on a success code is malformed —
+        // never a silent empty transcript (cloud meetings fall back per turn
+        // on errors, not on empty text).
+        for body in [
+            "{}",
+            r#"{"result":{}}"#,
+            r#"{"result":{"text":123}}"#,
+            r#"{"audio_info":{"duration":1}}"#,
+        ] {
+            let err = parse_response(reqwest::StatusCode::OK, Some("20000000"), None, body)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("malformed"), "{body}: {err}");
+        }
+        // A non-JSON success body is malformed too.
+        let err = parse_response(reqwest::StatusCode::OK, Some("20000000"), None, "not json")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("malformed"), "{err}");
     }
 
     #[test]

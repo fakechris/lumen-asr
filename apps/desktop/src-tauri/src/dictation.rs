@@ -669,16 +669,18 @@ pub fn set_asr_engine(
             // Cloud / config_only providers: store in asr config; local engine unchanged.
             if let Ok(mut cfg) = state.config.lock() {
                 if let Some(p) = crate::provider_presets::asr_preset_by_id(other) {
-                    cfg.asr.provider = p.id;
                     if !p.base_url.is_empty() {
                         cfg.asr.base_url = p.base_url;
                     }
                     if !p.default_model.is_empty() {
                         cfg.asr.model = p.default_model;
                     }
+                    // Provider-scoped key slots: park the outgoing provider's
+                    // key and load the incoming one (see AppConfig's helper).
+                    cfg.switch_asr_provider(&p.id, crate::secret_store::platform_store());
                     let _ = cfg.save();
                 } else {
-                    cfg.asr.provider = other.to_string();
+                    cfg.switch_asr_provider(other, crate::secret_store::platform_store());
                     let _ = cfg.save();
                 }
             }
@@ -698,7 +700,9 @@ pub fn set_asr_engine(
         unload_qwen(&state);
     }
     if let Ok(mut cfg) = state.config.lock() {
-        cfg.asr.provider = provider_id.clone();
+        // Local engines take the same slot swap: parking the outgoing cloud
+        // provider's key keeps it restorable when the user switches back.
+        cfg.switch_asr_provider(&provider_id, crate::secret_store::platform_store());
         if provider_id == "openai_audio" {
             if cfg.asr.base_url.is_empty() {
                 cfg.asr.base_url = "https://api.openai.com/v1".into();
@@ -771,15 +775,13 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         "local_sensevoice" => sv.ready,
         "local_qwen" => qwen.ready,
         "local_whisper" => wh.ready,
-        // openai_audio always needs its key; a base_url alone would leave
-        // cloud dictation and cloud meetings disagreeing with the UI badge.
-        "openai_audio" => !asr_cfg.api_key.is_empty(),
+        // The keyed cloud providers need their *own* key: keyed_cloud_key_ready
+        // also refuses a key left in the field for the outgoing provider when
+        // the keychain could not complete a provider switch.
+        "openai_audio" | "volcengine" | "minimax" => asr_cfg.keyed_cloud_key_ready(),
         // A custom endpoint may be an auth-free gateway; a base_url alone is
         // enough to try.
         "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
-        // volcengine / minimax: ready once the API key (volcengine 新版控制台
-        // APP Key 亦填在这里) is set.
-        "volcengine" | "minimax" => !asr_cfg.api_key.is_empty(),
         // config_only: selectable but not runnable yet
         _ => false,
     };
@@ -2004,8 +2006,11 @@ async fn run_asr(
         // Refresh the snapshot from the keychain when its key is missing (a
         // startup read may have timed out on the macOS access prompt).
         let mut asr_cfg = asr_cfg.clone();
-        if cloud_asr_requires_key(provider) && asr_cfg.api_key.trim().is_empty() {
-            asr_cfg.api_key = recover_asr_key_sync(state);
+        if cloud_asr_requires_key(provider) && !asr_cfg.keyed_cloud_key_ready() {
+            let key = recover_asr_key_sync(state);
+            if !key.is_empty() {
+                asr_cfg.adopt_recovered_key(key);
+            }
         }
         let outcome =
             run_cloud_asr_with_local_hedge(state, provider, &asr_cfg, samples_16k.clone(), attempt)
@@ -2054,9 +2059,18 @@ fn cloud_asr_requires_key(provider: &str) -> bool {
 /// the session. Fills the live config and returns the key when one appears;
 /// empty when nothing was recovered (or the user deliberately cleared it).
 pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
-    let slot = crate::secret_store::SecretSlot::AsrApiKey;
+    // The keychain slot is scoped to the *current* provider; a stale key for
+    // a provider the user switched away from must never fill the field.
+    let provider = state
+        .config
+        .lock()
+        .map(|cfg| cfg.asr.provider.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let slot = crate::secret_store::SecretSlot::AsrApiKey {
+        provider: provider.into(),
+    };
     let Some(key) = crate::secret_store::platform_store()
-        .and_then(|store| store.get(slot).ok().flatten())
+        .and_then(|store| store.get(slot.clone()).ok().flatten())
         .filter(|k| !k.trim().is_empty())
     else {
         return String::new();
@@ -2065,7 +2079,7 @@ pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
         .config
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if cfg.set_secret_from_retry(slot, &key) {
+    if cfg.set_secret_from_retry(slot.clone(), &key) {
         tracing::warn!(
             account = slot.account(),
             "cloud ASR key recovered from keychain after a failed startup read"
@@ -2073,8 +2087,15 @@ pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
         return key;
     }
     // The slot was not Unknown — typically the startup retry won the race and
-    // filled it while we held a keyless snapshot. The live key is the answer.
-    cfg.asr.api_key.clone()
+    // filled it while we held a keyless snapshot. The live field is the
+    // answer only when it may actually be sent to the current provider; a
+    // key parked for the outgoing provider (degraded switch) must not be
+    // handed back and re-labelled as the current provider's.
+    if cfg.asr.keyed_cloud_key_ready() {
+        cfg.asr.api_key.clone()
+    } else {
+        String::new()
+    }
 }
 
 /// Surfaced (and matched for the one extra retry cycle in `run_asr`) when a
@@ -2091,7 +2112,7 @@ async fn run_cloud_asr_with_local_hedge(
     // A provider that needs a key and still has none fails here with an
     // actionable message — sending the request anyway just gets a confusing
     // provider-side 401 ("You didn't provide an API key").
-    if cloud_asr_requires_key(provider) && asr_cfg.api_key.trim().is_empty() {
+    if cloud_asr_requires_key(provider) && !asr_cfg.keyed_cloud_key_ready() {
         return Err(CLOUD_ASR_MISSING_KEY.into());
     }
     let local_kind = local_hedge_engine_kind(state);

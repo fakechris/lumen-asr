@@ -117,7 +117,8 @@ pub fn get_asr_service_config(state: State<'_, AppState>) -> Result<AsrServiceSt
         runtime_path: cfg.asr.runtime_path.clone(),
         base_url: cfg.asr.base_url.clone(),
         model: cfg.asr.model.clone(),
-        has_api_key: !cfg.asr.api_key.is_empty(),
+        has_api_key: cfg.asr.keyed_cloud_key_ready()
+            || (!cfg.asr.api_key.is_empty() && !cfg.asr.keyed_cloud_provider()),
         volcengine_app_id: cfg.asr.volcengine_app_id.clone(),
         language: cfg.asr.language.clone(),
         timeout_secs: cfg.asr.timeout_secs,
@@ -145,7 +146,11 @@ pub fn save_asr_service_config(
                 guard.asr.model = p.default_model;
             }
         }
-        guard.asr.provider = v;
+        // Provider-scoped key slots: park the outgoing provider's key under
+        // its own account and load the incoming one, so one vendor's key is
+        // never sent to another. An explicit input.api_key below overwrites
+        // the swapped-in value and is saved under the new provider's slot.
+        guard.switch_asr_provider(&v, crate::secret_store::platform_store());
     }
     if let Some(v) = input.runtime_path {
         guard.asr.runtime_path = v;
@@ -157,7 +162,10 @@ pub fn save_asr_service_config(
         guard.asr.model = v;
     }
     if let Some(v) = input.api_key {
+        // A key typed in Settings belongs to the provider being saved — it
+        // is the current provider's own credential from here on.
         guard.asr.api_key = v;
+        guard.asr.api_key_provider = guard.asr.provider.trim().to_ascii_lowercase();
     }
     if let Some(v) = input.volcengine_app_id {
         guard.asr.volcengine_app_id = v;
@@ -175,7 +183,8 @@ pub fn save_asr_service_config(
         runtime_path: guard.asr.runtime_path.clone(),
         base_url: guard.asr.base_url.clone(),
         model: guard.asr.model.clone(),
-        has_api_key: !guard.asr.api_key.is_empty(),
+        has_api_key: guard.asr.keyed_cloud_key_ready()
+            || (!guard.asr.api_key.is_empty() && !guard.asr.keyed_cloud_provider()),
         volcengine_app_id: guard.asr.volcengine_app_id.clone(),
         language: guard.asr.language.clone(),
         timeout_secs: guard.asr.timeout_secs,

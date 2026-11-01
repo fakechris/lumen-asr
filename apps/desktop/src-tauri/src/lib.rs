@@ -190,10 +190,9 @@ fn schedule_secret_retry(app: tauri::AppHandle) {
             let Ok(config) = state.config.lock() else {
                 return;
             };
-            crate::secret_store::SecretSlot::ALL
-                .iter()
-                .copied()
-                .filter(|slot| config.secrets.get(*slot) == crate::secret_store::SlotSync::Unknown)
+            crate::secret_store::SecretSlot::active(&config.asr.provider)
+                .into_iter()
+                .filter(|slot| config.secrets.get(slot) == crate::secret_store::SlotSync::Unknown)
                 .collect()
         };
         if unknown.is_empty() {
@@ -207,7 +206,7 @@ fn schedule_secret_retry(app: tauri::AppHandle) {
         let mut tasks = tokio::task::JoinSet::new();
         for slot in unknown {
             let Some(store) = store else { continue };
-            tasks.spawn_blocking(move || (slot, store.get_patient(slot)));
+            tasks.spawn_blocking(move || (slot.clone(), store.get_patient(slot)));
         }
         while let Some(joined) = tasks.join_next().await {
             let Ok((slot, outcome)) = joined else {
@@ -219,7 +218,7 @@ fn schedule_secret_retry(app: tauri::AppHandle) {
             };
             match outcome {
                 Ok(Some(key)) if !key.is_empty() => {
-                    if config.set_secret_from_retry(slot, &key) {
+                    if config.set_secret_from_retry(slot.clone(), &key) {
                         tracing::info!(
                             account = slot.account(),
                             "API key recovered from keychain after the access prompt was answered"

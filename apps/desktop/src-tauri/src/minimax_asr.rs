@@ -84,9 +84,20 @@ impl MinimaxAsr {
 }
 
 /// `language` is a request header per the spec; empty/absent = 混合语言识别.
-fn language_header(language: &str) -> Option<(&'static str, String)> {
-    let language = language.trim();
-    (!language.is_empty()).then(|| ("language", language.to_string()))
+/// A per-request [`AsrRequest::language_hint`] wins over the construction-time
+/// config value, matching the OpenAI engine's documented precedence.
+fn effective_language(config_language: &str, request_hint: Option<&str>) -> Option<String> {
+    let hint = request_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .map(str::to_owned);
+    match hint {
+        Some(hint) => Some(hint),
+        None => {
+            let config = config_language.trim();
+            (!config.is_empty()).then(|| config.to_string())
+        }
+    }
 }
 
 /// Multipart form: `model` + `file`（the only required fields; response_format
@@ -193,8 +204,10 @@ impl AsrEngine for MinimaxAsr {
             .post(self.config.base_url.trim())
             .bearer_auth(self.config.api_key.trim())
             .multipart(form);
-        if let Some((name, value)) = language_header(&self.config.language) {
-            builder = builder.header(name, value);
+        if let Some(language) =
+            effective_language(&self.config.language, req.language_hint.as_deref())
+        {
+            builder = builder.header("language", language);
         }
 
         let resp = builder
@@ -234,13 +247,26 @@ mod tests {
 
     #[test]
     fn language_header_is_only_sent_when_set() {
-        assert_eq!(language_header("zh"), Some(("language", "zh".to_string())));
+        assert_eq!(effective_language("zh", None), Some("zh".to_string()));
         assert_eq!(
-            language_header("  en-US  "),
-            Some(("language", "en-US".to_string()))
+            effective_language("  en-US  ", None),
+            Some("en-US".to_string())
         );
-        assert_eq!(language_header(""), None);
-        assert_eq!(language_header("   "), None);
+        assert_eq!(effective_language("", None), None);
+        assert_eq!(effective_language("   ", None), None);
+    }
+
+    #[test]
+    fn per_request_language_hint_wins_over_the_configured_language() {
+        // Matches the OpenAI engine's precedence: request hint > config.
+        assert_eq!(effective_language("zh", Some("ja")), Some("ja".to_string()));
+        // A blank hint falls back to the configured language.
+        assert_eq!(
+            effective_language("zh", Some("   ")),
+            Some("zh".to_string())
+        );
+        // Neither set: 混合识别 (no header).
+        assert_eq!(effective_language("", Some("")), None);
     }
 
     #[test]

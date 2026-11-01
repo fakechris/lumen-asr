@@ -19,20 +19,49 @@ use parking_lot::Mutex;
 const KEYCHAIN_SERVICE: &str = "com.lumenopen.asr.credentials";
 
 /// One credential slot in [`crate::config::AppConfig`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The ASR key is **provider-scoped** (`asr-api-key-<provider>`): the app has
+/// one settings field but several keyed cloud providers (MiniMax /
+/// Volcengine / OpenAI / custom), and a single shared item would hand one
+/// vendor's key to another on every provider switch — a guaranteed
+/// provider-side 401. [`SecretSlot::AsrApiKeyLegacy`] is the pre-scoping
+/// account, kept readable only for the one-time migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretSlot {
-    AsrApiKey,
+    AsrApiKey {
+        provider: Arc<str>,
+    },
+    /// The pre-scoping `asr-api-key` item; read by the load-time migration
+    /// only. It maps onto the same config field so the shared save/load
+    /// plumbing stays total, but it never appears in [`SecretSlot::active`].
+    AsrApiKeyLegacy,
     CorrectorApiKey,
 }
 
 impl SecretSlot {
-    pub const ALL: [SecretSlot; 2] = [SecretSlot::AsrApiKey, SecretSlot::CorrectorApiKey];
+    /// The slots backing the config's credential fields: the corrector key
+    /// plus the ASR key scoped to the *currently configured* provider.
+    pub fn active(asr_provider: &str) -> Vec<SecretSlot> {
+        vec![
+            SecretSlot::AsrApiKey {
+                provider: Self::normalize_provider(asr_provider).into(),
+            },
+            SecretSlot::CorrectorApiKey,
+        ]
+    }
 
-    pub fn account(self) -> &'static str {
+    pub fn account(&self) -> String {
         match self {
-            SecretSlot::AsrApiKey => "asr-api-key",
-            SecretSlot::CorrectorApiKey => "corrector-api-key",
+            SecretSlot::AsrApiKey { provider } => format!("asr-api-key-{provider}"),
+            SecretSlot::AsrApiKeyLegacy => "asr-api-key".to_owned(),
+            SecretSlot::CorrectorApiKey => "corrector-api-key".to_owned(),
         }
+    }
+
+    /// Canonical provider id for slot accounts: lowercase, trimmed — matching
+    /// [`crate::dictation::canonical_asr_provider`]'s casing rules.
+    fn normalize_provider(provider: &str) -> String {
+        provider.trim().to_ascii_lowercase()
     }
 }
 
@@ -71,18 +100,20 @@ pub enum SlotSync {
 pub struct SecretSync(Arc<Mutex<[SlotSync; 2]>>);
 
 impl SecretSync {
-    fn index(slot: SecretSlot) -> usize {
+    /// Both ASR variants share index 0: the config tracks exactly one ASR
+    /// key (the current provider's), whatever account it syncs against.
+    fn index(slot: &SecretSlot) -> usize {
         match slot {
-            SecretSlot::AsrApiKey => 0,
+            SecretSlot::AsrApiKey { .. } | SecretSlot::AsrApiKeyLegacy => 0,
             SecretSlot::CorrectorApiKey => 1,
         }
     }
 
-    pub fn get(&self, slot: SecretSlot) -> SlotSync {
+    pub fn get(&self, slot: &SecretSlot) -> SlotSync {
         self.0.lock()[Self::index(slot)].clone()
     }
 
-    pub fn set(&self, slot: SecretSlot, state: SlotSync) {
+    pub fn set(&self, slot: &SecretSlot, state: SlotSync) {
         self.0.lock()[Self::index(slot)] = state;
     }
 }
@@ -106,14 +137,14 @@ pub fn load_slot(
     value: &mut String,
 ) -> LoadOutcome {
     if !value.is_empty() {
-        return match store.set(slot, value) {
+        return match store.set(slot.clone(), value) {
             Ok(()) => {
-                sync.set(slot, SlotSync::Known(value.clone()));
+                sync.set(&slot, SlotSync::Known(value.clone()));
                 LoadOutcome::Migrated
             }
             Err(error) => {
                 tracing::warn!(
-                    account = slot.account(),
+                    account = %slot.account(),
                     %error,
                     "keychain write failed; keeping API key in config file"
                 );
@@ -121,14 +152,14 @@ pub fn load_slot(
             }
         };
     }
-    match store.get(slot) {
+    match store.get(slot.clone()) {
         Ok(stored) => {
             let stored = stored.unwrap_or_default();
-            sync.set(slot, SlotSync::Known(stored.clone()));
+            sync.set(&slot, SlotSync::Known(stored.clone()));
             *value = stored;
         }
         Err(error) => {
-            tracing::warn!(account = slot.account(), %error, "keychain read failed");
+            tracing::warn!(account = %slot.account(), %error, "keychain read failed");
         }
     }
     LoadOutcome::Unchanged
@@ -143,7 +174,7 @@ pub fn save_slot(
     slot: SecretSlot,
     value: &str,
 ) -> bool {
-    let previous = sync.get(slot);
+    let previous = sync.get(&slot);
     if previous == SlotSync::Known(value.to_owned()) {
         return true;
     }
@@ -151,10 +182,10 @@ pub fn save_slot(
         // Only delete an item we have seen; an unknown state may hide a key
         // that a failed read could not surface.
         match previous {
-            SlotSync::Known(_) => match store.delete(slot) {
-                Ok(()) => sync.set(slot, SlotSync::Known(String::new())),
+            SlotSync::Known(_) => match store.delete(slot.clone()) {
+                Ok(()) => sync.set(&slot, SlotSync::Known(String::new())),
                 Err(error) => tracing::warn!(
-                    account = slot.account(),
+                    account = %slot.account(),
                     %error,
                     "keychain delete failed; the old key may reappear on next launch"
                 ),
@@ -163,18 +194,18 @@ pub fn save_slot(
             // user's clear must still stick for this session: recording
             // Known(empty) keeps a later retry read from resurrecting the
             // hidden key (next launch re-reads the store as before).
-            SlotSync::Unknown => sync.set(slot, SlotSync::Known(String::new())),
+            SlotSync::Unknown => sync.set(&slot, SlotSync::Known(String::new())),
         }
         return true;
     }
-    match store.set(slot, value) {
+    match store.set(slot.clone(), value) {
         Ok(()) => {
-            sync.set(slot, SlotSync::Known(value.to_owned()));
+            sync.set(&slot, SlotSync::Known(value.to_owned()));
             true
         }
         Err(error) => {
             tracing::warn!(
-                account = slot.account(),
+                account = %slot.account(),
                 %error,
                 "keychain write failed; keeping API key in config file"
             );
@@ -237,7 +268,8 @@ mod macos {
     fn read_keychain_item(slot: SecretSlot) -> Result<Option<String>, String> {
         use security_framework::passwords::get_generic_password;
         use security_framework_sys::base::errSecItemNotFound;
-        match get_generic_password(KEYCHAIN_SERVICE, slot.account()) {
+        let account = slot.account();
+        match get_generic_password(KEYCHAIN_SERVICE, &account) {
             Ok(bytes) => String::from_utf8(bytes)
                 .map(Some)
                 .map_err(|_| "keychain item is not valid UTF-8".to_owned()),
@@ -263,7 +295,7 @@ mod macos {
             with_timeout(move || {
                 security_framework::passwords::set_generic_password(
                     KEYCHAIN_SERVICE,
-                    slot.account(),
+                    &slot.account(),
                     value.as_bytes(),
                 )
                 .map_err(|error| format!("keychain write failed: {error}"))
@@ -274,7 +306,7 @@ mod macos {
             with_timeout(move || {
                 use security_framework::passwords::delete_generic_password;
                 use security_framework_sys::base::errSecItemNotFound;
-                match delete_generic_password(KEYCHAIN_SERVICE, slot.account()) {
+                match delete_generic_password(KEYCHAIN_SERVICE, &slot.account()) {
                     Ok(()) => Ok(()),
                     Err(error) if error.code() == errSecItemNotFound => Ok(()),
                     Err(error) => Err(format!("keychain delete failed: {error}")),
@@ -294,8 +326,11 @@ pub(crate) mod tests {
     /// unavailable Keychain.
     #[derive(Default)]
     pub(crate) struct FakeStore {
-        pub items: Mutex<HashMap<&'static str, String>>,
+        pub items: Mutex<HashMap<String, String>>,
         pub fail: Mutex<bool>,
+        /// Fail only reads (models a keychain access prompt pending on the
+        /// item) while writes still succeed.
+        pub fail_get: Mutex<bool>,
         pub writes: Mutex<usize>,
     }
 
@@ -311,8 +346,11 @@ pub(crate) mod tests {
 
     impl SecretStore for FakeStore {
         fn get(&self, slot: SecretSlot) -> Result<Option<String>, String> {
+            if *self.fail_get.lock() {
+                return Err("get unavailable".into());
+            }
             self.check()?;
-            Ok(self.items.lock().get(slot.account()).cloned())
+            Ok(self.items.lock().get(&slot.account()).cloned())
         }
         fn set(&self, slot: SecretSlot, value: &str) -> Result<(), String> {
             self.check()?;
@@ -322,8 +360,15 @@ pub(crate) mod tests {
         }
         fn delete(&self, slot: SecretSlot) -> Result<(), String> {
             self.check()?;
-            self.items.lock().remove(slot.account());
+            self.items.lock().remove(&slot.account());
             Ok(())
+        }
+    }
+
+    /// The provider-scoped ASR slot for tests.
+    fn asr_slot(provider: &str) -> SecretSlot {
+        SecretSlot::AsrApiKey {
+            provider: provider.into(),
         }
     }
 
@@ -332,11 +377,15 @@ pub(crate) mod tests {
         let store = FakeStore::default();
         let sync = SecretSync::default();
         let mut value = "sk-file".to_owned();
-        let outcome = load_slot(&store, &sync, SecretSlot::AsrApiKey, &mut value);
+        let outcome = load_slot(&store, &sync, asr_slot("minimax"), &mut value);
         assert_eq!(outcome, LoadOutcome::Migrated);
         assert_eq!(value, "sk-file");
         assert_eq!(
-            store.items.lock().get("asr-api-key").map(String::as_str),
+            store
+                .items
+                .lock()
+                .get("asr-api-key-minimax")
+                .map(String::as_str),
             Some("sk-file")
         );
     }
@@ -347,10 +396,10 @@ pub(crate) mod tests {
         *store.fail.lock() = true;
         let sync = SecretSync::default();
         let mut value = "sk-file".to_owned();
-        let outcome = load_slot(&store, &sync, SecretSlot::AsrApiKey, &mut value);
+        let outcome = load_slot(&store, &sync, asr_slot("minimax"), &mut value);
         assert_eq!(outcome, LoadOutcome::Unchanged);
         assert_eq!(value, "sk-file");
-        assert!(!save_slot(&store, &sync, SecretSlot::AsrApiKey, &value));
+        assert!(!save_slot(&store, &sync, asr_slot("minimax"), &value));
     }
 
     #[test]
@@ -359,7 +408,7 @@ pub(crate) mod tests {
         store
             .items
             .lock()
-            .insert("corrector-api-key", "sk-kc".into());
+            .insert("corrector-api-key".to_owned(), "sk-kc".into());
         let sync = SecretSync::default();
         let mut value = String::new();
         load_slot(&store, &sync, SecretSlot::CorrectorApiKey, &mut value);
@@ -377,16 +426,23 @@ pub(crate) mod tests {
     #[test]
     fn unreadable_store_never_deletes_on_empty_save() {
         let store = FakeStore::default();
-        store.items.lock().insert("asr-api-key", "sk-kc".into());
+        store
+            .items
+            .lock()
+            .insert("asr-api-key-minimax".to_owned(), "sk-kc".into());
         *store.fail.lock() = true;
         let sync = SecretSync::default();
         let mut value = String::new();
-        load_slot(&store, &sync, SecretSlot::AsrApiKey, &mut value);
+        load_slot(&store, &sync, asr_slot("minimax"), &mut value);
         assert_eq!(value, "");
         *store.fail.lock() = false;
-        assert!(save_slot(&store, &sync, SecretSlot::AsrApiKey, ""));
+        assert!(save_slot(&store, &sync, asr_slot("minimax"), ""));
         assert_eq!(
-            store.items.lock().get("asr-api-key").map(String::as_str),
+            store
+                .items
+                .lock()
+                .get("asr-api-key-minimax")
+                .map(String::as_str),
             Some("sk-kc")
         );
     }
@@ -394,12 +450,15 @@ pub(crate) mod tests {
     #[test]
     fn clearing_a_known_key_deletes_it() {
         let store = FakeStore::default();
-        store.items.lock().insert("asr-api-key", "sk-kc".into());
+        store
+            .items
+            .lock()
+            .insert("asr-api-key-minimax".to_owned(), "sk-kc".into());
         let sync = SecretSync::default();
         let mut value = String::new();
-        load_slot(&store, &sync, SecretSlot::AsrApiKey, &mut value);
-        assert!(save_slot(&store, &sync, SecretSlot::AsrApiKey, ""));
-        assert!(store.items.lock().get("asr-api-key").is_none());
+        load_slot(&store, &sync, asr_slot("minimax"), &mut value);
+        assert!(save_slot(&store, &sync, asr_slot("minimax"), ""));
+        assert!(store.items.lock().get("asr-api-key-minimax").is_none());
     }
 
     #[test]
@@ -410,17 +469,20 @@ pub(crate) mod tests {
         // resurrect the hidden key.
         let store = FakeStore::default();
         *store.fail.lock() = true;
-        store.items.lock().insert("asr-api-key", "sk-hidden".into());
+        store
+            .items
+            .lock()
+            .insert("asr-api-key-minimax".to_owned(), "sk-hidden".into());
         let mut cfg = crate::config::AppConfig::default();
         let sync = cfg.secrets.clone();
         let mut value = String::new();
-        load_slot(&store, &sync, SecretSlot::AsrApiKey, &mut value); // read fails → Unknown
-        assert!(save_slot(&store, &sync, SecretSlot::AsrApiKey, ""));
+        load_slot(&store, &sync, asr_slot("minimax"), &mut value); // read fails → Unknown
+        assert!(save_slot(&store, &sync, asr_slot("minimax"), ""));
         *store.fail.lock() = false;
-        assert!(!cfg.set_secret_from_retry(SecretSlot::AsrApiKey, "sk-hidden"));
+        assert!(!cfg.set_secret_from_retry(asr_slot("minimax"), "sk-hidden"));
         assert_eq!(cfg.asr.api_key, "");
         assert_eq!(
-            sync.get(SecretSlot::AsrApiKey),
+            sync.get(&asr_slot("minimax")),
             SlotSync::Known(String::new())
         );
     }
@@ -444,8 +506,35 @@ pub(crate) mod tests {
             Some("sk-new")
         );
         assert_eq!(
-            sync.get(SecretSlot::CorrectorApiKey),
+            sync.get(&SecretSlot::CorrectorApiKey),
             SlotSync::Known("sk-new".into())
+        );
+    }
+
+    #[test]
+    fn slots_are_scoped_per_provider_and_the_legacy_account_survives() {
+        // Distinct accounts per provider are the whole point of the scoping;
+        // the legacy account stays readable for the one-time migration.
+        assert_eq!(
+            asr_slot("minimax").account(),
+            "asr-api-key-minimax".to_owned()
+        );
+        assert_eq!(
+            asr_slot("volcengine").account(),
+            "asr-api-key-volcengine".to_owned()
+        );
+        assert_eq!(
+            SecretSlot::active("LOCAL_QWEN")[0].account(),
+            "asr-api-key-local_qwen"
+        );
+        assert_eq!(
+            SecretSlot::AsrApiKeyLegacy.account(),
+            "asr-api-key".to_owned()
+        );
+        // The active set scopes the ASR slot to the configured provider.
+        assert_eq!(
+            SecretSlot::active("minimax"),
+            vec![asr_slot("minimax"), SecretSlot::CorrectorApiKey]
         );
     }
 }

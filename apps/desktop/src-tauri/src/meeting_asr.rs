@@ -58,12 +58,17 @@ pub(crate) fn build_meeting_transcribe_engine(
     // mode unconfigured.
     let mut asr_cfg = asr_cfg;
     if asr_cfg.api_key.trim().is_empty() {
-        asr_cfg.api_key = crate::dictation::recover_asr_key_sync(state);
+        let key = crate::dictation::recover_asr_key_sync(state);
+        if !key.is_empty() {
+            asr_cfg.adopt_recovered_key(key);
+        }
     }
     // Mirror `asr_status_from`'s readiness rules so an unconfigured cloud
-    // selection fails here — loudly — instead of silently degrading turn by turn.
+    // selection fails here — loudly — instead of silently degrading turn by
+    // turn. `keyed_cloud_key_ready` also refuses a key still owned by the
+    // outgoing provider after an incomplete provider switch.
     let cloud_ready = match provider {
-        "volcengine" | "minimax" | "openai_audio" => !asr_cfg.api_key.trim().is_empty(),
+        "volcengine" | "minimax" | "openai_audio" => asr_cfg.keyed_cloud_key_ready(),
         // A custom endpoint may be an auth-free gateway; a configured
         // base_url alone is enough to try.
         "custom" => !asr_cfg.api_key.trim().is_empty() || !asr_cfg.base_url.trim().is_empty(),
