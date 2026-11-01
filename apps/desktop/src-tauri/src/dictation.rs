@@ -669,16 +669,18 @@ pub fn set_asr_engine(
             // Cloud / config_only providers: store in asr config; local engine unchanged.
             if let Ok(mut cfg) = state.config.lock() {
                 if let Some(p) = crate::provider_presets::asr_preset_by_id(other) {
-                    cfg.asr.provider = p.id;
                     if !p.base_url.is_empty() {
                         cfg.asr.base_url = p.base_url;
                     }
                     if !p.default_model.is_empty() {
                         cfg.asr.model = p.default_model;
                     }
+                    // Provider-scoped key slots: park the outgoing provider's
+                    // key and load the incoming one (see AppConfig's helper).
+                    cfg.switch_asr_provider(&p.id, crate::secret_store::platform_store());
                     let _ = cfg.save();
                 } else {
-                    cfg.asr.provider = other.to_string();
+                    cfg.switch_asr_provider(other, crate::secret_store::platform_store());
                     let _ = cfg.save();
                 }
             }
@@ -698,7 +700,9 @@ pub fn set_asr_engine(
         unload_qwen(&state);
     }
     if let Ok(mut cfg) = state.config.lock() {
-        cfg.asr.provider = provider_id.clone();
+        // Local engines take the same slot swap: parking the outgoing cloud
+        // provider's key keeps it restorable when the user switches back.
+        cfg.switch_asr_provider(&provider_id, crate::secret_store::platform_store());
         if provider_id == "openai_audio" {
             if cfg.asr.base_url.is_empty() {
                 cfg.asr.base_url = "https://api.openai.com/v1".into();
@@ -2054,9 +2058,18 @@ fn cloud_asr_requires_key(provider: &str) -> bool {
 /// the session. Fills the live config and returns the key when one appears;
 /// empty when nothing was recovered (or the user deliberately cleared it).
 pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
-    let slot = crate::secret_store::SecretSlot::AsrApiKey;
+    // The keychain slot is scoped to the *current* provider; a stale key for
+    // a provider the user switched away from must never fill the field.
+    let provider = state
+        .config
+        .lock()
+        .map(|cfg| cfg.asr.provider.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let slot = crate::secret_store::SecretSlot::AsrApiKey {
+        provider: provider.into(),
+    };
     let Some(key) = crate::secret_store::platform_store()
-        .and_then(|store| store.get(slot).ok().flatten())
+        .and_then(|store| store.get(slot.clone()).ok().flatten())
         .filter(|k| !k.trim().is_empty())
     else {
         return String::new();
@@ -2065,7 +2078,7 @@ pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
         .config
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if cfg.set_secret_from_retry(slot, &key) {
+    if cfg.set_secret_from_retry(slot.clone(), &key) {
         tracing::warn!(
             account = slot.account(),
             "cloud ASR key recovered from keychain after a failed startup read"

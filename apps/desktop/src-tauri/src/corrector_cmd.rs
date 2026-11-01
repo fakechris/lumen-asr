@@ -145,7 +145,11 @@ pub fn save_asr_service_config(
                 guard.asr.model = p.default_model;
             }
         }
-        guard.asr.provider = v;
+        // Provider-scoped key slots: park the outgoing provider's key under
+        // its own account and load the incoming one, so one vendor's key is
+        // never sent to another. An explicit input.api_key below overwrites
+        // the swapped-in value and is saved under the new provider's slot.
+        guard.switch_asr_provider(&v, crate::secret_store::platform_store());
     }
     if let Some(v) = input.runtime_path {
         guard.asr.runtime_path = v;

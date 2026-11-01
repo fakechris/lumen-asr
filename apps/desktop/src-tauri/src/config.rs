@@ -305,6 +305,13 @@ pub struct AsrServiceConfig {
     /// Optional BCP-47 / ISO language hint for cloud ASR.
     pub language: String,
     pub timeout_secs: u64,
+    /// Schema version of the ASR key keychain scoping. `0` = pre-scoping
+    /// (single `asr-api-key` item shared by every provider) — the loader
+    /// migrates it into the current provider's scoped item and bumps this to
+    /// `1` so a deliberately cleared key can never be resurrected by a
+    /// re-run. Purely a migration flag; nothing reads it otherwise.
+    #[serde(default)]
+    pub key_slot_version: u32,
 }
 
 impl Default for AsrServiceConfig {
@@ -323,6 +330,7 @@ impl Default for AsrServiceConfig {
             volcengine_app_id: String::new(),
             language: String::new(),
             timeout_secs: 120,
+            key_slot_version: 0,
         }
     }
 }
@@ -1036,6 +1044,7 @@ impl AppConfig {
                     let mut needs_save = c.apply_platform_fallbacks();
                     if let Some(store) = store {
                         needs_save |= c.load_secrets(store);
+                        needs_save |= c.migrate_asr_key_slot(store);
                     }
                     if needs_save {
                         if let Err(error) = c.save_with(path, store) {
@@ -1056,18 +1065,31 @@ impl AppConfig {
         }
     }
 
-    fn secret_value(&self, slot: SecretSlot) -> &str {
+    fn secret_value(&self, slot: &SecretSlot) -> &str {
         match slot {
-            SecretSlot::AsrApiKey => &self.asr.api_key,
+            // Both ASR accounts back the same single field: only the scoped
+            // variant ever appears in the active set, the legacy one is the
+            // migration's read source.
+            SecretSlot::AsrApiKey { .. } | SecretSlot::AsrApiKeyLegacy => &self.asr.api_key,
             SecretSlot::CorrectorApiKey => &self.corrector.api_key,
         }
     }
 
-    fn secret_field(&mut self, slot: SecretSlot) -> &mut String {
+    fn secret_field(&mut self, slot: &SecretSlot) -> &mut String {
         match slot {
-            SecretSlot::AsrApiKey => &mut self.asr.api_key,
+            SecretSlot::AsrApiKey { .. } | SecretSlot::AsrApiKeyLegacy => &mut self.asr.api_key,
             SecretSlot::CorrectorApiKey => &mut self.corrector.api_key,
         }
+    }
+
+    /// A retried/recovered key may only land in the slot the config is
+    /// actually using: an ASR slot scoped to a provider the user has since
+    /// switched away from must not overwrite the current provider's field.
+    fn slot_is_active(&self, slot: &SecretSlot) -> bool {
+        let SecretSlot::AsrApiKey { provider } = slot else {
+            return true;
+        };
+        provider.as_ref() == self.asr.provider.trim().to_ascii_lowercase()
     }
 
     /// Fill one credential from a retried keychain read. Only a slot whose
@@ -1079,19 +1101,21 @@ impl AppConfig {
     /// applied.
     pub fn set_secret_from_retry(&mut self, slot: SecretSlot, value: &str) -> bool {
         if value.is_empty()
-            || !self.secret_value(slot).is_empty()
-            || self.secrets.get(slot) != SlotSync::Unknown
+            || !self.slot_is_active(&slot)
+            || !self.secret_value(&slot).is_empty()
+            || self.secrets.get(&slot) != SlotSync::Unknown
         {
             return false;
         }
-        *self.secret_field(slot) = value.to_owned();
-        self.secrets.set(slot, SlotSync::Known(value.to_owned()));
+        let field = self.secret_field(&slot);
+        *field = value.to_owned();
+        self.secrets.set(&slot, SlotSync::Known(value.to_owned()));
         true
     }
 
     #[cfg(test)]
     fn set_secret_sync(&mut self, slot: SecretSlot, state: SlotSync) {
-        self.secrets.set(slot, state);
+        self.secrets.set(&slot, state);
     }
 
     /// Settle a slot whose retried read succeeded but found nothing stored:
@@ -1099,8 +1123,8 @@ impl AppConfig {
     /// retry loop can stop polling. A pending plaintext write (field set,
     /// slot Unknown) keeps its field untouched; the next save re-attempts it.
     pub fn mark_secret_absent(&mut self, slot: SecretSlot) {
-        if self.secrets.get(slot) == SlotSync::Unknown {
-            self.secrets.set(slot, SlotSync::Known(String::new()));
+        if self.slot_is_active(&slot) && self.secrets.get(&slot) == SlotSync::Unknown {
+            self.secrets.set(&slot, SlotSync::Known(String::new()));
         }
     }
 
@@ -1109,11 +1133,136 @@ impl AppConfig {
     fn load_secrets(&mut self, store: &dyn SecretStore) -> bool {
         let sync = self.secrets.clone();
         let mut migrated = false;
-        for slot in SecretSlot::ALL {
-            let field = self.secret_field(slot);
+        for slot in SecretSlot::active(&self.asr.provider) {
+            let field = self.secret_field(&slot);
             migrated |= secret_store::load_slot(store, &sync, slot, field) == LoadOutcome::Migrated;
         }
         migrated
+    }
+
+    /// One-time migration of the pre-scoping `asr-api-key` keychain item into
+    /// the current provider's scoped item. The legacy item authenticated
+    /// whatever provider was configured, so scoping it to that provider is
+    /// exactly right. Runs only while [`AsrServiceConfig::key_slot_version`]
+    /// is `0`; every observable outcome except a failing store bumps the
+    /// version, and a later deliberate clear of the scoped key can then never
+    /// be resurrected from the still-present legacy item. Returns `true` when
+    /// the version bump needs persisting.
+    fn migrate_asr_key_slot(&mut self, store: &dyn SecretStore) -> bool {
+        if self.asr.key_slot_version >= 1 {
+            return false;
+        }
+        let slot = SecretSlot::AsrApiKey {
+            provider: self.asr.provider.trim().to_ascii_lowercase().into(),
+        };
+        match store.get(slot.clone()) {
+            // Scoped item already there (an earlier partial migration): done.
+            Ok(Some(_)) => {
+                self.asr.key_slot_version = 1;
+                true
+            }
+            Ok(None) => match store.get(SecretSlot::AsrApiKeyLegacy) {
+                Ok(Some(legacy)) if !legacy.is_empty() => match store.set(slot.clone(), &legacy) {
+                    Ok(()) => {
+                        tracing::info!(
+                            account = %slot.account(),
+                            "legacy asr-api-key item migrated into the provider-scoped slot"
+                        );
+                        if self.asr.api_key.is_empty() {
+                            self.asr.api_key = legacy.clone();
+                            self.secrets.set(&slot, SlotSync::Known(legacy.clone()));
+                        }
+                        self.asr.key_slot_version = 1;
+                        true
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            account = %slot.account(),
+                            %error,
+                            "asr key slot migration write failed; retrying next launch"
+                        );
+                        false
+                    }
+                },
+                // Nothing stored pre-scoping: nothing to migrate.
+                _ => {
+                    self.asr.key_slot_version = 1;
+                    true
+                }
+            },
+            // The scoped read itself failed (e.g. prompt pending): retry the
+            // whole migration on the next launch by leaving the version at 0.
+            Err(error) => {
+                tracing::warn!(
+                    account = %slot.account(),
+                    %error,
+                    "asr key slot migration read failed; retrying next launch"
+                );
+                false
+            }
+        }
+    }
+
+    /// Switch the configured ASR provider, keeping each provider's key in its
+    /// own keychain slot: the outgoing provider's key is persisted under its
+    /// account and the incoming provider's key (empty when never configured)
+    /// is loaded into the field. Without this, one shared item would hand
+    /// e.g. a MiniMax key to Volcengine on every switch. With no credential
+    /// store (plaintext platforms) the single field simply carries over, as
+    /// before.
+    pub fn switch_asr_provider(&mut self, new_provider: &str, store: Option<&dyn SecretStore>) {
+        let new_provider = new_provider.trim().to_ascii_lowercase();
+        let old_provider = self.asr.provider.trim().to_ascii_lowercase();
+        if new_provider == old_provider {
+            // Normalize the stored casing even on a no-op switch.
+            self.asr.provider = new_provider;
+            return;
+        }
+        let Some(store) = store else {
+            self.asr.provider = new_provider;
+            return;
+        };
+        let old_slot = SecretSlot::AsrApiKey {
+            provider: old_provider.into(),
+        };
+        // Persist the current key under the outgoing provider first. If the
+        // store refuses (it stayed in the file as plaintext), keep it in the
+        // field rather than losing it: the caller's save then writes it back
+        // out, and the user re-enters the new provider's key — the same
+        // pre-scoping behaviour, never data loss.
+        let current = self.asr.api_key.clone();
+        if !secret_store::save_slot(store, &self.secrets, old_slot.clone(), &current) {
+            tracing::warn!(
+                account = %old_slot.account(),
+                "could not persist the outgoing provider's key; keeping it in the config field"
+            );
+            self.asr.provider = new_provider;
+            return;
+        }
+        self.asr.provider = new_provider.clone();
+        let new_slot = SecretSlot::AsrApiKey {
+            provider: new_provider.into(),
+        };
+        match store.get(new_slot.clone()) {
+            Ok(stored) => {
+                let value = stored.unwrap_or_default();
+                self.asr.api_key = value.clone();
+                self.secrets.set(&new_slot, SlotSync::Known(value));
+            }
+            // The read failed (prompt pending): run keyless rather than leak
+            // the old provider's key to the new one. The field stays empty
+            // and the slot Unknown, so the patient-read retry can still fill
+            // it once the prompt is answered.
+            Err(error) => {
+                tracing::warn!(
+                    account = %new_slot.account(),
+                    %error,
+                    "could not read the incoming provider's key; continuing without it"
+                );
+                self.asr.api_key.clear();
+                self.secrets.set(&new_slot, SlotSync::Unknown);
+            }
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -1137,8 +1286,8 @@ impl AppConfig {
         // left untouched, so a stale plaintext key in the old file can never
         // be migrated over a newer Keychain value on the next load.
         let mut on_disk = self.clone();
-        for slot in SecretSlot::ALL {
-            on_disk.secret_field(slot).clear();
+        for slot in SecretSlot::active(&self.asr.provider) {
+            on_disk.secret_field(&slot).clear();
         }
         let s = toml::to_string_pretty(&on_disk).map_err(|e| e.to_string())?;
         write_private(path, s.as_bytes())?;
@@ -1146,10 +1295,11 @@ impl AppConfig {
         // Then sync the Keychain; any key it refuses goes back into the file so
         // it is never lost.
         let mut kept_plaintext = false;
-        for slot in SecretSlot::ALL {
-            let mut value = self.secret_value(slot).to_owned();
-            if !secret_store::save_slot(store, &self.secrets, slot, &value) {
-                std::mem::swap(on_disk.secret_field(slot), &mut value);
+        for slot in SecretSlot::active(&self.asr.provider) {
+            let mut value = self.secret_value(&slot).to_owned();
+            if !secret_store::save_slot(store, &self.secrets, slot.clone(), &value) {
+                let field = on_disk.secret_field(&slot);
+                std::mem::swap(field, &mut value);
                 kept_plaintext = true;
             }
         }
@@ -1236,15 +1386,29 @@ mod tests {
     fn retried_secret_read_fills_only_unknown_slots() {
         use crate::secret_store::SlotSync;
         let mut cfg = AppConfig::default();
+        // Default provider is local_sensevoice — the slot the config starts with.
+        let asr = || SecretSlot::AsrApiKey {
+            provider: "local_sensevoice".into(),
+        };
 
         // Unknown (a startup read timed out on the keychain prompt): the
         // retried key is applied and remembered.
-        assert!(cfg.set_secret_from_retry(SecretSlot::AsrApiKey, "sk-recovered"));
+        assert!(cfg.set_secret_from_retry(asr(), "sk-recovered"));
         assert_eq!(cfg.asr.api_key, "sk-recovered");
 
         // A later retry of the same slot no longer applies (state is Known).
-        assert!(!cfg.set_secret_from_retry(SecretSlot::AsrApiKey, "sk-other"));
+        assert!(!cfg.set_secret_from_retry(asr(), "sk-other"));
         assert_eq!(cfg.asr.api_key, "sk-recovered");
+
+        // A retried read for a provider the config has switched away from
+        // must not touch the field (the parked task outlived the switch).
+        let mut switched = AppConfig::default();
+        switched.asr.provider = "minimax".into();
+        let stale = SecretSlot::AsrApiKey {
+            provider: "volcengine".into(),
+        };
+        assert!(!switched.set_secret_from_retry(stale, "sk-stale-vendor"));
+        assert_eq!(switched.asr.api_key, "");
 
         // Known(empty) — the user cleared the key on purpose — must not be
         // resurrected by a retry.
@@ -1255,14 +1419,24 @@ mod tests {
 
         // An empty recovery value never writes anything.
         let mut empty = AppConfig::default();
-        assert!(!empty.set_secret_from_retry(SecretSlot::AsrApiKey, ""));
+        assert!(!empty.set_secret_from_retry(
+            SecretSlot::AsrApiKey {
+                provider: empty.asr.provider.clone().into()
+            },
+            ""
+        ));
 
         // A plaintext key the store refused to take over (failed startup
         // write leaves the field set and the slot Unknown) is never replaced
         // by an older keychain item.
         let mut plaintext = AppConfig::default();
         plaintext.asr.api_key = "sk-kept-plaintext".into();
-        assert!(!plaintext.set_secret_from_retry(SecretSlot::AsrApiKey, "sk-stale"));
+        assert!(!plaintext.set_secret_from_retry(
+            SecretSlot::AsrApiKey {
+                provider: plaintext.asr.provider.clone().into()
+            },
+            "sk-stale"
+        ));
         assert_eq!(plaintext.asr.api_key, "sk-kept-plaintext");
     }
 
@@ -1275,17 +1449,20 @@ mod tests {
         // and empty; the loop stops polling and a later key cannot appear.
         cfg.mark_secret_absent(SecretSlot::CorrectorApiKey);
         assert_eq!(
-            cfg.secrets.get(SecretSlot::CorrectorApiKey),
+            cfg.secrets.get(&SecretSlot::CorrectorApiKey),
             SlotSync::Known(String::new())
         );
         assert!(!cfg.set_secret_from_retry(SecretSlot::CorrectorApiKey, "sk-late"));
 
         // Settling never disturbs a slot that is already known.
         let mut known = AppConfig::default();
-        known.set_secret_sync(SecretSlot::AsrApiKey, SlotSync::Known("sk-live".into()));
-        known.mark_secret_absent(SecretSlot::AsrApiKey);
+        let known_asr = SecretSlot::AsrApiKey {
+            provider: known.asr.provider.trim().to_ascii_lowercase().into(),
+        };
+        known.set_secret_sync(known_asr.clone(), SlotSync::Known("sk-live".into()));
+        known.mark_secret_absent(known_asr.clone());
         assert_eq!(
-            known.secrets.get(SecretSlot::AsrApiKey),
+            known.secrets.get(&known_asr),
             SlotSync::Known("sk-live".into())
         );
     }
@@ -1311,6 +1488,129 @@ mod tests {
         let reloaded = AppConfig::load_with(&path, Some(&store));
         assert_eq!(reloaded.asr.api_key, "sk-asr");
         assert_eq!(reloaded.corrector.api_key, "sk-llm");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_switch_parks_the_outgoing_key_and_loads_the_incoming_one() {
+        use crate::secret_store::tests::FakeStore;
+        let store = FakeStore::default();
+        let mut cfg = AppConfig::default();
+        cfg.asr.provider = "minimax".into();
+        cfg.asr.api_key = "sk-minimax".into();
+
+        cfg.switch_asr_provider("volcengine", Some(&store));
+        assert_eq!(cfg.asr.provider, "volcengine");
+        // Volcengine was never configured: field empty, slot settled.
+        assert_eq!(cfg.asr.api_key, "");
+        // The MiniMax key lives under its own account, ready to restore.
+        assert_eq!(
+            store
+                .items
+                .lock()
+                .get("asr-api-key-minimax")
+                .map(String::as_str),
+            Some("sk-minimax")
+        );
+
+        // Switching back restores it without any typing.
+        cfg.switch_asr_provider("minimax", Some(&store));
+        assert_eq!(cfg.asr.api_key, "sk-minimax");
+        assert_eq!(cfg.asr.provider, "minimax");
+
+        // A same-provider call is a casing-normalizing no-op.
+        cfg.switch_asr_provider("  MiniMax ", Some(&store));
+        assert_eq!(cfg.asr.provider, "minimax");
+        assert_eq!(cfg.asr.api_key, "sk-minimax");
+
+        // Without a credential store (plaintext platforms) the field simply
+        // carries over — the documented pre-scoping behaviour.
+        let mut plain = AppConfig::default();
+        plain.asr.provider = "minimax".into();
+        plain.asr.api_key = "sk-plain".into();
+        plain.switch_asr_provider("volcengine", None);
+        assert_eq!(plain.asr.provider, "volcengine");
+        assert_eq!(plain.asr.api_key, "sk-plain");
+    }
+
+    #[test]
+    fn provider_switch_with_pending_prompt_runs_keyless_but_recoverable() {
+        use crate::secret_store::tests::FakeStore;
+        use crate::secret_store::SlotSync;
+        let store = FakeStore::default();
+        // The incoming provider's slot read fails (access prompt pending):
+        // the old vendor's key must not leak into the new provider's field.
+        store
+            .items
+            .lock()
+            .insert("asr-api-key-volcengine".into(), "sk-volcengine".into());
+        *store.fail_get.lock() = true;
+        let mut cfg = AppConfig::default();
+        cfg.asr.provider = "minimax".into();
+        cfg.asr.api_key = "sk-minimax".into();
+        cfg.switch_asr_provider("volcengine", Some(&store));
+        assert_eq!(cfg.asr.provider, "volcengine");
+        assert_eq!(cfg.asr.api_key, "");
+        let volc = SecretSlot::AsrApiKey {
+            provider: "volcengine".into(),
+        };
+        assert_eq!(cfg.secrets.get(&volc), SlotSync::Unknown);
+        // Once the prompt is answered, the parked patient read still fills it.
+        *store.fail.lock() = false;
+        assert!(cfg.set_secret_from_retry(volc, "sk-volcengine"));
+        assert_eq!(cfg.asr.api_key, "sk-volcengine");
+    }
+
+    #[test]
+    fn provider_switch_never_loses_a_key_the_store_refused() {
+        use crate::secret_store::tests::FakeStore;
+        let store = FakeStore::default();
+        *store.fail.lock() = true;
+        let mut cfg = AppConfig::default();
+        cfg.asr.provider = "minimax".into();
+        cfg.asr.api_key = "sk-plaintext".into();
+        cfg.switch_asr_provider("volcengine", Some(&store));
+        // Store down: degrade to the pre-scoping single-field behaviour —
+        // the key stays in the field (never dropped), provider still flips.
+        assert_eq!(cfg.asr.provider, "volcengine");
+        assert_eq!(cfg.asr.api_key, "sk-plaintext");
+    }
+
+    #[test]
+    fn legacy_asr_key_migrates_once_into_the_scoped_slot() {
+        use crate::secret_store::tests::FakeStore;
+        let store = FakeStore::default();
+        // Pre-scoping layout: one shared item, provider = whoever used it.
+        store
+            .items
+            .lock()
+            .insert("asr-api-key".into(), "sk-legacy".into());
+        let path = temp_config_path("slot-migrate");
+        let mut cfg = AppConfig::default();
+        cfg.asr.provider = "minimax".into();
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_with(&path, Some(&store));
+        // The legacy item scoped to the configured provider, field filled.
+        assert_eq!(loaded.asr.api_key, "sk-legacy");
+        assert_eq!(
+            store
+                .items
+                .lock()
+                .get("asr-api-key-minimax")
+                .map(String::as_str),
+            Some("sk-legacy")
+        );
+        assert_eq!(loaded.asr.key_slot_version, 1);
+
+        // The user then clears the key deliberately…
+        let mut cleared = loaded.clone();
+        cleared.asr.api_key.clear();
+        cleared.save_with(&path, Some(&store)).unwrap();
+        // …so the legacy item (still present) must not resurrect it.
+        let reloaded = AppConfig::load_with(&path, Some(&store));
+        assert_eq!(reloaded.asr.api_key, "");
+        assert_eq!(reloaded.asr.key_slot_version, 1);
         let _ = fs::remove_file(path);
     }
 
