@@ -1292,6 +1292,45 @@ impl AppConfig {
         }
     }
 
+    /// Request-path completion of a pending key-slot migration: when the
+    /// startup migration could not read the legacy item in time (its access
+    /// prompt was pending or denied) and the config is still in the
+    /// pre-scoping state, adopt a successfully read legacy key for the
+    /// current provider — the same assumption the load-time migration makes
+    /// (the legacy key authenticated whatever provider was configured).
+    /// Returns the adopted key, or `None` when the state is not pending or
+    /// the store refuses the write.
+    pub fn adopt_legacy_key_if_pending(&mut self, store: &dyn SecretStore) -> Option<String> {
+        if self.asr.key_slot_version != 0
+            || !self.asr.api_key_provider.trim().is_empty()
+            || !self.asr.api_key.trim().is_empty()
+        {
+            return None;
+        }
+        let slot = SecretSlot::AsrApiKey {
+            provider: self.asr.provider.trim().to_ascii_lowercase().into(),
+        };
+        // The scoped slot must still be absent: a completed (or partially
+        // completed) migration means there is nothing to adopt.
+        if !matches!(store.get(slot.clone()), Ok(None)) {
+            return None;
+        }
+        let legacy = store.get(SecretSlot::AsrApiKeyLegacy).ok().flatten()?;
+        if legacy.trim().is_empty() {
+            return None;
+        }
+        store.set(slot.clone(), &legacy).ok()?;
+        self.asr.api_key = legacy.clone();
+        self.asr.api_key_provider = self.asr.provider.trim().to_ascii_lowercase();
+        self.asr.key_slot_version = 1;
+        self.secrets.set(&slot, SlotSync::Known(legacy.clone()));
+        tracing::info!(
+            account = %slot.account(),
+            "legacy asr-api-key adopted into the provider-scoped slot on first use"
+        );
+        Some(legacy)
+    }
+
     /// Switch the configured ASR provider, keeping each provider's key in its
     /// own keychain slot: the outgoing provider's key is persisted under its
     /// account and the incoming provider's key (empty when never configured)
@@ -1750,6 +1789,46 @@ mod tests {
         recovered.asr.adopt_recovered_key("sk-back".into());
         assert_eq!(recovered.asr.api_key_provider, "minimax");
         assert!(recovered.asr.keyed_cloud_key_ready());
+    }
+
+    #[test]
+    fn a_pending_migration_adopts_the_legacy_key_on_first_use() {
+        use crate::secret_store::tests::FakeStore;
+        let store = FakeStore::default();
+        store
+            .items
+            .lock()
+            .insert("asr-api-key".to_owned(), "sk-legacy".into());
+        let mut cfg = AppConfig::default();
+        cfg.asr.provider = "openai_audio".into();
+        // The startup migration could not read the legacy item in time; the
+        // first cloud request finishes the migration in place.
+        assert_eq!(
+            cfg.adopt_legacy_key_if_pending(&store),
+            Some("sk-legacy".to_owned())
+        );
+        assert_eq!(cfg.asr.api_key, "sk-legacy");
+        assert_eq!(cfg.asr.api_key_provider, "openai_audio");
+        assert_eq!(cfg.asr.key_slot_version, 1);
+        assert_eq!(
+            store
+                .items
+                .lock()
+                .get("asr-api-key-openai_audio")
+                .map(String::as_str),
+            Some("sk-legacy")
+        );
+        // Already migrated / marked / holding a key: never adopts again.
+        let mut done = cfg.clone();
+        assert_eq!(done.adopt_legacy_key_if_pending(&store), None);
+        let mut marked = AppConfig::default();
+        marked.asr.provider = "openai_audio".into();
+        marked.asr.api_key_provider = "minimax".into();
+        assert_eq!(marked.adopt_legacy_key_if_pending(&store), None);
+        let mut held = AppConfig::default();
+        held.asr.provider = "openai_audio".into();
+        held.asr.api_key = "sk-field".into();
+        assert_eq!(held.adopt_legacy_key_if_pending(&store), None);
     }
 
     #[test]

@@ -2069,12 +2069,29 @@ pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
     let slot = crate::secret_store::SecretSlot::AsrApiKey {
         provider: provider.into(),
     };
-    let Some(key) = crate::secret_store::platform_store()
-        .and_then(|store| store.get(slot.clone()).ok().flatten())
-        .filter(|k| !k.trim().is_empty())
-    else {
+    let Some(store) = crate::secret_store::platform_store() else {
         return String::new();
     };
+    let scoped = store
+        .get(slot.clone())
+        .ok()
+        .flatten()
+        .filter(|k| !k.trim().is_empty());
+    if scoped.is_none() {
+        // Pending pre-scoping migration (the startup read of the legacy item
+        // timed out on its access prompt): finish it right here — the user
+        // answering the prompt now unblocks the very request, no restart.
+        if let Some(legacy) = state
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .adopt_legacy_key_if_pending(store)
+        {
+            return legacy;
+        }
+        return String::new();
+    }
+    let key = scoped.expect("non-empty scoped key");
     let mut cfg = state
         .config
         .lock()
