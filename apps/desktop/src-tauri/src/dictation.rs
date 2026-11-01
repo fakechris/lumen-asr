@@ -2087,8 +2087,15 @@ pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
         return key;
     }
     // The slot was not Unknown — typically the startup retry won the race and
-    // filled it while we held a keyless snapshot. The live key is the answer.
-    cfg.asr.api_key.clone()
+    // filled it while we held a keyless snapshot. The live field is the
+    // answer only when it may actually be sent to the current provider; a
+    // key parked for the outgoing provider (degraded switch) must not be
+    // handed back and re-labelled as the current provider's.
+    if cfg.asr.keyed_cloud_key_ready() {
+        cfg.asr.api_key.clone()
+    } else {
+        String::new()
+    }
 }
 
 /// Surfaced (and matched for the one extra retry cycle in `run_asr`) when a

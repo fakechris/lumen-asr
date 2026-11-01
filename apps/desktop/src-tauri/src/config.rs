@@ -1133,6 +1133,18 @@ impl AppConfig {
         }
     }
 
+    /// Whether the `api_key` field's value belongs to the configured
+    /// provider (empty marker = legacy unmarked semantics). While false —
+    /// a degraded provider switch left the outgoing provider's key in the
+    /// field — the key must not be synced into the current provider's
+    /// keychain slot (load) nor cleared from the file for it (save): it
+    /// stays parked in the field, unusable, until the user re-enters a key
+    /// or switches back to its owner.
+    fn asr_key_owned_by_current_provider(&self) -> bool {
+        let marker = self.asr.api_key_provider.trim().to_ascii_lowercase();
+        marker.is_empty() || marker == self.asr.provider.trim().to_ascii_lowercase()
+    }
+
     /// A retried/recovered key may only land in the slot the config is
     /// actually using: an ASR slot scoped to a provider the user has since
     /// switched away from must not overwrite the current provider's field.
@@ -1192,6 +1204,14 @@ impl AppConfig {
         let sync = self.secrets.clone();
         let mut migrated = false;
         for slot in SecretSlot::active(&self.asr.provider) {
+            // A key still owned by the outgoing provider (degraded switch)
+            // must not be written into — nor replaced from — the current
+            // provider's slot; it stays parked in the file's field.
+            if matches!(slot, SecretSlot::AsrApiKey { .. })
+                && !self.asr_key_owned_by_current_provider()
+            {
+                continue;
+            }
             let field = self.secret_field(&slot);
             migrated |= secret_store::load_slot(store, &sync, slot, field) == LoadOutcome::Migrated;
         }
@@ -1389,6 +1409,14 @@ impl AppConfig {
         // be migrated over a newer Keychain value on the next load.
         let mut on_disk = self.clone();
         for slot in SecretSlot::active(&self.asr.provider) {
+            if matches!(slot, SecretSlot::AsrApiKey { .. })
+                && !self.asr_key_owned_by_current_provider()
+            {
+                // The field parks the outgoing provider's key; it stays in
+                // the file (like any key the store refused) instead of being
+                // cleared and mis-filed under the current provider.
+                continue;
+            }
             on_disk.secret_field(&slot).clear();
         }
         let s = toml::to_string_pretty(&on_disk).map_err(|e| e.to_string())?;
@@ -1398,6 +1426,14 @@ impl AppConfig {
         // it is never lost.
         let mut kept_plaintext = false;
         for slot in SecretSlot::active(&self.asr.provider) {
+            if matches!(slot, SecretSlot::AsrApiKey { .. })
+                && !self.asr_key_owned_by_current_provider()
+            {
+                // Never write the parked foreign key into the current
+                // provider's slot; it stays in the file.
+                kept_plaintext = true;
+                continue;
+            }
             let mut value = self.secret_value(&slot).to_owned();
             if !secret_store::save_slot(store, &self.secrets, slot.clone(), &value) {
                 let field = on_disk.secret_field(&slot);
@@ -1714,6 +1750,36 @@ mod tests {
         recovered.asr.adopt_recovered_key("sk-back".into());
         assert_eq!(recovered.asr.api_key_provider, "minimax");
         assert!(recovered.asr.keyed_cloud_key_ready());
+    }
+
+    #[test]
+    fn a_parked_foreign_key_never_lands_in_the_new_providers_slot() {
+        use crate::secret_store::tests::FakeStore;
+        let store = FakeStore::default();
+        *store.fail.lock() = true;
+        let path = temp_config_path("parked-foreign");
+        let mut cfg = AppConfig::default();
+        cfg.asr.provider = "minimax".into();
+        cfg.asr.api_key = "sk-minimax".into();
+        cfg.save_to(&path).unwrap();
+
+        // Degraded switch: the field keeps MiniMax's key, provider flips.
+        cfg.switch_asr_provider("volcengine", Some(&store));
+        assert_eq!(cfg.asr.api_key_provider, "minimax");
+
+        // The store recovers: neither a save nor a reload may file the parked
+        // key under volcengine — it stays parked in the config file.
+        *store.fail.lock() = false;
+        cfg.save_with(&path, Some(&store)).unwrap();
+        assert!(store.items.lock().get("asr-api-key-volcengine").is_none());
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("sk-minimax"), "{on_disk}");
+
+        let reloaded = AppConfig::load_with(&path, Some(&store));
+        assert_eq!(reloaded.asr.api_key, "sk-minimax");
+        assert_eq!(reloaded.asr.api_key_provider, "minimax");
+        assert!(!reloaded.asr.keyed_cloud_key_ready());
+        let _ = fs::remove_file(path);
     }
 
     #[test]
