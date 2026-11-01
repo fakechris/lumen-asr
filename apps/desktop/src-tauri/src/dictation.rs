@@ -775,15 +775,13 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
         "local_sensevoice" => sv.ready,
         "local_qwen" => qwen.ready,
         "local_whisper" => wh.ready,
-        // openai_audio always needs its key; a base_url alone would leave
-        // cloud dictation and cloud meetings disagreeing with the UI badge.
-        "openai_audio" => !asr_cfg.api_key.is_empty(),
+        // The keyed cloud providers need their *own* key: keyed_cloud_key_ready
+        // also refuses a key left in the field for the outgoing provider when
+        // the keychain could not complete a provider switch.
+        "openai_audio" | "volcengine" | "minimax" => asr_cfg.keyed_cloud_key_ready(),
         // A custom endpoint may be an auth-free gateway; a base_url alone is
         // enough to try.
         "custom" => !asr_cfg.api_key.is_empty() || !asr_cfg.base_url.is_empty(),
-        // volcengine / minimax: ready once the API key (volcengine 新版控制台
-        // APP Key 亦填在这里) is set.
-        "volcengine" | "minimax" => !asr_cfg.api_key.is_empty(),
         // config_only: selectable but not runnable yet
         _ => false,
     };
@@ -2008,8 +2006,11 @@ async fn run_asr(
         // Refresh the snapshot from the keychain when its key is missing (a
         // startup read may have timed out on the macOS access prompt).
         let mut asr_cfg = asr_cfg.clone();
-        if cloud_asr_requires_key(provider) && asr_cfg.api_key.trim().is_empty() {
-            asr_cfg.api_key = recover_asr_key_sync(state);
+        if cloud_asr_requires_key(provider) && !asr_cfg.keyed_cloud_key_ready() {
+            let key = recover_asr_key_sync(state);
+            if !key.is_empty() {
+                asr_cfg.adopt_recovered_key(key);
+            }
         }
         let outcome =
             run_cloud_asr_with_local_hedge(state, provider, &asr_cfg, samples_16k.clone(), attempt)
@@ -2104,7 +2105,7 @@ async fn run_cloud_asr_with_local_hedge(
     // A provider that needs a key and still has none fails here with an
     // actionable message — sending the request anyway just gets a confusing
     // provider-side 401 ("You didn't provide an API key").
-    if cloud_asr_requires_key(provider) && asr_cfg.api_key.trim().is_empty() {
+    if cloud_asr_requires_key(provider) && !asr_cfg.keyed_cloud_key_ready() {
         return Err(CLOUD_ASR_MISSING_KEY.into());
     }
     let local_kind = local_hedge_engine_kind(state);

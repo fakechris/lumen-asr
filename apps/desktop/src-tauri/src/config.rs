@@ -312,6 +312,16 @@ pub struct AsrServiceConfig {
     /// re-run. Purely a migration flag; nothing reads it otherwise.
     #[serde(default)]
     pub key_slot_version: u32,
+    /// Which provider the `api_key` field's value belongs to (canonical id).
+    /// Empty = unscoped (pre-marker config, or a key just typed into
+    /// Settings): treated as belonging to the current provider, preserving
+    /// the old single-field behaviour. A non-empty marker that *differs* from
+    /// the current provider means the field still holds the outgoing
+    /// provider's key after a switch the keychain could not complete —
+    /// [`AsrServiceConfig::keyed_cloud_key_ready`] then reports the key as
+    /// not usable, so one vendor's key is never sent to another.
+    #[serde(default)]
+    pub api_key_provider: String,
 }
 
 impl Default for AsrServiceConfig {
@@ -331,7 +341,48 @@ impl Default for AsrServiceConfig {
             language: String::new(),
             timeout_secs: 120,
             key_slot_version: 0,
+            api_key_provider: String::new(),
         }
+    }
+}
+
+impl AsrServiceConfig {
+    fn provider_id(&self) -> String {
+        self.provider.trim().to_ascii_lowercase()
+    }
+
+    /// The keyed cloud providers whose engine sends `api_key` as the vendor
+    /// credential. (`custom` stays permissive: its endpoints may be
+    /// auth-free gateways and its model/key names are the user's contract.)
+    pub fn keyed_cloud_provider(&self) -> bool {
+        matches!(
+            self.provider_id().as_str(),
+            "openai_audio" | "minimax" | "volcengine"
+        )
+    }
+
+    /// Whether `api_key` may be sent to the currently configured provider:
+    /// present, and — for the keyed providers — either unmarked (legacy
+    /// single-field semantics) or marked as this provider's key. A key the
+    /// keychain could not re-scope during a provider switch stays in the
+    /// field (never lost) but is marked for the outgoing provider and thus
+    /// not usable until the user re-enters it.
+    pub fn keyed_cloud_key_ready(&self) -> bool {
+        if self.api_key.trim().is_empty() {
+            return false;
+        }
+        if !self.keyed_cloud_provider() {
+            return true;
+        }
+        let marker = self.api_key_provider.trim().to_ascii_lowercase();
+        marker.is_empty() || marker == self.provider_id()
+    }
+
+    /// Adopt a key recovered for the *current* provider (keychain retry
+    /// paths), so the ownership marker matches what will actually be sent.
+    pub fn adopt_recovered_key(&mut self, key: String) {
+        self.api_key_provider = self.provider_id();
+        self.api_key = key;
     }
 }
 
@@ -1107,8 +1158,15 @@ impl AppConfig {
         {
             return false;
         }
-        let field = self.secret_field(&slot);
-        *field = value.to_owned();
+        {
+            let field = self.secret_field(&slot);
+            *field = value.to_owned();
+        }
+        // A recovered key comes from the slot's own account, so it belongs to
+        // that provider — keep the ownership marker in step.
+        if let SecretSlot::AsrApiKey { provider } = &slot {
+            self.asr.api_key_provider = provider.as_ref().to_owned();
+        }
         self.secrets.set(&slot, SlotSync::Known(value.to_owned()));
         true
     }
@@ -1184,10 +1242,21 @@ impl AppConfig {
                         false
                     }
                 },
-                // Nothing stored pre-scoping: nothing to migrate.
-                _ => {
+                // Nothing stored pre-scoping (or an empty legacy item):
+                // nothing to migrate.
+                Ok(_) => {
                     self.asr.key_slot_version = 1;
                     true
+                }
+                // The legacy read failed (e.g. its access prompt is still
+                // pending): retry the whole migration next launch by leaving
+                // the version at 0 — bumping here would abandon the key.
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "legacy asr-api-key read failed; slot migration retries next launch"
+                    );
+                    false
                 }
             },
             // The scoped read itself failed (e.g. prompt pending): retry the
@@ -1219,27 +1288,60 @@ impl AppConfig {
             return;
         }
         let Some(store) = store else {
+            // No credential store (plaintext platforms): the single field
+            // carries over unchanged, so it still belongs to the outgoing
+            // provider — mark it as such, which makes `keyed_cloud_key_ready`
+            // false until the user re-enters a key (empty field: marker is
+            // moot, point it at the new provider).
+            self.asr.api_key_provider = if self.asr.api_key.trim().is_empty() {
+                new_provider.clone()
+            } else {
+                old_provider.clone()
+            };
             self.asr.provider = new_provider;
             return;
         };
+        // The field's key belongs to its ownership marker (set by an earlier
+        // degraded switch), falling back to the configured provider for
+        // unmarked legacy configs — parking it under the *owner* is what lets
+        // a degraded switch round-trip back without mis-attributing the key.
+        let key_owner = {
+            let marker = self.asr.api_key_provider.trim().to_ascii_lowercase();
+            if marker.is_empty() {
+                old_provider.clone()
+            } else {
+                marker
+            }
+        };
         let old_slot = SecretSlot::AsrApiKey {
-            provider: old_provider.into(),
+            provider: key_owner.clone().into(),
         };
         // Persist the current key under the outgoing provider first. If the
         // store refuses (it stayed in the file as plaintext), keep it in the
-        // field rather than losing it: the caller's save then writes it back
-        // out, and the user re-enters the new provider's key — the same
-        // pre-scoping behaviour, never data loss.
+        // field rather than losing it — but leave the ownership marker on the
+        // outgoing provider so the keyed providers never send it to the new
+        // one: `keyed_cloud_key_ready` stays false until the user re-enters
+        // the key, and switching back re-validates it. Never data loss.
         let current = self.asr.api_key.clone();
         if !secret_store::save_slot(store, &self.secrets, old_slot.clone(), &current) {
             tracing::warn!(
                 account = %old_slot.account(),
                 "could not persist the outgoing provider's key; keeping it in the config field"
             );
+            // The field keeps the outgoing provider's key (never dropped),
+            // and the marker pins it to that provider: the keyed providers
+            // refuse to send it until the user re-enters a key, and
+            // switching back re-validates it without retyping.
+            self.asr.api_key_provider = if current.trim().is_empty() {
+                new_provider.clone()
+            } else {
+                key_owner.clone()
+            };
             self.asr.provider = new_provider;
             return;
         }
         self.asr.provider = new_provider.clone();
+        self.asr.api_key_provider = new_provider.clone();
         let new_slot = SecretSlot::AsrApiKey {
             provider: new_provider.into(),
         };
@@ -1531,6 +1633,10 @@ mod tests {
         plain.switch_asr_provider("volcengine", None);
         assert_eq!(plain.asr.provider, "volcengine");
         assert_eq!(plain.asr.api_key, "sk-plain");
+        // Plaintext platforms carry the field over, but the key stays pinned
+        // to the outgoing provider — never sent to the new one.
+        assert_eq!(plain.asr.api_key_provider, "minimax");
+        assert!(!plain.asr.keyed_cloud_key_ready());
     }
 
     #[test]
@@ -1574,6 +1680,64 @@ mod tests {
         // the key stays in the field (never dropped), provider still flips.
         assert_eq!(cfg.asr.provider, "volcengine");
         assert_eq!(cfg.asr.api_key, "sk-plaintext");
+        // The key is pinned to the outgoing provider: the keyed providers
+        // must refuse to send it until the user re-enters one…
+        assert_eq!(cfg.asr.api_key_provider, "minimax");
+        assert!(!cfg.asr.keyed_cloud_key_ready());
+        // …and switching back re-validates it without retyping (the store
+        // must accept writes again for the re-scope to complete).
+        *store.fail.lock() = false;
+        cfg.switch_asr_provider("minimax", Some(&store));
+        assert_eq!(cfg.asr.provider, "minimax");
+        assert!(cfg.asr.keyed_cloud_key_ready());
+    }
+
+    #[test]
+    fn a_key_marked_for_another_provider_is_never_usable_by_the_keyed_clouds() {
+        // Legacy configs carry no marker: the key is assumed to belong to
+        // the configured provider (pre-scoping single-field semantics).
+        let mut cfg = AppConfig::default();
+        cfg.asr.provider = "minimax".into();
+        cfg.asr.api_key = "sk-legacy-unmarked".into();
+        assert!(cfg.asr.keyed_cloud_key_ready());
+
+        // A marker for a different provider blocks the keyed clouds…
+        cfg.asr.api_key_provider = "volcengine".into();
+        assert!(!cfg.asr.keyed_cloud_key_ready());
+        // …while permissive providers (custom / local) never consult it.
+        cfg.asr.provider = "custom".into();
+        assert!(cfg.asr.keyed_cloud_key_ready());
+
+        // A recovered key re-marks ownership for its provider.
+        let mut recovered = AppConfig::default();
+        recovered.asr.provider = "minimax".into();
+        recovered.asr.adopt_recovered_key("sk-back".into());
+        assert_eq!(recovered.asr.api_key_provider, "minimax");
+        assert!(recovered.asr.keyed_cloud_key_ready());
+    }
+
+    #[test]
+    fn legacy_key_read_failure_leaves_the_migration_to_retry() {
+        use crate::secret_store::tests::FakeStore;
+        let store = FakeStore::default();
+        store
+            .items
+            .lock()
+            .insert("asr-api-key".to_owned(), "sk-legacy".into());
+        // The legacy item's read fails (its access prompt is pending): the
+        // version must stay 0 so the migration retries next launch instead
+        // of abandoning the key.
+        *store.fail_get.lock() = true;
+        let mut cfg = AppConfig::default();
+        cfg.asr.provider = "minimax".into();
+        assert!(!cfg.migrate_asr_key_slot(&store));
+        assert_eq!(cfg.asr.key_slot_version, 0);
+        assert_eq!(cfg.asr.api_key, "");
+        // The prompt gets answered; the next launch migrates normally.
+        *store.fail_get.lock() = false;
+        assert!(cfg.migrate_asr_key_slot(&store));
+        assert_eq!(cfg.asr.key_slot_version, 1);
+        assert_eq!(cfg.asr.api_key, "sk-legacy");
     }
 
     #[test]
