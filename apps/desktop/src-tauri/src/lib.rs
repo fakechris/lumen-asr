@@ -166,68 +166,75 @@ fn purge_legacy_short_silent_sessions(store: &Store, data_dir: &Path) -> Result<
         .map_err(|error| error.to_string())
 }
 
-/// Retry keychain reads for credentials whose stored value is still unknown.
+/// Recover credentials whose startup keychain read timed out.
 ///
 /// A startup read can time out on the macOS keychain access prompt (3 s cap),
-/// which leaves the API key empty in memory for the whole session — cloud
-/// requests then go out without an Authorization header and fail with a
-/// confusing provider-side 401. Once the user answers the prompt ("Always
-/// Allow"), a later retry recovers the key without an app restart.
+/// which leaves the API key empty in memory — cloud requests then go out
+/// without an Authorization header and fail with a confusing provider-side
+/// 401. The user may answer that prompt minutes or hours later, so instead of
+/// polling (each new read risks stacking another password prompt), one
+/// patient untimed read is parked per unknown slot: it blocks exactly as long
+/// as the access prompt stays unanswered and completes the moment the user
+/// clicks "Always Allow" — recovering the key in place, with no extra prompt
+/// and no app restart. A read that returns having found nothing settles the
+/// slot (a never-configured machine parks nothing); a read the user denies or
+/// that errors stops for the session — dictation and meetings still re-read
+/// once per request, so a later answer still recovers on first use.
 fn schedule_secret_retry(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        // Deadlines are measured from launch, not from the previous retry,
-        // so the three attempts land at 15/60/180 s even when a keychain
-        // read blocks on the access prompt for its full 3 s budget.
-        let start = tokio::time::Instant::now();
-        for deadline_secs in [15u64, 60, 180] {
-            let deadline = start + std::time::Duration::from_secs(deadline_secs);
-            if deadline > tokio::time::Instant::now() {
-                tokio::time::sleep_until(deadline).await;
-            }
-            let unknown: Vec<crate::secret_store::SecretSlot> = {
-                let state = app.state::<AppState>();
-                let Ok(config) = state.config.lock() else {
-                    return;
-                };
-                crate::secret_store::SecretSlot::ALL
-                    .iter()
-                    .copied()
-                    .filter(|slot| {
-                        config.secrets.get(*slot) == crate::secret_store::SlotSync::Unknown
-                    })
-                    .collect()
-            };
-            if unknown.is_empty() {
+        // Let the launch path settle first; the parking read then attaches to
+        // the still-pending prompt rather than racing the startup reads.
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let unknown: Vec<crate::secret_store::SecretSlot> = {
+            let state = app.state::<AppState>();
+            let Ok(config) = state.config.lock() else {
                 return;
-            }
-            // Keychain reads can block on the access prompt: keep them off the
-            // async runtime and out of the config lock.
-            let store = crate::secret_store::platform_store();
-            let recovered = tauri::async_runtime::spawn_blocking(move || {
-                unknown
-                    .into_iter()
-                    .filter_map(|slot| {
-                        let store = store?;
-                        store.get(slot).ok().flatten().map(|key| (slot, key))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .unwrap_or_default();
-            if recovered.is_empty() {
+            };
+            crate::secret_store::SecretSlot::ALL
+                .iter()
+                .copied()
+                .filter(|slot| config.secrets.get(*slot) == crate::secret_store::SlotSync::Unknown)
+                .collect()
+        };
+        if unknown.is_empty() {
+            return;
+        }
+        // One blocking task per unknown slot: each patient read parks on its
+        // own prompt, and a recovered key is applied the moment ITS read
+        // returns — not after every prompt has been answered (the second
+        // prompt may stay up for hours).
+        let store = crate::secret_store::platform_store();
+        let mut tasks = tokio::task::JoinSet::new();
+        for slot in unknown {
+            let Some(store) = store else { continue };
+            tasks.spawn_blocking(move || (slot, store.get_patient(slot)));
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((slot, outcome)) = joined else {
                 continue;
-            }
+            };
             let state = app.state::<AppState>();
             let Ok(mut config) = state.config.lock() else {
                 return;
             };
-            for (slot, key) in recovered {
-                if config.set_secret_from_retry(slot, &key) {
-                    tracing::info!(
-                        account = slot.account(),
-                        "API key recovered from keychain after delayed retry"
-                    );
+            match outcome {
+                Ok(Some(key)) if !key.is_empty() => {
+                    if config.set_secret_from_retry(slot, &key) {
+                        tracing::info!(
+                            account = slot.account(),
+                            "API key recovered from keychain after the access prompt was answered"
+                        );
+                    }
                 }
+                // The store answered and holds nothing: settled.
+                Ok(_) => config.mark_secret_absent(slot),
+                // Denied or failed: give up for this session — never
+                // re-prompt on a timer.
+                Err(error) => tracing::warn!(
+                    account = slot.account(),
+                    error = %error,
+                    "keychain recovery read failed; giving up for this session"
+                ),
             }
         }
     });

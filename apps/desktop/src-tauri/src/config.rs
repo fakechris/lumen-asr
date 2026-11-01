@@ -1094,6 +1094,16 @@ impl AppConfig {
         self.secrets.set(slot, state);
     }
 
+    /// Settle a slot whose retried read succeeded but found nothing stored:
+    /// the value is known to be absent (not blocked behind a prompt), so the
+    /// retry loop can stop polling. A pending plaintext write (field set,
+    /// slot Unknown) keeps its field untouched; the next save re-attempts it.
+    pub fn mark_secret_absent(&mut self, slot: SecretSlot) {
+        if self.secrets.get(slot) == SlotSync::Unknown {
+            self.secrets.set(slot, SlotSync::Known(String::new()));
+        }
+    }
+
     /// Fill API keys from the store, moving any plaintext key into it.
     /// Returns `true` when the file should be rewritten without plaintext.
     fn load_secrets(&mut self, store: &dyn SecretStore) -> bool {
@@ -1254,6 +1264,30 @@ mod tests {
         plaintext.asr.api_key = "sk-kept-plaintext".into();
         assert!(!plaintext.set_secret_from_retry(SecretSlot::AsrApiKey, "sk-stale"));
         assert_eq!(plaintext.asr.api_key, "sk-kept-plaintext");
+    }
+
+    #[test]
+    fn marking_a_slot_absent_settles_the_retry_loop() {
+        use crate::secret_store::SlotSync;
+        let mut cfg = AppConfig::default();
+
+        // A read that succeeds but finds nothing settles the slot as known
+        // and empty; the loop stops polling and a later key cannot appear.
+        cfg.mark_secret_absent(SecretSlot::CorrectorApiKey);
+        assert_eq!(
+            cfg.secrets.get(SecretSlot::CorrectorApiKey),
+            SlotSync::Known(String::new())
+        );
+        assert!(!cfg.set_secret_from_retry(SecretSlot::CorrectorApiKey, "sk-late"));
+
+        // Settling never disturbs a slot that is already known.
+        let mut known = AppConfig::default();
+        known.set_secret_sync(SecretSlot::AsrApiKey, SlotSync::Known("sk-live".into()));
+        known.mark_secret_absent(SecretSlot::AsrApiKey);
+        assert_eq!(
+            known.secrets.get(SecretSlot::AsrApiKey),
+            SlotSync::Known("sk-live".into())
+        );
     }
 
     #[test]
