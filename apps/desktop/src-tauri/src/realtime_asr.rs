@@ -186,11 +186,18 @@ impl RealtimeSession {
         // First event allowance, then idle-between-events: once the provider
         // has said something, a quiet window means it is finished (closing
         // early would truncate the committed trailing utterance).
+        // Before the first event: a generous deadline. After at least one
+        // utterance: a short idle window bounds the NEXT wait — an arrived
+        // event is always processed first, never discarded.
         let first_deadline = Duration::from_secs(10);
-        let mut remaining_first = first_deadline;
+        let idle = Duration::from_secs(2);
         loop {
-            let started = tokio::time::Instant::now();
-            let event = match tokio::time::timeout(remaining_first, self.events.recv()).await {
+            let wait = if text_parts.is_empty() {
+                first_deadline
+            } else {
+                idle
+            };
+            let event = match tokio::time::timeout(wait, self.events.recv()).await {
                 Ok(event) => event,
                 Err(_) => {
                     if text_parts.is_empty() {
@@ -200,16 +207,6 @@ impl RealtimeSession {
                 }
             };
             let Some(event) = event else { break };
-            let elapsed = started.elapsed();
-            if !text_parts.is_empty() && elapsed >= Duration::from_secs(2) {
-                break;
-            }
-            if text_parts.is_empty() {
-                remaining_first = remaining_first.checked_sub(elapsed).unwrap_or_default();
-                if remaining_first.is_zero() {
-                    return Err("realtime ASR timed out waiting for the transcript".into());
-                }
-            }
             match event {
                 RealtimeEvent::Partial { text } => outcome.trailing_partial = text,
                 RealtimeEvent::Utterance { text } => {
@@ -231,14 +228,23 @@ impl RealtimeSession {
         let base = if config.base_url.trim().is_empty() {
             "wss://api.openai.com/v1/realtime".to_string()
         } else {
-            // A config meant for the batch REST API (https://…/v1) maps onto
-            // the realtime endpoint by replacing scheme and path.
             let trimmed = config.base_url.trim().trim_end_matches('/');
-            let host = trimmed
-                .strip_prefix("https://")
-                .or_else(|| trimmed.strip_prefix("http://"))
-                .unwrap_or(trimmed);
-            format!("wss://{host}/v1/realtime")
+            if trimmed.starts_with("wss://") {
+                // An explicit realtime endpoint passes through untouched.
+                trimmed.to_string()
+            } else {
+                // A batch REST base URL (e.g. https://api.openai.com/v1) maps
+                // onto the realtime endpoint by host only — keeping the /v1
+                // path would produce wss://…/v1/v1/realtime.
+                let host = trimmed
+                    .strip_prefix("https://")
+                    .or_else(|| trimmed.strip_prefix("http://"))
+                    .unwrap_or(trimmed)
+                    .split('/')
+                    .next()
+                    .unwrap_or(trimmed);
+                format!("wss://{host}/v1/realtime")
+            }
         };
         // GA: the session model must be a realtime model; the transcription
         // model rides inside audio.input.transcription (gpt-live-transcribe).
@@ -387,10 +393,12 @@ impl RealtimeSession {
     // ── Volcengine sauc bigmodel (binary v3) ────────────────────────────
 
     async fn open_volcengine(config: &RealtimeConfig) -> Result<Self, String> {
-        let base = if config.base_url.trim().is_empty() {
-            "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel".to_string()
-        } else {
-            config.base_url.trim().to_string()
+        // The config's base_url for volcengine is the batch HTTP endpoint
+        // (…/auc/bigmodel/recognize/flash) — useless for WebSocket. Only an
+        // explicit wss:// override replaces the default streaming endpoint.
+        let base = match config.base_url.trim() {
+            url if url.starts_with("wss://") => url.to_string(),
+            _ => "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel".to_string(),
         };
         let mut request = base
             .into_client_request()
@@ -1012,14 +1020,25 @@ pub fn spawn_realtime_run(
     let (end_tx, end_rx) = tokio::sync::oneshot::channel::<()>();
     let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
     let partial_for_task = std::sync::Arc::clone(&partial);
+    let collected = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let collected_for_task = std::sync::Arc::clone(&collected);
+    let collected_for_merge = std::sync::Arc::clone(&collected_for_task);
     tokio::spawn(async move {
-        let mut outcome = run_pump(config, tap, end_rx, partial_for_task).await;
+        let mut outcome = run_pump(config, tap, end_rx, partial_for_task, collected_for_task).await;
         if let Ok(res) = outcome.as_mut() {
-            if !res.trailing_partial.trim().is_empty() && res.text.trim().is_empty() {
+            // The recognizer finalized some sentences while the user was
+            // still speaking (server VAD); merge them ahead of anything the
+            // final drain produced — the two event sets are disjoint.
+            let mut parts: Vec<String> = std::mem::take(&mut *collected_for_merge.lock());
+            if !res.text.trim().is_empty() {
+                parts.push(res.text.trim().to_string());
+            }
+            if parts.is_empty() && !res.trailing_partial.trim().is_empty() {
                 // Speech stopped mid-utterance: the trailing partial is the
                 // transcript.
-                res.text = res.trailing_partial.trim().to_string();
+                parts.push(res.trailing_partial.trim().to_string());
             }
+            res.text = parts.join(" ");
         }
         let _ = outcome_tx.send(outcome);
     });
@@ -1037,9 +1056,32 @@ async fn run_pump(
     tap: std::sync::mpsc::Receiver<lumen_asr::LiveChunk>,
     mut end: tokio::sync::oneshot::Receiver<()>,
     partial: std::sync::Arc<parking_lot::Mutex<String>>,
+    collected: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
 ) -> Result<RealtimeOutcome, String> {
-    use std::sync::mpsc::RecvTimeoutError;
+    // Bridge the blocking std tap onto the async runtime with a dedicated
+    // thread, so the pump never blocks a Tokio worker on recv_timeout for
+    // the length of the recording.
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<lumen_asr::LiveChunk>(64);
+    let bridge = std::thread::spawn(move || {
+        while let Ok(chunk) = tap.recv() {
+            if chunk_tx.blocking_send(chunk).is_err() {
+                break;
+            }
+        }
+    });
+    let outcome = run_pump_inner(config, &mut chunk_rx, &mut end, partial, collected).await;
+    drop(chunk_rx);
+    let _ = bridge.join();
+    outcome
+}
 
+async fn run_pump_inner(
+    config: RealtimeConfig,
+    chunk_rx: &mut tokio::sync::mpsc::Receiver<lumen_asr::LiveChunk>,
+    end: &mut tokio::sync::oneshot::Receiver<()>,
+    partial: std::sync::Arc<parking_lot::Mutex<String>>,
+    collected: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+) -> Result<RealtimeOutcome, String> {
     let mut session = match RealtimeSession::open(&config).await {
         Ok(session) => session,
         Err(error) => return Err(format!("realtime connect: {error}")),
@@ -1052,39 +1094,40 @@ async fn run_pump(
     let mut input_rate = 44_100u32;
 
     loop {
-        // End signal polled non-blocking; the tap drives the loop timing.
-        if matches!(
-            end.try_recv(),
-            Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-        ) {
-            break;
-        }
-        match tap.recv_timeout(Duration::from_millis(20)) {
-            Ok(chunk) => {
-                if chunk.sample_rate > 0 {
-                    input_rate = chunk.sample_rate;
-                }
-                if chunk.sample_rate != resampler_input_rate(&resampler) {
-                    resampler = LinearResampler::new(input_rate, target_rate);
-                }
-                for sample in resampler.process(&chunk.samples) {
-                    push_pcm16(&mut pcm16_buffer, sample);
-                }
-                while pcm16_buffer.len() >= chunk_bytes {
-                    let rest = pcm16_buffer.split_off(chunk_bytes);
-                    let chunk = std::mem::replace(&mut pcm16_buffer, rest);
-                    if let Err(error) = session.send_audio(&chunk).await {
-                        return Err(format!("realtime send: {error}"));
+        tokio::select! {
+            chunk = chunk_rx.recv() => match chunk {
+                Some(chunk) => {
+                    if chunk.sample_rate > 0 {
+                        input_rate = chunk.sample_rate;
+                    }
+                    if chunk.sample_rate != resampler_input_rate(&resampler) {
+                        resampler = LinearResampler::new(input_rate, target_rate);
+                    }
+                    for sample in resampler.process(&chunk.samples) {
+                        push_pcm16(&mut pcm16_buffer, sample);
+                    }
+                    while pcm16_buffer.len() >= chunk_bytes {
+                        let rest = pcm16_buffer.split_off(chunk_bytes);
+                        let chunk = std::mem::replace(&mut pcm16_buffer, rest);
+                        if let Err(error) = session.send_audio(&chunk).await {
+                            return Err(format!("realtime send: {error}"));
+                        }
                     }
                 }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+                None => break, // capture stopped (tap dropped)
+            },
+            _ = &mut *end => break,
         }
+        // Server VAD finalizes sentences mid-speech: keep them.
         while let Ok(event) = session.events.try_recv() {
             match event {
                 RealtimeEvent::Partial { text } => *partial.lock() = text,
-                RealtimeEvent::Utterance { .. } | RealtimeEvent::Done => {}
+                RealtimeEvent::Utterance { text } => {
+                    if !text.trim().is_empty() {
+                        collected.lock().push(text.trim().to_string());
+                    }
+                }
+                RealtimeEvent::Done => {}
                 RealtimeEvent::Failed { message } => {
                     return Err(format!("realtime failed: {message}"));
                 }

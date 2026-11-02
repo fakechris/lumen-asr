@@ -306,7 +306,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             ],
             needs_api_key: true,
             status: "wired".into(),
-            realtime: false,
+            realtime: true,
             notes: "POST /audio/transcriptions；推荐新一代 gpt-transcribe（性价比最高）或 gpt-4o-mini-transcribe；gpt-4o-transcribe-diarize 仅适合整文件多说话人批式（单次上限约 23 分钟），App 内听写与云端会议均为逐句短音频，选它时会自动改用 gpt-transcribe".into(),
         },
         AsrProviderPreset {
@@ -330,7 +330,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec![],
             needs_api_key: true,
             status: "wired".into(),
-            realtime: false,
+            realtime: true,
             notes: "同步 HTTP 一句话识别（极速版，资源 volc.bigasr.auc_turbo）。凭据：Access Token 填在 API Key；旧版控制台还需在 App ID 栏填 App ID，新版控制台只需把 APP Key 填进 API Key。".into(),
         },
         AsrProviderPreset {
@@ -366,7 +366,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec!["stepaudio-2.5-asr".into()],
             needs_api_key: true,
             status: "config_only".into(),
-            realtime: true,
+            realtime: false,
             notes: "批式 HTTP；模型 stepaudio-2.5-asr".into(),
         },
         AsrProviderPreset {
@@ -378,7 +378,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec!["mimo-v2.5-asr".into()],
             needs_api_key: true,
             status: "config_only".into(),
-            realtime: true,
+            realtime: false,
             notes: "批式；audio/wav".into(),
         },
         AsrProviderPreset {

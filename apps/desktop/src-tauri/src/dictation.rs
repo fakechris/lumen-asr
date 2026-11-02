@@ -1189,6 +1189,7 @@ pub async fn stop_and_transcribe_inner(
     let mut capture = match capture_result {
         Ok(capture) => capture,
         Err(error) => {
+            abort_realtime(state);
             let error = error.to_string();
             mark_attempt_failed(
                 &mut attempt,
@@ -1244,6 +1245,7 @@ pub async fn stop_and_transcribe_inner(
     attempt.pipeline_metrics.audio_duration_ms = duration_ms;
 
     if capture.samples.is_empty() {
+        abort_realtime(state);
         record_capture_signal_issue(&mut attempt, CaptureSignalIssue::AbsoluteSilence);
         let error = "no audio captured (0 samples) — hold longer or check mic".to_string();
         mark_attempt_failed(
@@ -1284,6 +1286,7 @@ pub async fn stop_and_transcribe_inner(
     attempt.pipeline_metrics.preprocess_ms = elapsed_ms(preprocess_started);
     let (rms, peak) = session_debug::audio_stats(&samples_16k);
     if let Err(issue) = ensure_audible_capture(rms, peak) {
+        abort_realtime(state);
         let error = issue.message();
         tracing::error!(peak, rms, ?issue, "audio capture rejected before ASR");
         record_capture_signal_issue(&mut attempt, issue);
@@ -1383,11 +1386,13 @@ pub async fn stop_and_transcribe_inner(
         "ASR result"
     );
 
-    let correction = if realtime_used && !matches!(intent, IntentSpec::Translate { .. }) {
-        // Realtime mode: the streaming recognizer already applies
-        // punctuation/ITN (and hotword biasing), so the LLM pass is skipped
-        // for plain intents. Translate still needs the model.
-        tracing::info!(attempt_id = %attempt.id, "corrector bypassed (realtime ASR)");
+    let correction = if realtime_used && matches!(intent, IntentSpec::Default | IntentSpec::Raw) {
+        // Realtime bypasses the corrector for the plain dictation intents —
+        // the streaming recognizer already emits punctuation/ITN and the
+        // settings copy says so (「跳过 AI 修正」). Explicit polish or
+        // translate requests still run the model: realtime replaces the ASR
+        // stage, never an explicit user instruction.
+        tracing::info!(attempt_id = %attempt.id, "corrector bypassed (realtime ASR + plain intent)");
         CorrectionStageOutput {
             text: enhanced_text.clone(),
             engine: "realtime".into(),
@@ -1437,6 +1442,7 @@ pub async fn stop_and_transcribe_inner(
     // Last point an Esc cancel can win: after this the text may be pasted or
     // copied, so a cancelled session must stop here without any output.
     if !processing_cancel().commit_output() {
+        abort_realtime(state);
         clear_unconsumed_edit_target();
         return Err(DICTATION_CANCELLED.into());
     }
@@ -2169,29 +2175,26 @@ pub(crate) fn realtime_active(asr_cfg: &AsrServiceConfig) -> bool {
 /// Called before `state.audio.start()`; failure is logged and dictation
 /// proceeds on the normal batch path (the run handle stays `None`).
 fn maybe_start_realtime(state: &AppState) {
-    let asr_cfg = state
+    let mut asr_cfg = state
         .config
         .lock()
         .map(|cfg| cfg.asr.clone())
         .unwrap_or_default();
-    let provider = canonical_asr_provider(&asr_cfg.provider);
-    if !realtime_active(&AsrServiceConfig {
-        provider: provider.clone(),
-        ..asr_cfg.clone()
-    }) {
-        let _ = state.audio.set_live_tap(None);
-        return;
-    }
-    // Reuse the keychain recovery once: a pending prompt heals here rather
-    // than falling straight back to batch.
-    let mut asr_cfg = asr_cfg;
-    if asr_cfg.api_key.trim().is_empty() {
+    // Keychain recovery runs BEFORE the readiness check: with a pending
+    // access prompt the field is empty, and checking first would fall back
+    // to batch without ever attempting recovery.
+    if asr_cfg.realtime_enabled && asr_cfg.api_key.trim().is_empty() {
         let key = recover_asr_key_sync(state);
         if !key.is_empty() {
             asr_cfg.adopt_recovered_key(key);
         }
     }
     if !realtime_active(&asr_cfg) {
+        let _ = state.audio.set_live_tap(None);
+        return;
+    }
+    let provider = canonical_asr_provider(&asr_cfg.provider);
+    {
         tracing::warn!("realtime dictation requested but the key is not ready; using batch");
         let _ = state.audio.set_live_tap(None);
         return;
@@ -2210,6 +2213,20 @@ fn maybe_start_realtime(state: &AppState) {
     let handle = crate::realtime_asr::spawn_realtime_run(config, rx);
     tracing::info!(provider, "realtime dictation session starting");
     *state.realtime.lock() = Some(handle);
+}
+
+/// Abort any live realtime run without waiting for its transcript: used on
+/// every non-finishing exit (capture failure, silent audio, cancel) so no
+/// stale handle is left for a later stop to wait on.
+pub(crate) fn abort_realtime(state: &AppState) {
+    if let Some(handle) = state.realtime.lock().take() {
+        tracing::info!(
+            provider = handle.provider,
+            "aborting realtime dictation run"
+        );
+        drop(handle); // dropping `end` breaks the pump; the task winds down
+    }
+    let _ = state.audio.set_live_tap(None);
 }
 
 /// Finish the realtime run at stop, if one is active. Returns the final
