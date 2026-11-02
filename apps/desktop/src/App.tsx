@@ -2360,6 +2360,7 @@ function SettingsPanel({
       models: string[];
       needsApiKey: boolean;
       status: string;
+      realtime: boolean;
       notes: string;
     }[]
   >([]);
@@ -2369,6 +2370,7 @@ function SettingsPanel({
   const [asrModel, setAsrModel] = useState("");
   const [asrApiKey, setAsrApiKey] = useState("");
   const [asrLanguage, setAsrLanguage] = useState("");
+  const [asrRealtime, setAsrRealtime] = useState(false);
   const [asrHasKey, setAsrHasKey] = useState(false);
   const [asrAppId, setAsrAppId] = useState("");
   const [asrModels, setAsrModels] = useState<AsrModelStatus | null>(null);
@@ -2548,6 +2550,7 @@ function SettingsPanel({
         setAsrBaseUrl(asrC.baseUrl);
         setAsrModel(asrC.model);
         setAsrLanguage(asrC.language || "");
+        setAsrRealtime(asrC.realtimeEnabled);
         setAsrHasKey(asrC.hasApiKey);
         setAsrAppId(asrC.volcengineAppId || "");
         setAsrModels(asrStatus);
@@ -3928,6 +3931,22 @@ function SettingsPanel({
                 placeholder="可选 zh / en"
               />
             </div>
+            <div className="form-row">
+              <label className="muted-text">
+                <input
+                  type="checkbox"
+                  checked={asrRealtime}
+                  disabled={busy || !asrPresets.find((p) => p.id === asrProvider)?.realtime}
+                  onChange={(e) => setAsrRealtime(e.target.checked)}
+                />{" "}
+                实时识别（Realtime）
+              </label>
+            </div>
+            <p className="muted-text" style={{ fontSize: "0.82rem", marginTop: 0 }}>
+              {asrPresets.find((p) => p.id === asrProvider)?.realtime
+                ? "边说边识别，松开按键后立即可插入，并跳过 AI 修正（识别自带标点与热词偏置）。失败自动回退普通批式。"
+                : "当前供应商暂不支持实时识别（支持：OpenAI Audio、火山引擎）。"}
+            </p>
           </>
         )}
         <div className="actions">
@@ -3945,6 +3964,7 @@ function SettingsPanel({
                     baseUrl: asrBaseUrl,
                     model: asrModel,
                     language: asrLanguage,
+                    realtimeEnabled: asrRealtime,
                   };
                   if (asrApiKey.trim()) input.apiKey = asrApiKey.trim();
                   if (asrProvider === "volcengine")
@@ -3955,6 +3975,7 @@ function SettingsPanel({
                   setAsrBaseUrl(s.baseUrl);
                   setAsrModel(s.model);
                   setAsrLanguage(s.language);
+                  setAsrRealtime(s.realtimeEnabled);
                   setAsrHasKey(s.hasApiKey);
                   setAsrAppId(s.volcengineAppId || "");
                   setAsrApiKey("");

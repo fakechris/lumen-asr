@@ -242,6 +242,7 @@ export const api = {
         models: string[];
         needsApiKey: boolean;
         status: string;
+        realtime: boolean;
         notes: string;
       }[]
     >("list_asr_presets"),
@@ -254,6 +255,7 @@ export const api = {
       hasApiKey: boolean;
       volcengineAppId: string;
       language: string;
+      realtimeEnabled: boolean;
       timeoutSecs: number;
     }>("get_asr_service_config"),
   saveAsrServiceConfig: (input: {
@@ -264,6 +266,7 @@ export const api = {
     apiKey?: string;
     volcengineAppId?: string;
     language?: string;
+    realtimeEnabled?: boolean;
     timeoutSecs?: number;
   }) =>
     invoke<{
@@ -274,6 +277,7 @@ export const api = {
       hasApiKey: boolean;
       volcengineAppId: string;
       language: string;
+      realtimeEnabled: boolean;
       timeoutSecs: number;
     }>("save_asr_service_config", { input }),
   correctText: (text: string) =>

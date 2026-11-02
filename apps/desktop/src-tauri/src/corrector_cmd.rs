@@ -90,6 +90,7 @@ pub struct AsrServiceStatus {
     /// the Settings field can round-trip it like base_url/model).
     pub volcengine_app_id: String,
     pub language: String,
+    pub realtime_enabled: bool,
     pub timeout_secs: u64,
 }
 
@@ -103,6 +104,7 @@ pub struct AsrServiceInput {
     pub api_key: Option<String>,
     pub volcengine_app_id: Option<String>,
     pub language: Option<String>,
+    pub realtime_enabled: Option<bool>,
     pub timeout_secs: Option<u64>,
 }
 
@@ -121,6 +123,7 @@ pub fn get_asr_service_config(state: State<'_, AppState>) -> Result<AsrServiceSt
             || (!cfg.asr.api_key.is_empty() && !cfg.asr.keyed_cloud_provider()),
         volcengine_app_id: cfg.asr.volcengine_app_id.clone(),
         language: cfg.asr.language.clone(),
+        realtime_enabled: cfg.asr.realtime_enabled,
         timeout_secs: cfg.asr.timeout_secs,
     })
 }
@@ -173,6 +176,11 @@ pub fn save_asr_service_config(
     if let Some(v) = input.language {
         guard.asr.language = v;
     }
+    if let Some(v) = input.realtime_enabled {
+        // The toggle is only meaningful for providers with realtime support;
+        // enabling it elsewhere is stored but inert (the UI greys it out).
+        guard.asr.realtime_enabled = v;
+    }
     if let Some(v) = input.timeout_secs {
         guard.asr.timeout_secs = v.max(15);
     }
@@ -187,6 +195,7 @@ pub fn save_asr_service_config(
             || (!guard.asr.api_key.is_empty() && !guard.asr.keyed_cloud_provider()),
         volcengine_app_id: guard.asr.volcengine_app_id.clone(),
         language: guard.asr.language.clone(),
+        realtime_enabled: guard.asr.realtime_enabled,
         timeout_secs: guard.asr.timeout_secs,
     };
     drop(guard);

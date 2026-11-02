@@ -41,6 +41,8 @@ chrono = { workspace = true }
 cpal = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
 rfd = { version = "0.15", default-features = false }

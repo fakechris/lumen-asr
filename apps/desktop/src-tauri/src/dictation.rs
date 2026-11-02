@@ -6,14 +6,14 @@ use crate::context_capture::{
 };
 use crate::pipeline_attempt::{
     apply_asr_result, build_pipeline_identity, elapsed_ms, mark_attempt_failed, persist_attempt,
-    run_corrector_stage, write_attempt_debug, AttemptDebug,
+    run_corrector_stage, write_attempt_debug, AttemptDebug, CorrectionStageOutput,
 };
 use crate::session_debug;
 use crate::AppState;
 use lumen_asr::{
     lumen_models_dir, paraformer_offline_ready, prepare_for_asr, probe_status, sensevoice_ready,
-    whisper_ready, AsrEngine, AsrRequest, AsrResult, AudioDeviceInfo, EngineKind, EngineStatus,
-    OpenAiAudioAsr, OpenAiAudioConfig, ParaformerAsr,
+    whisper_ready, AsrEngine, AsrEngineId, AsrRequest, AsrResult, AudioDeviceInfo, EngineKind,
+    EngineStatus, OpenAiAudioAsr, OpenAiAudioConfig, ParaformerAsr,
 };
 use lumen_core::{FocusInfo, InsertStrategy, SessionRecord, SessionStatus};
 use lumen_platform_macos::{
@@ -923,6 +923,7 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     });
     state.context.begin(hint);
     configure_session_vad(state);
+    maybe_start_realtime(state);
     let audio_config = state
         .config
         .lock()
@@ -1324,33 +1325,52 @@ pub async fn stop_and_transcribe_inner(
     schedule_late_context_archive(late_context_archive.take(), app);
 
     let asr_started = Instant::now();
-    let asr_run = match run_asr(state, engine_kind, &asr_cfg, samples_16k, &mut attempt).await {
-        Ok(run) => run,
-        Err(error) => {
-            attempt.pipeline_metrics.asr_ms = elapsed_ms(asr_started);
-            attempt.pipeline_metrics.set_asr_rtf();
-            mark_attempt_failed(&mut attempt, PipelineStage::Asr, &error, pipeline_started);
-            rec.status = SessionStatus::Failed;
-            rec.asr_engine = Some(asr_engine_str.clone());
-            write_attempt_debug(
-                &mut rec,
-                &attempt,
-                AttemptDebug {
-                    target: target.as_ref(),
-                    frontmost_before_insert: None,
-                    sample_rate_capture: sample_rate,
-                    num_samples_capture: num_samples,
-                    samples_asr: &samples_for_debug,
-                    rms,
-                    peak,
-                    notes: vec!["ASR failed".into()],
-                },
-            );
-            if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
-                tracing::warn!(error = %persist_error, "failed to persist ASR failure");
+    let realtime_final = finish_realtime(state, &mut attempt).await;
+    let realtime_used = matches!(&realtime_final, Some(Ok(text)) if !text.trim().is_empty());
+    let asr_run = if realtime_used {
+        // Realtime produced the final transcript during speech; the batch
+        // ASR round trip (and, for plain intents, the LLM correction pass)
+        // is skipped entirely.
+        let provider = canonical_asr_provider(&asr_cfg.provider);
+        let label = format!("{provider}_realtime");
+        let text = realtime_final
+            .expect("realtime_used implies a final transcript")
+            .expect("checked non-empty");
+        let mut result = AsrResult::new(text, AsrEngineId::Other);
+        result.engine_label = label.clone();
+        AsrRun {
+            result,
+            engine_label: label,
+        }
+    } else {
+        match run_asr(state, engine_kind, &asr_cfg, samples_16k, &mut attempt).await {
+            Ok(run) => run,
+            Err(error) => {
+                attempt.pipeline_metrics.asr_ms = elapsed_ms(asr_started);
+                attempt.pipeline_metrics.set_asr_rtf();
+                mark_attempt_failed(&mut attempt, PipelineStage::Asr, &error, pipeline_started);
+                rec.status = SessionStatus::Failed;
+                rec.asr_engine = Some(asr_engine_str.clone());
+                write_attempt_debug(
+                    &mut rec,
+                    &attempt,
+                    AttemptDebug {
+                        target: target.as_ref(),
+                        frontmost_before_insert: None,
+                        sample_rate_capture: sample_rate,
+                        num_samples_capture: num_samples,
+                        samples_asr: &samples_for_debug,
+                        rms,
+                        peak,
+                        notes: vec!["ASR failed".into()],
+                    },
+                );
+                if let Err(persist_error) = persist_attempt(state, save, &rec, attempt) {
+                    tracing::warn!(error = %persist_error, "failed to persist ASR failure");
+                }
+                clear_unconsumed_edit_target();
+                return Err(error);
             }
-            clear_unconsumed_edit_target();
-            return Err(error);
         }
     };
     let asr_engine_label = asr_run.engine_label;
@@ -1363,21 +1383,34 @@ pub async fn stop_and_transcribe_inner(
         "ASR result"
     );
 
-    tracing::info!(?intent, "running corrector with session intent");
-    let correction = match run_corrector_stage(
-        state,
-        &cfg,
-        &enhanced_text,
-        intent.clone(),
-        captured_context.as_ref(),
-        &mut attempt,
-    )
-    .await
-    {
-        Ok(correction) => correction,
-        Err(error) => {
-            clear_unconsumed_edit_target();
-            return Err(error);
+    let correction = if realtime_used && !matches!(intent, IntentSpec::Translate { .. }) {
+        // Realtime mode: the streaming recognizer already applies
+        // punctuation/ITN (and hotword biasing), so the LLM pass is skipped
+        // for plain intents. Translate still needs the model.
+        tracing::info!(attempt_id = %attempt.id, "corrector bypassed (realtime ASR)");
+        CorrectionStageOutput {
+            text: enhanced_text.clone(),
+            engine: "realtime".into(),
+            model_applied: false,
+            fallback_reason: None,
+        }
+    } else {
+        tracing::info!(?intent, "running corrector with session intent");
+        match run_corrector_stage(
+            state,
+            &cfg,
+            &enhanced_text,
+            intent.clone(),
+            captured_context.as_ref(),
+            &mut attempt,
+        )
+        .await
+        {
+            Ok(correction) => correction,
+            Err(error) => {
+                clear_unconsumed_edit_target();
+                return Err(error);
+            }
         }
     };
     let corrected_text = correction.text;
@@ -2121,6 +2154,117 @@ pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
         cfg.asr.api_key.clone()
     } else {
         String::new()
+    }
+}
+
+/// Realtime dictation is active when the user enabled it, the selected
+/// provider has a streaming engine, and its key is loaded.
+pub(crate) fn realtime_active(asr_cfg: &AsrServiceConfig) -> bool {
+    asr_cfg.realtime_enabled
+        && crate::realtime_asr::provider_supports_realtime(&asr_cfg.provider)
+        && asr_cfg.keyed_cloud_key_ready()
+}
+
+/// Open the realtime session for a recording and install the mic live tap.
+/// Called before `state.audio.start()`; failure is logged and dictation
+/// proceeds on the normal batch path (the run handle stays `None`).
+fn maybe_start_realtime(state: &AppState) {
+    let asr_cfg = state
+        .config
+        .lock()
+        .map(|cfg| cfg.asr.clone())
+        .unwrap_or_default();
+    let provider = canonical_asr_provider(&asr_cfg.provider);
+    if !realtime_active(&AsrServiceConfig {
+        provider: provider.clone(),
+        ..asr_cfg.clone()
+    }) {
+        let _ = state.audio.set_live_tap(None);
+        return;
+    }
+    // Reuse the keychain recovery once: a pending prompt heals here rather
+    // than falling straight back to batch.
+    let mut asr_cfg = asr_cfg;
+    if asr_cfg.api_key.trim().is_empty() {
+        let key = recover_asr_key_sync(state);
+        if !key.is_empty() {
+            asr_cfg.adopt_recovered_key(key);
+        }
+    }
+    if !realtime_active(&asr_cfg) {
+        tracing::warn!("realtime dictation requested but the key is not ready; using batch");
+        let _ = state.audio.set_live_tap(None);
+        return;
+    }
+    let (tap, rx) = lumen_asr::live_tap();
+    let _ = state.audio.set_live_tap(Some(tap));
+    let config = crate::realtime_asr::RealtimeConfig {
+        provider: provider.clone(),
+        api_key: asr_cfg.api_key.clone(),
+        app_id: asr_cfg.volcengine_app_id.clone(),
+        base_url: asr_cfg.base_url.clone(),
+        language: asr_cfg.language.clone(),
+        hotwords: Vec::new(),
+        model: String::new(),
+    };
+    let handle = crate::realtime_asr::spawn_realtime_run(config, rx);
+    tracing::info!(provider, "realtime dictation session starting");
+    *state.realtime.lock() = Some(handle);
+}
+
+/// Finish the realtime run at stop, if one is active. Returns the final
+/// transcript on success; a failed/empty realtime run falls back to the
+/// batch pipeline (the captured samples are still available).
+async fn finish_realtime(
+    state: &AppState,
+    attempt: &mut DictationAttemptRecord,
+) -> Option<Result<String, String>> {
+    let handle = state.realtime.lock().take()?;
+    let _ = state.audio.set_live_tap(None);
+    let started = Instant::now();
+    let provider = handle.provider.clone();
+    let partial = handle.partial.lock().clone();
+    let outcome = match tokio::time::timeout(Duration::from_secs(15), handle.finish()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("realtime task ended without a result".into()),
+        Err(_) => Err("realtime ASR timed out".into()),
+    };
+    let elapsed = elapsed_ms(started);
+    attempt.pipeline_metrics.asr_ms = elapsed;
+    attempt.pipeline_metrics.asr_rtf = None;
+    let mut runtime = lumen_asr::AsrRuntimeDiagnostics::default();
+    runtime.model = Some(format!("{provider}_realtime"));
+    attempt.pipeline_metrics.asr_runtime = Some(runtime);
+    match outcome {
+        Ok(out) if !out.text.trim().is_empty() => {
+            tracing::info!(
+                provider,
+                partial_chars = partial.chars().count(),
+                chars = out.text.chars().count(),
+                finish_ms = elapsed,
+                "realtime dictation final transcript"
+            );
+            Some(Ok(out.text))
+        }
+        Ok(_) => {
+            tracing::warn!(
+                provider,
+                "realtime dictation returned no transcript; falling back to batch"
+            );
+            Some(Err("realtime transcript was empty".into()))
+        }
+        Err(error) => {
+            tracing::warn!(provider, %error, "realtime dictation failed; falling back to batch");
+            attempt
+                .pipeline_metrics
+                .stage_issues
+                .push(PipelineStageIssue {
+                    stage: PipelineStage::Asr,
+                    kind: PipelineIssueKind::Fallback,
+                    message: format!("realtime failed ({error}); used batch ASR"),
+                });
+            Some(Err(error))
+        }
     }
 }
 
@@ -2966,6 +3110,7 @@ mod attempt_metric_tests {
             Store::open(dir.join("capture.sqlite")).unwrap(),
         )));
         AppState {
+            realtime: parking_lot::Mutex::new(None),
             edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(
                 store.clone(),
                 false,
@@ -3273,6 +3418,7 @@ mod attempt_metric_tests {
             Store::open(dir.path().join("capture.sqlite")).unwrap(),
         )));
         let state = AppState {
+            realtime: parking_lot::Mutex::new(None),
             edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(
                 store.clone(),
                 false,

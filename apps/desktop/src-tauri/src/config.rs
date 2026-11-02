@@ -304,6 +304,13 @@ pub struct AsrServiceConfig {
     pub volcengine_app_id: String,
     /// Optional BCP-47 / ISO language hint for cloud ASR.
     pub language: String,
+    /// Realtime (streaming) dictation for providers that support it
+    /// (openai_audio / volcengine): audio streams while speaking, the final
+    /// transcript is ready immediately after speech ends, and the LLM
+    /// correction pass is skipped (hotwords bias the recognizer instead).
+    /// Inert for providers without realtime support.
+    #[serde(default)]
+    pub realtime_enabled: bool,
     pub timeout_secs: u64,
     /// Schema version of the ASR key keychain scoping. `0` = pre-scoping
     /// (single `asr-api-key` item shared by every provider) — the loader
@@ -339,6 +346,7 @@ impl Default for AsrServiceConfig {
             api_key: String::new(),
             volcengine_app_id: String::new(),
             language: String::new(),
+            realtime_enabled: false,
             timeout_secs: 120,
             key_slot_version: 0,
             api_key_provider: String::new(),
