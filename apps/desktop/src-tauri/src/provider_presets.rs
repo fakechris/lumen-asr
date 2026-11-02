@@ -248,6 +248,8 @@ pub struct AsrProviderPreset {
     pub needs_api_key: bool,
     /// wired | config_only（UI 可选，云端实现逐步补齐）
     pub status: String,
+    /// Whether this provider has a realtime (streaming) engine wired.
+    pub realtime: bool,
     pub notes: String,
 }
 
@@ -262,6 +264,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec!["sensevoice-small".into()],
             needs_api_key: false,
             status: "wired".into(),
+            realtime: false,
             notes: "默认；离线 sherpa-onnx".into(),
         },
         AsrProviderPreset {
@@ -273,6 +276,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec!["qwen3-sherpa".into()],
             needs_api_key: false,
             status: "wired".into(),
+            realtime: false,
             notes: "本地 sherpa-onnx 高准确率引擎（自动识别语种，无需 Python）；识别后沿用当前文本整理流程。".into(),
         },
         AsrProviderPreset {
@@ -284,6 +288,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec![],
             needs_api_key: false,
             status: "wired".into(),
+            realtime: false,
             notes: "若本机已配置 whisper 目录".into(),
         },
         AsrProviderPreset {
@@ -301,6 +306,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             ],
             needs_api_key: true,
             status: "wired".into(),
+            realtime: true,
             notes: "POST /audio/transcriptions；推荐新一代 gpt-transcribe（性价比最高）或 gpt-4o-mini-transcribe；gpt-4o-transcribe-diarize 仅适合整文件多说话人批式（单次上限约 23 分钟），App 内听写与云端会议均为逐句短音频，选它时会自动改用 gpt-transcribe".into(),
         },
         AsrProviderPreset {
@@ -312,6 +318,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec![],
             needs_api_key: true,
             status: "config_only".into(),
+            realtime: false,
             notes: "DashScope realtime WebSocket；流式客户端待接".into(),
         },
         AsrProviderPreset {
@@ -323,6 +330,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec![],
             needs_api_key: true,
             status: "wired".into(),
+            realtime: true,
             notes: "同步 HTTP 一句话识别（极速版，资源 volc.bigasr.auc_turbo）。凭据：Access Token 填在 API Key；旧版控制台还需在 App ID 栏填 App ID，新版控制台只需把 APP Key 填进 API Key。".into(),
         },
         AsrProviderPreset {
@@ -334,6 +342,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec!["asr-1.0".into()],
             needs_api_key: true,
             status: "wired".into(),
+            realtime: false,
             notes: "同步 multipart 一句话识别（模型 asr-1.0，单次 ≤500 秒 / 50 MB）。API Key 填 platform.minimaxi.com 的接口密钥；语言留空为混合识别。".into(),
         },
         AsrProviderPreset {
@@ -345,6 +354,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec!["stt-rt-v4".into()],
             needs_api_key: true,
             status: "config_only".into(),
+            realtime: false,
             notes: "实时 WebSocket；流式客户端待接".into(),
         },
         AsrProviderPreset {
@@ -356,6 +366,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec!["stepaudio-2.5-asr".into()],
             needs_api_key: true,
             status: "config_only".into(),
+            realtime: false,
             notes: "批式 HTTP；模型 stepaudio-2.5-asr".into(),
         },
         AsrProviderPreset {
@@ -367,6 +378,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec!["mimo-v2.5-asr".into()],
             needs_api_key: true,
             status: "config_only".into(),
+            realtime: false,
             notes: "批式；audio/wav".into(),
         },
         AsrProviderPreset {
@@ -378,6 +390,7 @@ pub fn asr_presets() -> Vec<AsrProviderPreset> {
             models: vec![],
             needs_api_key: true,
             status: "config_only".into(),
+            realtime: false,
             notes: "兼容 OpenAI transcriptions 形状的第三方".into(),
         },
     ]

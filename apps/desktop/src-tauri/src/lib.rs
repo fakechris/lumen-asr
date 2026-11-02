@@ -42,6 +42,7 @@ mod pane_observer;
 mod permissions_cmd;
 mod pipeline_attempt;
 mod provider_presets;
+mod realtime_asr;
 mod secret_store;
 mod session_debug;
 mod ui_cmd;
@@ -459,6 +460,9 @@ pub(crate) fn delete_session_with_artifacts(
 
 pub struct AppState {
     pub store: Arc<Mutex<Option<Store>>>,
+    /// Live realtime dictation run for the active recording (streaming cloud
+    /// ASR). `None` when realtime is off, unsupported, or not recording.
+    pub realtime: parking_lot::Mutex<Option<crate::realtime_asr::RealtimeHandle>>,
     pub(crate) edit_learning: edit_learning_runtime::DesktopEditLearning,
     pub audio: AudioCapture,
     /// Serializes capture transitions and holds attenuation only while recording.
@@ -690,6 +694,7 @@ pub fn run() {
         })
         .manage(AppState {
             store,
+            realtime: parking_lot::Mutex::new(None),
             edit_learning,
             audio,
             dictation_ducking: Mutex::new(None),
