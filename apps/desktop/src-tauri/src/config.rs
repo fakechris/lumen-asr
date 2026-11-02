@@ -1301,6 +1301,15 @@ impl AppConfig {
     /// Returns the adopted key, or `None` when the state is not pending or
     /// the store refuses the write.
     pub fn adopt_legacy_key_if_pending(&mut self, store: &dyn SecretStore) -> Option<String> {
+        // State guards BEFORE the legacy read: once the migration is done
+        // (or a key is held), no recovery attempt may touch the legacy item —
+        // each read risks re-prompting the keychain access dialog.
+        if self.asr.key_slot_version != 0
+            || !self.asr.api_key_provider.trim().is_empty()
+            || !self.asr.api_key.trim().is_empty()
+        {
+            return None;
+        }
         let legacy = store.get(SecretSlot::AsrApiKeyLegacy).ok().flatten()?;
         self.adopt_legacy_key(store, &legacy)
     }

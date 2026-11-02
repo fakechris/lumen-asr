@@ -213,62 +213,68 @@ fn schedule_secret_retry(app: tauri::AppHandle) {
         // prompt may stay up for hours).
         let store = crate::secret_store::platform_store();
         let mut tasks = tokio::task::JoinSet::new();
+        // The legacy read starts FIRST-CLASS alongside the active slots: an
+        // unanswered active-slot prompt can park its task for hours, and the
+        // pending migration must not serialize behind it.
+        if legacy_pending {
+            if let Some(store) = store {
+                tasks.spawn_blocking(move || {
+                    (
+                        None,
+                        store.get_patient(crate::secret_store::SecretSlot::AsrApiKeyLegacy),
+                    )
+                });
+            }
+        }
         for slot in unknown {
             let Some(store) = store else { continue };
-            tasks.spawn_blocking(move || (slot.clone(), store.get_patient(slot)));
+            tasks.spawn_blocking(move || (Some(slot.clone()), store.get_patient(slot)));
         }
         while let Some(joined) = tasks.join_next().await {
-            let Ok((slot, outcome)) = joined else {
+            let Ok((task, outcome)) = joined else {
                 continue;
             };
             let state = app.state::<AppState>();
             let Ok(mut config) = state.config.lock() else {
                 break;
             };
-            match outcome {
-                Ok(Some(key)) if !key.is_empty() => {
-                    if config.set_secret_from_retry(slot.clone(), &key) {
-                        tracing::info!(
-                            account = slot.account(),
-                            "API key recovered from keychain after the access prompt was answered"
-                        );
-                    }
-                }
-                // The store answered and holds nothing: settled.
-                Ok(_) => config.mark_secret_absent(slot),
-                // Denied or failed: give up for this session — never
-                // re-prompt on a timer.
-                Err(error) => tracing::warn!(
-                    account = slot.account(),
-                    error = %error,
-                    "keychain recovery read failed; giving up for this session"
-                ),
-            }
-        }
-
-        // Pending legacy migration: park ONE patient read on the legacy item.
-        // Whenever the user answers its prompt — seconds or hours from now —
-        // the migration completes in place; no restart, nothing re-entered,
-        // and no timed read silently discarding the answer.
-        if legacy_pending {
-            if let Some(store) = store {
-                let outcome = tokio::task::spawn_blocking(move || {
-                    store.get_patient(crate::secret_store::SecretSlot::AsrApiKeyLegacy)
-                })
-                .await;
-                if let Ok(Ok(Some(legacy))) = outcome {
-                    if !legacy.trim().is_empty() {
-                        let state = app.state::<AppState>();
-                        let Ok(mut config) = state.config.lock() else {
-                            return;
-                        };
-                        if config.adopt_legacy_key(store, &legacy).is_some() {
+            match task {
+                // The pending-migration read: adopt the legacy key in place
+                // the moment its prompt is answered — no restart, nothing
+                // re-entered, no timed read discarding the answer.
+                None => {
+                    let Some(store) = store else {
+                        unreachable!("legacy task only spawns with a store")
+                    };
+                    if let Ok(Some(legacy)) = outcome {
+                        if !legacy.trim().is_empty()
+                            && config.adopt_legacy_key(store, &legacy).is_some()
+                        {
                             tracing::info!(
                                 "legacy asr-api-key adopted after the access prompt was answered"
                             );
                         }
                     }
                 }
+                Some(slot) => match outcome {
+                    Ok(Some(key)) if !key.is_empty() => {
+                        if config.set_secret_from_retry(slot.clone(), &key) {
+                            tracing::info!(
+                                account = slot.account(),
+                                "API key recovered from keychain after the access prompt was answered"
+                            );
+                        }
+                    }
+                    // The store answered and holds nothing: settled.
+                    Ok(_) => config.mark_secret_absent(slot),
+                    // Denied or failed: give up for this session — never
+                    // re-prompt on a timer.
+                    Err(error) => tracing::warn!(
+                        account = slot.account(),
+                        error = %error,
+                        "keychain recovery read failed; giving up for this session"
+                    ),
+                },
             }
         }
     });

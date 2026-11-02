@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 use lumen_asr::{
     LiveTapSender, MeetingAudioFormat, RecordingSummary, SystemTrackRecorder, SystemTrackSender,
 };
-use lumen_platform_macos::{SystemAudioCapture, SystemAudioError, SystemAudioSink, SystemAudioTarget};
+use lumen_platform_macos::{
+    SystemAudioCapture, SystemAudioError, SystemAudioSink, SystemAudioTarget,
+};
 
 /// One live tap→WAV session for the active meeting recording.
 struct Session {
@@ -117,7 +119,9 @@ impl MeetingSystemAudio {
             }
         }
         let Some(sample_rate) = sample_rate_opt else {
-            tracing::warn!("system audio capture target had no active audio processes; recording mic-only");
+            tracing::warn!(
+                "system audio capture target had no active audio processes; recording mic-only"
+            );
             return None;
         };
 
