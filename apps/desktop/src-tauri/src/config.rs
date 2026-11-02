@@ -1301,9 +1301,28 @@ impl AppConfig {
     /// Returns the adopted key, or `None` when the state is not pending or
     /// the store refuses the write.
     pub fn adopt_legacy_key_if_pending(&mut self, store: &dyn SecretStore) -> Option<String> {
+        // State guards BEFORE the legacy read: once the migration is done
+        // (or a key is held), no recovery attempt may touch the legacy item —
+        // each read risks re-prompting the keychain access dialog.
         if self.asr.key_slot_version != 0
             || !self.asr.api_key_provider.trim().is_empty()
             || !self.asr.api_key.trim().is_empty()
+        {
+            return None;
+        }
+        let legacy = store.get(SecretSlot::AsrApiKeyLegacy).ok().flatten()?;
+        self.adopt_legacy_key(store, &legacy)
+    }
+
+    /// [`adopt_legacy_key_if_pending`] with the legacy value already read
+    /// (e.g. by a patient read that waited out the access prompt): finishes
+    /// the pending migration without re-reading — and thus without risking
+    /// another prompt.
+    pub fn adopt_legacy_key(&mut self, store: &dyn SecretStore, legacy: &str) -> Option<String> {
+        if self.asr.key_slot_version != 0
+            || !self.asr.api_key_provider.trim().is_empty()
+            || !self.asr.api_key.trim().is_empty()
+            || legacy.trim().is_empty()
         {
             return None;
         }
@@ -1315,10 +1334,7 @@ impl AppConfig {
         if !matches!(store.get(slot.clone()), Ok(None)) {
             return None;
         }
-        let legacy = store.get(SecretSlot::AsrApiKeyLegacy).ok().flatten()?;
-        if legacy.trim().is_empty() {
-            return None;
-        }
+        let legacy = legacy.to_owned();
         store.set(slot.clone(), &legacy).ok()?;
         self.asr.api_key = legacy.clone();
         self.asr.api_key_provider = self.asr.provider.trim().to_ascii_lowercase();
