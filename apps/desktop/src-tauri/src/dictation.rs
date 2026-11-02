@@ -900,7 +900,16 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     if state.audio.is_recording() {
         return Ok(());
     }
-    let status = asr_status_from(state);
+    // Readiness self-heal: a keyed cloud provider whose key is missing may
+    // be a pending legacy-slot migration or an unanswered keychain prompt —
+    // one bounded recovery attempt here (which also adopts a pending legacy
+    // key) turns 未就绪 into a working start instead of blocking the gate.
+    let mut status = asr_status_from(state);
+    if !status.active_ready && cloud_asr_requires_key(&status.provider) {
+        if !recover_asr_key_sync(state).trim().is_empty() {
+            status = asr_status_from(state);
+        }
+    }
     ensure_active_asr_ready(
         &status.provider,
         &status.provider_label,
