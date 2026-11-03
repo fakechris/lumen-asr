@@ -73,6 +73,7 @@ export default function Capsule() {
         setPhase("notice");
         setMessage(p.message);
       } else if (p.phase === "done") {
+        setPartial(null);
         const notice = dictationDoneNotice({
           fallbackReason: p.outcome.fallbackReason,
           insertNotice: p.outcome.insertNotice,
@@ -173,7 +174,7 @@ export default function Capsule() {
         {badge}
       </span>
       <span className="capsule-text">{label}</span>
-      {phase === "listening" && partial && (
+      {(phase === "listening" || phase === "processing") && partial && (
         <span
           className="capsule-partial"
           title={partial}
