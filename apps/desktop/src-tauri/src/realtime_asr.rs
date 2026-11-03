@@ -302,6 +302,10 @@ impl RealtimeSession {
             .await
             .map_err(|e| format!("session update send: {e}"))?;
 
+        // Accumulates word-level deltas per utterance item, so Partial
+        // events carry the item's transcript-so-far.
+        let mut item_buffers: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         tokio::spawn(async move {
             while let Some(frame) = reader.next().await {
                 let frame = match frame {
@@ -344,6 +348,9 @@ impl RealtimeSession {
                         }
                     }
                     "conversation.item.input_audio_transcription.completed" => {
+                        if let Some(item) = value.get("item_id").and_then(|v| v.as_str()) {
+                            item_buffers.remove(item);
+                        }
                         if let Some(t) = value.get("transcript").and_then(|v| v.as_str()) {
                             let _ = tx
                                 .send(RealtimeEvent::Utterance {
