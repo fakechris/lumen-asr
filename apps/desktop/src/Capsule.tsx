@@ -31,6 +31,7 @@ type DictationEvent =
     }
   | { phase: "notice"; message: string }
   | { phase: "error"; message: string }
+  | { phase: "partial"; text: string }
   | { phase: "cancelled" };
 
 export default function Capsule() {
@@ -40,6 +41,7 @@ export default function Capsule() {
   const [intent, setIntent] = useState("default");
   const [targetLang, setTargetLang] = useState<string | null>(null);
   const [escCancel, setEscCancel] = useState(false);
+  const [partial, setPartial] = useState<string | null>(null);
 
   useEffect(() => {
     let un: (() => void) | undefined;
@@ -47,6 +49,7 @@ export default function Capsule() {
       const p = e.payload;
       if (p.phase === "listening") {
         setPhase("listening");
+        setPartial(null);
         setMessage(p.message || "录音中");
         setIntent(p.intent || "default");
         setTargetLang(p.targetLanguage ?? null);
@@ -59,8 +62,12 @@ export default function Capsule() {
         if (p.intent) setIntent(p.intent);
         if (p.targetLanguage != null) setTargetLang(p.targetLanguage);
         setEscCancel(p.escCancel === true);
+      } else if (p.phase === "partial") {
+        // Realtime ASR live transcript while the key is still held.
+        setPartial(p.text);
       } else if (p.phase === "error") {
         setPhase("error");
+        setPartial(null);
         setMessage(p.message);
       } else if (p.phase === "notice") {
         setPhase("notice");
@@ -166,6 +173,18 @@ export default function Capsule() {
         {badge}
       </span>
       <span className="capsule-text">{label}</span>
+      {phase === "listening" && partial && (
+        <span
+          className="capsule-partial"
+          title={partial}
+          ref={(el) => {
+            // Keep the newest text in view as it streams in.
+            if (el) el.scrollLeft = el.scrollWidth;
+          }}
+        >
+          {partial}
+        </span>
+      )}
       {escCancel && (phase === "listening" || phase === "processing") && (
         <span className="capsule-hint">Esc 取消</span>
       )}
