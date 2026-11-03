@@ -201,7 +201,13 @@ impl RealtimeSession {
                 Ok(event) => event,
                 Err(_) => {
                     if text_parts.is_empty() {
-                        return Err("realtime ASR timed out waiting for the transcript".into());
+                        // Nothing arrived at all — e.g. the drained-commit
+                        // case where every utterance was finalized during
+                        // speech (they live in the pump's collected buffer).
+                        // Return empty rather than erroring: the caller's
+                        // merge joins the collected utterances in, and a
+                        // genuinely empty transcript falls back to batch.
+                        return Ok(RealtimeOutcome::default());
                     }
                     break;
                 }
