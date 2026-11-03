@@ -985,6 +985,9 @@ impl LinearResampler {
     }
 }
 
+/// Live-partial callback (capsule preview); `None` disables it.
+type PartialSink = Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>;
+
 /// Handle to one live realtime dictation run. The owning task pumps the mic
 /// tap into the session and finishes it on `end`.
 pub struct RealtimeHandle {
@@ -1014,6 +1017,7 @@ impl RealtimeHandle {
 pub fn spawn_realtime_run(
     config: RealtimeConfig,
     tap: std::sync::mpsc::Receiver<lumen_asr::LiveChunk>,
+    on_partial: PartialSink,
 ) -> RealtimeHandle {
     let provider = config.provider.clone();
     let partial = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
@@ -1023,8 +1027,17 @@ pub fn spawn_realtime_run(
     let collected = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     let collected_for_task = std::sync::Arc::clone(&collected);
     let collected_for_merge = std::sync::Arc::clone(&collected_for_task);
+    let on_partial = on_partial.clone();
     tokio::spawn(async move {
-        let mut outcome = run_pump(config, tap, end_rx, partial_for_task, collected_for_task).await;
+        let mut outcome = run_pump(
+            config,
+            tap,
+            end_rx,
+            partial_for_task,
+            collected_for_task,
+            on_partial,
+        )
+        .await;
         if let Ok(res) = outcome.as_mut() {
             // The recognizer finalized some sentences while the user was
             // still speaking (server VAD); merge them ahead of anything the
@@ -1057,6 +1070,7 @@ async fn run_pump(
     mut end: tokio::sync::oneshot::Receiver<()>,
     partial: std::sync::Arc<parking_lot::Mutex<String>>,
     collected: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    on_partial: PartialSink,
 ) -> Result<RealtimeOutcome, String> {
     // Bridge the blocking std tap onto the async runtime with a dedicated
     // thread, so the pump never blocks a Tokio worker on recv_timeout for
@@ -1069,7 +1083,15 @@ async fn run_pump(
             }
         }
     });
-    let outcome = run_pump_inner(config, &mut chunk_rx, &mut end, partial, collected).await;
+    let outcome = run_pump_inner(
+        config,
+        &mut chunk_rx,
+        &mut end,
+        partial,
+        collected,
+        on_partial,
+    )
+    .await;
     drop(chunk_rx);
     let _ = bridge.join();
     outcome
@@ -1081,6 +1103,7 @@ async fn run_pump_inner(
     end: &mut tokio::sync::oneshot::Receiver<()>,
     partial: std::sync::Arc<parking_lot::Mutex<String>>,
     collected: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    on_partial: PartialSink,
 ) -> Result<RealtimeOutcome, String> {
     let mut session = match RealtimeSession::open(&config).await {
         Ok(session) => session,
@@ -1121,7 +1144,19 @@ async fn run_pump_inner(
         // Server VAD finalizes sentences mid-speech: keep them.
         while let Ok(event) = session.events.try_recv() {
             match event {
-                RealtimeEvent::Partial { text } => *partial.lock() = text,
+                RealtimeEvent::Partial { text } => {
+                    let changed = {
+                        let mut guard = partial.lock();
+                        let changed = *guard != text;
+                        *guard = text.clone();
+                        changed
+                    };
+                    if changed {
+                        if let Some(sink) = on_partial.as_ref() {
+                            sink(&text);
+                        }
+                    }
+                }
                 RealtimeEvent::Utterance { text } => {
                     if !text.trim().is_empty() {
                         collected.lock().push(text.trim().to_string());

@@ -807,8 +807,8 @@ pub fn asr_status_from(state: &AppState) -> AsrStatus {
 }
 
 #[tauri::command]
-pub fn start_recording(state: State<'_, AppState>) -> Result<(), String> {
-    start_recording_inner(&state)
+pub fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    start_recording_inner(&state, Some(&app))
 }
 
 pub(crate) fn ensure_active_asr_ready(
@@ -892,7 +892,7 @@ fn kick_silero_model_download() {
     });
 }
 
-pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
+pub fn start_recording_inner(state: &AppState, app: Option<&AppHandle>) -> Result<(), String> {
     let mut ducking = state
         .dictation_ducking
         .lock()
@@ -923,7 +923,7 @@ pub fn start_recording_inner(state: &AppState) -> Result<(), String> {
     });
     state.context.begin(hint);
     configure_session_vad(state);
-    maybe_start_realtime(state);
+    maybe_start_realtime(state, app);
     let audio_config = state
         .config
         .lock()
@@ -2163,6 +2163,25 @@ pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
     }
 }
 
+/// Cap on dictionary terms biasing a realtime session: volcengine accepts
+/// 100 inline hotword tokens, OpenAI's prompt stays effective at this size.
+const MAX_REALTIME_HOTWORDS: usize = 50;
+
+/// Personal-dictionary terms used to bias the realtime recognizer (the
+/// streaming replacement for the LLM correction pass).
+fn realtime_hotwords_from_entries(entries: &[lumen_dictionary::DictionaryEntry]) -> Vec<String> {
+    let mut terms: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry.term.as_ref())
+        .map(|term| term.trim().to_string())
+        .filter(|term| !term.is_empty())
+        .collect();
+    terms.sort_unstable();
+    terms.dedup();
+    terms.truncate(MAX_REALTIME_HOTWORDS);
+    terms
+}
+
 /// Realtime dictation is active when the user enabled it, the selected
 /// provider has a streaming engine, and its key is loaded.
 pub(crate) fn realtime_active(asr_cfg: &AsrServiceConfig) -> bool {
@@ -2174,7 +2193,7 @@ pub(crate) fn realtime_active(asr_cfg: &AsrServiceConfig) -> bool {
 /// Open the realtime session for a recording and install the mic live tap.
 /// Called before `state.audio.start()`; failure is logged and dictation
 /// proceeds on the normal batch path (the run handle stays `None`).
-fn maybe_start_realtime(state: &AppState) {
+fn maybe_start_realtime(state: &AppState, app: Option<&AppHandle>) {
     let mut asr_cfg = state
         .config
         .lock()
@@ -2194,23 +2213,45 @@ fn maybe_start_realtime(state: &AppState) {
         return;
     }
     let provider = canonical_asr_provider(&asr_cfg.provider);
-    {
-        tracing::warn!("realtime dictation requested but the key is not ready; using batch");
-        let _ = state.audio.set_live_tap(None);
-        return;
-    }
     let (tap, rx) = lumen_asr::live_tap();
     let _ = state.audio.set_live_tap(Some(tap));
+    let hotwords = state
+        .store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(|store| store.list_dictionary().ok())
+        .map(|entries| realtime_hotwords_from_entries(&entries))
+        .unwrap_or_default();
+    if !hotwords.is_empty() {
+        tracing::debug!(
+            count = hotwords.len(),
+            "realtime hotwords from personal dictionary"
+        );
+    }
     let config = crate::realtime_asr::RealtimeConfig {
         provider: provider.clone(),
         api_key: asr_cfg.api_key.clone(),
         app_id: asr_cfg.volcengine_app_id.clone(),
         base_url: asr_cfg.base_url.clone(),
         language: asr_cfg.language.clone(),
-        hotwords: Vec::new(),
+        hotwords,
         model: String::new(),
     };
-    let handle = crate::realtime_asr::spawn_realtime_run(config, rx);
+    // Live partial preview: the capsule shows the streaming text while the
+    // key is still held. No AppHandle (e.g. headless paths) → no preview.
+    let on_partial = app.map(|app| {
+        let app = app.clone();
+        std::sync::Arc::new(move |text: &str| {
+            emit_dictation(
+                &app,
+                DictationUiEvent::Partial {
+                    text: text.to_string(),
+                },
+            );
+        }) as std::sync::Arc<dyn Fn(&str) + Send + Sync>
+    });
+    let handle = crate::realtime_asr::spawn_realtime_run(config, rx, on_partial);
     tracing::info!(provider, "realtime dictation session starting");
     *state.realtime.lock() = Some(handle);
 }
@@ -2584,6 +2625,10 @@ pub enum DictationUiEvent {
     Notice {
         message: String,
     },
+    /// Realtime ASR live partial (capsule preview while still holding).
+    Partial {
+        text: String,
+    },
     Cancelled,
 }
 
@@ -2822,7 +2867,7 @@ pub async fn dictation_start_with_intent(app: AppHandle, intent: IntentSpec) -> 
         .map(|c| c.hotkey.show_capsule)
         .unwrap_or(true);
 
-    match start_recording_inner(&state) {
+    match start_recording_inner(&state, Some(&app)) {
         Ok(()) => {
             // Serialize the final state check and UI publication with stop's
             // RECORDING -> PROCESSING transition. A quick release can finish
@@ -3305,6 +3350,83 @@ mod attempt_metric_tests {
         );
         assert_eq!(openai_diarize_model_override("whisper-1"), None);
         assert_eq!(openai_diarize_model_override(""), None);
+    }
+
+    #[tokio::test]
+    async fn maybe_start_realtime_starts_a_run_when_enabled_and_keyed() {
+        // Regression: a dead unconditional return once sat between the
+        // readiness gate and the tap install, so realtime never started at
+        // all. The handle must exist whenever the mode is configured.
+        let dir = tempfile::tempdir().unwrap();
+        let state = {
+            let mut s = test_state_with_sensevoice(dir.path(), dir.path().join("sv"));
+            s.config.lock().unwrap().asr = crate::config::AsrServiceConfig {
+                provider: "openai_audio".into(),
+                api_key: "sk-test".into(),
+                realtime_enabled: true,
+                ..Default::default()
+            };
+            s
+        };
+        maybe_start_realtime(&state, None);
+        let handle = state.realtime.lock().take();
+        assert!(
+            handle.is_some(),
+            "realtime run must start when enabled+keyed"
+        );
+        // Disabled or unsupported providers must not start one.
+        {
+            let mut s = test_state_with_sensevoice(dir.path(), dir.path().join("sv2"));
+            s.config.lock().unwrap().asr = crate::config::AsrServiceConfig {
+                provider: "minimax".into(),
+                api_key: "sk-test".into(),
+                realtime_enabled: true,
+                ..Default::default()
+            };
+            maybe_start_realtime(&s, None);
+            assert!(
+                s.realtime.lock().is_none(),
+                "minimax has no realtime engine"
+            );
+        }
+    }
+
+    #[test]
+    fn realtime_hotwords_dedupe_trim_and_cap() {
+        use lumen_dictionary::DictionaryEntry;
+        let entry = |term: Option<&str>| DictionaryEntry {
+            id: uuid::Uuid::new_v4(),
+            kind: lumen_core::DictEntryKind::Term,
+            term: term.map(str::to_string),
+            from_text: None,
+            to_text: None,
+            source: lumen_core::DictEntrySource::Manual,
+            hit_count: 0,
+            confirmed: true,
+            updated_at: chrono::Utc::now(),
+        };
+        let mut entries: Vec<_> = ["Lumen", " 豆包 ", "MiniMax", "Lumen"]
+            .iter()
+            .map(|t| entry(Some(t)))
+            .collect();
+        entries.push(entry(None)); // malformed entry contributes nothing
+        let hotwords = realtime_hotwords_from_entries(&entries);
+        assert_eq!(hotwords, ["Lumen", "MiniMax", "豆包"]);
+        let many: Vec<_> = (0..80).map(|i| entry(Some(&format!("term{i}")))).collect();
+        assert_eq!(
+            realtime_hotwords_from_entries(&many).len(),
+            MAX_REALTIME_HOTWORDS
+        );
+    }
+
+    #[test]
+    fn partial_ui_event_serializes_camelcase() {
+        let value = serde_json::to_value(DictationUiEvent::Partial {
+            text: "你好".into(),
+        })
+        .unwrap();
+        assert_eq!(value["phase"], "partial");
+        assert_eq!(value["text"], "你好");
     }
 
     #[test]
