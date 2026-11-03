@@ -2213,11 +2213,6 @@ fn maybe_start_realtime(state: &AppState, app: Option<&AppHandle>) {
         return;
     }
     let provider = canonical_asr_provider(&asr_cfg.provider);
-    {
-        tracing::warn!("realtime dictation requested but the key is not ready; using batch");
-        let _ = state.audio.set_live_tap(None);
-        return;
-    }
     let (tap, rx) = lumen_asr::live_tap();
     let _ = state.audio.set_live_tap(Some(tap));
     let hotwords = state
@@ -3355,6 +3350,45 @@ mod attempt_metric_tests {
         );
         assert_eq!(openai_diarize_model_override("whisper-1"), None);
         assert_eq!(openai_diarize_model_override(""), None);
+    }
+
+    #[tokio::test]
+    async fn maybe_start_realtime_starts_a_run_when_enabled_and_keyed() {
+        // Regression: a dead unconditional return once sat between the
+        // readiness gate and the tap install, so realtime never started at
+        // all. The handle must exist whenever the mode is configured.
+        let dir = tempfile::tempdir().unwrap();
+        let state = {
+            let mut s = test_state_with_sensevoice(dir.path(), dir.path().join("sv"));
+            s.config.lock().unwrap().asr = crate::config::AsrServiceConfig {
+                provider: "openai_audio".into(),
+                api_key: "sk-test".into(),
+                realtime_enabled: true,
+                ..Default::default()
+            };
+            s
+        };
+        maybe_start_realtime(&state, None);
+        let handle = state.realtime.lock().take();
+        assert!(
+            handle.is_some(),
+            "realtime run must start when enabled+keyed"
+        );
+        // Disabled or unsupported providers must not start one.
+        {
+            let mut s = test_state_with_sensevoice(dir.path(), dir.path().join("sv2"));
+            s.config.lock().unwrap().asr = crate::config::AsrServiceConfig {
+                provider: "minimax".into(),
+                api_key: "sk-test".into(),
+                realtime_enabled: true,
+                ..Default::default()
+            };
+            maybe_start_realtime(&s, None);
+            assert!(
+                s.realtime.lock().is_none(),
+                "minimax has no realtime engine"
+            );
+        }
     }
 
     #[test]
