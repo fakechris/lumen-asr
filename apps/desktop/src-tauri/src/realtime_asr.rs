@@ -381,16 +381,23 @@ impl RealtimeSession {
                         }
                     }
                     "conversation.item.input_audio_transcription.delta" => {
-                        let item = value
-                            .get("item_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        awaiting_done.insert(item.clone());
                         let delta = value.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                        let text = item_buffers.entry(item).or_default();
-                        text.push_str(delta);
-                        let _ = tx.send(RealtimeEvent::Partial { text: text.clone() }).await;
+                        if let Some(item) = value.get("item_id").and_then(|v| v.as_str()) {
+                            // Deltas without an item_id cannot be tracked to
+                            // completion — pass them through untracked rather
+                            // than inserting a phantom id that would stall
+                            // the completion set forever.
+                            awaiting_done.insert(item.to_string());
+                            let text = item_buffers.entry(item.to_string()).or_default();
+                            text.push_str(delta);
+                            let _ = tx.send(RealtimeEvent::Partial { text: text.clone() }).await;
+                        } else {
+                            let _ = tx
+                                .send(RealtimeEvent::Partial {
+                                    text: delta.to_string(),
+                                })
+                                .await;
+                        }
                     }
                     "conversation.item.input_audio_transcription.completed" => {
                         if let Some(item) = value.get("item_id").and_then(|v| v.as_str()) {
