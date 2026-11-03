@@ -201,7 +201,13 @@ impl RealtimeSession {
                 Ok(event) => event,
                 Err(_) => {
                     if text_parts.is_empty() {
-                        return Err("realtime ASR timed out waiting for the transcript".into());
+                        // Nothing arrived at all — e.g. the drained-commit
+                        // case where every utterance was finalized during
+                        // speech (they live in the pump's collected buffer).
+                        // Return empty rather than erroring: the caller's
+                        // merge joins the collected utterances in, and a
+                        // genuinely empty transcript falls back to batch.
+                        return Ok(RealtimeOutcome::default());
                     }
                     break;
                 }
@@ -376,6 +382,15 @@ impl RealtimeSession {
                             .pointer("/error/message")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown realtime error");
+                        // Committing after the server VAD already drained the
+                        // buffer ("buffer too small … 0.00ms") is benign —
+                        // everything was auto-committed at the pause. Treating
+                        // it as fatal would throw away a complete transcript
+                        // and fall back to batch (observed live).
+                        if error.contains("buffer too small") {
+                            tracing::debug!("commit on an already-drained buffer ignored");
+                            continue;
+                        }
                         let _ = tx
                             .send(RealtimeEvent::Failed {
                                 message: error.to_string(),
@@ -873,11 +888,14 @@ mod tests {
         assert_eq!(session.sample_rate(), 24_000);
         for chunk in data.chunks(4800) {
             session.send_audio(chunk).await.expect("send");
-            // Realtime pacing (100 ms of audio per 60 ms tick keeps the
-            // upload slightly ahead of playout). Events are left queued for
-            // finish() to collect — consuming them here would starve it.
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            // Realtime pacing (100 ms of audio per 100 ms tick) — matches
+            // production streaming.
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // Release-after-a-pause: let the server VAD commit the trailing
+        // utterance first, so finish()'s commit hits a drained buffer —
+        // the exact live scenario that used to fail the whole session.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         let outcome = session.finish().await.expect("finish");
         println!("FINAL: [{}]", outcome.text);
         assert!(!outcome.text.trim().is_empty(), "expected a transcript");
