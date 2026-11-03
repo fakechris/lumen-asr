@@ -190,25 +190,10 @@ impl RealtimeSession {
         // utterance: a short idle window bounds the NEXT wait — an arrived
         // event is always processed first, never discarded.
         let first_deadline = Duration::from_secs(10);
-        // Post-utterance idle window: the provider has spoken, a short quiet
-        // gap means it is done. Volcengine signals completion explicitly
-        // (last-server-frame flag) so the idle never bites; OpenAI's commit
-        // flush lands ~0.8s after release and a backlog burst can space
-        // consecutive transcripts further apart — so for OpenAI the idle
-        // cutoff only arms after a 1.2s post-commit grace (measured live).
-        let idle = Duration::from_millis(800);
-        let grace_until = (self.provider == "openai_audio")
-            .then(|| tokio::time::Instant::now() + Duration::from_millis(1200));
+        let idle = Duration::from_secs(2);
         loop {
             let wait = if text_parts.is_empty() {
                 first_deadline
-            } else if let Some(grace) = grace_until {
-                let now = tokio::time::Instant::now();
-                if now < grace {
-                    grace - now
-                } else {
-                    idle
-                }
             } else {
                 idle
             };
@@ -317,6 +302,10 @@ impl RealtimeSession {
             .await
             .map_err(|e| format!("session update send: {e}"))?;
 
+        // Accumulates word-level deltas per utterance item, so Partial
+        // events carry the item's transcript-so-far.
+        let mut item_buffers: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         tokio::spawn(async move {
             while let Some(frame) = reader.next().await {
                 let frame = match frame {
@@ -359,6 +348,9 @@ impl RealtimeSession {
                         }
                     }
                     "conversation.item.input_audio_transcription.completed" => {
+                        if let Some(item) = value.get("item_id").and_then(|v| v.as_str()) {
+                            item_buffers.remove(item);
+                        }
                         if let Some(t) = value.get("transcript").and_then(|v| v.as_str()) {
                             let _ = tx
                                 .send(RealtimeEvent::Utterance {
@@ -881,10 +873,10 @@ mod tests {
         assert_eq!(session.sample_rate(), 24_000);
         for chunk in data.chunks(4800) {
             session.send_audio(chunk).await.expect("send");
-            // Realtime pacing (100 ms of audio per 100 ms tick) — matches
-            // production streaming; faster-than-realtime pacing creates an
-            // artificial post-commit backlog the server must drain.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Realtime pacing (100 ms of audio per 60 ms tick keeps the
+            // upload slightly ahead of playout). Events are left queued for
+            // finish() to collect — consuming them here would starve it.
+            tokio::time::sleep(Duration::from_millis(60)).await;
         }
         let outcome = session.finish().await.expect("finish");
         println!("FINAL: [{}]", outcome.text);
@@ -1173,20 +1165,8 @@ async fn run_pump_inner(
                     }
                 }
                 RealtimeEvent::Utterance { text } => {
-                    let text = text.trim().to_string();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    collected.lock().push(text.clone());
-                    // OpenAI's GA transcription sessions emit no word-level
-                    // partials — finalized sentences ARE the live preview.
-                    let preview = {
-                        let mut guard = partial.lock();
-                        *guard = collected.lock().join(" ");
-                        guard.clone()
-                    };
-                    if let Some(sink) = on_partial.as_ref() {
-                        sink(&preview);
+                    if !text.trim().is_empty() {
+                        collected.lock().push(text.trim().to_string());
                     }
                 }
                 RealtimeEvent::Done => {}
