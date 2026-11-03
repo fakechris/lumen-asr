@@ -96,6 +96,9 @@ pub struct RealtimeOutcome {
 /// A live realtime session. Drop closes the socket (best-effort).
 pub struct RealtimeSession {
     provider: String,
+    /// Set once finish() sends the end-of-stream marker; the reader task
+    /// observes it to emit the deterministic Done (see finish_with).
+    commit_phase: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Writer half owned by the caller; reader runs in a task.
     writer: futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<
@@ -153,9 +156,20 @@ impl RealtimeSession {
         }
     }
 
-    /// End the audio stream and drain events until the final text arrives
-    /// (or the deadline passes). Returns the assembled outcome.
-    pub async fn finish(mut self) -> Result<RealtimeOutcome, String> {
+    /// End the audio stream and drain events until the final text arrives.
+    /// Convenience wrapper over [`Self::finish_with`].
+    #[allow(dead_code)] // exercised via finish_with in production; direct tests use it too
+    pub async fn finish(self) -> Result<RealtimeOutcome, String> {
+        self.finish_with(&mut |_| {}).await
+    }
+
+    /// [`Self::finish`] with a live tap into the drained events — the
+    /// post-release delta stream (OpenAI flushes at commit) feeds the
+    /// capsule preview through this.
+    pub async fn finish_with(
+        mut self,
+        on_event: &mut (dyn FnMut(&RealtimeEvent) + Send),
+    ) -> Result<RealtimeOutcome, String> {
         match self.provider.as_str() {
             "openai_audio" => {
                 // Commit flushes the trailing utterance immediately (the
@@ -181,38 +195,25 @@ impl RealtimeSession {
             }
             _ => unreachable!(),
         }
+        // Completion is EVENT-DRIVEN: the reader task emits Done when the
+        // provider's own semantics say everything is finalized (OpenAI:
+        // commit sent + every observed item received transcription.done;
+        // volcengine: the last-server-frame flag). The deadline below is a
+        // pure safety net, never the completion mechanism — on timeout we
+        // return whatever arrived (the caller's merge joins the pump's
+        // mid-speech utterances back in).
+        self.commit_phase
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = Duration::from_secs(10);
         let mut outcome = RealtimeOutcome::default();
         let mut text_parts: Vec<String> = Vec::new();
-        // First event allowance, then idle-between-events: once the provider
-        // has said something, a quiet window means it is finished (closing
-        // early would truncate the committed trailing utterance).
-        // Before the first event: a generous deadline. After at least one
-        // utterance: a short idle window bounds the NEXT wait — an arrived
-        // event is always processed first, never discarded.
-        let first_deadline = Duration::from_secs(10);
-        let idle = Duration::from_secs(2);
         loop {
-            let wait = if text_parts.is_empty() {
-                first_deadline
-            } else {
-                idle
-            };
-            let event = match tokio::time::timeout(wait, self.events.recv()).await {
+            let event = match tokio::time::timeout(deadline, self.events.recv()).await {
                 Ok(event) => event,
-                Err(_) => {
-                    if text_parts.is_empty() {
-                        // Nothing arrived at all — e.g. the drained-commit
-                        // case where every utterance was finalized during
-                        // speech (they live in the pump's collected buffer).
-                        // Return empty rather than erroring: the caller's
-                        // merge joins the collected utterances in, and a
-                        // genuinely empty transcript falls back to batch.
-                        return Ok(RealtimeOutcome::default());
-                    }
-                    break;
-                }
+                Err(_) => break, // safety net only
             };
             let Some(event) = event else { break };
+            on_event(&event);
             match event {
                 RealtimeEvent::Partial { text } => outcome.trailing_partial = text,
                 RealtimeEvent::Utterance { text } => {
@@ -308,10 +309,23 @@ impl RealtimeSession {
             .await
             .map_err(|e| format!("session update send: {e}"))?;
 
+        let commit_phase = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let commit_phase_for_reader = std::sync::Arc::clone(&commit_phase);
         // Accumulates word-level deltas per utterance item, so Partial
         // events carry the item's transcript-so-far.
         let mut item_buffers: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        // Item-lifecycle completion set: an item exists from its first
+        // lifecycle event (speech_started / committed / delta) and is
+        // finalized by `transcription.completed(item_id)` — the last event
+        // of every item, carrying the final transcript. After OUR commit no
+        // new item can start (no further audio flows), so "commit sent +
+        // set empty" IS completion — emitted as Done, with zero guessing.
+        let mut awaiting_done: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let commit_sent = std::sync::Arc::clone(&commit_phase_for_reader);
+        let is_complete = move |awaiting: &std::collections::HashSet<String>| {
+            commit_sent.load(std::sync::atomic::Ordering::SeqCst) && awaiting.is_empty()
+        };
         tokio::spawn(async move {
             while let Some(frame) = reader.next().await {
                 let frame = match frame {
@@ -342,8 +356,21 @@ impl RealtimeSession {
                     | "session.updated"
                     | "transcription_session.created"
                     | "transcription_session.updated" => {}
-                    "input_audio_buffer.speech_started" => {}
+                    "input_audio_buffer.speech_started" => {
+                        if let Some(item) = value.get("item_id").and_then(|v| v.as_str()) {
+                            awaiting_done.insert(item.to_string());
+                        }
+                    }
                     "input_audio_buffer.speech_stopped" => {}
+                    "input_audio_buffer.committed" => {
+                        if let Some(item) = value.get("item_id").and_then(|v| v.as_str()) {
+                            awaiting_done.insert(item.to_string());
+                        }
+                        if is_complete(&awaiting_done) {
+                            let _ = tx.send(RealtimeEvent::Done).await;
+                            return;
+                        }
+                    }
                     "conversation.item.input_audio_transcription.partial" => {
                         if let Some(t) = value.get("transcript").and_then(|v| v.as_str()) {
                             let _ = tx
@@ -353,9 +380,28 @@ impl RealtimeSession {
                                 .await;
                         }
                     }
+                    "conversation.item.input_audio_transcription.delta" => {
+                        let item = value
+                            .get("item_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        awaiting_done.insert(item.clone());
+                        let delta = value.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                        let text = item_buffers.entry(item).or_default();
+                        text.push_str(delta);
+                        let _ = tx.send(RealtimeEvent::Partial { text: text.clone() }).await;
+                    }
                     "conversation.item.input_audio_transcription.completed" => {
                         if let Some(item) = value.get("item_id").and_then(|v| v.as_str()) {
                             item_buffers.remove(item);
+                            // Live-verified terminal marker: every committed
+                            // item ends with completed(item_id) carrying the
+                            // final transcript (conversation.item.done fires
+                            // EARLIER, before the last deltas). The session is
+                            // complete when our commit is out and no item
+                            // awaits its completed.
+                            awaiting_done.remove(item);
                         }
                         if let Some(t) = value.get("transcript").and_then(|v| v.as_str()) {
                             let _ = tx
@@ -363,6 +409,10 @@ impl RealtimeSession {
                                     text: t.to_string(),
                                 })
                                 .await;
+                        }
+                        if is_complete(&awaiting_done) {
+                            let _ = tx.send(RealtimeEvent::Done).await;
+                            return;
                         }
                     }
                     "conversation.item.input_audio_transcription.failed" => {
@@ -389,6 +439,10 @@ impl RealtimeSession {
                         // and fall back to batch (observed live).
                         if error.contains("buffer too small") {
                             tracing::debug!("commit on an already-drained buffer ignored");
+                            if is_complete(&awaiting_done) {
+                                let _ = tx.send(RealtimeEvent::Done).await;
+                                return;
+                            }
                             continue;
                         }
                         let _ = tx
@@ -406,6 +460,7 @@ impl RealtimeSession {
 
         Ok(RealtimeSession {
             provider: "openai_audio".into(),
+            commit_phase,
             writer,
             events: rx,
             seq: 0,
@@ -553,6 +608,7 @@ impl RealtimeSession {
 
         Ok(RealtimeSession {
             provider: "volcengine".into(),
+            commit_phase: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             writer,
             events: rx,
             seq: 1,
@@ -1200,7 +1256,29 @@ async fn run_pump_inner(
             return Err(format!("realtime send tail: {error}"));
         }
     }
-    session.finish().await
+    // Forward the post-release event stream into the preview: OpenAI's
+    // deltas arrive here (at commit), after the pump loop has exited.
+    let partial_for_finish = std::sync::Arc::clone(&partial);
+    let on_partial_for_finish = on_partial.as_ref().map(std::sync::Arc::clone);
+    let mut forward = move |event: &RealtimeEvent| {
+        if let RealtimeEvent::Partial { text } = event {
+            let preview = {
+                let finalized = partial_for_finish.lock().clone();
+                if finalized.is_empty() {
+                    text.clone()
+                } else {
+                    // The pump's preview already contains finalized text;
+                    // the drain's partial replaces its streaming tail.
+                    text.clone()
+                }
+            };
+            *partial_for_finish.lock() = preview.clone();
+            if let Some(sink) = on_partial_for_finish.as_ref() {
+                sink(&preview);
+            }
+        }
+    };
+    session.finish_with(&mut forward).await
 }
 
 fn resampler_input_rate(resampler: &LinearResampler) -> u32 {
