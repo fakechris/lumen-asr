@@ -118,9 +118,9 @@ pub fn write_sidecar(
 
 /// Read the realtime transcript sidecar for a meeting (if present).
 pub fn read_sidecar(wav_path: &Path) -> Option<RealtimeTranscriptSidecar> {
-    let stem = wav_path.file_stem()?;
-    let stem = stem.to_string_lossy();
-    let path = wav_path.with_file_name(format!("{stem}.realtime_transcript.json"));
+    let stem = wav_path.file_stem()?.to_string_lossy();
+    let uuid_part: String = stem.chars().take(36).collect();
+    let path = wav_path.with_file_name(format!("{uuid_part}.realtime_transcript.json"));
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }

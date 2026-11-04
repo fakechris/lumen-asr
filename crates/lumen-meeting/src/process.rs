@@ -318,12 +318,22 @@ async fn transcribe_track(
             turns = total_turns,
             "transcribing with realtime sidecar (gap-filling only)"
         );
+        // Build per-turn texts from alignment fragments (each fragment knows
+        // its target turn index; realign_turn_texts expects one text per turn).
         let fragments = crate::align::align_sentences(&realtime_sentences, &diar.turns);
-        let (mut texts, mut words) = crate::align::realign_turn_texts(
-            &diar.turns,
-            &fragment_texts(&fragments),
-            &fragment_words(&fragments),
-        );
+        let mut texts: Vec<String> = vec![String::new(); diar.turns.len()];
+        let mut words: Vec<Vec<lumen_transcript::Word>> = vec![Vec::new(); diar.turns.len()];
+        for fragment in &fragments {
+            {
+                let turn_idx = fragment.turn;
+                if turn_idx < texts.len() && !fragment.text.trim().is_empty() {
+                    if !texts[turn_idx].is_empty() {
+                        texts[turn_idx].push(' ');
+                    }
+                    texts[turn_idx].push_str(fragment.text.trim());
+                }
+            }
+        }
         // Find uncovered turns (empty text after alignment).
         let gap_indices: Vec<usize> = texts
             .iter()

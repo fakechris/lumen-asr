@@ -881,12 +881,13 @@ fn start_meeting_recording_with_targets(
     let need_mic_tap = streaming_dir.is_some() || cloud_rt;
     let (mic_tap, mic_rx, mic_cloud_rx) = if need_mic_tap {
         if cloud_rt && streaming_dir.is_some() {
-            // Both consumers: fork the tap.
-            let (forked, rx_a, rx_b) = lumen_asr::fork_live_tap("mic", t0);
-            let (tap_a, _tap_b) = forked.into_parts();
-            (Some(tap_a), Some(rx_a), Some(rx_b))
+            let (tap, rx_a) = live_tap_channel("mic", t0, LIVE_TAP_CAPACITY);
+            let (forked, rx_b) = tap.fork();
+            (Some(forked), Some(rx_a), Some(rx_b))
+        } else if cloud_rt {
+            let (tap, rx) = live_tap_channel("mic", t0, LIVE_TAP_CAPACITY);
+            (Some(tap), None, Some(rx))
         } else {
-            // Only one consumer (local preview OR cloud realtime).
             let (tap, rx) = live_tap_channel("mic", t0, LIVE_TAP_CAPACITY);
             (Some(tap), Some(rx), None)
         }
@@ -981,9 +982,12 @@ fn start_meeting_recording_with_targets(
         let need_sys_tap = (streaming_dir.is_some() && system_live_preview) || cloud_rt;
         let (system_tap, system_rx, mut system_cloud_rx_local) = if need_sys_tap {
             if cloud_rt && streaming_dir.is_some() && system_live_preview {
-                let (forked, rx_a, rx_b) = lumen_asr::fork_live_tap("system", t0);
-                let (tap_a, _tap_b) = forked.into_parts();
-                (Some(tap_a), Some(rx_a), Some(rx_b))
+                let (tap, rx_a) = live_tap_channel("system", t0, LIVE_TAP_CAPACITY);
+                let (forked, rx_b) = tap.fork();
+                (Some(forked), Some(rx_a), Some(rx_b))
+            } else if cloud_rt {
+                let (tap, rx) = live_tap_channel("system", t0, LIVE_TAP_CAPACITY);
+                (Some(tap), None, Some(rx))
             } else {
                 let (tap, rx) = live_tap_channel("system", t0, LIVE_TAP_CAPACITY);
                 (Some(tap), Some(rx), None)
@@ -2105,6 +2109,9 @@ pub fn set_meeting_transcribe_engine(
             .config
             .lock()
             .map_err(|_| "config lock poisoned".to_string())?;
+        if value == "local" {
+            cfg.meeting.realtime_transcription = false;
+        }
         cfg.meeting.transcribe_engine = value;
         cfg.save()?;
     }
