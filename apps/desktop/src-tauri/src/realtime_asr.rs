@@ -284,9 +284,17 @@ impl RealtimeSession {
         if !config.language.trim().is_empty() {
             transcription["language"] = serde_json::json!(config.language.trim());
         }
+        // Style steering: the transcription model is LLM-based and accepts
+        // imperative cleanup instructions alongside vocabulary hints (the
+        // batch API's prompt parameter behaves the same way). Keep it short —
+        // long prompts risk echo-back on short/silent audio (known provider
+        // issue), and this is a soft constraint, not a hard filter.
+        let mut prompt_parts: Vec<String> = Vec::new();
         if !config.hotwords.is_empty() {
-            transcription["prompt"] = serde_json::json!(config.hotwords.join(", "));
+            prompt_parts.push(config.hotwords.join(", "));
         }
+        prompt_parts.push("去除口头语（呃、啊、嗯），输出流畅规范的标点。".into());
+        transcription["prompt"] = serde_json::json!(prompt_parts.join("\n"));
         // GA schema: audio.input.{format,transcription,turn_detection};
         // create_response=false keeps the session transcription-only (no
         // synthesized audio output, no response latency or cost).
@@ -531,7 +539,7 @@ impl RealtimeSession {
                 "enable_punc": true,
                 "enable_itn": true,
                 "result_type": "full",
-                "enable_ddc": false,
+                "enable_ddc": true,
                 "show_utterances": true,
             }
         });
