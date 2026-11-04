@@ -2789,6 +2789,7 @@ function SettingsPanel({
             key={t.id}
             type="button"
             className={`settings-tab ${settingsTab === t.id ? "active" : ""}`}
+            aria-current={settingsTab === t.id ? "true" : undefined}
             onClick={() => setSettingsTab(t.id)}
           >
             <span className="settings-tab-label">{t.label}</span>
@@ -2796,6 +2797,13 @@ function SettingsPanel({
           </button>
         ))}
       </nav>
+
+      {/* Always mounted so an in-flight Qwen model download survives sub-tab
+          switches and its completion still refreshes app health; hidden
+          unless the speech tab is active. */}
+      <div style={{ display: settingsTab === "speech" ? "block" : "none" }}>
+        <QwenDownloadRow onError={onError} onSaved={onSaved} />
+      </div>
 
       {settingsTab === "general" && (
       <>
@@ -3418,7 +3426,15 @@ function SettingsPanel({
         )}
 
         <hr className="settings-divider" />
-        <details className="settings-details">
+        {meetingApps?.loadError && (
+          <div className="recording-retry" role="alert" style={{ marginBottom: 10 }}>
+            <span>会议应用目录载入失败：{meetingApps.loadError}（自动检测已停用，展开下方目录修正 TOML 后重载）</span>
+          </div>
+        )}
+        <details
+          className="settings-details"
+          open={Boolean(meetingApps?.loadError)}
+        >
           <summary>会议 / 录制应用目录（高级，点开展开）</summary>
           <p className="muted-text">
             这份列表来自用户数据目录中的独立 TOML
@@ -3872,9 +3888,8 @@ function SettingsPanel({
             </div>
           </div>
         )}
-        {asrProvider === "local_qwen" && (
-          <QwenDownloadRow onError={onError} onSaved={onSaved} />
-        )}
+        {/* QwenDownloadRow lives above (always mounted) so downloads
+            continue while other settings tabs are open. */}
         {!asrProvider.startsWith("local") && (
           <>
             <div className="form-row">
