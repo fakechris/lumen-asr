@@ -2331,6 +2331,11 @@ function SettingsPanel({
   onError: (e: string | null) => void;
   onSaved: () => void;
 }) {
+  // Settings sub-tabs: group the eight sections into four findable areas
+  // (macOS-System-Settings mental model) instead of one long scroll.
+  const [settingsTab, setSettingsTab] = useState<
+    "general" | "speech" | "meeting" | "output"
+  >("speech");
   const [cfg, setCfg] = useState<CorrectorStatus | null>(null);
   const [enabled, setEnabled] = useState(true);
   const [provider, setProvider] = useState("ollama");
@@ -2769,8 +2774,31 @@ function SettingsPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const settingsTabs: { id: typeof settingsTab; label: string; hint: string }[] = [
+    { id: "speech", label: "语音识别", hint: "听写/会议引擎 · 凭据 · 实时" },
+    { id: "meeting", label: "会议", hint: "检测 · 格式 · 纪要 · 看护" },
+    { id: "output", label: "文本输出", hint: "AI 修正 · 插入 · 学习" },
+    { id: "general", label: "通用", hint: "权限 · 声音 · 快捷键" },
+  ];
+
   return (
     <>
+      <nav className="settings-tabs" aria-label="设置分区">
+        {settingsTabs.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            className={`settings-tab ${settingsTab === t.id ? "active" : ""}`}
+            onClick={() => setSettingsTab(t.id)}
+          >
+            <span className="settings-tab-label">{t.label}</span>
+            <span className="settings-tab-hint">{t.hint}</span>
+          </button>
+        ))}
+      </nav>
+
+      {settingsTab === "general" && (
+      <>
       <section className="card settings-section">
         <h2>权限</h2>
         {perm ? (
@@ -3348,6 +3376,10 @@ function SettingsPanel({
         })()}
       </section>
 
+      </>)}
+
+      {settingsTab === "meeting" && (
+      <>
       <section className="card settings-section">
         <h2>会议自动检测</h2>
         <p className="muted-text">
@@ -3386,10 +3418,12 @@ function SettingsPanel({
         )}
 
         <hr className="settings-divider" />
-        <h3>会议 / 录制应用目录</h3>
-        <p className="muted-text">
-          这份列表来自用户数据目录中的独立 TOML 文件，不编译进客户端。检测和系统声音录制都会立即使用保存后的列表；浏览器即使允许检测，仍会在每次录制前提示“整个浏览器”范围。
-        </p>
+        <details className="settings-details">
+          <summary>会议 / 录制应用目录（高级，点开展开）</summary>
+          <p className="muted-text">
+            这份列表来自用户数据目录中的独立 TOML
+            文件，不编译进客户端。检测和系统声音录制都会立即使用保存后的列表；浏览器即使允许检测，仍会在每次录制前提示“整个浏览器”范围。
+          </p>
         {meetingApps ? (
           <>
             <p className="muted-text meeting-app-config-path">
@@ -3590,6 +3624,8 @@ function SettingsPanel({
           <p className="muted-text">会议应用目录尚未载入。</p>
         )}
 
+        </details>
+
         <hr className="settings-divider" />
         <div className="form-row">
           <label className="form-label" htmlFor="meeting-audio-format">
@@ -3611,27 +3647,6 @@ function SettingsPanel({
           只影响之后开始的录音；已有录音无论哪种格式都能正常播放、剪辑和处理。
         </p>
 
-        <hr className="settings-divider" />
-        <div className="form-row">
-          <label className="form-label" htmlFor="meeting-transcribe-engine">
-            转写引擎
-          </label>
-          <select
-            id="meeting-transcribe-engine"
-            className="input"
-            value={meetingTranscribeEngine}
-            disabled={busy}
-            style={{ maxWidth: 320 }}
-            onChange={(e) => saveMeetingTranscribeEngine(e.target.value)}
-          >
-            <option value="local">本地引擎（默认，音频不出本机）</option>
-            <option value="cloud">云端引擎（跟随「语音识别」的在线 ASR）</option>
-          </select>
-        </div>
-        <p className="muted-text">
-          决定会议最终转写用哪个识别引擎（说话人分离始终在本地完成）。选择云端会把录音逐句上传到所选的在线
-          ASR（如 MiniMax ASR），通常对远场、口音更准，按时长计费；网络或鉴权失败的单句会自动回退本地引擎。
-        </p>
 
         <hr className="settings-divider" />
         <div className="form-row">
@@ -3730,6 +3745,10 @@ function SettingsPanel({
         </div>
       </section>
 
+      </>)}
+
+      {settingsTab === "speech" && (
+      <>
       <section className="card settings-section">
         <h2>语音识别（ASR）</h2>
         <p className="muted-text">
@@ -3992,8 +4011,34 @@ function SettingsPanel({
             保存 ASR 设置
           </button>
         </div>
+
+        <hr className="settings-divider" />
+        <div className="form-row">
+          <label className="form-label" htmlFor="meeting-transcribe-engine">
+            会议转写引擎
+          </label>
+          <select
+            id="meeting-transcribe-engine"
+            className="input"
+            value={meetingTranscribeEngine}
+            disabled={busy}
+            style={{ maxWidth: 320 }}
+            onChange={(e) => saveMeetingTranscribeEngine(e.target.value)}
+          >
+            <option value="local">本地引擎（默认，音频不出本机）</option>
+            <option value="cloud">云端引擎（跟随上方在线 ASR 配置）</option>
+          </select>
+        </div>
+        <p className="muted-text">
+          决定会议最终转写用哪个识别引擎（说话人分离始终在本地完成）。选择云端会把录音逐句上传到上方配置的在线
+          ASR（如 MiniMax / 火山 / OpenAI），通常对远场、口音更准，按时长计费；网络或鉴权失败的单句会自动回退本地引擎。
+        </p>
       </section>
 
+      </>)}
+
+      {settingsTab === "output" && (
+      <>
       <section className="card settings-section">
         <h2>插入策略</h2>
         <div className="form-row">
@@ -4439,6 +4484,7 @@ function SettingsPanel({
           </button>
         </div>
       </section>
+      </>)}
 
       <section className="card muted">
         <h2>说明</h2>
