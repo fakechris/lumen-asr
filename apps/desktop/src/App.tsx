@@ -2484,6 +2484,8 @@ function SettingsPanel({
   // (the online ASR configured under 语音识别 settings; uploads meeting audio).
   const [meetingTranscribeEngine, setMeetingTranscribeEngine] =
     useState("local");
+  // Meeting cloud realtime transcription (audio streams during recording).
+  const [meetingRealtime, setMeetingRealtime] = useState(false);
   // Latest-wins token, same rationale as `meetingAudioFormatSave` above.
   const meetingTranscribeEngineSave = useRef(0);
   const saveMeetingTranscribeEngine = useCallback(
@@ -2636,6 +2638,12 @@ function SettingsPanel({
         try {
           const engine = await api.getMeetingTranscribeEngine();
           setMeetingTranscribeEngine(engine.transcribeEngine);
+        } catch {
+          /* transcription engine selection is best-effort */
+        }
+        try {
+          const rt = await api.getMeetingRealtimeConfig();
+          setMeetingRealtime(rt.realtimeTranscription);
         } catch {
           /* transcription engine selection is best-effort */
         }
@@ -4052,6 +4060,35 @@ function SettingsPanel({
           决定会议最终转写用哪个识别引擎（说话人分离始终在本地完成）。选择云端会把录音逐句上传到上方配置的在线
           ASR（如 MiniMax / 火山 / OpenAI），通常对远场、口音更准，按时长计费；网络或鉴权失败的单句会自动回退本地引擎。
         </p>
+        <div className="form-row">
+          <label className="muted-text">
+            <input
+              type="checkbox"
+              checked={meetingRealtime}
+              disabled={busy || !asrPresets.find((p) => p.id === asrProvider)?.realtime}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setMeetingRealtime(next);
+                void api
+                  .setMeetingRealtimeConfig(next)
+                  .then((saved) => setMeetingRealtime(saved.realtimeTranscription))
+                  .then(() => api.getMeetingTranscribeEngine())
+                  .then((eng) => setMeetingTranscribeEngine(eng.transcribeEngine))
+                  .catch((err) => onError(String(err)));
+              }}
+            />{" "}
+            会议实时云端转写（录音同时流式，停止即出终稿）
+          </label>
+        </div>
+        {asrPresets.find((p) => p.id === asrProvider)?.realtime ? (
+          <p className="muted-text" style={{ fontSize: "0.82rem", marginTop: 0 }}>
+            录音期间音频持续流式到云端识别引擎，停止后终稿立刻可用（本地说话人分离照常，离线管线只补漏句）。
+          </p>
+        ) : (
+          <p className="muted-text" style={{ fontSize: "0.82rem", marginTop: 0 }}>
+            当前 ASR 供应商暂不支持实时流式（支持：OpenAI Audio、火山引擎）。
+          </p>
+        )}
       </section>
 
       </>)}

@@ -876,11 +876,23 @@ fn start_meeting_recording_with_targets(
     let streaming_dir = crate::meeting_live::streaming_dir_if_ready();
     let t0 = Instant::now();
     let t0_wall_clock = chrono::Utc::now().to_rfc3339();
-    let (mic_tap, mic_rx) = if streaming_dir.is_some() {
-        let (tap, rx) = live_tap_channel("mic", t0, LIVE_TAP_CAPACITY);
-        (Some(tap), Some(rx))
+    // Cloud realtime needs the tap too — independently of the local model.
+    let cloud_rt = crate::meeting_realtime::meeting_realtime_active(&state);
+    let need_mic_tap = streaming_dir.is_some() || cloud_rt;
+    let (mic_tap, mic_rx, mic_cloud_rx) = if need_mic_tap {
+        if cloud_rt && streaming_dir.is_some() {
+            let (tap, rx_a) = live_tap_channel("mic", t0, LIVE_TAP_CAPACITY);
+            let (forked, rx_b) = tap.fork();
+            (Some(forked), Some(rx_a), Some(rx_b))
+        } else if cloud_rt {
+            let (tap, rx) = live_tap_channel("mic", t0, LIVE_TAP_CAPACITY);
+            (Some(tap), None, Some(rx))
+        } else {
+            let (tap, rx) = live_tap_channel("mic", t0, LIVE_TAP_CAPACITY);
+            (Some(tap), Some(rx), None)
+        }
     } else {
-        (None, None)
+        (None, None, None)
     };
     // Production meetings use the plain cpal microphone path.
     const VOICE_PROCESSING_SAFE_FOR_MEETINGS: bool = false;
@@ -958,6 +970,8 @@ fn start_meeting_recording_with_targets(
         .unwrap_or((true, true));
     let mut system_feed: Option<crate::meeting_live::LiveTrackFeed> = None;
     let mut system_offset_seconds: Option<f64> = None;
+    let mut system_rate_for_pump: Option<u32> = None;
+    let mut system_cloud_rx: Option<std::sync::mpsc::Receiver<lumen_asr::LiveAudioPacket>> = None;
     if system_audio_enabled {
         // A detection-started recording supplies the exact accepted app (or an
         // empty list for browser mic-only). A manual recording uses every
@@ -965,19 +979,33 @@ fn start_meeting_recording_with_targets(
         // There is intentionally no global-system-audio fallback.
         let targets = system_audio_bundle_ids
             .unwrap_or_else(|| state.meeting_detection.manual_capture_bundle_ids());
-        let (system_tap, system_rx) = if streaming_dir.is_some() && system_live_preview {
-            let (tap, rx) = live_tap_channel("system", t0, LIVE_TAP_CAPACITY);
-            (Some(tap), Some(rx))
+        let need_sys_tap = (streaming_dir.is_some() && system_live_preview) || cloud_rt;
+        let (system_tap, system_rx, mut system_cloud_rx_local) = if need_sys_tap {
+            if cloud_rt && streaming_dir.is_some() && system_live_preview {
+                let (tap, rx_a) = live_tap_channel("system", t0, LIVE_TAP_CAPACITY);
+                let (forked, rx_b) = tap.fork();
+                (Some(forked), Some(rx_a), Some(rx_b))
+            } else if cloud_rt {
+                let (tap, rx) = live_tap_channel("system", t0, LIVE_TAP_CAPACITY);
+                (Some(tap), None, Some(rx))
+            } else {
+                let (tap, rx) = live_tap_channel("system", t0, LIVE_TAP_CAPACITY);
+                (Some(tap), Some(rx), None)
+            }
         } else {
-            (None, None)
+            (None, None, None)
         };
         let system_path = dir.join(format!("{meeting_id}.system.{}", audio_format.extension()));
-        if let Some(system_rate) =
-            state
-                .meeting_system_audio
-                .start(system_path.clone(), targets, system_tap, audio_format)
-        {
+        let system_start_rate = state.meeting_system_audio.start(
+            system_path.clone(),
+            targets,
+            system_tap,
+            audio_format,
+        );
+        if let Some(system_rate) = system_start_rate {
             system_offset_seconds = Some(t0.elapsed().as_secs_f64());
+            system_rate_for_pump = Some(system_rate);
+            system_cloud_rx = system_cloud_rx_local.take();
             if let Some(rx) = system_rx {
                 system_feed = Some(crate::meeting_live::LiveTrackFeed {
                     rx,
@@ -1026,6 +1054,43 @@ fn start_meeting_recording_with_targets(
             system_feed,
         );
     }
+    // Cloud realtime pumps (alongside the local live worker, if any).
+    if cloud_rt {
+        if let Some(config) = crate::meeting_realtime::build_meeting_realtime_config(&state) {
+            let provider = config.provider.clone();
+            let mic_pump = mic_cloud_rx.map(|rx| {
+                crate::realtime_asr::spawn_meeting_pump(
+                    config.clone(),
+                    "mic",
+                    rx,
+                    sample_rate,
+                    None,
+                )
+            });
+            let system_pump = system_cloud_rx.and_then(|rx| {
+                system_rate_for_pump.map(|rate| {
+                    crate::realtime_asr::spawn_meeting_pump(
+                        config.clone(),
+                        "system",
+                        rx,
+                        rate,
+                        None,
+                    )
+                })
+            });
+            if mic_pump.is_some() || system_pump.is_some() {
+                tracing::info!(%provider, meeting_id = %meeting_id, "meeting cloud realtime started");
+                *state.meeting_realtime.lock() =
+                    Some(crate::meeting_realtime::MeetingRealtimeOwner {
+                        meeting_id,
+                        mic_pump: mic_pump
+                            .unwrap_or_else(|| panic!("cloud_rt implies mic_cloud_rx")),
+                        system_pump,
+                    });
+            }
+        }
+    }
+
     apply_hotkey_action(&app, action);
 
     // 7. Best-effort calendar link (opt-out): look up the current / imminent
@@ -1389,6 +1454,50 @@ pub fn stop_meeting_recording(
     // pipeline below, which replaces the live preview. Its finalized segments
     // feed the draft minutes once the meeting is handed to processing.
     let live_lines = state.meeting_live.stop();
+
+    // Cloud realtime pumps: stop, collect utterances, write the sidecar.
+    // Must happen BEFORE spawn_meeting_processing (the offline pipeline
+    // reads the sidecar). Bounded — a hung session doesn't block the stop.
+    // The async collect runs on the async runtime via block_in_place.
+    let realtime_utterances = {
+        let owner = state.meeting_realtime.lock().take();
+        match owner {
+            Some(owner) => {
+                let meeting_dir = default_data_dir().join("meetings");
+                let realtime_meeting_id = owner.meeting_id;
+                tracing::info!(
+                    meeting_id = %realtime_meeting_id,
+                    "stopping meeting cloud realtime pumps"
+                );
+                let provider = crate::dictation::canonical_asr_provider(
+                    &state
+                        .config
+                        .lock()
+                        .map(|c| c.asr.provider.clone())
+                        .unwrap_or_default(),
+                );
+                let utterances = tauri::async_runtime::block_on(async move {
+                    owner
+                        .stop_and_collect(std::time::Duration::from_secs(20))
+                        .await
+                });
+                crate::meeting_realtime::write_sidecar(
+                    &meeting_dir,
+                    realtime_meeting_id,
+                    &provider,
+                    &utterances,
+                );
+                utterances
+            }
+            None => Vec::new(),
+        }
+    };
+    if !realtime_utterances.is_empty() {
+        tracing::info!(
+            count = realtime_utterances.len(),
+            "meeting cloud realtime collected"
+        );
+    }
 
     // Unconditionally release the exclusive mode and restore the dictation
     // hotkey. If we bailed out on the `stop()` error above, `end_meeting` and
@@ -1944,6 +2053,48 @@ pub fn get_meeting_transcribe_engine(
 /// Persist the meeting transcription-engine selection. Unknown values fall
 /// back to `local` (the private-by-default choice). Takes effect on the next
 /// meeting processing run.
+/// Serialized realtime transcription preference for the settings UI.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingRealtimeConfig {
+    pub realtime_transcription: bool,
+}
+
+#[tauri::command]
+pub fn get_meeting_realtime_config(
+    state: State<'_, AppState>,
+) -> Result<MeetingRealtimeConfig, String> {
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    Ok(MeetingRealtimeConfig {
+        realtime_transcription: cfg.meeting.realtime_transcription,
+    })
+}
+
+/// Persist the realtime-transcription toggle. Enabling it also switches the
+/// meeting engine to cloud (realtime requires a cloud provider); disabling
+/// leaves the engine setting untouched.
+#[tauri::command]
+pub fn set_meeting_realtime_config(
+    state: State<'_, AppState>,
+    realtime_transcription: bool,
+) -> Result<MeetingRealtimeConfig, String> {
+    {
+        let mut cfg = state
+            .config
+            .lock()
+            .map_err(|_| "config lock poisoned".to_string())?;
+        cfg.meeting.realtime_transcription = realtime_transcription;
+        if realtime_transcription && cfg.meeting.transcribe_engine != "cloud" {
+            cfg.meeting.transcribe_engine = "cloud".into();
+        }
+        cfg.save()?;
+    }
+    get_meeting_realtime_config(state)
+}
+
 #[tauri::command]
 pub fn set_meeting_transcribe_engine(
     state: State<'_, AppState>,
@@ -1958,6 +2109,9 @@ pub fn set_meeting_transcribe_engine(
             .config
             .lock()
             .map_err(|_| "config lock poisoned".to_string())?;
+        if value == "local" {
+            cfg.meeting.realtime_transcription = false;
+        }
         cfg.meeting.transcribe_engine = value;
         cfg.save()?;
     }

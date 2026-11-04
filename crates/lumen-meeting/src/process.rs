@@ -37,6 +37,32 @@ use crate::minutes::{
     generate_minutes, minutes_summaries, render_transcript_for_minutes, MinutesError,
 };
 use crate::pipeline::{diarize_wav, transcribe_turns, DiarModels, MeetingError, MeetingOptions};
+
+/// A realtime utterance from the cloud session sidecar.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimeSidecarUtterance {
+    pub track: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimeSidecar {
+    pub schema: u32,
+    pub provider: String,
+    pub utterances: Vec<RealtimeSidecarUtterance>,
+}
+
+/// Read the realtime transcript sidecar for a meeting (if present).
+pub fn read_realtime_sidecar(wav_path: &Path) -> Option<RealtimeSidecar> {
+    let stem = wav_path.file_stem()?.to_string_lossy();
+    let path = wav_path.with_file_name(format!("{stem}.realtime_transcript.json"));
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
 use crate::progress::{
     format_stage_breakdown, ProcessingPlan, ProcessingProgress, ProcessingStage, ProcessingTrack,
     ProgressReporter, StageTimer,
@@ -259,27 +285,116 @@ async fn transcribe_track(
         words: Vec::with_capacity(diar.turns.len()),
     };
     // Per-turn ASR — the loop-heavy stage. Report entering it, then tick once
-    // per finished turn (throttled) so a long meeting shows "识别 i/N". With
-    // `opts.turn_concurrency > 1` (cloud engines) turns run bounded-concurrent;
-    // results are still delivered in turn order.
+    // per finished turn (throttled) so a long meeting shows "识别 i/N".
+    // When a realtime sidecar exists, use its utterances as the primary
+    // text (aligned to diar turns) and batch-transcribe only uncovered gaps.
     let total_turns = diar.turns.len();
     stages.start(ProcessingStage::Transcribe, Some(track));
-    let results = transcribe_turns(
-        asr_engine,
-        Arc::clone(&diar.samples),
-        sample_rate,
-        &diar.turns,
-        opts,
-        |done| {
-            if let Some(reporter) = stages.reporter {
-                reporter.tick(ProcessingStage::Transcribe, Some(track), done, total_turns);
+    let track_name = match track {
+        ProcessingTrack::Mic => "mic",
+        ProcessingTrack::System => "system",
+    };
+    let realtime_sentences: Vec<crate::align::AsrSentence> = read_realtime_sidecar(wav)
+        .map(|sidecar| {
+            sidecar
+                .utterances
+                .iter()
+                .filter(|u| u.track == track_name)
+                .map(|u| crate::align::AsrSentence {
+                    text: u.text.clone(),
+                    start: u.start_seconds,
+                    end: u.end_seconds,
+                    words: Vec::new(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !realtime_sentences.is_empty() {
+        // Realtime-first: align cloud utterances to diar turns, gap-fill the rest.
+        tracing::info!(
+            track = track_name,
+            realtime = realtime_sentences.len(),
+            turns = total_turns,
+            "transcribing with realtime sidecar (gap-filling only)"
+        );
+        // Build per-turn texts from alignment fragments (each fragment knows
+        // its target turn index; realign_turn_texts expects one text per turn).
+        let fragments = crate::align::align_sentences(&realtime_sentences, &diar.turns);
+        let mut texts: Vec<String> = vec![String::new(); diar.turns.len()];
+        let mut words: Vec<Vec<lumen_transcript::Word>> = vec![Vec::new(); diar.turns.len()];
+        for fragment in &fragments {
+            {
+                let turn_idx = fragment.turn;
+                if turn_idx < texts.len() && !fragment.text.trim().is_empty() {
+                    if !texts[turn_idx].is_empty() {
+                        texts[turn_idx].push(' ');
+                    }
+                    texts[turn_idx].push_str(fragment.text.trim());
+                }
             }
-        },
-    )
-    .await?;
-    for (text, turn_words) in results {
-        take.texts.push(text);
-        take.words.push(turn_words);
+        }
+        // Find uncovered turns (empty text after alignment).
+        let gap_indices: Vec<usize> = texts
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.trim().is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        if !gap_indices.is_empty() {
+            let gap_turns: Vec<crate::assemble::DiarTurn> =
+                gap_indices.iter().map(|&i| diar.turns[i]).collect();
+            tracing::info!(
+                track = track_name,
+                gaps = gap_turns.len(),
+                "batch-transcribing uncovered turns"
+            );
+            let gap_results = transcribe_turns(
+                asr_engine,
+                Arc::clone(&diar.samples),
+                sample_rate,
+                &gap_turns,
+                opts,
+                |done| {
+                    if let Some(reporter) = stages.reporter {
+                        reporter.tick(
+                            ProcessingStage::Transcribe,
+                            Some(track),
+                            done,
+                            gap_turns.len(),
+                        );
+                    }
+                },
+            )
+            .await?;
+            for (gap_idx, (text, turn_words)) in gap_results.into_iter().enumerate() {
+                if let Some(orig_idx) = gap_indices.get(gap_idx) {
+                    texts[*orig_idx] = text;
+                    words[*orig_idx] = turn_words;
+                }
+            }
+        }
+        take.texts = texts;
+        take.words = words;
+    } else {
+        // No sidecar: existing full per-turn batch path.
+        let results = transcribe_turns(
+            asr_engine,
+            Arc::clone(&diar.samples),
+            sample_rate,
+            &diar.turns,
+            opts,
+            |done| {
+                if let Some(reporter) = stages.reporter {
+                    reporter.tick(ProcessingStage::Transcribe, Some(track), done, total_turns);
+                }
+            },
+        )
+        .await?;
+        for (text, turn_words) in results {
+            take.texts.push(text);
+            take.words.push(turn_words);
+        }
     }
 
     // Sentence×turn realignment: re-attribute each word-timed sentence to the
@@ -891,6 +1006,19 @@ async fn run(
         .update_meeting_status(meeting_id, MeetingStatus::Ready)
         .map_err(ProcessError::Store)?;
     Ok(())
+}
+
+/// Extract texts from aligned fragments for realign_turn_texts input.
+fn fragment_texts(fragments: &[crate::align::AlignedFragment]) -> Vec<String> {
+    fragments.iter().map(|f| f.text.clone()).collect()
+}
+
+/// Extract word timings from aligned fragments (empty — realtime utterances
+/// carry no word-level timestamps).
+fn fragment_words(
+    _fragments: &[crate::align::AlignedFragment],
+) -> Vec<Vec<lumen_transcript::Word>> {
+    Vec::new()
 }
 
 #[cfg(test)]

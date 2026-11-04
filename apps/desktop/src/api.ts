@@ -664,6 +664,16 @@ export const api = {
   getMeetingTranscribeEngine: () =>
     invoke<{ transcribeEngine: string }>("get_meeting_transcribe_engine"),
 
+  /** Read the meeting realtime-transcription toggle. */
+  getMeetingRealtimeConfig: () =>
+    invoke<{ realtimeTranscription: boolean }>("get_meeting_realtime_config"),
+
+  /** Persist the realtime toggle; enabling also switches the engine to cloud. */
+  setMeetingRealtimeConfig: (realtimeTranscription: boolean) =>
+    invoke<{ realtimeTranscription: boolean }>("set_meeting_realtime_config", {
+      realtimeTranscription,
+    }),
+
   /** Persist the meeting transcription engine; applies to the next meeting
    * processing run. Resolves the stored value. */
   setMeetingTranscribeEngine: (transcribeEngine: string) =>
