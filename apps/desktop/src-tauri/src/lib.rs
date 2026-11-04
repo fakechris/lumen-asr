@@ -32,6 +32,7 @@ mod meeting_journal;
 mod meeting_live;
 mod meeting_mic_aec;
 mod meeting_queue;
+mod meeting_realtime;
 mod meeting_system_audio;
 mod minimax_asr;
 mod mod_chord;
@@ -463,6 +464,8 @@ pub struct AppState {
     /// Live realtime dictation run for the active recording (streaming cloud
     /// ASR). `None` when realtime is off, unsupported, or not recording.
     pub realtime: parking_lot::Mutex<Option<crate::realtime_asr::RealtimeHandle>>,
+    /// Cloud realtime pumps for the active meeting recording.
+    pub meeting_realtime: parking_lot::Mutex<Option<crate::meeting_realtime::MeetingRealtimeOwner>>,
     pub(crate) edit_learning: edit_learning_runtime::DesktopEditLearning,
     pub audio: AudioCapture,
     /// Serializes capture transitions and holds attenuation only while recording.
@@ -695,6 +698,7 @@ pub fn run() {
         .manage(AppState {
             store,
             realtime: parking_lot::Mutex::new(None),
+            meeting_realtime: parking_lot::Mutex::new(None),
             edit_learning,
             audio,
             dictation_ducking: Mutex::new(None),
@@ -799,6 +803,8 @@ pub fn run() {
             meeting_cmd::set_minutes_template,
             meeting_cmd::get_meeting_transcribe_engine,
             meeting_cmd::set_meeting_transcribe_engine,
+            meeting_cmd::get_meeting_realtime_config,
+            meeting_cmd::set_meeting_realtime_config,
             meeting_cmd::read_meeting_audio_wav,
             meeting_cmd::continue_meeting_after_silence,
             meeting_cmd::continue_meeting_after_max_duration,

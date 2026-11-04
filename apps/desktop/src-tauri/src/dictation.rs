@@ -3172,6 +3172,7 @@ mod attempt_metric_tests {
             Store::open(dir.join("capture.sqlite")).unwrap(),
         )));
         AppState {
+            meeting_realtime: parking_lot::Mutex::new(None),
             realtime: parking_lot::Mutex::new(None),
             edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(
                 store.clone(),
@@ -3557,6 +3558,7 @@ mod attempt_metric_tests {
             Store::open(dir.path().join("capture.sqlite")).unwrap(),
         )));
         let state = AppState {
+            meeting_realtime: parking_lot::Mutex::new(None),
             realtime: parking_lot::Mutex::new(None),
             edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(
                 store.clone(),

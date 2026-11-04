@@ -15,13 +15,13 @@ pub use lumen_asr_engine::{
 // shared lumen-suite `lumen-audio` crate; re-exported so every existing
 // `lumen_asr::` call site is unchanged.
 pub use lumen_audio::{
-    copy_pcm16_wav_range, decode_opus_to_pcm, live_tap, live_tap_channel, pcm_to_wav_bytes,
-    repair_wav_header, trim_trailing_silence, AudioCapture, AudioDeviceInfo, AudioError,
-    CaptureResult, LiveAudioPacket, LiveChunk, LiveTap, LiveTapSender, MeetingAudioFormat,
-    MeetingRecorder, MeetingRecorderError, OpusSink, RecordingSummary, RepairedWav, SampleSink,
-    SilenceAutoStop, SileroVad, SileroVadError, SystemTrackRecorder, SystemTrackSender,
-    TimestampAutoStop, VadAction, WavRangeError, WavRangeSummary, WavSink, LIVE_TAP_CAPACITY,
-    OPUS_SAMPLE_RATE,
+    copy_pcm16_wav_range, decode_opus_to_pcm, fork_live_tap, live_tap, live_tap_channel,
+    pcm_to_wav_bytes, repair_wav_header, trim_trailing_silence, AudioCapture, AudioDeviceInfo,
+    AudioError, CaptureResult, ForkedTapSender, LiveAudioPacket, LiveChunk, LiveTap, LiveTapSender,
+    MeetingAudioFormat, MeetingRecorder, MeetingRecorderError, OpusSink, RecordingSummary,
+    RepairedWav, SampleSink, SilenceAutoStop, SileroVad, SileroVadError, SystemTrackRecorder,
+    SystemTrackSender, TimestampAutoStop, VadAction, WavRangeError, WavRangeSummary, WavSink,
+    LIVE_TAP_CAPACITY, OPUS_SAMPLE_RATE,
 };
 
 // Engine layer (trait, engines, diagnostics, pure audio helpers).

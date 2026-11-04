@@ -162,6 +162,12 @@ pub struct MeetingConfig {
     /// the provider, and a ready local engine silently covers failed turns).
     /// Unknown values fall back to `"local"` at use time.
     pub transcribe_engine: String,
+    /// Cloud realtime transcription during meeting recording: mic + system
+    /// audio stream to the cloud realtime ASR for the entire meeting, and
+    /// the offline per-turn batch ASR becomes a gap-filler only. Requires
+    /// a provider with realtime support (openai_audio / volcengine).
+    #[serde(default)]
+    pub realtime_transcription: bool,
 }
 
 impl Default for MeetingConfig {
@@ -182,6 +188,7 @@ impl Default for MeetingConfig {
             audio_format: default_meeting_audio_format(),
             minutes_template: String::new(),
             transcribe_engine: "local".into(),
+            realtime_transcription: false,
         }
     }
 }

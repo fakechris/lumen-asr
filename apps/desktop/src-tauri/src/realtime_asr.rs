@@ -1346,3 +1346,326 @@ mod pump_tests {
         assert_eq!(&buffer[4..6], &(-32767i16).to_le_bytes());
     }
 }
+
+// ── Meeting realtime pump (per-track, long-lived) ────────────────────
+
+/// One finalized utterance from a meeting realtime session, stamped on the
+/// meeting's unified timeline (matches the WAV-based diar turns).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimeUtterance {
+    /// "mic" | "system"
+    pub track: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    /// Final transcript with punctuation (the provider's own cleanup).
+    pub text: String,
+}
+
+/// The sidecar persisted next to the meeting WAV: the collected realtime
+/// utterances for the offline pipeline's gap-filling.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimeTranscriptSidecar {
+    pub schema: u32,
+    pub provider: String,
+    pub utterances: Vec<RealtimeUtterance>,
+}
+
+/// Anchors the audio stream to the meeting timeline the same way the local
+/// live worker does: the first packet's arrival fixes the origin, and every
+/// later position is `origin + samples_fed / rate` (glued to the WAV sample
+/// count, immune to callback jitter and pauses).
+struct MeetingSampleClock {
+    /// Unified-timeline position (seconds) of the first sample ever fed.
+    origin_seconds: Option<f64>,
+    samples_fed: u64,
+    sample_rate: u32,
+}
+
+impl MeetingSampleClock {
+    fn new() -> Self {
+        Self {
+            origin_seconds: None,
+            samples_fed: 0,
+            sample_rate: 0,
+        }
+    }
+
+    /// Observe a packet: the first one fixes the origin; later ones advance
+    /// by sample count (authoritative — the packet's own `start_seconds` is
+    /// callback-arrival-based and jittery, the sample count is not).
+    fn observe(&mut self, packet_start_seconds: f64, samples: usize, rate: u32) {
+        if self.origin_seconds.is_none() {
+            self.origin_seconds = Some(packet_start_seconds);
+            self.sample_rate = rate.max(1);
+        }
+        if rate.max(1) != self.sample_rate {
+            // Device rate change mid-meeting: trust the new rate for the
+            // increment (the provider resampler handles the format change).
+            self.sample_rate = rate.max(1);
+        }
+        self.samples_fed += samples as u64;
+    }
+
+    /// Current position on the unified timeline (seconds).
+    fn now_seconds(&self) -> f64 {
+        match self.origin_seconds {
+            Some(origin) => origin + self.samples_fed as f64 / self.sample_rate as f64,
+            None => 0.0,
+        }
+    }
+}
+
+/// Handle to one track's cloud realtime session for a meeting.
+pub struct MeetingRealtimePump {
+    pub track: String,
+    end: tokio::sync::oneshot::Sender<()>,
+    outcome: tokio::sync::oneshot::Receiver<Result<RealtimeOutcome, String>>,
+    /// Utterances finalized during the meeting (shared with the pump task).
+    utterances: std::sync::Arc<parking_lot::Mutex<Vec<RealtimeUtterance>>>,
+    /// Latest live partial (for the meeting-live-transcript event).
+    pub partial: std::sync::Arc<parking_lot::Mutex<String>>,
+}
+
+impl MeetingRealtimePump {
+    /// Signal end-of-audio and collect all finalized utterances.
+    pub async fn stop_and_collect(self, deadline: std::time::Duration) -> Vec<RealtimeUtterance> {
+        let _ = self.end.send(());
+        let _ = tokio::time::timeout(deadline, self.outcome).await;
+        let mut collected = self.utterances.lock().clone();
+        collected.sort_by(|a, b| {
+            a.start_seconds
+                .partial_cmp(&b.start_seconds)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        collected
+    }
+}
+
+/// Spawn a long-lived cloud realtime pump for one meeting track.
+///
+/// Unlike the dictation pump (seconds-long, timestamp-free), this runs for
+/// the entire meeting, stamps every finalized utterance on the unified
+/// timeline, and collects them for the offline pipeline's gap-filling.
+pub fn spawn_meeting_pump(
+    config: RealtimeConfig,
+    track: &str,
+    tap_rx: std::sync::mpsc::Receiver<lumen_asr::LiveAudioPacket>,
+    capture_rate: u32,
+    on_partial: PartialSink,
+) -> MeetingRealtimePump {
+    let track = track.to_string();
+    let utterances = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let partial = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+    let (end_tx, end_rx) = tokio::sync::oneshot::channel::<()>();
+    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+
+    let utterances_for_task = std::sync::Arc::clone(&utterances);
+    let partial_for_task = std::sync::Arc::clone(&partial);
+    let track_for_task = track.clone();
+    tokio::spawn(async move {
+        let result = run_meeting_pump(
+            config,
+            &track_for_task,
+            tap_rx,
+            capture_rate,
+            end_rx,
+            &partial_for_task,
+            &utterances_for_task,
+            on_partial,
+        )
+        .await;
+        let _ = outcome_tx.send(result.map(|_| RealtimeOutcome::default()));
+    });
+
+    MeetingRealtimePump {
+        track,
+        end: end_tx,
+        outcome: outcome_rx,
+        utterances,
+        partial,
+    }
+}
+
+async fn run_meeting_pump(
+    config: RealtimeConfig,
+    track: &str,
+    tap_rx: std::sync::mpsc::Receiver<lumen_asr::LiveAudioPacket>,
+    capture_rate: u32,
+    mut end: tokio::sync::oneshot::Receiver<()>,
+    partial: &std::sync::Arc<parking_lot::Mutex<String>>,
+    utterances: &std::sync::Arc<parking_lot::Mutex<Vec<RealtimeUtterance>>>,
+    on_partial: PartialSink,
+) -> Result<(), String> {
+    // Bridge the blocking std tap onto the async runtime.
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<lumen_asr::LiveAudioPacket>(64);
+    let bridge = std::thread::spawn(move || {
+        while let Ok(packet) = tap_rx.recv() {
+            if chunk_tx.blocking_send(packet).is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = run_meeting_pump_inner(
+        config,
+        track,
+        &mut chunk_rx,
+        capture_rate,
+        &mut end,
+        partial,
+        utterances,
+        on_partial,
+    )
+    .await;
+    drop(chunk_rx);
+    let _ = bridge.join();
+    result
+}
+
+async fn run_meeting_pump_inner(
+    config: RealtimeConfig,
+    track: &str,
+    chunk_rx: &mut tokio::sync::mpsc::Receiver<lumen_asr::LiveAudioPacket>,
+    capture_rate: u32,
+    end: &mut tokio::sync::oneshot::Receiver<()>,
+    partial: &std::sync::Arc<parking_lot::Mutex<String>>,
+    utterances: &std::sync::Arc<parking_lot::Mutex<Vec<RealtimeUtterance>>>,
+    on_partial: PartialSink,
+) -> Result<(), String> {
+    let mut session = match RealtimeSession::open(&config).await {
+        Ok(session) => session,
+        Err(error) => return Err(format!("meeting realtime connect: {error}")),
+    };
+    let target_rate = session.sample_rate();
+    let mut resampler = LinearResampler::new(capture_rate.max(1), target_rate);
+    let mut pcm16_buffer: Vec<u8> = Vec::new();
+    let chunk_bytes = (target_rate as usize / 10) * 2; // ~100 ms
+    let mut clock = MeetingSampleClock::new();
+    let mut last_utterance_end = 0.0f64;
+
+    loop {
+        tokio::select! {
+            chunk = chunk_rx.recv() => match chunk {
+                Some(packet) => {
+                    clock.observe(packet.start_seconds, packet.samples.len(), capture_rate.max(1));
+                    for sample in resampler.process(&packet.samples) {
+                        push_pcm16(&mut pcm16_buffer, sample);
+                    }
+                    while pcm16_buffer.len() >= chunk_bytes {
+                        let rest = pcm16_buffer.split_off(chunk_bytes);
+                        let chunk = std::mem::replace(&mut pcm16_buffer, rest);
+                        if let Err(error) = session.send_audio(&chunk).await {
+                            tracing::warn!(track, %error, "meeting realtime send failed; ending session");
+                            return Err(format!("send: {error}"));
+                        }
+                    }
+                }
+                None => break, // track stopped (tap dropped)
+            },
+            _ = &mut *end => break,
+        }
+        // Drain events: collect finalized utterances with timeline stamps.
+        while let Ok(event) = session.events.try_recv() {
+            match event {
+                RealtimeEvent::Partial { text } => {
+                    let changed = {
+                        let mut guard = partial.lock();
+                        let changed = *guard != text;
+                        *guard = text.clone();
+                        changed
+                    };
+                    if changed {
+                        if let Some(sink) = on_partial.as_ref() {
+                            sink(&partial.lock().clone());
+                        }
+                    }
+                }
+                RealtimeEvent::Utterance { text } => {
+                    let text = text.trim().to_string();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let end_seconds = clock.now_seconds();
+                    let start_seconds = last_utterance_end.max(0.0);
+                    last_utterance_end = end_seconds;
+                    utterances.lock().push(RealtimeUtterance {
+                        track: track.to_string(),
+                        start_seconds,
+                        end_seconds,
+                        text,
+                    });
+                }
+                RealtimeEvent::Done => {}
+                RealtimeEvent::Failed { message } => {
+                    tracing::warn!(track, %message, "meeting realtime failed; collecting what we have");
+                    return Err(format!("failed: {message}"));
+                }
+            }
+        }
+    }
+
+    // Flush tail + finish: collect any remaining utterances.
+    if !pcm16_buffer.is_empty() {
+        let _ = session.send_audio(&pcm16_buffer).await;
+    }
+    let outcome = session.finish().await;
+    if let Ok(out) = outcome {
+        // The finish's text_parts are post-commit utterances; add them.
+        if !out.text.trim().is_empty() {
+            let end_seconds = clock.now_seconds();
+            utterances.lock().push(RealtimeUtterance {
+                track: track.to_string(),
+                start_seconds: last_utterance_end,
+                end_seconds,
+                text: out.text.trim().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod meeting_pump_tests {
+    use super::*;
+
+    #[test]
+    fn sample_clock_anchors_to_first_packet() {
+        let mut clock = MeetingSampleClock::new();
+        clock.observe(5.0, 0, 16_000); // first packet at t=5.0s on the timeline
+        clock.observe(5.1, 16_000, 16_000); // 1s of audio
+        assert!(
+            (clock.now_seconds() - 6.0).abs() < 0.01,
+            "{}",
+            clock.now_seconds()
+        );
+    }
+
+    #[test]
+    fn sample_clock_ignores_arrival_jitter() {
+        let mut clock = MeetingSampleClock::new();
+        clock.observe(0.0, 0, 16_000);
+        clock.observe(0.2, 16_000, 16_000); // "late" arrival, still 1s of audio
+        clock.observe(0.21, 16_000, 16_000); // jittery but same audio count
+        assert!((clock.now_seconds() - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn sidecar_serializes_roundtrip() {
+        let sidecar = RealtimeTranscriptSidecar {
+            schema: 1,
+            provider: "volcengine".into(),
+            utterances: vec![RealtimeUtterance {
+                track: "mic".into(),
+                start_seconds: 0.5,
+                end_seconds: 3.2,
+                text: "你好".into(),
+            }],
+        };
+        let json = serde_json::to_string(&sidecar).unwrap();
+        let back: RealtimeTranscriptSidecar = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.utterances[0].text, "你好");
+        assert_eq!(back.utterances[0].start_seconds, 0.5);
+    }
+}
