@@ -3962,7 +3962,7 @@ function SettingsPanel({
                 value={asrLanguage}
                 disabled={busy}
                 onChange={(e) => setAsrLanguage(e.target.value)}
-                placeholder="可选 zh / en"
+                placeholder="建议填 zh：流式识别锁定语言，可显著减少中英混杂与乱插英文"
               />
             </div>
             <div className="form-row">
