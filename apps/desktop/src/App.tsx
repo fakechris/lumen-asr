@@ -3962,7 +3962,11 @@ function SettingsPanel({
                 value={asrLanguage}
                 disabled={busy}
                 onChange={(e) => setAsrLanguage(e.target.value)}
-                placeholder="可选 zh / en"
+                placeholder={
+                  asrProvider === "openai_audio"
+                    ? "建议填 zh：OpenAI 流式识别锁定语言，可显著减少中英混杂"
+                    : "可选 zh / en"
+                }
               />
             </div>
             <div className="form-row">
