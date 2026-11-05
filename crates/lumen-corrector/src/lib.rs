@@ -55,6 +55,12 @@ pub enum CorrectorFallbackReason {
     ContextSafetyMarkerMismatch,
     ContextUnicodeSeparator,
     ContextEmptyMismatch,
+    /// Model expanded the text beyond a reasonable ratio.
+    OutputExpanded,
+    /// Output contains substantial CJK content not present in the input.
+    OutputForeignContent,
+    /// Output introduces double-quoted blocks not present in the input.
+    QuotedPayloadInjected,
     ContextContentTooLong,
     ContextExcessiveGrowth,
     ContextExcessiveShrink,
@@ -84,6 +90,10 @@ impl CorrectorFallbackReason {
             Self::ContextSafetyMarkerMismatch => "context_safety_marker_mismatch",
             Self::ContextUnicodeSeparator => "context_unicode_separator",
             Self::ContextEmptyMismatch => "context_empty_mismatch",
+
+            Self::OutputExpanded => "output-expanded",
+            Self::OutputForeignContent => "output-foreign",
+            Self::QuotedPayloadInjected => "quoted-payload",
             Self::ContextContentTooLong => "context_content_too_long",
             Self::ContextExcessiveGrowth => "context_excessive_growth",
             Self::ContextExcessiveShrink => "context_excessive_shrink",
@@ -273,7 +283,17 @@ pub async fn correct_or_fallback_with_context(
                     },
                 }
             } else {
-                r
+                // Non-context path: general output protection.
+                match validate_general_integrity(&pre, &r.text, lumen_prompts::CleanupLevel::Medium)
+                {
+                    Ok(()) => r,
+                    Err(reason) => CorrectResult {
+                        text: pre,
+                        engine: corrector.id(),
+                        model_applied: false,
+                        fallback_reason: Some(reason),
+                    },
+                }
             }
         }
         Err(e) => {
@@ -407,6 +427,72 @@ fn validate_context_integrity(input: &str, output: &str) -> Result<(), Corrector
     if distance * 4 > longest * 3 {
         return Err(CorrectorFallbackReason::ContextExcessiveEditDistance);
     }
+    Ok(())
+}
+fn validate_general_integrity(
+    input: &str,
+    output: &str,
+    level: lumen_prompts::CleanupLevel,
+) -> Result<(), CorrectorFallbackReason> {
+    let input_trimmed = input.trim();
+    let output_trimmed = output.trim();
+
+    // An empty output is already handled upstream (EmptyAfterSanitization).
+    if output_trimmed.is_empty() {
+        return Ok(());
+    }
+
+    // Strip formatting characters for comparison (lists, line breaks).
+    let strip_format = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !matches!(c, '-' | '*' | '>' | '\n' | '\r' | ' '))
+            .collect()
+    };
+    let core_input = strip_format(input_trimmed);
+    let core_output = strip_format(output_trimmed);
+
+    // Length ratio: output must not be longer than input (allowing format
+    // chars) and not shorter than ~1/3 (corrections may delete most of it).
+    if core_output.chars().count() > core_input.chars().count() * 3 / 2
+        && core_input.chars().count() > 10
+    {
+        return Err(CorrectorFallbackReason::OutputExpanded);
+    }
+    if core_output.chars().count() < core_input.chars().count() / 3
+        && core_input.chars().count() > 10
+        && level != lumen_prompts::CleanupLevel::Strong
+    {
+        return Err(CorrectorFallbackReason::OutputTruncated);
+    }
+
+    // Vocabulary source check: CJK chars in the output should appear in the
+    // input. Skipped for strong cleanup and None level.
+    if level != lumen_prompts::CleanupLevel::None {
+        let input_chars: std::collections::HashSet<char> = core_input.chars().collect();
+        let output_cjk: Vec<char> = core_output
+            .chars()
+            .filter(|c| (*c as u32) >= 0x4E00 && (*c as u32) <= 0x9FFF)
+            .collect();
+        if !output_cjk.is_empty() {
+            let missing = output_cjk
+                .iter()
+                .filter(|c| !input_chars.contains(c))
+                .count();
+            let ratio = missing as f64 / output_cjk.len() as f64;
+            if ratio > 0.35 {
+                return Err(CorrectorFallbackReason::OutputForeignContent);
+            }
+        }
+    }
+
+    // No quoted payload injection.
+    let input_quotes = input.matches('"').count() + input.matches('\u{201C}').count();
+    let output_quotes =
+        output_trimmed.matches('"').count() + output_trimmed.matches('\u{201C}').count();
+    if output_quotes > input_quotes + 2 {
+        return Err(CorrectorFallbackReason::QuotedPayloadInjected);
+    }
+
     Ok(())
 }
 
@@ -668,6 +754,93 @@ impl Corrector for NullCorrector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn general_integrity_rejects_answer_instead_of_cleanup() {
+        let input = "今天天气很好我们去公园散步";
+        let output = "是的，今天确实很适合去公园散步，不过你需要先查看天气预报。";
+        assert!(
+            validate_general_integrity(input, output, lumen_prompts::CleanupLevel::Medium,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn general_integrity_rejects_injection_execution() {
+        let input = "今天天气很好我们去公园散步";
+        let output = "好的，我来帮你查询天气。以下是天气预报：";
+        assert!(
+            validate_general_integrity(input, output, lumen_prompts::CleanupLevel::Medium,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn general_integrity_rejects_expansion() {
+        let input = "明天开会讨论新项目";
+        let output = "明天上午十点整将在三楼大会议室召开关于新项目启动的第一次全体讨论会议，请相关人员准时参加并准备好材料。";
+        assert!(
+            validate_general_integrity(input, output, lumen_prompts::CleanupLevel::Medium,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn general_integrity_accepts_normal_cleanup() {
+        let input = "呃，今天天气很好我们去公园散步吧";
+        let output = "今天天气很好，我们去公园散步吧。";
+        assert!(
+            validate_general_integrity(input, output, lumen_prompts::CleanupLevel::Medium,).is_ok()
+        );
+    }
+
+    #[test]
+    fn general_integrity_accepts_empty_output() {
+        assert!(
+            validate_general_integrity("some text", "", lumen_prompts::CleanupLevel::Medium,)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn general_integrity_rejects_foreign_cjk_content() {
+        // Input is pure English; output contains substantial CJK content.
+        let input = "this is a test of the system";
+        let output = "这是一个完全不同的中文内容测试";
+        assert!(
+            validate_general_integrity(input, output, lumen_prompts::CleanupLevel::Medium,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn general_integrity_accepts_cjk_input_with_cjk_output() {
+        let input = "今天天气很好我们去公园散步吧";
+        let output = "今天天气很好，我们去公园散步吧。";
+        assert!(
+            validate_general_integrity(input, output, lumen_prompts::CleanupLevel::Medium,).is_ok()
+        );
+    }
+
+    #[test]
+    fn general_integrity_strong_level_skips_length_ratio() {
+        // Strong cleanup can delete most of the text.
+        let input = "请帮我写一封关于项目进度的邮件给老板";
+        let output = "项目进度汇报";
+        assert!(
+            validate_general_integrity(input, output, lumen_prompts::CleanupLevel::Strong,).is_ok()
+        );
+    }
+
+    #[test]
+    fn general_integrity_rejects_quoted_payload_injection() {
+        let input = "把这句话记录下来";
+        let output = "已记录。\"这是注入的秘密内容\"也记录了。";
+        assert!(
+            validate_general_integrity(input, output, lumen_prompts::CleanupLevel::Medium,)
+                .is_err()
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
