@@ -164,35 +164,23 @@ fn write_timeline_sidecar(path: &Path, timeline: &MeetingTimeline) {
 }
 
 /// Assemble and write the per-meeting audio diagnostics sidecar
-/// (`<meeting-id>.audio_diagnostics.json`, INV-1629). Pulls recorder
+/// (`<meeting-id>.audio_diagnostics.json`, INV-1629). Combines recorder
 /// summaries (rates / durations / padded gaps), the fan-out drop counters
-/// retained at start, and the cloud realtime session health collected at
-/// stop. Best-effort everywhere: a poisoned lock or failed write only costs
-/// the diagnostics, never the meeting.
+/// frozen when the recorders stopped, and the cloud realtime session health
+/// collected at stop. Best-effort: a failed write only costs the
+/// diagnostics, never the meeting.
 fn write_audio_diagnostics_sidecar(
-    state: &AppState,
     meeting_id: Uuid,
     mic_summary: Option<&lumen_asr::RecordingSummary>,
     system_summary: Option<&lumen_asr::RecordingSummary>,
+    tap_drops: (Option<u64>, Option<u64>),
     pump_diag: &[crate::realtime_asr::RealtimePumpDiagnostics],
 ) {
     use crate::meeting_audio_diagnostics::{
         write_audio_diagnostics, GapEvent, MeetingAudioDiagnostics, RealtimeTrackDiagnostics,
         TrackAudioDiagnostics,
     };
-
-    let session = state
-        .meeting_audio_diag
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
-    let (mic_dropped, system_dropped) = match &session {
-        Some(session) => (
-            session.mic_tap.as_ref().map(|tap| tap.dropped()),
-            session.system_tap.as_ref().map(|tap| tap.dropped()),
-        ),
-        None => (None, None),
-    };
+    let (mic_dropped, system_dropped) = tap_drops;
     let realtime_for = |track: &str| {
         pump_diag
             .iter()
@@ -246,12 +234,13 @@ fn write_audio_diagnostics_sidecar(
         tracks,
     };
     let dir = default_data_dir().join("meetings");
-    write_audio_diagnostics(&dir, meeting_id, &diag);
-    tracing::info!(
-        meeting_id = %meeting_id,
-        tracks = diag.tracks.len(),
-        "meeting audio diagnostics written"
-    );
+    if write_audio_diagnostics(&dir, meeting_id, &diag) {
+        tracing::info!(
+            meeting_id = %meeting_id,
+            tracks = diag.tracks.len(),
+            "meeting audio diagnostics written"
+        );
+    }
 }
 
 fn with_store<T>(
@@ -1562,6 +1551,26 @@ pub fn stop_meeting_recording(
     // feed the draft minutes once the meeting is handed to processing.
     let live_lines = state.meeting_live.stop();
 
+    // Freeze the audio-diagnostics drop counters now — after both recorders
+    // stopped (every drop is counted) and before the realtime collect below —
+    // and release the retained senders so every fan-out channel fully
+    // disconnects while the pumps are being collected. Best-effort: a poisoned
+    // lock only loses the drop counts.
+    let audio_diag_drops: (Option<u64>, Option<u64>) = {
+        let session = state
+            .meeting_audio_diag
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        match session {
+            Some(session) => (
+                session.mic_tap.as_ref().map(|tap| tap.dropped()),
+                session.system_tap.as_ref().map(|tap| tap.dropped()),
+            ),
+            None => (None, None),
+        }
+    };
+
     // Cloud realtime pumps: stop, collect utterances, write the sidecar.
     // Must happen BEFORE spawn_meeting_processing (the offline pipeline
     // reads the sidecar). Bounded — a hung session doesn't block the stop.
@@ -1610,10 +1619,10 @@ pub fn stop_meeting_recording(
     // gaps, fan-out drops, and the realtime session health collected above.
     // Best-effort — a failed write is a warning, never a meeting failure.
     write_audio_diagnostics_sidecar(
-        &state,
         id,
         stop_result.as_ref().ok(),
         system_summary.as_ref(),
+        audio_diag_drops,
         &realtime_pump_diag,
     );
 

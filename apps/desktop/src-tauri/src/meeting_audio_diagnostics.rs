@@ -65,6 +65,10 @@ pub struct RealtimeTrackDiagnostics {
     /// delivered (upstream drops / stalls); strongly negative means
     /// over-delivery.
     pub clock_drift_seconds: Option<f64>,
+    /// True when the stop path's bounded wait for the session to finish
+    /// timed out: whatever was collected is partial, and a `None` drift then
+    /// means "not finalized", not "no audio".
+    pub collection_timed_out: bool,
     /// Finalized utterances collected from the session(s).
     pub utterance_count: usize,
 }
@@ -143,6 +147,7 @@ impl From<crate::realtime_asr::RealtimePumpDiagnostics> for RealtimeTrackDiagnos
             resampler_initializations: p.resampler_initializations,
             stream_change_events: p.stream_change_events,
             clock_drift_seconds: p.clock_drift_seconds,
+            collection_timed_out: p.collection_timed_out,
             utterance_count: p.utterance_count,
         }
     }
@@ -150,16 +155,25 @@ impl From<crate::realtime_asr::RealtimePumpDiagnostics> for RealtimeTrackDiagnos
 
 /// Write the diagnostics sidecar next to the meeting WAVs. Best-effort: a
 /// failure logs a warning and changes nothing else — the meeting itself is
-/// never at risk from diagnostics.
-pub fn write_audio_diagnostics(dir: &Path, meeting_id: uuid::Uuid, diag: &MeetingAudioDiagnostics) {
+/// never at risk from diagnostics. Returns `true` iff the file was written.
+pub fn write_audio_diagnostics(
+    dir: &Path,
+    meeting_id: uuid::Uuid,
+    diag: &MeetingAudioDiagnostics,
+) -> bool {
     let path = dir.join(format!("{meeting_id}.audio_diagnostics.json"));
     match serde_json::to_string_pretty(diag) {
-        Ok(json) => {
-            if let Err(error) = std::fs::write(&path, json) {
+        Ok(json) => match std::fs::write(&path, json) {
+            Ok(()) => true,
+            Err(error) => {
                 tracing::warn!(%error, path = %path.display(), "audio diagnostics write failed");
+                false
             }
+        },
+        Err(error) => {
+            tracing::warn!(%error, "audio diagnostics serialize failed");
+            false
         }
-        Err(error) => tracing::warn!(%error, "audio diagnostics serialize failed"),
     }
 }
 
@@ -196,6 +210,7 @@ mod tests {
                             to: "44100".into(),
                         }],
                         clock_drift_seconds: Some(0.03),
+                        collection_timed_out: false,
                         utterance_count: 214,
                     }),
                 },

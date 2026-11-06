@@ -1463,6 +1463,10 @@ pub struct RealtimePumpDiagnostics {
     pub resampler_initializations: u32,
     pub stream_change_events: Vec<crate::meeting_audio_diagnostics::StreamChangeEvent>,
     pub clock_drift_seconds: Option<f64>,
+    /// True when the stop path's bounded wait for the session to finish
+    /// timed out: whatever was collected is partial, and a `None` drift then
+    /// means "not finalized", not "no audio".
+    pub collection_timed_out: bool,
     pub utterance_count: usize,
 }
 
@@ -1491,7 +1495,7 @@ impl MeetingRealtimePump {
     /// track's session diagnostics.
     pub async fn stop_and_collect(self, deadline: std::time::Duration) -> PumpCollect {
         let _ = self.end.send(());
-        let _ = tokio::time::timeout(deadline, self.outcome).await;
+        let outcome = tokio::time::timeout(deadline, self.outcome).await;
         let mut collected = self.utterances.lock().clone();
         collected.sort_by(|a, b| {
             a.start_seconds
@@ -1501,6 +1505,10 @@ impl MeetingRealtimePump {
         let mut diagnostics = self.diagnostics.lock().clone();
         diagnostics.track = self.track.clone();
         diagnostics.utterance_count = collected.len();
+        // Distinguish "collection timed out" (the session is still finishing
+        // or hung) from "no audio ever arrived" so the sidecar never reads a
+        // quiet-but-hung session as a clean empty one.
+        diagnostics.collection_timed_out = outcome.is_err();
         PumpCollect {
             utterances: collected,
             diagnostics,
@@ -1610,107 +1618,116 @@ async fn run_meeting_pump_inner(
         diagnostics,
         on_partial,
     } = refs;
-    let mut session = match RealtimeSession::open(&config).await {
-        Ok(session) => session,
-        Err(error) => return Err(format!("meeting realtime connect: {error}")),
-    };
-    let target_rate = session.sample_rate();
-    let mut resampler = LinearResampler::new(capture_rate.max(1), target_rate);
-    let mut pcm16_buffer: Vec<u8> = Vec::new();
-    let chunk_bytes = (target_rate as usize / 10) * 2; // ~100 ms
+    // The whole session runs in an inner block so the sample-clock snapshot
+    // below finalizes on every exit path — send / provider failures included
+    // — and the sidecar keeps the clock picture of a session that died
+    // mid-meeting.
     let mut clock = MeetingSampleClock::new();
-    let mut last_utterance_end = 0.0f64;
+    let result = async {
+        let mut session = match RealtimeSession::open(&config).await {
+            Ok(session) => session,
+            Err(error) => return Err(format!("meeting realtime connect: {error}")),
+        };
+        let target_rate = session.sample_rate();
+        let mut resampler = LinearResampler::new(capture_rate.max(1), target_rate);
+        let mut pcm16_buffer: Vec<u8> = Vec::new();
+        let chunk_bytes = (target_rate as usize / 10) * 2; // ~100 ms
+        let mut last_utterance_end = 0.0f64;
 
-    loop {
-        tokio::select! {
-            chunk = chunk_rx.recv() => match chunk {
-                Some(packet) => {
-                    clock.observe(packet.start_seconds, packet.samples.len(), capture_rate.max(1));
-                    {
-                        let mut diag = diagnostics.lock();
-                        diag.packets_observed += 1;
-                        diag.samples_fed += packet.samples.len() as u64;
-                    }
-                    for sample in resampler.process(&packet.samples) {
-                        push_pcm16(&mut pcm16_buffer, sample);
-                    }
-                    while pcm16_buffer.len() >= chunk_bytes {
-                        let rest = pcm16_buffer.split_off(chunk_bytes);
-                        let chunk = std::mem::replace(&mut pcm16_buffer, rest);
-                        if let Err(error) = session.send_audio(&chunk).await {
-                            tracing::warn!(track, %error, "meeting realtime send failed; ending session");
-                            return Err(format!("send: {error}"));
+        loop {
+            tokio::select! {
+                chunk = chunk_rx.recv() => match chunk {
+                    Some(packet) => {
+                        clock.observe(packet.start_seconds, packet.samples.len(), capture_rate.max(1));
+                        {
+                            let mut diag = diagnostics.lock();
+                            diag.packets_observed += 1;
+                            diag.samples_fed += packet.samples.len() as u64;
+                        }
+                        for sample in resampler.process(&packet.samples) {
+                            push_pcm16(&mut pcm16_buffer, sample);
+                        }
+                        while pcm16_buffer.len() >= chunk_bytes {
+                            let rest = pcm16_buffer.split_off(chunk_bytes);
+                            let chunk = std::mem::replace(&mut pcm16_buffer, rest);
+                            if let Err(error) = session.send_audio(&chunk).await {
+                                tracing::warn!(track, %error, "meeting realtime send failed; ending session");
+                                return Err(format!("send: {error}"));
+                            }
                         }
                     }
-                }
-                None => break, // track stopped (tap dropped)
-            },
-            _ = &mut *end => break,
-        }
-        // Drain events: collect finalized utterances with timeline stamps.
-        while let Ok(event) = session.events.try_recv() {
-            match event {
-                RealtimeEvent::Partial { text } => {
-                    let changed = {
-                        let mut guard = partial.lock();
-                        let changed = *guard != text;
-                        *guard = text.clone();
-                        changed
-                    };
-                    if changed {
-                        if let Some(sink) = on_partial.as_ref() {
-                            sink(&partial.lock().clone());
+                    None => break, // track stopped (tap dropped)
+                },
+                _ = &mut *end => break,
+            }
+            // Drain events: collect finalized utterances with timeline stamps.
+            while let Ok(event) = session.events.try_recv() {
+                match event {
+                    RealtimeEvent::Partial { text } => {
+                        let changed = {
+                            let mut guard = partial.lock();
+                            let changed = *guard != text;
+                            *guard = text.clone();
+                            changed
+                        };
+                        if changed {
+                            if let Some(sink) = on_partial.as_ref() {
+                                sink(&partial.lock().clone());
+                            }
                         }
                     }
-                }
-                RealtimeEvent::Utterance { text } => {
-                    let text = text.trim().to_string();
-                    if text.is_empty() {
-                        continue;
+                    RealtimeEvent::Utterance { text } => {
+                        let text = text.trim().to_string();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let end_seconds = clock.now_seconds();
+                        let start_seconds = last_utterance_end.max(0.0);
+                        last_utterance_end = end_seconds;
+                        utterances.lock().push(RealtimeUtterance {
+                            track: track.to_string(),
+                            start_seconds,
+                            end_seconds,
+                            text,
+                        });
                     }
-                    let end_seconds = clock.now_seconds();
-                    let start_seconds = last_utterance_end.max(0.0);
-                    last_utterance_end = end_seconds;
-                    utterances.lock().push(RealtimeUtterance {
-                        track: track.to_string(),
-                        start_seconds,
-                        end_seconds,
-                        text,
-                    });
-                }
-                RealtimeEvent::Done => {}
-                RealtimeEvent::Failed { message } => {
-                    tracing::warn!(track, %message, "meeting realtime failed; collecting what we have");
-                    return Err(format!("failed: {message}"));
+                    RealtimeEvent::Done => {}
+                    RealtimeEvent::Failed { message } => {
+                        tracing::warn!(track, %message, "meeting realtime failed; collecting what we have");
+                        return Err(format!("failed: {message}"));
+                    }
                 }
             }
         }
-    }
 
-    // Flush tail + finish: collect any remaining utterances.
-    if !pcm16_buffer.is_empty() {
-        let _ = session.send_audio(&pcm16_buffer).await;
-    }
-    let outcome = session.finish().await;
-    if let Ok(out) = outcome {
-        // The finish's text_parts are post-commit utterances; add them.
-        if !out.text.trim().is_empty() {
-            let end_seconds = clock.now_seconds();
-            utterances.lock().push(RealtimeUtterance {
-                track: track.to_string(),
-                start_seconds: last_utterance_end,
-                end_seconds,
-                text: out.text.trim().to_string(),
-            });
+        // Flush tail + finish: collect any remaining utterances.
+        if !pcm16_buffer.is_empty() {
+            let _ = session.send_audio(&pcm16_buffer).await;
         }
+        let outcome = session.finish().await;
+        if let Ok(out) = outcome {
+            // The finish's text_parts are post-commit utterances; add them.
+            if !out.text.trim().is_empty() {
+                let end_seconds = clock.now_seconds();
+                utterances.lock().push(RealtimeUtterance {
+                    track: track.to_string(),
+                    start_seconds: last_utterance_end,
+                    end_seconds,
+                    text: out.text.trim().to_string(),
+                });
+            }
+        }
+        Ok(())
     }
-    // Finalize the session-health numbers from the sample clock.
+    .await;
+    // Finalize the session-health numbers from the sample clock on every
+    // exit path.
     {
         let mut diag = diagnostics.lock();
         diag.stream_change_events = clock.rate_change_events.clone();
         diag.clock_drift_seconds = clock.drift_seconds();
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
