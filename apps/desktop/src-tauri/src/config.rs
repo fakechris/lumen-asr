@@ -1362,6 +1362,27 @@ impl AppConfig {
         Some(legacy)
     }
 
+    /// Apply the incoming provider's preset defaults on a switch. The preset
+    /// is the authority for whether a model name applies: assigning
+    /// `default_model` unconditionally (including empty — e.g. Volcengine)
+    /// clears the outgoing provider's model instead of leaving a stale
+    /// `gpt-transcribe` in the config. `base_url` stays conditional so a
+    /// preset without an endpoint never blanks a user's custom value.
+    /// A same-provider call is a no-op: re-saving the current provider must
+    /// not reset a user's customized model back to the preset default.
+    pub fn apply_asr_preset_defaults(&mut self, new_provider: &str) {
+        let new_provider = new_provider.trim().to_ascii_lowercase();
+        if new_provider == self.asr.provider.trim().to_ascii_lowercase() {
+            return;
+        }
+        if let Some(p) = crate::provider_presets::asr_preset_by_id(&new_provider) {
+            if !p.base_url.is_empty() {
+                self.asr.base_url = p.base_url;
+            }
+            self.asr.model = p.default_model;
+        }
+    }
+
     /// Switch the configured ASR provider, keeping each provider's key in its
     /// own keychain slot: the outgoing provider's key is persisted under its
     /// account and the incoming provider's key (empty when never configured)
@@ -1697,6 +1718,42 @@ mod tests {
         assert_eq!(reloaded.asr.api_key, "sk-asr");
         assert_eq!(reloaded.corrector.api_key, "sk-llm");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn preset_defaults_clear_the_model_for_no_model_providers() {
+        // OpenAI carries a model name; Volcengine's preset has neither a
+        // default model nor a model list — switching to it must clear the
+        // outgoing provider's model instead of leaving a stale gpt-transcribe.
+        let mut cfg = AppConfig::default();
+        cfg.asr.provider = "openai_audio".into();
+        cfg.asr.model = "gpt-transcribe".into();
+        cfg.asr.base_url = "https://api.openai.com/v1".into();
+
+        cfg.apply_asr_preset_defaults("volcengine");
+        assert_eq!(cfg.asr.model, "");
+        assert_eq!(
+            cfg.asr.base_url,
+            "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
+        );
+
+        // Switching back restores the OpenAI preset default (the command
+        // flow updates the provider field via switch_asr_provider first —
+        // mirror that here).
+        cfg.asr.provider = "volcengine".into();
+        cfg.apply_asr_preset_defaults("openai_audio");
+        assert_eq!(cfg.asr.model, "gpt-transcribe");
+
+        // Re-saving the same provider is a no-op: a user-customized model
+        // survives (and a casing-only difference is not a switch).
+        cfg.asr.provider = "openai_audio".into();
+        cfg.asr.model = "gpt-4o-transcribe".into();
+        cfg.apply_asr_preset_defaults("OpenAI_Audio");
+        assert_eq!(cfg.asr.model, "gpt-4o-transcribe");
+
+        // An unknown provider id leaves the fields untouched.
+        cfg.apply_asr_preset_defaults("not_a_provider");
+        assert_eq!(cfg.asr.model, "gpt-4o-transcribe");
     }
 
     #[test]
