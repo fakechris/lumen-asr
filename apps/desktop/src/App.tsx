@@ -2370,6 +2370,9 @@ function SettingsPanel({
     }[]
   >([]);
   const [asrProvider, setAsrProvider] = useState("local_sensevoice");
+  // The provider as last loaded from / saved to the backend — the key-status
+  // badge describes *this* provider, not the unsaved dropdown selection.
+  const [savedAsrProvider, setSavedAsrProvider] = useState("local_sensevoice");
   const [asrRuntimePath, setAsrRuntimePath] = useState("");
   const [asrBaseUrl, setAsrBaseUrl] = useState("");
   const [asrModel, setAsrModel] = useState("");
@@ -2553,6 +2556,7 @@ function SettingsPanel({
         setLlmPresets(presets);
         setAsrPresets(asrP);
         setAsrProvider(asrC.provider);
+        setSavedAsrProvider(asrC.provider);
         setAsrRuntimePath(asrC.runtimePath || "");
         setAsrBaseUrl(asrC.baseUrl);
         setAsrModel(asrC.model);
@@ -3796,7 +3800,11 @@ function SettingsPanel({
               const p = asrPresets.find((x) => x.id === id);
               if (p) {
                 if (p.baseUrl) setAsrBaseUrl(p.baseUrl);
-                if (p.defaultModel) setAsrModel(p.defaultModel);
+                // The preset is the authority for the model field, including
+                // "no model" (empty default, e.g. Volcengine) — syncing
+                // unconditionally clears the outgoing provider's model
+                // instead of leaving a stale value behind.
+                setAsrModel(p.defaultModel);
               }
             }}
           >
@@ -3917,9 +3925,14 @@ function SettingsPanel({
               </label>
               <input
                 className="input"
-                value={asrModel}
-                disabled={busy}
+                value={asrNeedsNoModel(asrPresets.find((p) => p.id === asrProvider)) ? "" : asrModel}
+                disabled={busy || asrNeedsNoModel(asrPresets.find((p) => p.id === asrProvider))}
                 onChange={(e) => setAsrModel(e.target.value)}
+                placeholder={
+                  asrNeedsNoModel(asrPresets.find((p) => p.id === asrProvider))
+                    ? "此引擎无需模型名"
+                    : "模型名"
+                }
                 list="asr-model-list"
               />
               <datalist id="asr-model-list">
@@ -3953,11 +3966,13 @@ function SettingsPanel({
                 disabled={busy}
                 onChange={(e) => setAsrApiKey(e.target.value)}
                 placeholder={
-                  asrHasKey
-                    ? "已保存（留空不改）"
-                    : asrProvider === "volcengine"
-                      ? "Access Token / 新版 APP Key"
-                      : "必填"
+                  asrProvider !== savedAsrProvider
+                    ? "切换未保存：请粘贴该 Provider 的 Key 后保存"
+                    : asrHasKey
+                      ? "已保存（留空不改）"
+                      : asrProvider === "volcengine"
+                        ? "Access Token / 新版 APP Key"
+                        : "必填"
                 }
               />
             </div>
@@ -4017,6 +4032,7 @@ function SettingsPanel({
                     input.volcengineAppId = asrAppId.trim();
                   const s = await api.saveAsrServiceConfig(input);
                   setAsrProvider(s.provider);
+                  setSavedAsrProvider(s.provider);
                   setAsrRuntimePath(s.runtimePath || "");
                   setAsrBaseUrl(s.baseUrl);
                   setAsrModel(s.model);
@@ -4769,6 +4785,13 @@ function Overview({
 }
 
 /** Quality of a session result — drives recovery UI, not decoration. */
+// Whether a cloud ASR preset takes no model name at all (e.g. Volcengine:
+// both its batch and realtime engines are identified by the endpoint, not a
+// model string) — the Model input renders disabled with a hint for these.
+function asrNeedsNoModel(p: { defaultModel: string; models: string[] } | undefined): boolean {
+  return !!p && p.defaultModel === "" && p.models.length === 0;
+}
+
 function sessionQuality(s: SessionRecord): "ok" | "weak" | "empty" {
   const t = sessionMainText(s);
   if (!t) return "empty";

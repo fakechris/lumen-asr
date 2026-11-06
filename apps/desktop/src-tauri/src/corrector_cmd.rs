@@ -140,15 +140,10 @@ pub fn save_asr_service_config(
         .map_err(|_| "config lock poisoned".to_string())?;
     if let Some(v) = input.provider {
         let v = crate::dictation::canonical_asr_provider(&v);
-        // Apply preset defaults when switching provider.
-        if let Some(p) = crate::provider_presets::asr_preset_by_id(&v) {
-            if !p.base_url.is_empty() {
-                guard.asr.base_url = p.base_url;
-            }
-            if !p.default_model.is_empty() {
-                guard.asr.model = p.default_model;
-            }
-        }
+        // Apply preset defaults when switching provider (the preset is the
+        // authority for the model field, including clearing it for
+        // providers that take no model name, e.g. Volcengine).
+        guard.apply_asr_preset_defaults(&v);
         // Provider-scoped key slots: park the outgoing provider's key under
         // its own account and load the incoming one, so one vendor's key is
         // never sent to another. An explicit input.api_key below overwrites
