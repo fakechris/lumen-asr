@@ -1368,8 +1368,14 @@ impl AppConfig {
     /// clears the outgoing provider's model instead of leaving a stale
     /// `gpt-transcribe` in the config. `base_url` stays conditional so a
     /// preset without an endpoint never blanks a user's custom value.
+    /// A same-provider call is a no-op: re-saving the current provider must
+    /// not reset a user's customized model back to the preset default.
     pub fn apply_asr_preset_defaults(&mut self, new_provider: &str) {
-        if let Some(p) = crate::provider_presets::asr_preset_by_id(new_provider) {
+        let new_provider = new_provider.trim().to_ascii_lowercase();
+        if new_provider == self.asr.provider.trim().to_ascii_lowercase() {
+            return;
+        }
+        if let Some(p) = crate::provider_presets::asr_preset_by_id(&new_provider) {
             if !p.base_url.is_empty() {
                 self.asr.base_url = p.base_url;
             }
@@ -1731,13 +1737,23 @@ mod tests {
             "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
         );
 
-        // Switching back restores the OpenAI preset default.
+        // Switching back restores the OpenAI preset default (the command
+        // flow updates the provider field via switch_asr_provider first —
+        // mirror that here).
+        cfg.asr.provider = "volcengine".into();
         cfg.apply_asr_preset_defaults("openai_audio");
         assert_eq!(cfg.asr.model, "gpt-transcribe");
 
+        // Re-saving the same provider is a no-op: a user-customized model
+        // survives (and a casing-only difference is not a switch).
+        cfg.asr.provider = "openai_audio".into();
+        cfg.asr.model = "gpt-4o-transcribe".into();
+        cfg.apply_asr_preset_defaults("OpenAI_Audio");
+        assert_eq!(cfg.asr.model, "gpt-4o-transcribe");
+
         // An unknown provider id leaves the fields untouched.
         cfg.apply_asr_preset_defaults("not_a_provider");
-        assert_eq!(cfg.asr.model, "gpt-transcribe");
+        assert_eq!(cfg.asr.model, "gpt-4o-transcribe");
     }
 
     #[test]

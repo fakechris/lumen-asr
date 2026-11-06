@@ -4023,7 +4023,12 @@ function SettingsPanel({
                     provider: asrProvider,
                     runtimePath: asrRuntimePath,
                     baseUrl: asrBaseUrl,
-                    model: asrModel,
+                    // Never send a model for providers that take none — a
+                    // stale value here would overwrite the backend's
+                    // preset-time clearing on the same request.
+                    model: asrNeedsNoModel(asrPresets.find((p) => p.id === asrProvider))
+                      ? ""
+                      : asrModel,
                     language: asrLanguage,
                     realtimeEnabled: asrRealtime,
                   };
