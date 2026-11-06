@@ -73,18 +73,29 @@ pub struct MeetingRealtimeOwner {
 }
 
 impl MeetingRealtimeOwner {
-    /// Stop all pumps and collect their utterances (bounded).
-    pub async fn stop_and_collect(self, deadline: Duration) -> Vec<RealtimeUtterance> {
-        let mut all = self.mic_pump.stop_and_collect(deadline).await;
+    /// Stop all pumps and collect their utterances (bounded) plus each
+    /// track's session-health diagnostics for the audio sidecar.
+    pub async fn stop_and_collect(
+        self,
+        deadline: Duration,
+    ) -> (
+        Vec<RealtimeUtterance>,
+        Vec<crate::realtime_asr::RealtimePumpDiagnostics>,
+    ) {
+        let mic = self.mic_pump.stop_and_collect(deadline).await;
+        let mut diagnostics = vec![mic.diagnostics];
+        let mut all = mic.utterances;
         if let Some(sys) = self.system_pump {
-            all.extend(sys.stop_and_collect(deadline).await);
+            let sys = sys.stop_and_collect(deadline).await;
+            diagnostics.push(sys.diagnostics);
+            all.extend(sys.utterances);
         }
         all.sort_by(|a, b| {
             a.start_seconds
                 .partial_cmp(&b.start_seconds)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        all
+        (all, diagnostics)
     }
 }
 

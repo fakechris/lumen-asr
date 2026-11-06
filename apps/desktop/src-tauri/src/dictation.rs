@@ -3173,6 +3173,7 @@ mod attempt_metric_tests {
         )));
         AppState {
             meeting_realtime: parking_lot::Mutex::new(None),
+            meeting_audio_diag: std::sync::Mutex::new(None),
             realtime: parking_lot::Mutex::new(None),
             edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(
                 store.clone(),
@@ -3559,6 +3560,7 @@ mod attempt_metric_tests {
         )));
         let state = AppState {
             meeting_realtime: parking_lot::Mutex::new(None),
+            meeting_audio_diag: std::sync::Mutex::new(None),
             realtime: parking_lot::Mutex::new(None),
             edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(
                 store.clone(),

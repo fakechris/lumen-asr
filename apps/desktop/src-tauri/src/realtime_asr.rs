@@ -1375,20 +1375,29 @@ pub struct RealtimeTranscriptSidecar {
 /// Anchors the audio stream to the meeting timeline the same way the local
 /// live worker does: the first packet's arrival fixes the origin, and every
 /// later position is `origin + samples_fed / rate` (glued to the WAV sample
-/// count, immune to callback jitter and pauses).
+/// count, immune to callback jitter and pauses). Arrival times are also kept
+/// so stop can report arrival-vs-sample-count drift, and rate changes are
+/// recorded as stream-change events for the audio diagnostics sidecar.
 struct MeetingSampleClock {
     /// Unified-timeline position (seconds) of the first sample ever fed.
     origin_seconds: Option<f64>,
+    /// Arrival timestamp of the first / most recent packet (same timeline).
+    first_arrival: Option<f64>,
+    last_arrival: f64,
     samples_fed: u64,
     sample_rate: u32,
+    rate_change_events: Vec<crate::meeting_audio_diagnostics::StreamChangeEvent>,
 }
 
 impl MeetingSampleClock {
     fn new() -> Self {
         Self {
             origin_seconds: None,
+            first_arrival: None,
+            last_arrival: 0.0,
             samples_fed: 0,
             sample_rate: 0,
+            rate_change_events: Vec::new(),
         }
     }
 
@@ -1396,15 +1405,25 @@ impl MeetingSampleClock {
     /// by sample count (authoritative — the packet's own `start_seconds` is
     /// callback-arrival-based and jittery, the sample count is not).
     fn observe(&mut self, packet_start_seconds: f64, samples: usize, rate: u32) {
+        let rate = rate.max(1);
         if self.origin_seconds.is_none() {
             self.origin_seconds = Some(packet_start_seconds);
-            self.sample_rate = rate.max(1);
-        }
-        if rate.max(1) != self.sample_rate {
+            self.first_arrival = Some(packet_start_seconds);
+            self.sample_rate = rate;
+        } else if rate != self.sample_rate {
             // Device rate change mid-meeting: trust the new rate for the
-            // increment (the provider resampler handles the format change).
-            self.sample_rate = rate.max(1);
+            // increment (the provider resampler handles the format change)
+            // and record the event for the audio diagnostics sidecar.
+            self.rate_change_events
+                .push(crate::meeting_audio_diagnostics::StreamChangeEvent {
+                    at_seconds: self.now_seconds(),
+                    kind: "sample_rate".into(),
+                    from: self.sample_rate.to_string(),
+                    to: rate.to_string(),
+                });
+            self.sample_rate = rate;
         }
+        self.last_arrival = packet_start_seconds;
         self.samples_fed += samples as u64;
     }
 
@@ -1415,6 +1434,43 @@ impl MeetingSampleClock {
             None => 0.0,
         }
     }
+
+    /// Arrival span minus sample-count span. Healthy real-time delivery
+    /// reads as ≈ -(one packet duration): every packet's samples are
+    /// attributed to its own arrival, so the sample span runs one packet
+    /// ahead of the arrival span. Values near zero or positive mean the pump
+    /// received less audio than wall time delivered (upstream drops /
+    /// stalls); strongly negative means over-delivery. `None` when no audio
+    /// ever arrived.
+    fn drift_seconds(&self) -> Option<f64> {
+        let first = self.first_arrival?;
+        let sample_span = self.samples_fed as f64 / self.sample_rate as f64;
+        Some((self.last_arrival - first) - sample_span)
+    }
+}
+
+/// Session health for one meeting realtime track, collected while the pump
+/// runs and persisted in the audio diagnostics sidecar at stop.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimePumpDiagnostics {
+    pub track: String,
+    pub sessions_started: u32,
+    pub reconnects: u32,
+    pub failures: Vec<String>,
+    pub packets_observed: u64,
+    pub samples_fed: u64,
+    pub resampler_initializations: u32,
+    pub stream_change_events: Vec<crate::meeting_audio_diagnostics::StreamChangeEvent>,
+    pub clock_drift_seconds: Option<f64>,
+    pub utterance_count: usize,
+}
+
+/// What a meeting pump hands back at stop: the transcript fragments plus the
+/// track's session-health diagnostics for the audio sidecar.
+pub struct PumpCollect {
+    pub utterances: Vec<RealtimeUtterance>,
+    pub diagnostics: RealtimePumpDiagnostics,
 }
 
 /// Handle to one track's cloud realtime session for a meeting.
@@ -1426,11 +1482,14 @@ pub struct MeetingRealtimePump {
     utterances: std::sync::Arc<parking_lot::Mutex<Vec<RealtimeUtterance>>>,
     /// Latest live partial (for the meeting-live-transcript event).
     pub partial: std::sync::Arc<parking_lot::Mutex<String>>,
+    /// Session health (shared with the pump task, finalized at stop).
+    diagnostics: std::sync::Arc<parking_lot::Mutex<RealtimePumpDiagnostics>>,
 }
 
 impl MeetingRealtimePump {
-    /// Signal end-of-audio and collect all finalized utterances.
-    pub async fn stop_and_collect(self, deadline: std::time::Duration) -> Vec<RealtimeUtterance> {
+    /// Signal end-of-audio and collect all finalized utterances plus the
+    /// track's session diagnostics.
+    pub async fn stop_and_collect(self, deadline: std::time::Duration) -> PumpCollect {
         let _ = self.end.send(());
         let _ = tokio::time::timeout(deadline, self.outcome).await;
         let mut collected = self.utterances.lock().clone();
@@ -1439,7 +1498,13 @@ impl MeetingRealtimePump {
                 .partial_cmp(&b.start_seconds)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        collected
+        let mut diagnostics = self.diagnostics.lock().clone();
+        diagnostics.track = self.track.clone();
+        diagnostics.utterance_count = collected.len();
+        PumpCollect {
+            utterances: collected,
+            diagnostics,
+        }
     }
 }
 
@@ -1458,24 +1523,31 @@ pub fn spawn_meeting_pump(
     let track = track.to_string();
     let utterances = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     let partial = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+    let diagnostics = std::sync::Arc::new(parking_lot::Mutex::new(RealtimePumpDiagnostics {
+        track: track.clone(),
+        sessions_started: 1,
+        resampler_initializations: 1,
+        ..Default::default()
+    }));
     let (end_tx, end_rx) = tokio::sync::oneshot::channel::<()>();
     let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
 
     let utterances_for_task = std::sync::Arc::clone(&utterances);
     let partial_for_task = std::sync::Arc::clone(&partial);
+    let diagnostics_for_task = std::sync::Arc::clone(&diagnostics);
     let track_for_task = track.clone();
     tokio::spawn(async move {
-        let result = run_meeting_pump(
-            config,
-            &track_for_task,
-            tap_rx,
-            capture_rate,
-            end_rx,
-            &partial_for_task,
-            &utterances_for_task,
+        let refs = MeetingPumpRefs {
+            partial: partial_for_task,
+            utterances: utterances_for_task,
+            diagnostics: diagnostics_for_task.clone(),
             on_partial,
-        )
-        .await;
+        };
+        let result =
+            run_meeting_pump(config, &track_for_task, tap_rx, capture_rate, end_rx, refs).await;
+        if let Err(message) = &result {
+            diagnostics_for_task.lock().failures.push(message.clone());
+        }
         let _ = outcome_tx.send(result.map(|_| RealtimeOutcome::default()));
     });
 
@@ -1485,7 +1557,18 @@ pub fn spawn_meeting_pump(
         outcome: outcome_rx,
         utterances,
         partial,
+        diagnostics,
     }
+}
+
+/// Shared state one meeting pump task works against: the live partial
+/// preview, the finalized utterances, and the session-health diagnostics it
+/// accumulates. Owned so the spawned task is 'static.
+struct MeetingPumpRefs {
+    partial: std::sync::Arc<parking_lot::Mutex<String>>,
+    utterances: std::sync::Arc<parking_lot::Mutex<Vec<RealtimeUtterance>>>,
+    diagnostics: std::sync::Arc<parking_lot::Mutex<RealtimePumpDiagnostics>>,
+    on_partial: PartialSink,
 }
 
 async fn run_meeting_pump(
@@ -1494,9 +1577,7 @@ async fn run_meeting_pump(
     tap_rx: std::sync::mpsc::Receiver<lumen_asr::LiveAudioPacket>,
     capture_rate: u32,
     mut end: tokio::sync::oneshot::Receiver<()>,
-    partial: &std::sync::Arc<parking_lot::Mutex<String>>,
-    utterances: &std::sync::Arc<parking_lot::Mutex<Vec<RealtimeUtterance>>>,
-    on_partial: PartialSink,
+    refs: MeetingPumpRefs,
 ) -> Result<(), String> {
     // Bridge the blocking std tap onto the async runtime.
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<lumen_asr::LiveAudioPacket>(64);
@@ -1508,17 +1589,8 @@ async fn run_meeting_pump(
         }
     });
 
-    let result = run_meeting_pump_inner(
-        config,
-        track,
-        &mut chunk_rx,
-        capture_rate,
-        &mut end,
-        partial,
-        utterances,
-        on_partial,
-    )
-    .await;
+    let result =
+        run_meeting_pump_inner(config, track, &mut chunk_rx, capture_rate, &mut end, &refs).await;
     drop(chunk_rx);
     let _ = bridge.join();
     result
@@ -1530,10 +1602,14 @@ async fn run_meeting_pump_inner(
     chunk_rx: &mut tokio::sync::mpsc::Receiver<lumen_asr::LiveAudioPacket>,
     capture_rate: u32,
     end: &mut tokio::sync::oneshot::Receiver<()>,
-    partial: &std::sync::Arc<parking_lot::Mutex<String>>,
-    utterances: &std::sync::Arc<parking_lot::Mutex<Vec<RealtimeUtterance>>>,
-    on_partial: PartialSink,
+    refs: &MeetingPumpRefs,
 ) -> Result<(), String> {
+    let MeetingPumpRefs {
+        partial,
+        utterances,
+        diagnostics,
+        on_partial,
+    } = refs;
     let mut session = match RealtimeSession::open(&config).await {
         Ok(session) => session,
         Err(error) => return Err(format!("meeting realtime connect: {error}")),
@@ -1550,6 +1626,11 @@ async fn run_meeting_pump_inner(
             chunk = chunk_rx.recv() => match chunk {
                 Some(packet) => {
                     clock.observe(packet.start_seconds, packet.samples.len(), capture_rate.max(1));
+                    {
+                        let mut diag = diagnostics.lock();
+                        diag.packets_observed += 1;
+                        diag.samples_fed += packet.samples.len() as u64;
+                    }
                     for sample in resampler.process(&packet.samples) {
                         push_pcm16(&mut pcm16_buffer, sample);
                     }
@@ -1623,6 +1704,12 @@ async fn run_meeting_pump_inner(
             });
         }
     }
+    // Finalize the session-health numbers from the sample clock.
+    {
+        let mut diag = diagnostics.lock();
+        diag.stream_change_events = clock.rate_change_events.clone();
+        diag.clock_drift_seconds = clock.drift_seconds();
+    }
     Ok(())
 }
 
@@ -1667,5 +1754,45 @@ mod meeting_pump_tests {
         let back: RealtimeTranscriptSidecar = serde_json::from_str(&json).unwrap();
         assert_eq!(back.utterances[0].text, "你好");
         assert_eq!(back.utterances[0].start_seconds, 0.5);
+    }
+
+    #[test]
+    fn sample_clock_records_rate_changes_with_timeline_position() {
+        let mut clock = MeetingSampleClock::new();
+        clock.observe(0.0, 0, 16_000);
+        clock.observe(0.1, 16_000, 16_000); // 1s fed, timeline at 1.0
+        clock.observe(1.1, 8_000, 44_100); // rate change mid-meeting
+        assert_eq!(clock.rate_change_events.len(), 1);
+        let event = &clock.rate_change_events[0];
+        assert_eq!(event.kind, "sample_rate");
+        assert_eq!(event.from, "16000");
+        assert_eq!(event.to, "44100");
+        assert!(
+            (event.at_seconds - 1.0).abs() < 0.01,
+            "{}",
+            event.at_seconds
+        );
+        // No further event for a stable rate.
+        clock.observe(1.2, 44_100, 44_100);
+        assert_eq!(clock.rate_change_events.len(), 1);
+    }
+
+    #[test]
+    fn sample_clock_drift_arrival_minus_sample_span() {
+        // Steady real-time delivery: one packet duration of audio arriving
+        // every packet duration. Drift reads as -(last packet duration) —
+        // the inherent bias of attributing each packet's samples to its own
+        // arrival.
+        let mut clock = MeetingSampleClock::new();
+        clock.observe(0.0, 16_000, 16_000);
+        clock.observe(1.0, 16_000, 16_000);
+        assert!((clock.drift_seconds().unwrap() + 1.0).abs() < 1e-6);
+        // Missing upstream audio (a half packet lost): arrivals keep wall
+        // pace but fewer samples are fed, so drift moves toward positive.
+        clock.observe(2.0, 8_000, 16_000);
+        let drift = clock.drift_seconds().unwrap();
+        assert!((drift + 0.5).abs() < 1e-6, "{drift}");
+        // No audio ever → no drift estimate.
+        assert!(MeetingSampleClock::new().drift_seconds().is_none());
     }
 }

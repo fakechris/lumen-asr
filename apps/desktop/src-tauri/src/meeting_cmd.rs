@@ -163,6 +163,97 @@ fn write_timeline_sidecar(path: &Path, timeline: &MeetingTimeline) {
     }
 }
 
+/// Assemble and write the per-meeting audio diagnostics sidecar
+/// (`<meeting-id>.audio_diagnostics.json`, INV-1629). Pulls recorder
+/// summaries (rates / durations / padded gaps), the fan-out drop counters
+/// retained at start, and the cloud realtime session health collected at
+/// stop. Best-effort everywhere: a poisoned lock or failed write only costs
+/// the diagnostics, never the meeting.
+fn write_audio_diagnostics_sidecar(
+    state: &AppState,
+    meeting_id: Uuid,
+    mic_summary: Option<&lumen_asr::RecordingSummary>,
+    system_summary: Option<&lumen_asr::RecordingSummary>,
+    pump_diag: &[crate::realtime_asr::RealtimePumpDiagnostics],
+) {
+    use crate::meeting_audio_diagnostics::{
+        write_audio_diagnostics, GapEvent, MeetingAudioDiagnostics, RealtimeTrackDiagnostics,
+        TrackAudioDiagnostics,
+    };
+
+    let session = state
+        .meeting_audio_diag
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    let (mic_dropped, system_dropped) = match &session {
+        Some(session) => (
+            session.mic_tap.as_ref().map(|tap| tap.dropped()),
+            session.system_tap.as_ref().map(|tap| tap.dropped()),
+        ),
+        None => (None, None),
+    };
+    let realtime_for = |track: &str| {
+        pump_diag
+            .iter()
+            .find(|diag| diag.track == track)
+            .map(|diag| RealtimeTrackDiagnostics::from(diag.clone()))
+    };
+
+    let mut tracks = Vec::new();
+    if let Some(summary) = mic_summary {
+        let mut track = TrackAudioDiagnostics::from_summary(
+            "mic",
+            summary.sample_rate,
+            summary.duration_seconds,
+            &summary
+                .gaps
+                .iter()
+                .map(|gap| GapEvent {
+                    start_seconds: gap.start_seconds,
+                    duration_seconds: gap.duration_seconds,
+                })
+                .collect::<Vec<_>>(),
+            mic_dropped,
+        );
+        track.realtime = realtime_for("mic");
+        tracks.push(track);
+    }
+    if let Some(summary) = system_summary {
+        let mut track = TrackAudioDiagnostics::from_summary(
+            "system",
+            summary.sample_rate,
+            summary.duration_seconds,
+            &summary
+                .gaps
+                .iter()
+                .map(|gap| GapEvent {
+                    start_seconds: gap.start_seconds,
+                    duration_seconds: gap.duration_seconds,
+                })
+                .collect::<Vec<_>>(),
+            system_dropped,
+        );
+        track.realtime = realtime_for("system");
+        tracks.push(track);
+    }
+    if tracks.is_empty() {
+        return;
+    }
+    let diag = MeetingAudioDiagnostics {
+        schema: 1,
+        meeting_id: meeting_id.to_string(),
+        tracks,
+    };
+    let dir = default_data_dir().join("meetings");
+    write_audio_diagnostics(&dir, meeting_id, &diag);
+    tracing::info!(
+        meeting_id = %meeting_id,
+        tracks = diag.tracks.len(),
+        "meeting audio diagnostics written"
+    );
+}
+
 fn with_store<T>(
     state: &State<'_, AppState>,
     f: impl FnOnce(&lumen_store::Store) -> Result<T, String>,
@@ -894,6 +985,9 @@ fn start_meeting_recording_with_targets(
     } else {
         (None, None, None)
     };
+    // Retain a drop-counter view of the fan-out for the audio diagnostics
+    // sidecar (forks share one counter, so this sees the recorder's drops).
+    let mic_diag_tap = mic_tap.clone();
     // Production meetings use the plain cpal microphone path.
     const VOICE_PROCESSING_SAFE_FOR_MEETINGS: bool = false;
     let aec_rate = if VOICE_PROCESSING_SAFE_FOR_MEETINGS
@@ -972,6 +1066,7 @@ fn start_meeting_recording_with_targets(
     let mut system_offset_seconds: Option<f64> = None;
     let mut system_rate_for_pump: Option<u32> = None;
     let mut system_cloud_rx: Option<std::sync::mpsc::Receiver<lumen_asr::LiveAudioPacket>> = None;
+    let mut system_diag_tap_retained: Option<lumen_asr::LiveTapSender> = None;
     if system_audio_enabled {
         // A detection-started recording supplies the exact accepted app (or an
         // empty list for browser mic-only). A manual recording uses every
@@ -995,6 +1090,7 @@ fn start_meeting_recording_with_targets(
         } else {
             (None, None, None)
         };
+        let system_diag_tap = system_tap.clone();
         let system_path = dir.join(format!("{meeting_id}.system.{}", audio_format.extension()));
         let system_start_rate = state.meeting_system_audio.start(
             system_path.clone(),
@@ -1003,6 +1099,7 @@ fn start_meeting_recording_with_targets(
             audio_format,
         );
         if let Some(system_rate) = system_start_rate {
+            system_diag_tap_retained = system_diag_tap;
             system_offset_seconds = Some(t0.elapsed().as_secs_f64());
             system_rate_for_pump = Some(system_rate);
             system_cloud_rx = system_cloud_rx_local.take();
@@ -1025,6 +1122,16 @@ fn start_meeting_recording_with_targets(
         }
         // `system_rx` (when the tap failed to start) drops here, so the live
         // worker sees an immediately-disconnected system feed — i.e. none.
+    }
+
+    // Retain the fan-out drop counters for the stop path's audio diagnostics
+    // sidecar. Best-effort: a poisoned lock only loses the drop counts.
+    if let Ok(mut guard) = state.meeting_audio_diag.lock() {
+        *guard = Some(crate::meeting_audio_diagnostics::MeetingAudioDiagSession {
+            meeting_id,
+            mic_tap: mic_diag_tap,
+            system_tap: system_diag_tap_retained,
+        });
     }
 
     // Persist the unified-timeline sidecar next to the meeting WAVs. Purely
@@ -1459,7 +1566,7 @@ pub fn stop_meeting_recording(
     // Must happen BEFORE spawn_meeting_processing (the offline pipeline
     // reads the sidecar). Bounded — a hung session doesn't block the stop.
     // The async collect runs on the async runtime via block_in_place.
-    let realtime_utterances = {
+    let (realtime_utterances, realtime_pump_diag) = {
         let owner = state.meeting_realtime.lock().take();
         match owner {
             Some(owner) => {
@@ -1476,7 +1583,7 @@ pub fn stop_meeting_recording(
                         .map(|c| c.asr.provider.clone())
                         .unwrap_or_default(),
                 );
-                let utterances = tauri::async_runtime::block_on(async move {
+                let (utterances, pump_diag) = tauri::async_runtime::block_on(async move {
                     owner
                         .stop_and_collect(std::time::Duration::from_secs(20))
                         .await
@@ -1487,9 +1594,9 @@ pub fn stop_meeting_recording(
                     &provider,
                     &utterances,
                 );
-                utterances
+                (utterances, pump_diag)
             }
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         }
     };
     if !realtime_utterances.is_empty() {
@@ -1498,6 +1605,17 @@ pub fn stop_meeting_recording(
             "meeting cloud realtime collected"
         );
     }
+
+    // Audio pipeline diagnostics sidecar: per-track rates, durations, padded
+    // gaps, fan-out drops, and the realtime session health collected above.
+    // Best-effort — a failed write is a warning, never a meeting failure.
+    write_audio_diagnostics_sidecar(
+        &state,
+        id,
+        stop_result.as_ref().ok(),
+        system_summary.as_ref(),
+        &realtime_pump_diag,
+    );
 
     // Unconditionally release the exclusive mode and restore the dictation
     // hotkey. If we bailed out on the `stop()` error above, `end_meeting` and

@@ -25,6 +25,7 @@ mod input_device;
 mod learning;
 mod meeting_apps;
 mod meeting_asr;
+mod meeting_audio_diagnostics;
 mod meeting_cmd;
 mod meeting_detection;
 mod meeting_draft;
@@ -466,6 +467,10 @@ pub struct AppState {
     pub realtime: parking_lot::Mutex<Option<crate::realtime_asr::RealtimeHandle>>,
     /// Cloud realtime pumps for the active meeting recording.
     pub meeting_realtime: parking_lot::Mutex<Option<crate::meeting_realtime::MeetingRealtimeOwner>>,
+    /// Fan-out drop-counter handles retained across the active recording so
+    /// the stop path can write the audio diagnostics sidecar (INV-1629).
+    pub meeting_audio_diag:
+        std::sync::Mutex<Option<crate::meeting_audio_diagnostics::MeetingAudioDiagSession>>,
     pub(crate) edit_learning: edit_learning_runtime::DesktopEditLearning,
     pub audio: AudioCapture,
     /// Serializes capture transitions and holds attenuation only while recording.
@@ -699,6 +704,7 @@ pub fn run() {
             store,
             realtime: parking_lot::Mutex::new(None),
             meeting_realtime: parking_lot::Mutex::new(None),
+            meeting_audio_diag: std::sync::Mutex::new(None),
             edit_learning,
             audio,
             dictation_ducking: Mutex::new(None),
