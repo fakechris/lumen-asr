@@ -4793,8 +4793,11 @@ function Overview({
 // Whether a cloud ASR preset takes no model name at all (e.g. Volcengine:
 // both its batch and realtime engines are identified by the endpoint, not a
 // model string) — the Model input renders disabled with a hint for these.
-function asrNeedsNoModel(p: { defaultModel: string; models: string[] } | undefined): boolean {
-  return !!p && p.defaultModel === "" && p.models.length === 0;
+// The `custom` preset also has an empty default and list, but as an
+// OpenAI-transcriptions-shaped endpoint it *requires* a user-supplied model
+// name, so it stays editable.
+function asrNeedsNoModel(p: { id: string; defaultModel: string; models: string[] } | undefined): boolean {
+  return !!p && p.id !== "custom" && p.defaultModel === "" && p.models.length === 0;
 }
 
 function sessionQuality(s: SessionRecord): "ok" | "weak" | "empty" {
