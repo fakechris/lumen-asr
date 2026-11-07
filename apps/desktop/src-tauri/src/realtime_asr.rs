@@ -1009,7 +1009,7 @@ mod tests {
     fn wav_payload(bytes: &[u8]) -> Vec<u8> {
         let mut offset = 12;
         while offset + 8 <= bytes.len() {
-            let id = &bytes[offset..offset + 4];
+            let id = &bytes[offset..4 + offset];
             let size = u32::from_le_bytes([
                 bytes[offset + 4],
                 bytes[offset + 5],
@@ -1023,6 +1023,77 @@ mod tests {
             offset += 8 + size + (size % 2);
         }
         panic!("no data chunk in wav fixture");
+    }
+
+    /// Playback comparison tool: replays each debug bundle's recorded
+    /// `audio_16k.wav` into a Volcengine realtime session (same framing,
+    /// pacing and request config as production) and prints the result next
+    /// to the transcript the OpenAI realtime session produced for the very
+    /// same audio. Also reports wall time and time-to-first-partial.
+    ///
+    /// Run:
+    ///   VOLC_KEY=… PLAYBACK_DIRS="dir1,dir2" \
+    ///     cargo test -p lumen-asr-desktop realtime_playback_volc --ignored -- --nocapture
+    #[tokio::test]
+    #[ignore = "live network test; needs VOLC_KEY and PLAYBACK_DIRS"]
+    async fn realtime_playback_volc() {
+        let key = std::env::var("VOLC_KEY").expect("VOLC_KEY");
+        let app_id = std::env::var("VOLC_APP_ID").unwrap_or_default();
+        let dirs = std::env::var("PLAYBACK_DIRS").expect("PLAYBACK_DIRS");
+        for dir in dirs.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+            let base = std::path::Path::new(dir);
+            let recorded = std::fs::read_to_string(base.join("asr.txt")).unwrap_or_default();
+            let wav = std::fs::read(base.join("audio_16k.wav")).expect("audio_16k.wav");
+            let data = wav_payload(&wav);
+            let secs = data.len() as f64 / 32_000.0;
+
+            let config = RealtimeConfig {
+                provider: "volcengine".into(),
+                api_key: key.clone(),
+                app_id: app_id.clone(),
+                ..RealtimeConfig::default()
+            };
+            let started = std::time::Instant::now();
+            let mut session = match RealtimeSession::open(&config).await {
+                Ok(session) => session,
+                Err(error) => {
+                    println!("=== {dir}: connect failed: {error}");
+                    continue;
+                }
+            };
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            while let Ok(event) = session.events.try_recv() {
+                if let RealtimeEvent::Failed { message } = event {
+                    println!("=== {dir}: pre-audio failure: {message}");
+                }
+            }
+            let mut first_partial: Option<f64> = None;
+            let send = async {
+                for chunk in data.chunks(3200) {
+                    session.send_audio(chunk).await.expect("send");
+                    // ~1.7x realtime pacing (same as the smoke test).
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    while let Ok(event) = session.events.try_recv() {
+                        if let RealtimeEvent::Partial { .. } = event {
+                            first_partial.get_or_insert(started.elapsed().as_secs_f64());
+                        }
+                    }
+                }
+            };
+            send.await;
+            let outcome = session.finish().await;
+            let elapsed = started.elapsed().as_secs_f64();
+            println!(
+                "=== {dir} ({secs:.1}s audio, wall {elapsed:.1}s, first-partial {:?})",
+                first_partial
+            );
+            println!("OPENAI  : {}", recorded.trim());
+            match outcome {
+                Ok(out) => println!("VOLC    : {}", out.text.trim()),
+                Err(error) => println!("VOLC    : <finish error {error}>"),
+            }
+            println!();
+        }
     }
 }
 
