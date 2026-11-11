@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 
 /// Keychain service shared by every provider credential.
 #[cfg(target_os = "macos")]
+#[cfg_attr(test, allow(dead_code))]
 const KEYCHAIN_SERVICE: &str = "com.lumenopen.asr.credentials";
 
 /// One credential slot in [`crate::config::AppConfig`].
@@ -224,18 +225,27 @@ pub fn save_slot(
 /// cannot stick). Local and test builds therefore keep API keys in the
 /// 0600 config file, exactly like non-macOS platforms. `LUMEN_KEYCHAIN=1`
 /// forces the Keychain on (to exercise that path on a dev build), `=0`
-/// forces it off.
+/// forces it off. Test binaries are additionally hard-short-circuited:
+/// they never touch the real Keychain even when `LUMEN_KEYCHAIN=1`
+/// leaks into a test run.
 pub fn platform_store() -> Option<&'static dyn SecretStore> {
     #[cfg(target_os = "macos")]
     {
-        if !keychain_enabled(
-            option_env!("LUMEN_OFFICIAL_BUILD").is_some(),
-            std::env::var_os("LUMEN_KEYCHAIN").as_deref(),
-        ) {
-            return None;
+        #[cfg(test)]
+        {
+            None
         }
-        static STORE: macos::KeychainStore = macos::KeychainStore;
-        Some(&STORE)
+        #[cfg(not(test))]
+        {
+            if !keychain_enabled(
+                option_env!("LUMEN_OFFICIAL_BUILD").is_some(),
+                std::env::var_os("LUMEN_KEYCHAIN").as_deref(),
+            ) {
+                return None;
+            }
+            static STORE: macos::KeychainStore = macos::KeychainStore;
+            Some(&STORE)
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -255,6 +265,9 @@ fn keychain_enabled(official_build: bool, override_flag: Option<&std::ffi::OsStr
 }
 
 #[cfg(target_os = "macos")]
+// Under `cfg(test)` the Keychain backend is hard-short-circuited away, so
+// its items read as dead code to the test build; keep the module intact.
+#[cfg_attr(test, allow(dead_code))]
 mod macos {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -348,6 +361,14 @@ pub(crate) mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_biniversals_never_get_the_real_keychain() {
+        // Hard short-circuit: a test binary must never read or write the
+        // login Keychain, whatever the build type or LUMEN_KEYCHAIN says.
+        assert!(platform_store().is_none());
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
