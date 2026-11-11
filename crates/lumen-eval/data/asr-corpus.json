@@ -1,0 +1,277 @@
+{
+  "version": 1,
+  "dictionary_terms": [
+    "Lumen",
+    "Tauri",
+    "sherpa-onnx",
+    "Qwen3-ASR",
+    "diarization",
+    "INV",
+    "EditFlow"
+  ],
+  "clips": [
+    {
+      "id": "zh-filler-1",
+      "set": "zh-filler",
+      "lang": "zh",
+      "text": "嗯，那个，我们下周二，呃不对，下周三下午三点开个会，讨论一下预算。",
+      "clean": "我们下周三下午三点开个会，讨论一下预算。",
+      "must": ["下周三", "下午三点", "预算"],
+      "must_not": ["嗯", "那个", "呃", "下周二", "不对"],
+      "terms": []
+    },
+    {
+      "id": "zh-filler-2",
+      "set": "zh-filler",
+      "lang": "zh",
+      "text": "这个需求吧，就是，大概要，呃，两天左右。",
+      "clean": "这个需求大概要两天左右。",
+      "must": ["需求", "两天"],
+      "must_not": ["就是", "呃"],
+      "terms": []
+    },
+    {
+      "id": "zh-filler-3",
+      "set": "zh-filler",
+      "lang": "zh",
+      "text": "我觉得吧，嗯，这个方案还行，不过就是说，成本有点高。",
+      "clean": "我觉得这个方案还行，不过成本有点高。",
+      "must": ["方案", "成本"],
+      "must_not": ["嗯", "就是说"],
+      "terms": []
+    },
+    {
+      "id": "zh-filler-4",
+      "set": "zh-filler",
+      "lang": "zh",
+      "text": "那个，你等一下，啊，我重新说一遍。",
+      "clean": "你等一下，我重新说一遍。",
+      "must": ["重新说一遍"],
+      "must_not": ["那个", "啊"],
+      "terms": []
+    },
+    {
+      "id": "zh-filler-5",
+      "set": "zh-filler",
+      "lang": "zh",
+      "text": "对，对，就是那个意思，嗯，你懂的。",
+      "clean": "就是那个意思，你懂的。",
+      "must": ["那个意思"],
+      "must_not": ["嗯"],
+      "terms": []
+    },
+    {
+      "id": "zh-plain-1",
+      "set": "zh-plain",
+      "lang": "zh",
+      "text": "今天的天气很好，我们下午去公园散步，晚上一起吃饭吧。",
+      "clean": "今天的天气很好，我们下午去公园散步，晚上一起吃饭吧。",
+      "must": ["公园", "散步"],
+      "must_not": [],
+      "terms": []
+    },
+    {
+      "id": "zh-plain-2",
+      "set": "zh-plain",
+      "lang": "zh",
+      "text": "会议纪要已经发到你的邮箱，请查收附件。",
+      "clean": "会议纪要已经发到你的邮箱，请查收附件。",
+      "must": ["会议纪要", "邮箱", "附件"],
+      "must_not": [],
+      "terms": []
+    },
+    {
+      "id": "zh-plain-3",
+      "set": "zh-plain",
+      "lang": "zh",
+      "text": "这台机器的内存是三十二G，硬盘一TB。",
+      "clean": "这台机器的内存是32G，硬盘1TB。",
+      "must": ["32G", "1TB"],
+      "must_not": [],
+      "terms": []
+    },
+    {
+      "id": "en-1",
+      "set": "en",
+      "lang": "en",
+      "text": "Let's ship the release on Friday, no wait, on Thursday morning.",
+      "clean": "Let's ship the release on Thursday morning.",
+      "must": ["release", "thursday morning"],
+      "must_not": ["friday", "no wait"],
+      "terms": []
+    },
+    {
+      "id": "en-2",
+      "set": "en",
+      "lang": "en",
+      "text": "Um, I think we should, like, refactor the audio pipeline first.",
+      "clean": "I think we should refactor the audio pipeline first.",
+      "must": ["refactor", "audio pipeline"],
+      "must_not": ["um", "like"],
+      "terms": []
+    },
+    {
+      "id": "en-3",
+      "set": "en",
+      "lang": "en",
+      "text": "The build failed because of a missing dependency.",
+      "clean": "The build failed because of a missing dependency.",
+      "must": ["build", "dependency"],
+      "must_not": [],
+      "terms": []
+    },
+    {
+      "id": "en-4",
+      "set": "en",
+      "lang": "en",
+      "text": "It costs twelve dollars and takes twenty minutes.",
+      "clean": "It costs 12 dollars and takes 20 minutes.",
+      "must": ["12 dollars", "20 minutes"],
+      "must_not": [],
+      "terms": []
+    },
+    {
+      "id": "mix-1",
+      "set": "mix",
+      "lang": "mix",
+      "text": "我们的服务用 Kubernetes 部署，CPU 占用太高了，需要 scale out。",
+      "clean": "我们的服务用 Kubernetes 部署，CPU 占用太高了，需要 scale out。",
+      "must": ["Kubernetes", "CPU", "scale out"],
+      "must_not": [],
+      "terms": []
+    },
+    {
+      "id": "mix-2",
+      "set": "mix",
+      "lang": "mix",
+      "text": "这个 bug 已经在 main 分支修掉了，下个 release 会带上。",
+      "clean": "这个 bug 已经在 main 分支修掉了，下个 release 会带上。",
+      "must": ["bug", "main", "release"],
+      "must_not": [],
+      "terms": []
+    },
+    {
+      "id": "mix-3",
+      "set": "mix",
+      "lang": "mix",
+      "text": "把 API 的超时改成五百毫秒。",
+      "clean": "把 API 的超时改成 500 毫秒。",
+      "must": ["API", "500 毫秒"],
+      "must_not": [],
+      "terms": []
+    },
+    {
+      "id": "mix-4",
+      "set": "mix",
+      "lang": "mix",
+      "text": "Qwen3-ASR 跑在 sherpa-onnx 上，效果不错。",
+      "clean": "Qwen3-ASR 跑在 sherpa-onnx 上，效果不错。",
+      "must": ["Qwen3-ASR", "sherpa-onnx"],
+      "must_not": [],
+      "terms": ["Qwen3-ASR", "sherpa-onnx"]
+    },
+    {
+      "id": "dict-1",
+      "set": "dict",
+      "lang": "mix",
+      "text": "Lumen 的新版本用 diarization 分离说话人。",
+      "clean": "Lumen 的新版本用 diarization 分离说话人。",
+      "must": ["Lumen", "diarization"],
+      "must_not": [],
+      "terms": ["Lumen", "diarization"]
+    },
+    {
+      "id": "dict-2",
+      "set": "dict",
+      "lang": "mix",
+      "text": "记得把 Tauri 工程的 lock 文件提交了。",
+      "clean": "记得把 Tauri 工程的 lock 文件提交了。",
+      "must": ["Tauri"],
+      "must_not": [],
+      "terms": ["Tauri"]
+    },
+    {
+      "id": "dict-3",
+      "set": "dict",
+      "lang": "mix",
+      "text": "我们的术语表里有 sherpa-onnx、diarization 和 EditFlow。",
+      "clean": "我们的术语表里有 sherpa-onnx、diarization 和 EditFlow。",
+      "must": ["sherpa-onnx", "EditFlow"],
+      "must_not": [],
+      "terms": ["sherpa-onnx", "diarization", "EditFlow"]
+    },
+    {
+      "id": "dict-4",
+      "set": "dict",
+      "lang": "zh",
+      "text": "这个问题去问欧阳明远，他负责 INV 流程。",
+      "clean": "这个问题去问欧阳明远，他负责 INV 流程。",
+      "must": ["欧阳明远"],
+      "must_not": [],
+      "terms": ["欧阳明远", "INV"]
+    },
+    {
+      "id": "dict-5",
+      "set": "dict",
+      "lang": "mix",
+      "text": "句子结尾也要有词条，比如 Lumen。",
+      "clean": "句子结尾也要有词条，比如 Lumen。",
+      "must": ["词条", "Lumen"],
+      "must_not": [],
+      "terms": ["Lumen"]
+    },
+    {
+      "id": "long-mix-zh",
+      "set": "long",
+      "lang": "mix",
+      "text": null,
+      "clean": null,
+      "must": [],
+      "must_not": ["嗯", "那个", "呃"],
+      "terms": ["Lumen", "diarization"],
+      "source_clip_ids": [
+        "zh-filler-1",
+        "zh-plain-1",
+        "mix-1",
+        "dict-1",
+        "zh-filler-3",
+        "zh-plain-2",
+        "mix-3",
+        "dict-4",
+        "zh-filler-2",
+        "mix-2",
+        "dict-2",
+        "zh-plain-3",
+        "dict-5",
+        "zh-filler-4"
+      ],
+      "gap_seconds": 0.8
+    },
+    {
+      "id": "long-en-led",
+      "set": "long",
+      "lang": "mix",
+      "text": null,
+      "clean": null,
+      "must": [],
+      "must_not": ["um", "like", "嗯", "那个"],
+      "terms": ["sherpa-onnx", "Qwen3-ASR"],
+      "source_clip_ids": [
+        "en-1",
+        "en-2",
+        "zh-filler-1",
+        "mix-1",
+        "en-3",
+        "dict-1",
+        "zh-plain-1",
+        "en-4",
+        "mix-2",
+        "zh-filler-3",
+        "dict-3",
+        "zh-plain-2",
+        "mix-4"
+      ],
+      "gap_seconds": 0.8
+    }
+  ]
+}

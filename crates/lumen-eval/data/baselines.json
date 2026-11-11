@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "notes": "Provisional gates recorded on the maintainer's Apple Silicon Mac (2026-11-11, models: sensevoice int8 sherpa-onnx, qwen3-sherpa). Error rate is normalized CER/WER against the expected cleanup; raw-ASR runs keep filler residue, so allow_check_failures records the observed residue. Re-record with `eval asr --engine X --record-baseline` on your machine, review, then paste here.",
+  "engines": {
+    "sensevoice": {
+      "provisional": true,
+      "sets": {
+        "dict": {
+          "max_mean_error_rate": 0.22000000000000003,
+          "min_term_hit_ratio": 0.4444,
+          "allow_check_failures": 6
+        },
+        "en": {
+          "max_mean_error_rate": 0.28,
+          "min_term_hit_ratio": 1.0,
+          "allow_check_failures": 5
+        },
+        "long": {
+          "max_mean_error_rate": 0.75,
+          "min_term_hit_ratio": 0.0,
+          "allow_check_failures": 56
+        },
+        "mix": {
+          "max_mean_error_rate": 0.22000000000000003,
+          "min_term_hit_ratio": 0.0,
+          "allow_check_failures": 7
+        },
+        "zh-filler": {
+          "max_mean_error_rate": 0.3,
+          "min_term_hit_ratio": 1.0,
+          "allow_check_failures": 11
+        },
+        "zh-plain": {
+          "max_mean_error_rate": 0.09,
+          "min_term_hit_ratio": 1.0,
+          "allow_check_failures": 1
+        }
+      }
+    },
+    "qwen": {
+      "provisional": true,
+      "sets": {
+        "dict": {
+          "max_mean_error_rate": 0.33,
+          "min_term_hit_ratio": 0.2222,
+          "allow_check_failures": 10
+        },
+        "en": {
+          "max_mean_error_rate": 0.21000000000000002,
+          "min_term_hit_ratio": 1.0,
+          "allow_check_failures": 4
+        },
+        "long": {
+          "max_mean_error_rate": 1.3,
+          "min_term_hit_ratio": 0.0,
+          "allow_check_failures": 61
+        },
+        "mix": {
+          "max_mean_error_rate": 0.37,
+          "min_term_hit_ratio": 0.0,
+          "allow_check_failures": 5
+        },
+        "zh-filler": {
+          "max_mean_error_rate": 0.28,
+          "min_term_hit_ratio": 1.0,
+          "allow_check_failures": 12
+        },
+        "zh-plain": {
+          "max_mean_error_rate": 0.12000000000000001,
+          "min_term_hit_ratio": 1.0,
+          "allow_check_failures": 2
+        }
+      }
+    }
+  }
+}
