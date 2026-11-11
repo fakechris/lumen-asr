@@ -7,6 +7,10 @@
 //! Model path resolution / readiness / install locking / downloads live in
 //! `lumen-models`.
 
+pub mod chunked;
+
+pub use chunked::{join_transcripts, PauseSegmenter, SegmentPlannerConfig, SegmentRange};
+
 pub use lumen_asr_engine::{
     MlxWhisperAsr, MlxWhisperConfig, DEFAULT_MLX_WHISPER_MODEL, MLX_WHISPER_WORKER,
 };
