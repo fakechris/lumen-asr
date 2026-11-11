@@ -20,8 +20,13 @@ Depending on the features you use, Lumen ASR processes:
 
 Dictation history, audio, models, configuration, and diagnostics are stored in
 local application-data directories. On macOS, provider API keys are kept in the
-login Keychain rather than in the configuration file; on other platforms they
-remain in the configuration file in the user's application-data directory.
+login Keychain rather than in the configuration file — in official release
+builds. Local development builds are ad-hoc signed with an identity that
+changes on every rebuild, which the Keychain cannot authorize without a
+password prompt each time, so they keep API keys in the 0600 configuration
+file instead (`LUMEN_KEYCHAIN=1` opts a dev build into the Keychain). On
+other platforms keys remain in the configuration file in the user's
+application-data directory.
 macOS context snapshots are sealed before they are retained. Windows context capture is currently disabled and uses a
 fail-closed adapter.
 

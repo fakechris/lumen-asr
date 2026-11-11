@@ -215,9 +215,25 @@ pub fn save_slot(
 }
 
 /// The credential store for this platform, or `None` to keep keys in the file.
+///
+/// On macOS the Keychain is only used by **official release builds**
+/// (`LUMEN_OFFICIAL_BUILD` set by the release workflow). Every local
+/// build is ad-hoc signed, and an ad-hoc signature changes on each
+/// rebuild — a Keychain ACL cannot recognize the next binary, so every
+/// key read would prompt for the login password (and "Always Allow"
+/// cannot stick). Local and test builds therefore keep API keys in the
+/// 0600 config file, exactly like non-macOS platforms. `LUMEN_KEYCHAIN=1`
+/// forces the Keychain on (to exercise that path on a dev build), `=0`
+/// forces it off.
 pub fn platform_store() -> Option<&'static dyn SecretStore> {
     #[cfg(target_os = "macos")]
     {
+        if !keychain_enabled(
+            option_env!("LUMEN_OFFICIAL_BUILD").is_some(),
+            std::env::var_os("LUMEN_KEYCHAIN").as_deref(),
+        ) {
+            return None;
+        }
         static STORE: macos::KeychainStore = macos::KeychainStore;
         Some(&STORE)
     }
@@ -225,6 +241,17 @@ pub fn platform_store() -> Option<&'static dyn SecretStore> {
     {
         None
     }
+}
+
+/// Pure decision core of the Keychain policy, split out for tests.
+#[cfg(target_os = "macos")]
+fn keychain_enabled(official_build: bool, override_flag: Option<&std::ffi::OsStr>) -> bool {
+    match override_flag {
+        Some(value) if value == "1" => return true,
+        Some(value) if value == "0" => return false,
+        _ => {}
+    }
+    official_build
 }
 
 #[cfg(target_os = "macos")]
@@ -321,6 +348,31 @@ pub(crate) mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_policy_off_for_local_builds_and_overridable() {
+        use super::keychain_enabled;
+        use std::ffi::OsStr;
+        assert!(
+            !keychain_enabled(false, None),
+            "local (ad-hoc, ever-changing) builds never touch the Keychain"
+        );
+        assert!(
+            keychain_enabled(true, None),
+            "official release builds use it"
+        );
+        assert!(
+            keychain_enabled(false, Some(OsStr::new("1"))),
+            "explicit opt-in"
+        );
+        assert!(
+            !keychain_enabled(true, Some(OsStr::new("0"))),
+            "explicit opt-out"
+        );
+        // Unrecognized values fall back to the build type.
+        assert!(!keychain_enabled(false, Some(OsStr::new("yes"))));
+    }
 
     /// In-memory store; `fail` makes every call error to model a locked or
     /// unavailable Keychain.
