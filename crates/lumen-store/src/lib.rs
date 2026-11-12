@@ -1273,6 +1273,16 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Clear the audio_path of a session without touching any other
+    /// field; a targeted UPDATE that cannot insert a new row (INV-1804).
+    pub fn clear_session_audio(&self, id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET audio_path=NULL WHERE id=?1",
+            params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_session(&self, id: Uuid) -> Result<bool> {
         Ok(self.delete_sessions(&[id])? > 0)
     }

@@ -941,7 +941,7 @@ export interface HistoryExportOutcome {
 }
 
 export interface HistoryRetentionPreview {
-  wouldDelete: number;
+  would_delete: number;
 }
 
 export interface HistoryRetentionApplied {
