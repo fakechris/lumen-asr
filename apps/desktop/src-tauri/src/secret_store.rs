@@ -138,6 +138,21 @@ pub fn load_slot(
     value: &mut String,
 ) -> LoadOutcome {
     if !value.is_empty() {
+        // Migration policy (INV-1817 review): a key found in the file may
+        // only fill an EMPTY keychain slot. An existing entry is the
+        // official build's credential and wins — a local build's file key
+        // (written while it had no Keychain) must never overwrite it.
+        if let Ok(Some(stored)) = store.get(slot.clone()) {
+            if stored != *value {
+                tracing::info!(
+                    account = %slot.account(),
+                    "keychain already holds a different key; keeping it over the file value"
+                );
+                sync.set(&slot, SlotSync::Known(stored.clone()));
+                *value = stored;
+                return LoadOutcome::Migrated;
+            }
+        }
         return match store.set(slot.clone(), value) {
             Ok(()) => {
                 sync.set(&slot, SlotSync::Known(value.clone()));
@@ -218,7 +233,8 @@ pub fn save_slot(
 /// The credential store for this platform, or `None` to keep keys in the file.
 ///
 /// On macOS the Keychain is only used by **official release builds**
-/// (`LUMEN_OFFICIAL_BUILD` set by the release workflow). Every local
+/// (`LUMEN_OFFICIAL_BUILD=1` set by the release workflow; any other
+/// value is not official). Every local
 /// build is ad-hoc signed, and an ad-hoc signature changes on each
 /// rebuild — a Keychain ACL cannot recognize the next binary, so every
 /// key read would prompt for the login password (and "Always Allow"
@@ -361,6 +377,37 @@ pub(crate) mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn file_key_never_overwrites_an_existing_keychain_entry() {
+        // Migration policy (INV-1817 review): the file value may only
+        // fill an EMPTY slot; an existing stored key wins on load.
+        let store = FakeStore::default();
+        store
+            .set(SecretSlot::CorrectorApiKey, "release-key")
+            .unwrap();
+        let sync = SecretSync::default();
+        let mut field = "dev-key".to_string();
+        let outcome = load_slot(&store, &sync, SecretSlot::CorrectorApiKey, &mut field);
+        assert_eq!(field, "release-key", "stored credential wins");
+        assert_eq!(outcome, LoadOutcome::Migrated);
+        // Same value: plain no-op write path stays.
+        let mut same = "release-key".to_string();
+        assert_eq!(
+            load_slot(&store, &sync, SecretSlot::CorrectorApiKey, &mut same),
+            LoadOutcome::Migrated
+        );
+        // Empty slot: the file value migrates in.
+        let mut fresh = "dev-key".to_string();
+        assert_eq!(
+            load_slot(&store, &sync, SecretSlot::AsrApiKeyLegacy, &mut fresh),
+            LoadOutcome::Migrated
+        );
+        assert_eq!(
+            store.get(SecretSlot::AsrApiKeyLegacy).unwrap().as_deref(),
+            Some("dev-key")
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

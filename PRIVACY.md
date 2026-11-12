@@ -24,7 +24,10 @@ login Keychain rather than in the configuration file — in official release
 builds. Local development builds are ad-hoc signed with an identity that
 changes on every rebuild, which the Keychain cannot authorize without a
 password prompt each time, so they keep API keys in the 0600 configuration
-file instead (`LUMEN_KEYCHAIN=1` opts a dev build into the Keychain). On
+file instead (`LUMEN_KEYCHAIN=1` opts a dev build into the Keychain).
+Conversely, an official build run with `LUMEN_KEYCHAIN=0` also keeps keys
+in the file. A key present in the configuration file never overwrites an
+existing Keychain entry — the Keychain credential wins on load. On
 other platforms keys remain in the configuration file in the user's
 application-data directory.
 macOS context snapshots are sealed before they are retained. Windows context capture is currently disabled and uses a
