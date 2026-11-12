@@ -153,8 +153,12 @@ fn ms_to_samples(ms: u64) -> usize {
 pub fn join_transcripts(parts: &[&str]) -> String {
     let mut out = String::new();
     for part in parts.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        // A space goes between two parts only when neither boundary is a
+        // CJK ideograph: Latin↔Latin (including punctuation like "Hello."
+        // + "world", and accented "café" + "noir") reads as two words;
+        // CJK boundaries never do.
         let needs_space = match (out.chars().last(), part.chars().next()) {
-            (Some(prev), Some(next)) => is_latin_word(prev) && is_latin_word(next),
+            (Some(prev), Some(next)) => !is_cjk_ideograph(prev) && !is_cjk_ideograph(next),
             _ => false,
         };
         if needs_space {
@@ -165,8 +169,10 @@ pub fn join_transcripts(parts: &[&str]) -> String {
     out
 }
 
-fn is_latin_word(c: char) -> bool {
-    c.is_ascii_alphanumeric()
+fn is_cjk_ideograph(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c)
+        || ('\u{3400}'..='\u{4DBF}').contains(&c)
+        || ('\u{F900}'..='\u{FAFF}').contains(&c)
 }
 
 #[cfg(test)]
@@ -256,5 +262,8 @@ mod tests {
             "先说这些。然后continue"
         );
         assert_eq!(join_transcripts(&["  spaced  ", "out "]), "spaced out");
+        // Accented Latin and punctuation: still word boundaries (N49N).
+        assert_eq!(join_transcripts(&["café", "noir"]), "café noir");
+        assert_eq!(join_transcripts(&["Hello.", "world"]), "Hello. world");
     }
 }

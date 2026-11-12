@@ -950,6 +950,9 @@ pub fn start_recording_inner(state: &AppState, app: Option<&AppHandle>) -> Resul
         None
     };
     state.audio.start().map_err(|error| {
+        // Capture start failed: the chunked worker spawned above must not
+        // linger waiting for audio that will never arrive.
+        shutdown_chunked(state);
         cancel_pane_target_discovery();
         state.context.clear_active();
         error.to_string()
@@ -2609,7 +2612,19 @@ async fn run_local_asr(
     let chunked_worker = state.chunked.lock().take();
     if let Some(worker) = chunked_worker {
         if worker.engine_kind() == engine_kind {
-            let run = worker.finish();
+            // finish() blocks on a channel read for up to 90s; keep that
+            // off the async executor so other commands keep running.
+            let run = tokio::task::spawn_blocking(move || worker.finish())
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "chunked finish panicked; using unusable run");
+                    crate::chunked_asr::ChunkedRun {
+                        segments: Vec::new(),
+                        boundary_samples: 0,
+                        segment_ms: Vec::new(),
+                        tap_dropped: false,
+                    }
+                });
             if run.usable() {
                 let boundary = run.boundary_samples.min(samples_16k.len());
                 tracing::info!(
@@ -2626,14 +2641,33 @@ async fn run_local_asr(
                     .map(|s| s.clone().unwrap_or_default())
                     .collect();
                 let tail = &samples_16k[boundary..];
-                // A tail worth a pass; below ~250 ms it is trailing silence.
-                if tail.len() >= 16_000 / 4 {
-                    let tail_text = engine
+                // A tail worth a pass; below ~250 ms it is trailing silence,
+                // but only when it is silent — a short voiced tail after a
+                // hard-cap split still carries speech and must transcribe.
+                let tail_has_speech =
+                    tail.len() >= 16_000 / 4 || crate::chunked_asr::tail_has_speech(tail);
+                if tail_has_speech {
+                    match engine
                         .transcribe(AsrRequest::new(tail.to_vec(), 16_000))
                         .await
-                        .map_err(|e| e.to_string())?
-                        .text;
-                    parts.push(tail_text);
+                    {
+                        Ok(result) => parts.push(result.text),
+                        Err(error) => {
+                            // Tail failed; the closed segments are good but
+                            // the whole-buffer fallback is the honest path.
+                            tracing::warn!(%error, "chunked tail transcription failed; whole-buffer pass");
+                            parts.clear(); // signal: fall through below
+                        }
+                    }
+                }
+                if parts.is_empty() && !run.segments.is_empty() {
+                    // Tail error: segments were fine but the run is not
+                    // complete without the tail; use the whole buffer.
+                    tracing::info!("chunked tail error; whole-buffer fallback");
+                    return local_asr_engine(state, engine_kind)?
+                        .transcribe(AsrRequest::new(samples_16k, 16_000))
+                        .await
+                        .map_err(|e| e.to_string());
                 }
                 let part_refs: Vec<&str> = parts.iter().map(String::as_str).collect();
                 let text = lumen_asr::join_transcripts(&part_refs);

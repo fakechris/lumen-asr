@@ -52,11 +52,14 @@ pub struct ChunkedRun {
     pub boundary_samples: usize,
     /// Wall-clock ms each background segment took (diagnostics).
     pub segment_ms: Vec<u64>,
+    /// The capture tap dropped packets during this recording; the boundary
+    /// cannot be trusted and the stop path falls back.
+    pub tap_dropped: bool,
 }
 
 impl ChunkedRun {
     pub fn usable(&self) -> bool {
-        !self.segments.is_empty() && self.segments.iter().all(|s| s.is_ok())
+        !self.tap_dropped && !self.segments.is_empty() && self.segments.iter().all(|s| s.is_ok())
     }
 
     pub fn joined(&self) -> String {
@@ -73,6 +76,9 @@ struct Outcome {
     segments: Vec<Result<String, String>>,
     segment_ms: Vec<u64>,
     boundary: usize,
+    /// True when the tap dropped packets (total received audio is far
+    /// less than wall-clock would produce); the run falls back.
+    tap_dropped: bool,
 }
 
 pub struct ChunkedWorker {
@@ -132,9 +138,38 @@ fn run_loop(
     let mut segments: Vec<Result<String, String>> = Vec::new();
     let mut segment_ms: Vec<u64> = Vec::new();
     let mut consecutive_errors = 0u32;
+    let started_at = Instant::now();
+    let mut total_samples_received: usize = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
+            // Drain any chunks still queued from the capture tap before
+            // computing the final boundary: audio that arrived while a
+            // segment was transcribing belongs to this recording.
+            while let Ok(chunk) = rx.try_recv() {
+                let chunk_16k = if chunk.sample_rate == 16_000 {
+                    chunk.samples
+                } else {
+                    resample_linear(&chunk.samples, chunk.sample_rate, 16_000)
+                };
+                buffer.extend(chunk_16k.iter().copied());
+                for sample in chunk_16k {
+                    frame.push(sample);
+                    if frame.len() == FRAME_SAMPLES {
+                        let voiced = rms_of(&frame) >= VOICED_RMS;
+                        frame.clear();
+                        for range in planner.push_frame(voiced, FRAME_SAMPLES) {
+                            let _ = transcribe_range(
+                                &engine,
+                                &buffer,
+                                range,
+                                &mut segments,
+                                &mut segment_ms,
+                            );
+                        }
+                    }
+                }
+            }
             break;
         }
         let chunk = match rx.recv_timeout(Duration::from_millis(200)) {
@@ -150,6 +185,7 @@ fn run_loop(
         // Ranges index the cumulative buffer, so the buffer must contain
         // the frame that closes a segment before that segment transcribes.
         buffer.extend(chunk_16k.iter().copied());
+        total_samples_received += chunk_16k.len();
         for sample in chunk_16k {
             frame.push(sample);
             if frame.len() == FRAME_SAMPLES {
@@ -175,10 +211,15 @@ fn run_loop(
         }
     }
 
+    let elapsed_s = started_at.elapsed().as_secs_f64();
+    let expected_samples = (elapsed_s * 16_000.0) as usize;
+    let tap_dropped = expected_samples > 0 && total_samples_received < expected_samples * 8 / 10;
+
     Outcome {
         segments,
         segment_ms,
         boundary: planner.boundary(),
+        tap_dropped,
     }
 }
 
@@ -239,15 +280,18 @@ impl ChunkedWorker {
                 segments,
                 segment_ms,
                 boundary,
+                tap_dropped,
             }) => ChunkedRun {
                 segments,
                 boundary_samples: boundary,
                 segment_ms,
+                tap_dropped,
             },
             None => ChunkedRun {
                 segments: Vec::new(),
                 boundary_samples: 0,
                 segment_ms: Vec::new(),
+                tap_dropped: false,
             },
         }
     }
@@ -292,6 +336,22 @@ pub(crate) fn test_tap(
     capacity: usize,
 ) -> (std::sync::mpsc::SyncSender<LiveChunk>, Receiver<LiveChunk>) {
     std::sync::mpsc::sync_channel(capacity)
+}
+
+/// True when a short tail (below the 250 ms threshold) still carries
+/// voiced audio: the recording stopped shortly after a hard-cap split
+/// and the remaining speech must not be discarded.
+pub fn tail_has_speech(tail: &[f32]) -> bool {
+    if tail.is_empty() {
+        return false;
+    }
+    // Check 30 ms frames; any voiced frame means speech is present.
+    for frame in tail.chunks(FRAME_SAMPLES) {
+        if rms_of(frame) >= VOICED_RMS {
+            return true;
+        }
+    }
+    false
 }
 
 fn rms_of(samples: &[f32]) -> f32 {
