@@ -932,3 +932,36 @@ export const api = {
       intoSpeakerId,
     }),
 };
+
+/** INV-1804: batch history export result. */
+export interface HistoryExportOutcome {
+  path: string;
+  sessions: number;
+  bytes: number;
+}
+
+export interface HistoryRetentionPreview {
+  would_delete: number;
+}
+
+export interface HistoryRetentionApplied {
+  deleted: number;
+}
+
+export async function exportHistory(
+  target: string,
+  format: "md" | "jsonl",
+  scope: "all" | "dictation",
+): Promise<HistoryExportOutcome> {
+  return invoke<HistoryExportOutcome>("export_history", { target, format, scope });
+}
+
+export async function historyRetentionPreview(): Promise<HistoryRetentionPreview> {
+  return invoke<HistoryRetentionPreview>("history_retention_preview");
+}
+
+export async function historyRetentionApply(): Promise<HistoryRetentionApplied> {
+  return invoke<HistoryRetentionApplied>("history_retention_apply");
+}
+
+export { historyExportFilename } from "./historyExport.ts";
