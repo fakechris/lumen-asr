@@ -28,6 +28,9 @@ jobs:
     runs-on: macos-15
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Official release builds are the only builds allowed to store
+      # credentials in the macOS Keychain (see secret_store::platform_store).
+      LUMEN_OFFICIAL_BUILD: "1"
 
     steps:
       - name: Check out release tag
@@ -79,6 +82,9 @@ jobs:
     runs-on: windows-latest
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Official release builds are the only builds allowed to store
+      # credentials in the macOS Keychain (see secret_store::platform_store).
+      LUMEN_OFFICIAL_BUILD: "1"
 
     steps:
       - name: Check out release tag

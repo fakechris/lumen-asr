@@ -2514,6 +2514,7 @@ dependencies = [
  "lumen-corrector",
  "lumen-dictionary",
  "lumen-edit-learning",
+ "lumen-eval",
  "lumen-identity",
  "lumen-inject",
  "lumen-meeting",
@@ -2670,6 +2671,15 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "uuid",
+]
+
+[[package]]
+name = "lumen-eval"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
