@@ -11,7 +11,7 @@
 /// correctness is enforced per-clip through the corpus `must_not` fields,
 /// not through this list. Longest first when stripping so "就是说" wins
 /// over shorter prefixes.
-const CJK_FILLERS: &[&str] = &["就是说", "那个", "嗯", "呃", "啊", "哦", "唉"];
+const CJK_FILLERS: &[&str] = &["就是说", "嗯", "呃", "啊", "哦", "唉"];
 const LATIN_FILLERS: &[&str] = &["um", "uh", "er", "ah", "like", "basically"];
 
 /// Chinese numeral characters recognized by [`parse_chinese_numeral`].
@@ -111,7 +111,9 @@ fn replace_chinese_numerals(s: &str) -> String {
     while i < chars.len() {
         if is_numeral_char(chars[i]) {
             let start = i;
-            while i < chars.len() && is_numeral_char(chars[i]) && i - start < 4 {
+            // A continuous run is parsed as one unit (五千三百二十 → 5320);
+            // unparseable longer runs keep the leave-as-is fallback.
+            while i < chars.len() && is_numeral_char(chars[i]) && i - start < 12 {
                 i += 1;
             }
             let run: String = chars[start..i].iter().collect();
@@ -288,6 +290,7 @@ mod tests {
         assert_eq!(parse_chinese_numeral("五百"), Some(500));
         assert_eq!(parse_chinese_numeral("两千"), Some(2_000));
         assert_eq!(parse_chinese_numeral("五千三百二十"), Some(5_320));
+        assert_eq!(parse_chinese_numeral("二千零一十"), Some(2_010));
         assert_eq!(parse_chinese_numeral("三十二"), Some(32));
         assert_eq!(parse_chinese_numeral("不是数字x"), None);
     }

@@ -167,6 +167,8 @@ impl Corpus {
                 merged.extend(source.must.iter().cloned());
             }
         }
+        merged.sort();
+        merged.dedup();
         merged
     }
 
@@ -180,6 +182,8 @@ impl Corpus {
                 merged.extend(source.terms.iter().cloned());
             }
         }
+        merged.sort();
+        merged.dedup();
         merged
     }
 

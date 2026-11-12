@@ -322,8 +322,13 @@ fn run_asr(args: &[String]) -> i32 {
         return 2;
     }
 
-    let engine_lang = lang.as_deref().or(Some("zh"));
-    let engine = match build_engine(choice, engine_lang, "mlx-community/whisper-large-v3-turbo") {
+    // No forced language: engines auto-detect unless --lang is given
+    // (SenseVoice auto mode covers the mixed-script corpus).
+    let engine = match build_engine(
+        choice,
+        lang.as_deref(),
+        "mlx-community/whisper-large-v3-turbo",
+    ) {
         Ok(e) => e,
         Err(error) => {
             eprintln!("eval asr: {error}");
@@ -331,6 +336,13 @@ fn run_asr(args: &[String]) -> i32 {
         }
     };
 
+    // Report only on the selected clips: a `--set` filter scopes the run.
+    let mut corpus = corpus;
+    corpus
+        .clips
+        .retain(|c| sets.as_ref().map(|s| s.contains(&c.set)).unwrap_or(true));
+
+    let engine_errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let engine_label = choice.as_str().to_string();
     let report = EvalReport::run(&engine_label, &corpus, |clip, _text| {
         let path = clips_dir.join(format!("{}.wav", clip.id));
@@ -338,6 +350,7 @@ fn run_asr(args: &[String]) -> i32 {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("eval asr: {}: {e}", path.display());
+                engine_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Hypothesis::text(String::new());
             }
         };
@@ -349,25 +362,18 @@ fn run_asr(args: &[String]) -> i32 {
             Ok(result) => Hypothesis::text(result.text),
             Err(error) => {
                 eprintln!("eval asr: {}: engine error: {error}", clip.id);
+                engine_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Hypothesis::text(String::new())
             }
         }
     });
-    let report = match report {
+    let mut report = match report {
         Ok(r) => r,
         Err(e) => {
             eprintln!("eval asr: {e}");
             return 2;
         }
     };
-
-    if let Some(out) = flag_value(args, "--out") {
-        let payload = serde_json::to_string_pretty(&report).unwrap_or_default();
-        if let Err(e) = std::fs::write(&out, payload) {
-            eprintln!("eval asr: cannot write {out}: {e}");
-            return 2;
-        }
-    }
 
     if let Some(record_path) = record_baseline {
         let recorded = Baselines::from_report(&report, true);
@@ -400,7 +406,24 @@ fn run_asr(args: &[String]) -> i32 {
             }
         },
     };
-    let verdict = compare_with_baselines(&report, &baselines);
+    let mut verdict = compare_with_baselines(&report, &baselines);
+    // Transcription failures fail the run even when the numbers pass.
+    let errors = engine_errors.load(std::sync::atomic::Ordering::Relaxed);
+    if errors > 0 {
+        verdict.pass = false;
+        verdict
+            .breaches
+            .push(format!("{errors} clip transcription error(s)"));
+    }
+    // --out reports carry the evaluated mode, written after the verdict.
+    report.mode = verdict.mode;
+    if let Some(out) = flag_value(args, "--out") {
+        let payload = serde_json::to_string_pretty(&report).unwrap_or_default();
+        if let Err(e) = std::fs::write(&out, payload) {
+            eprintln!("eval asr: cannot write {out}: {e}");
+            return 2;
+        }
+    }
     let payload = serde_json::json!({
         "report": report,
         "verdict": verdict,

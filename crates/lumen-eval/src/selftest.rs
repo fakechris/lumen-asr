@@ -22,8 +22,28 @@ pub fn run() -> Result<Vec<String>, String> {
         corpus.clips.len(),
         corpus.dictionary_terms.len()
     ));
-    Baselines::embedded()?;
+    let baselines = Baselines::embedded()?;
     performed.push("embedded baselines parse".to_string());
+    // Every recorded engine gates every set: a missing set entry would
+    // silently make that set report-only for that engine.
+    let expected: Vec<&str> = crate::corpus::EvalSet::ALL
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    for (engine, entry) in &baselines.engines {
+        for set in &expected {
+            if !entry.sets.contains_key(*set) {
+                return Err(format!(
+                    "baseline engine `{engine}` has no entry for set `{set}`"
+                ));
+            }
+        }
+    }
+    performed.push(format!(
+        "baseline coverage: {} engine(s) gate all {} sets",
+        baselines.engines.len(),
+        expected.len()
+    ));
 
     // 2. A clean pass through the corpus stays green under strict gates.
     let clean_report = EvalReport::run("selftest", &corpus, |clip, text| {

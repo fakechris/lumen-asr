@@ -106,7 +106,10 @@ mod tests {
 
     #[test]
     fn punctuation_and_fillers_are_free() {
-        let e = error_rate("嗯，那个，我们下周三！", "我们下周三");
+        // 那个 is content now (kept on both sides); unambiguous fillers free.
+        let e = error_rate("嗯，我们下周三！", "我们下周三");
+        assert_eq!(e.rate, 0.0);
+        let e = error_rate("嗯，那个，我们下周三！", "那个我们下周三");
         assert_eq!(e.rate, 0.0);
     }
 
