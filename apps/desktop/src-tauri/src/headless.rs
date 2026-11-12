@@ -53,6 +53,7 @@ pub fn maybe_run_cli() -> Option<i32> {
         Some("meeting") if args.get(1).map(String::as_str) == Some("compact") => {
             Some(run_meeting_compact(&args[2..]))
         }
+        Some("eval") => Some(crate::eval_cmd::run_eval(&args[1..])),
         Some("voiceprint-match") => Some(run_voiceprint_match(&args[1..])),
         Some("--help") | Some("-h") => {
             print_help();
@@ -90,6 +91,11 @@ fn print_help() {
          meeting compact [--dry-run] [--meeting <id>]\n    \
            Migrate stored meeting recordings from PCM WAV to Ogg-Opus in place.\n    \
            Verify-then-delete per track; safe to re-run; skips live recordings.\n  \
+         eval <synth|asr|selftest> [options]\n    \
+           ASR quality harness (INV-1805). synth synthesizes the corpus clips\n    \
+           with macOS `say`; asr scores an engine against the corpus and gates\n    \
+           it against the checked-in baselines; selftest validates the harness\n    \
+           (corpus, baselines, injected-regression detection) without audio.\n  \
          voiceprint-match <meeting_id>\n\
          \nWith no headless command the desktop app launches normally.\n\
          \nEngines:\n  \
@@ -316,7 +322,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EngineChoice {
+pub(crate) enum EngineChoice {
     SenseVoice,
     Qwen,
     /// mlx-whisper Metal (production Whisper).
@@ -326,7 +332,7 @@ enum EngineChoice {
 }
 
 impl EngineChoice {
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "sensevoice" | "sv" | "local_sensevoice" => Some(Self::SenseVoice),
             "qwen" | "qwen3" | "qwen3-asr" | "local_qwen" => Some(Self::Qwen),
@@ -336,7 +342,7 @@ impl EngineChoice {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::SenseVoice => "sensevoice",
             Self::Qwen => "qwen",
@@ -577,7 +583,7 @@ fn python_for_mlx() -> PathBuf {
     crate::config::AppConfig::load().asr.python_executable()
 }
 
-fn build_engine(
+pub(crate) fn build_engine(
     choice: EngineChoice,
     lang: Option<&str>,
     mlx_whisper_model: &str,

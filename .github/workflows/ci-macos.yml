@@ -74,5 +74,13 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+      # ASR quality-gate harness self-check (INV-1805): validates the
+      # embedded corpus/baselines and proves the gate catches an injected
+      # cleanup regression and a diarization speaker collapse. The
+      # audio-dependent side (`eval synth` + `eval asr` against real
+      # engines) runs locally — see docs/EVAL.md.
+      - name: ASR eval gate self-check
+        run: cargo run -p lumen-asr-desktop -- eval selftest
+
       - name: Run workspace clippy
         run: cargo clippy --workspace --all-targets
