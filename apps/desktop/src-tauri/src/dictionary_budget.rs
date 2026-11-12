@@ -192,6 +192,9 @@ struct TextProfile {
     lowered: String,
     cjk: HashSet<char>,
     tokens: HashSet<String>,
+    /// INV-1803: shared mention decision — folded containment plus bounded
+    /// Latin edit distance, the same matcher every injection site uses.
+    mention: lumen_dictionary::MentionMatcher,
 }
 
 impl TextProfile {
@@ -200,6 +203,7 @@ impl TextProfile {
             lowered: text.to_lowercase(),
             cjk: text.chars().filter(|c| is_cjk(*c)).collect(),
             tokens: ascii_tokens(text).into_iter().collect(),
+            mention: lumen_dictionary::MentionMatcher::default(),
         }
     }
 
@@ -221,7 +225,7 @@ impl TextProfile {
     }
 
     fn contains(&self, key: &str) -> bool {
-        self.lowered.contains(&key.to_lowercase())
+        self.mention.mentions(&self.lowered, key) || self.lowered.contains(&key.to_lowercase())
     }
 }
 
@@ -325,6 +329,8 @@ fn line_chars(count: usize, item_chars: usize, label: &str, separator: &str) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::select_for_prompt;
+
     use super::*;
     use chrono::Duration;
     use lumen_prompts::format_dictionary_block;
@@ -524,5 +530,158 @@ mod tests {
         let second = select_for_prompt(&entries, text, DICTIONARY_PROMPT_BUDGET_CHARS);
         assert_eq!(first.context.terms, second.context.terms);
         assert_eq!(first.context.replacements, second.context.replacements);
+    }
+    /// INV-1803 A4: with a 150-entry dictionary and a text that mentions
+    /// three terms (exact, fullwidth, one-character slip), every mentioned
+    /// term survives the budget selection; the block stays within budget.
+    #[test]
+    fn budget_keeps_all_three_mention_shapes() {
+        let mut entries: Vec<DictionaryEntry> = (0..147)
+            .map(|i| DictionaryEntry {
+                id: uuid::Uuid::new_v4(),
+                kind: lumen_core::DictEntryKind::Term,
+                term: Some(format!("无关词{i:03}")),
+                from_text: None,
+                to_text: None,
+                source: lumen_core::DictEntrySource::Manual,
+                hit_count: 0,
+                confirmed: true,
+                updated_at: chrono::Utc::now(),
+            })
+            .collect();
+        for term in ["Lumen", "sherpa-onnx", "欧阳明远"] {
+            entries.push(DictionaryEntry {
+                id: uuid::Uuid::new_v4(),
+                kind: lumen_core::DictEntryKind::Term,
+                term: Some(term.to_string()),
+                from_text: None,
+                to_text: None,
+                source: lumen_core::DictEntrySource::Manual,
+                hit_count: 0,
+                confirmed: true,
+                updated_at: chrono::Utc::now(),
+            });
+        }
+        // One exact, one fullwidth, one one-character Latin slip.
+        let text = "部署好了 ＳＨＥＲＰＡ-ＯＮＮＸ 和 Lurnen，还问了欧阳明远";
+        let selection = select_for_prompt(&entries, text, DICTIONARY_PROMPT_BUDGET_CHARS);
+        for mentioned in ["Lumen", "sherpa-onnx", "欧阳明远"] {
+            assert!(
+                selection.context.terms.iter().any(|t| t == mentioned),
+                "mentioned term {mentioned} must survive the budget selection"
+            );
+        }
+        assert!(rendered_chars(&selection.context) <= DICTIONARY_PROMPT_BUDGET_CHARS);
+        assert_eq!(selection.total_terms, 150);
+    }
+
+    /// INV-1803 A3: corrector first-token latency with the dictionary block
+    /// at full size vs budget-selected, against a local OpenAI-compatible
+    /// endpoint (Ollama). Prompt processing dominates a `max_tokens: 1`
+    /// request, so its wall time is a faithful TTFT proxy.
+    ///
+    /// ```text
+    /// LUMEN_TTFT_URL=http://127.0.0.1:11434/v1
+    /// LUMEN_TTFT_MODEL=qwen3.5:9b
+    /// cargo test -p lumen-asr-desktop corrector_ttft_bench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "set LUMEN_TTFT_URL and LUMEN_TTFT_MODEL (needs a local LLM endpoint)"]
+    fn corrector_ttft_bench() {
+        let url = match std::env::var("LUMEN_TTFT_URL") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => panic!("LUMEN_TTFT_URL not set"),
+        };
+        let model = std::env::var("LUMEN_TTFT_MODEL").unwrap_or_else(|_| "qwen3.5:9b".to_string());
+        let entries: Vec<DictionaryEntry> = (0..150)
+            .map(|i| DictionaryEntry {
+                id: uuid::Uuid::new_v4(),
+                kind: lumen_core::DictEntryKind::Term,
+                term: Some(format!("LumenStreamingPipeline-术语条目{i:03}")),
+                from_text: None,
+                to_text: None,
+                source: lumen_core::DictEntrySource::Manual,
+                hit_count: 0,
+                confirmed: true,
+                updated_at: chrono::Utc::now(),
+            })
+            .collect();
+        let entries = {
+            // Mention three terms so the budget path has something to keep.
+            let mut e = entries;
+            for term in ["Lumen", "sherpa-onnx", "欧阳明远"] {
+                e.push(DictionaryEntry {
+                    id: uuid::Uuid::new_v4(),
+                    kind: lumen_core::DictEntryKind::Term,
+                    term: Some(term.to_string()),
+                    from_text: None,
+                    to_text: None,
+                    source: lumen_core::DictEntrySource::Manual,
+                    hit_count: 0,
+                    confirmed: true,
+                    updated_at: chrono::Utc::now(),
+                });
+            }
+            e
+        };
+        let asr_text = "部署好了 sherpa-onnx 和 Lumen，还问了欧阳明远";
+        let full = {
+            let (terms, replacements) = split_for_injection(&entries);
+            DictionaryContext {
+                terms,
+                replacements,
+            }
+        };
+        let budgeted =
+            select_for_prompt(&entries, asr_text, DICTIONARY_PROMPT_BUDGET_CHARS).context;
+        println!(
+            "TTFT_BENCH full_block_chars={} budgeted_block_chars={}",
+            rendered_chars(&full),
+            rendered_chars(&budgeted)
+        );
+
+        let measure = |context: &DictionaryContext| -> f64 {
+            let block = format!(
+                "{}{}",
+                lumen_prompts::DICTIONARY_TERMS_LABEL,
+                context.terms.join(lumen_prompts::DICTIONARY_TERM_SEPARATOR)
+            );
+            let body = serde_json::json!({
+                "model": model,
+                "max_tokens": 1,
+                "messages": [
+                    {"role": "system", "content": format!("你是语音输入的文本整理器。\n{block}")},
+                    {"role": "user", "content": asr_text}
+                ]
+            });
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap();
+            let mut times: Vec<f64> = Vec::new();
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                let response = client
+                    .post(format!("{url}/chat/completions"))
+                    .json(&body)
+                    .send()
+                    .expect("request ok");
+                assert!(response.status().is_success(), "{}", response.status());
+                let _ = response.text().unwrap();
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            times[1]
+        };
+        let full_ms = measure(&full);
+        let budgeted_ms = measure(&budgeted);
+        println!(
+            "TTFT_BENCH median_full_ms={full_ms:.0} median_budgeted_ms={budgeted_ms:.0} saved_ms={:.0}",
+            full_ms - budgeted_ms
+        );
+        assert!(
+            budgeted_ms <= full_ms + 150.0,
+            "budgeted first token must not be slower than the full block"
+        );
     }
 }

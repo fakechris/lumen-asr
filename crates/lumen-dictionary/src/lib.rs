@@ -4,8 +4,12 @@
 //! - Always record edit events at the store layer.
 //! - Generate *candidates* here; promote only on user confirm (or optional N threshold).
 
+pub mod injection;
 pub mod leak;
 
+pub use injection::{
+    select_hotword_terms, InjectionProfile, MentionMatcher, MEETING_HOTWORDS, REALTIME_HOTWORDS,
+};
 pub use leak::{clean_with_contrast, detect_term_echo, EchoCleaned, EchoConfig, EchoRun};
 
 use chrono::{DateTime, Utc};

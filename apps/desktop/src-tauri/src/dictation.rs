@@ -2194,23 +2194,13 @@ pub(crate) fn recover_asr_key_sync(state: &AppState) -> String {
     }
 }
 
-/// Cap on dictionary terms biasing a realtime session: volcengine accepts
-/// 100 inline hotword tokens, OpenAI's prompt stays effective at this size.
-const MAX_REALTIME_HOTWORDS: usize = 50;
-
 /// Personal-dictionary terms used to bias the realtime recognizer (the
-/// streaming replacement for the LLM correction pass).
+/// streaming replacement for the LLM correction pass). INV-1803: one
+/// shared policy — capped at 30, most-recently-modified first (a longer
+/// list slows a streaming recognizer and lowers its accuracy; the newest
+/// entries are the ones the user is making stick).
 fn realtime_hotwords_from_entries(entries: &[lumen_dictionary::DictionaryEntry]) -> Vec<String> {
-    let mut terms: Vec<String> = entries
-        .iter()
-        .filter_map(|entry| entry.term.as_ref())
-        .map(|term| term.trim().to_string())
-        .filter(|term| !term.is_empty())
-        .collect();
-    terms.sort_unstable();
-    terms.dedup();
-    terms.truncate(MAX_REALTIME_HOTWORDS);
-    terms
+    lumen_dictionary::select_hotword_terms(entries, lumen_dictionary::REALTIME_HOTWORDS)
 }
 
 /// Realtime dictation is active when the user enabled it, the selected
@@ -3660,7 +3650,7 @@ mod attempt_metric_tests {
         let many: Vec<_> = (0..80).map(|i| entry(Some(&format!("term{i}")))).collect();
         assert_eq!(
             realtime_hotwords_from_entries(&many).len(),
-            MAX_REALTIME_HOTWORDS
+            lumen_dictionary::REALTIME_HOTWORDS.max_terms
         );
     }
 
