@@ -541,3 +541,140 @@ pub fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
         Err("当前平台不支持打开文件夹".into())
     }
 }
+
+// ── INV-1804: history batch export + retention ─────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryExportOutcome {
+    pub path: String,
+    pub sessions: usize,
+    pub bytes: usize,
+}
+
+fn first_words(text: &str, max_chars: usize) -> String {
+    let clean: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    clean.chars().take(max_chars).collect()
+}
+
+/// Export the dictation history to one file. `format`: "md" (human-readable,
+/// 清理前后 per session) or "jsonl" (one full session record per line,
+/// machine-readable). `scope`: "all" | "dictation" — meetings keep their
+/// per-meeting export (`export_meeting_file`); no audio is included.
+#[tauri::command]
+pub fn export_history(
+    state: State<'_, AppState>,
+    target: String,
+    format: String,
+    scope: String,
+) -> Result<HistoryExportOutcome, String> {
+    if !matches!(scope.as_str(), "all" | "dictation") {
+        return Err(format!(
+            "scope `{scope}` not supported for batch export — meetings use per-meeting export"
+        ));
+    }
+    let sessions = with_store(&state, |s| {
+        s.list_sessions(100_000).map_err(|e| e.to_string())
+    })?;
+    let content = match format.as_str() {
+        "jsonl" => {
+            let mut out = String::new();
+            for rec in &sessions {
+                out.push_str(&serde_json::to_string(rec).map_err(|e| e.to_string())?);
+                out.push('\n');
+            }
+            out
+        }
+        "md" => {
+            let mut out = String::from("# Lumen ASR 历史导出\n\n");
+            for rec in &sessions {
+                let title = first_words(rec.asr_raw.as_deref().unwrap_or("(无文本)"), 12);
+                out.push_str(&format!(
+                    "## {} · {}\n\n- 引擎：{} / 修正：{}\n- 状态：{}\n\n**清理前**：{}\n\n**清理后**：{}\n\n---\n\n",
+                    rec.created_at.format("%Y-%m-%d %H:%M"),
+                    title,
+                    rec.asr_engine.as_deref().unwrap_or("-"),
+                    rec.corrector_engine.as_deref().unwrap_or("-"),
+                    serde_json::to_string(&rec.status).unwrap_or_default(),
+                    rec.asr_raw.as_deref().unwrap_or(""),
+                    rec.pasted.as_deref().or(rec.corrected.as_deref()).unwrap_or(""),
+                ));
+            }
+            out
+        }
+        other => return Err(format!("format `{other}` must be md or jsonl")),
+    };
+    std::fs::write(&target, content.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(HistoryExportOutcome {
+        path: target,
+        sessions: sessions.len(),
+        bytes: content.len(),
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryRetentionPreview {
+    pub would_delete: usize,
+}
+
+/// How many sessions the configured retention policy would delete now.
+#[tauri::command]
+pub fn history_retention_preview(
+    state: State<'_, AppState>,
+) -> Result<HistoryRetentionPreview, String> {
+    let policy = history_policy_from_config(&state);
+    let now = chrono::Utc::now();
+    with_store(&state, |s| {
+        Ok(HistoryRetentionPreview {
+            would_delete: s
+                .retention_candidates(&policy, now)
+                .map_err(|e| e.to_string())?
+                .len(),
+        })
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryRetentionApplied {
+    pub deleted: usize,
+}
+
+/// Apply the configured retention policy: delete the candidate rows with
+/// their artifacts (audio files included). Audit-logged.
+#[tauri::command]
+pub fn history_retention_apply(
+    state: State<'_, AppState>,
+) -> Result<HistoryRetentionApplied, String> {
+    let policy = history_policy_from_config(&state);
+    let now = chrono::Utc::now();
+    let ids = with_store(&state, |s| {
+        s.retention_candidates(&policy, now)
+            .map_err(|e| e.to_string())
+    })?;
+    let data_dir = lumen_platform::default_data_dir();
+    let mut deleted = 0usize;
+    with_store(&state, |store| -> Result<(), String> {
+        for id in &ids {
+            if crate::delete_session_with_artifacts(store, &data_dir, *id)? {
+                deleted += 1;
+            }
+        }
+        Ok(())
+    })?;
+    let _ = &state;
+    tracing::info!(
+        deleted,
+        candidates = ids.len(),
+        max_age_days = ?policy.max_age_days,
+        max_sessions = ?policy.max_sessions,
+        "history retention applied (INV-1804)"
+    );
+    Ok(HistoryRetentionApplied { deleted })
+}
+
+fn history_policy_from_config(state: &State<'_, AppState>) -> lumen_store::RetentionPolicy {
+    let cfg = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    lumen_store::RetentionPolicy {
+        max_age_days: cfg.history.retention_days,
+        max_sessions: cfg.history.max_sessions,
+    }
+}

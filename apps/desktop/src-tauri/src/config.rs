@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub ui: UiConfig,
     /// Voice-activity detection (silence auto-stop / trailing trim).
     pub vad: VadConfig,
+    pub history: HistoryConfig,
     /// Speech recognition backend (local or cloud).
     pub asr: AsrServiceConfig,
     /// Local, encrypted context capture used for replay and pipeline provenance.
@@ -45,6 +46,7 @@ impl Default for AppConfig {
             audio: AudioConfig::default(),
             ui: UiConfig::default(),
             vad: VadConfig::default(),
+            history: HistoryConfig::default(),
             asr: AsrServiceConfig::default(),
             context: ContextCaptureConfig::default(),
             meeting: MeetingConfig::default(),
@@ -796,6 +798,25 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self { sounds: true }
+    }
+}
+
+/// History lifecycle settings (INV-1804). Defaults: retention off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// Delete sessions older than this many days; `None` = no age rule.
+    pub retention_days: Option<u32>,
+    /// Keep at most this many sessions (newest kept); `None` = no cap.
+    pub max_sessions: Option<u32>,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: None,
+            max_sessions: None,
+        }
     }
 }
 

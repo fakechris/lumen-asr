@@ -1930,6 +1930,28 @@ pub async fn retry_session_transcription(
     // new attempt row rather than overwriting the first attempt's sidecars.
     persist_attempt(&state, true, &rec, attempt)?;
 
+    // INV-1804 A3: the recording served its retry purpose — drop it so a
+    // failed session's 7-day audio exemption ends the moment it succeeds.
+    let retry_audio = rec.audio_path.clone().filter(|p| !p.trim().is_empty());
+    if let Some(audio) = retry_audio.as_deref() {
+        match std::fs::remove_file(audio) {
+            Ok(()) => {
+                rec.audio_path = None;
+                let _ = state
+                    .store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|store| store.save_session(&rec));
+                tracing::info!(audio, "retry succeeded; failed-session audio deleted");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                rec.audio_path = None;
+            }
+            Err(error) => tracing::warn!(%error, audio, "could not delete retry audio"),
+        }
+    }
+
     tracing::info!(
         %id,
         asr_chars = asr_text.chars().count(),

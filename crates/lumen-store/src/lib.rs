@@ -2556,6 +2556,80 @@ fn parse_strategy(s: &str) -> InsertStrategy {
     }
 }
 
+// ── INV-1804: history retention ────────────────────────────────────────────
+
+/// Retention rules for the dictation history. `None` disables a rule; both
+/// `None` (the default) means retention is off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionPolicy {
+    /// Delete sessions older than this many days.
+    #[serde(default)]
+    pub max_age_days: Option<u32>,
+    /// Keep at most this many sessions (newest kept).
+    #[serde(default)]
+    pub max_sessions: Option<u32>,
+}
+
+/// A `failed` session that still has its recording is exempt from retention
+/// for this many days: the recording is what `retry_session_transcription`
+/// needs (INV-1804). A successful retry (or the expiry) ends the exemption.
+pub const FAILED_AUDIO_KEEP_DAYS: i64 = 7;
+
+impl Store {
+    /// Session ids the policy would delete at `now` — the age rule, the
+    /// cap rule, or both. Both rules exempt a `failed` session whose audio
+    /// still exists and is younger than [`FAILED_AUDIO_KEEP_DAYS`].
+    pub fn retention_candidates(
+        &self,
+        policy: &RetentionPolicy,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Uuid>> {
+        if policy.max_age_days.is_none() && policy.max_sessions.is_none() {
+            return Ok(Vec::new());
+        }
+        let audio_cutoff = (now - chrono::Duration::days(FAILED_AUDIO_KEEP_DAYS)).to_rfc3339();
+        let mut ids: Vec<Uuid> = Vec::new();
+        let mut push_rows =
+            |stmt_text: &str, params: &[&dyn rusqlite::ToSql], ids: &mut Vec<Uuid>| -> Result<()> {
+                let mut stmt = self.conn.prepare(stmt_text)?;
+                let rows = stmt.query_map(params, |row| row.get::<_, String>(0))?;
+                for id in rows {
+                    let id = id?;
+                    let parsed =
+                        Uuid::parse_str(&id).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+                    ids.push(parsed);
+                }
+                Ok(())
+            };
+        if let Some(days) = policy.max_age_days {
+            let cutoff = (now - chrono::Duration::days(days as i64)).to_rfc3339();
+            push_rows(
+                r#"SELECT id FROM sessions
+                   WHERE created_at < ?1
+                     AND NOT (status='failed' AND audio_path IS NOT NULL AND created_at >= ?2)"#,
+                &[&cutoff, &audio_cutoff],
+                &mut ids,
+            )?;
+        }
+        if let Some(cap) = policy.max_sessions {
+            let cap = i64::from(cap);
+            push_rows(
+                r#"SELECT id FROM (
+                     SELECT id, created_at,
+                            ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn
+                     FROM sessions
+                     WHERE NOT (status='failed' AND audio_path IS NOT NULL AND created_at >= ?1)
+                   ) WHERE rn > ?2 ORDER BY created_at ASC"#,
+                &[&audio_cutoff, &cap],
+                &mut ids,
+            )?;
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+}
+
 fn status_str(s: SessionStatus) -> &'static str {
     match s {
         SessionStatus::InProgress => "in_progress",
@@ -2613,6 +2687,155 @@ fn parse_dict_source(s: &str) -> DictEntrySource {
 
 #[cfg(test)]
 mod tests {
+
+    // ── INV-1804 retention ─────────────────────────────────────────────
+
+    fn retention_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("t.sqlite")).unwrap();
+        (dir, store)
+    }
+
+    fn seed(
+        rec_id: &str,
+        days_ago: i64,
+        status: SessionStatus,
+        audio: Option<&str>,
+    ) -> SessionRecord {
+        let mut rec = SessionRecord::new();
+        rec.id = Uuid::parse_str(rec_id).unwrap();
+        rec.created_at = Utc::now() - chrono::Duration::days(days_ago);
+        rec.status = status;
+        rec.audio_path = audio.map(str::to_string);
+        rec
+    }
+
+    #[test]
+    fn retention_age_rule_respects_boundary_and_failed_audio() {
+        let (_dir, store) = retention_store();
+        store
+            .save_session(&seed(
+                "00000000-0000-0000-0000-000000000001",
+                31,
+                SessionStatus::Completed,
+                None,
+            ))
+            .unwrap();
+        store
+            .save_session(&seed(
+                "00000000-0000-0000-0000-000000000002",
+                29,
+                SessionStatus::Completed,
+                None,
+            ))
+            .unwrap();
+        // Failed without audio, old: purgeable immediately.
+        store
+            .save_session(&seed(
+                "00000000-0000-0000-0000-000000000005",
+                40,
+                SessionStatus::Failed,
+                None,
+            ))
+            .unwrap();
+        let policy = RetentionPolicy {
+            max_age_days: Some(30),
+            max_sessions: None,
+        };
+        let ids = store.retention_candidates(&policy, Utc::now()).unwrap();
+        let ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        assert!(
+            ids.contains(&"00000000-0000-0000-0000-000000000001".to_string()),
+            "31d completed deleted"
+        );
+        assert!(
+            !ids.contains(&"00000000-0000-0000-0000-000000000002".to_string()),
+            "29d kept"
+        );
+        assert!(
+            ids.contains(&"00000000-0000-0000-0000-000000000005".to_string()),
+            "failed no audio purgeable"
+        );
+
+        // Tight age window exercises the failed-audio exemption: a failed
+        // session with audio is purgeable by age only after 7 days.
+        store
+            .save_session(&seed(
+                "00000000-0000-0000-0000-000000000006",
+                6,
+                SessionStatus::Failed,
+                Some("/tmp/a.wav"),
+            ))
+            .unwrap();
+        store
+            .save_session(&seed(
+                "00000000-0000-0000-0000-000000000007",
+                8,
+                SessionStatus::Failed,
+                Some("/tmp/b.wav"),
+            ))
+            .unwrap();
+        let tight = RetentionPolicy {
+            max_age_days: Some(5),
+            max_sessions: None,
+        };
+        let ids = store.retention_candidates(&tight, Utc::now()).unwrap();
+        let ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        assert!(
+            !ids.contains(&"00000000-0000-0000-0000-000000000006".to_string()),
+            "failed+audio within 7d exempt from age rule"
+        );
+        assert!(
+            ids.contains(&"00000000-0000-0000-0000-000000000007".to_string()),
+            "failed+audio past 7d purgeable"
+        );
+    }
+
+    #[test]
+    fn retention_cap_keeps_newest_and_both_rules_union() {
+        let (_dir, store) = retention_store();
+        for (i, days) in [1u8, 2, 3, 4, 5].iter().enumerate() {
+            store
+                .save_session(&seed(
+                    &format!("00000000-0000-0000-0000-{0:012}", i as u64 + 1),
+                    *days as i64,
+                    SessionStatus::Completed,
+                    None,
+                ))
+                .unwrap();
+        }
+        let cap_only = RetentionPolicy {
+            max_age_days: None,
+            max_sessions: Some(3),
+        };
+        let ids = store.retention_candidates(&cap_only, Utc::now()).unwrap();
+        assert_eq!(ids.len(), 2, "5 sessions capped at 3 delete the 2 oldest");
+        assert!(!ids.contains(&Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()));
+
+        let both = RetentionPolicy {
+            max_age_days: Some(3),
+            max_sessions: Some(3),
+        };
+        let ids = store.retention_candidates(&both, Utc::now()).unwrap();
+        assert_eq!(ids.len(), 3, "age (4d,5d) and cap overlap dedups");
+    }
+
+    #[test]
+    fn retention_disabled_deletes_nothing() {
+        let (_dir, store) = retention_store();
+        store
+            .save_session(&seed(
+                "00000000-0000-0000-0000-000000000009",
+                400,
+                SessionStatus::Completed,
+                None,
+            ))
+            .unwrap();
+        let ids = store
+            .retention_candidates(&RetentionPolicy::default(), Utc::now())
+            .unwrap();
+        assert!(ids.is_empty());
+    }
     use super::*;
     use lumen_dictionary::DictionaryEntry;
     use lumen_edit_learning::{
