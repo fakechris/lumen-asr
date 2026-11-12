@@ -61,6 +61,15 @@ struct Occurrence {
     term: usize,
 }
 
+fn utf8_char_len(first_byte: u8) -> usize {
+    match first_byte {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
 fn is_separator(c: char) -> bool {
     matches!(
         c,
@@ -73,7 +82,10 @@ fn is_separator(c: char) -> bool {
 /// woven into one.
 fn at_sentence_boundary(text: &str, start: usize) -> bool {
     let prefix = &text[..start];
-    match prefix.chars().next_back() {
+    // Skip trailing whitespace (a newline or spaces after the sentence
+    // end) before checking the boundary character.
+    let trimmed = prefix.trim_end();
+    match trimmed.chars().next_back() {
         None => true,
         Some('。') | Some('！') | Some('？') | Some('!') | Some('?') | Some('\n') | Some('；')
         | Some(';') | Some('.') | Some('嗯') | Some('呃') | Some('啊') | Some('哦') => true,
@@ -123,19 +135,36 @@ pub fn detect_term_echo_with(
         return None;
     }
 
-    let lowered = text.to_lowercase();
+    // Search case-insensitively but map offsets back to the original
+    // text: lowercase can change byte lengths for some Unicode.
     let mut occurrences: Vec<Occurrence> = Vec::new();
     for (index, term) in terms.iter().enumerate() {
         let needle = term.to_lowercase();
-        let mut from = 0;
-        while let Some(found) = lowered[from..].find(&needle) {
-            let start = from + found;
-            occurrences.push(Occurrence {
-                start,
-                end: start + needle.len(),
-                term: index,
-            });
-            from = start + needle.len().max(1);
+        let mut search_from = 0;
+        while search_from <= text.len() {
+            let hay = text[search_from..].to_lowercase();
+            if let Some(found) = hay.find(&needle) {
+                // Map the lowered offset back: walk both strings together.
+                let hay_bytes = text[search_from..].as_bytes();
+                let lower_bytes = hay.as_bytes();
+                let mut orig_start = search_from;
+                let mut lower_pos = 0;
+                let target = found;
+                while lower_pos < target && orig_start < hay_bytes.len() {
+                    let lower_char_len = utf8_char_len(lower_bytes[lower_pos]);
+                    orig_start += lower_char_len;
+                    lower_pos += lower_char_len;
+                }
+                let char_len = needle.len();
+                occurrences.push(Occurrence {
+                    start: orig_start,
+                    end: orig_start + char_len,
+                    term: index,
+                });
+                search_from = orig_start + char_len.max(1);
+            } else {
+                break;
+            }
         }
     }
     if occurrences.is_empty() {
@@ -158,6 +187,16 @@ pub fn detect_term_echo_with(
             (chain_start..=i).map(|j| occurrences[j].term).collect();
         if distinct.len() < cfg.min_chain_terms || !at_sentence_boundary(text, start) {
             continue;
+        }
+        // A chain that flows into sentence content (the next char after
+        // the last term is a word, not a separator or end) is a recited
+        // list inside a sentence, not an echo.
+        if let Some(next) = text[end..].chars().next() {
+            if !is_separator(next)
+                && !matches!(next, '。' | '！' | '？' | '!' | '?' | '\n' | '；' | ';')
+            {
+                continue;
+            }
         }
         let chain_terms: Vec<String> = distinct
             .into_iter()
