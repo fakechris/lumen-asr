@@ -720,7 +720,8 @@ pub(crate) fn unload_qwen(state: &AppState) {
     // sherpa-onnx Qwen3-ASR: dropping the cached recognizer releases the model;
     // the next request reloads it lazily. False just means nothing was loaded.
     // Every local engine replacement passes through here, so it also resets
-    // the prewarm bookkeeping.
+    // the prewarm bookkeeping and any in-flight chunked worker.
+    shutdown_chunked(state);
     if let Ok(engine) = state.qwen.lock() {
         engine.unload();
     }
@@ -924,6 +925,7 @@ pub fn start_recording_inner(state: &AppState, app: Option<&AppHandle>) -> Resul
     state.context.begin(hint);
     configure_session_vad(state);
     maybe_start_realtime(state, app);
+    maybe_start_chunked(state);
     let audio_config = state
         .config
         .lock()
@@ -948,6 +950,9 @@ pub fn start_recording_inner(state: &AppState, app: Option<&AppHandle>) -> Resul
         None
     };
     state.audio.start().map_err(|error| {
+        // Capture start failed: the chunked worker spawned above must not
+        // linger waiting for audio that will never arrive.
+        shutdown_chunked(state);
         cancel_pane_target_discovery();
         state.context.clear_active();
         error.to_string()
@@ -2267,7 +2272,59 @@ pub(crate) fn abort_realtime(state: &AppState) {
         );
         drop(handle); // dropping `end` breaks the pump; the task winds down
     }
+    shutdown_chunked(state);
     let _ = state.audio.set_live_tap(None);
+}
+
+/// INV-1807: local batch engines segment long dictations at pauses and
+/// transcribe finished stretches in the background while the user keeps
+/// talking; stop only pays for the tail. Mutually exclusive with realtime
+/// (cloud streaming) — one provider is either local batch or realtime, and
+/// realtime owns the live tap for its recording, so this is a no-op then.
+fn maybe_start_chunked(state: &AppState) {
+    if state.realtime.lock().is_some() {
+        return; // realtime owns the live tap for this recording
+    }
+    let (provider, engine_kind) = {
+        let cfg = state.config.lock().unwrap_or_else(|e| e.into_inner());
+        let engine = *state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        (cfg.asr.provider.clone(), engine)
+    };
+    let Some(kind) = dictation_local_engine_kind(&provider, engine_kind) else {
+        return;
+    };
+    // `local_asr_engine` serves every non-Qwen/Whisper kind from SenseVoice.
+    let kind = match kind {
+        EngineKind::Whisper | EngineKind::Qwen => kind,
+        _ => EngineKind::SenseVoice,
+    };
+    let engine = match local_asr_engine(state, kind) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::debug!(%error, "skipping chunked transcription (no engine)");
+            return;
+        }
+    };
+    let (tap, rx) = lumen_asr::live_tap();
+    let _ = state.audio.set_live_tap(Some(tap));
+    *state.chunked.lock() = Some(crate::chunked_asr::spawn_chunked_worker(
+        kind,
+        engine,
+        rx,
+        lumen_asr::SegmentPlannerConfig::default(),
+    ));
+    tracing::info!(engine = kind.as_str(), "chunked dictation session starting");
+}
+
+/// Stop and drop any active chunked worker without waiting for its text
+/// (cancel, engine switch, non-finishing exits). Dropping the worker sets
+/// its stop flag; the loop exits after any in-flight engine call and logs
+/// whatever it had transcribed.
+pub(crate) fn shutdown_chunked(state: &AppState) {
+    if let Some(worker) = state.chunked.lock().take() {
+        tracing::info!("chunked dictation session stopped");
+        drop(worker);
+    }
 }
 
 /// Finish the realtime run at stop, if one is active. Returns the final
@@ -2547,6 +2604,92 @@ async fn run_local_asr(
     engine_kind: EngineKind,
     samples_16k: Vec<f32>,
 ) -> Result<AsrResult, String> {
+    // INV-1807: when background chunked transcription ran for this engine,
+    // reuse its segments and transcribe only the tail instead of the whole
+    // buffer. Any failed segment (or a missing run) falls back to the
+    // whole-buffer pass below.
+    // Bound separately so the lock guard drops before any await below.
+    let chunked_worker = state.chunked.lock().take();
+    if let Some(worker) = chunked_worker {
+        if worker.engine_kind() == engine_kind {
+            // finish() blocks on a channel read for up to 90s; keep that
+            // off the async executor so other commands keep running.
+            let run = tokio::task::spawn_blocking(move || worker.finish())
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "chunked finish panicked; using unusable run");
+                    crate::chunked_asr::ChunkedRun {
+                        segments: Vec::new(),
+                        boundary_samples: 0,
+                        segment_ms: Vec::new(),
+                        tap_dropped: false,
+                    }
+                });
+            if run.usable() {
+                let boundary = run.boundary_samples.min(samples_16k.len());
+                tracing::info!(
+                    segments = run.segments.len(),
+                    boundary_samples = boundary,
+                    tail_samples = samples_16k.len() - boundary,
+                    segment_ms = ?run.segment_ms,
+                    "chunked run accepted; transcribing tail"
+                );
+                let engine = local_asr_engine(state, engine_kind)?;
+                let mut parts: Vec<String> = run
+                    .segments
+                    .iter()
+                    .map(|s| s.clone().unwrap_or_default())
+                    .collect();
+                let tail = &samples_16k[boundary..];
+                // A tail worth a pass; below ~250 ms it is trailing silence,
+                // but only when it is silent — a short voiced tail after a
+                // hard-cap split still carries speech and must transcribe.
+                let tail_has_speech =
+                    tail.len() >= 16_000 / 4 || crate::chunked_asr::tail_has_speech(tail);
+                if tail_has_speech {
+                    match engine
+                        .transcribe(AsrRequest::new(tail.to_vec(), 16_000))
+                        .await
+                    {
+                        Ok(result) => parts.push(result.text),
+                        Err(error) => {
+                            // Tail failed; the closed segments are good but
+                            // the whole-buffer fallback is the honest path.
+                            tracing::warn!(%error, "chunked tail transcription failed; whole-buffer pass");
+                            parts.clear(); // signal: fall through below
+                        }
+                    }
+                }
+                if parts.is_empty() && !run.segments.is_empty() {
+                    // Tail error: segments were fine but the run is not
+                    // complete without the tail; use the whole buffer.
+                    tracing::info!("chunked tail error; whole-buffer fallback");
+                    return local_asr_engine(state, engine_kind)?
+                        .transcribe(AsrRequest::new(samples_16k, 16_000))
+                        .await
+                        .map_err(|e| e.to_string());
+                }
+                let part_refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+                let text = lumen_asr::join_transcripts(&part_refs);
+                if !text.trim().is_empty() {
+                    let mut result = AsrResult::new(text, AsrEngineId::Other);
+                    result.engine_label = format!("{}+chunked", engine_kind.as_str());
+                    return Ok(result);
+                }
+                tracing::warn!("chunked run produced empty text; whole-buffer pass instead");
+            } else {
+                tracing::info!(
+                    segments = run.segments.len(),
+                    "chunked run unusable; whole-buffer transcription"
+                );
+            }
+        } else {
+            tracing::info!(
+                expected = engine_kind.as_str(),
+                "chunked run engine mismatch; whole-buffer transcription"
+            );
+        }
+    }
     // sherpa-onnx Qwen3-ASR auto-detects the language and has no per-request
     // hotword/shadow channel — a plain transcribe is the whole contract for
     // every local engine.
@@ -3175,6 +3318,7 @@ mod attempt_metric_tests {
             meeting_realtime: parking_lot::Mutex::new(None),
             meeting_audio_diag: std::sync::Mutex::new(None),
             realtime: parking_lot::Mutex::new(None),
+            chunked: parking_lot::Mutex::new(None),
             edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(
                 store.clone(),
                 false,
@@ -3562,6 +3706,7 @@ mod attempt_metric_tests {
             meeting_realtime: parking_lot::Mutex::new(None),
             meeting_audio_diag: std::sync::Mutex::new(None),
             realtime: parking_lot::Mutex::new(None),
+            chunked: parking_lot::Mutex::new(None),
             edit_learning: crate::edit_learning_runtime::DesktopEditLearning::new(
                 store.clone(),
                 false,
