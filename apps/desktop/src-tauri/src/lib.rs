@@ -17,6 +17,7 @@ mod detection_stats;
 mod dictation;
 mod dictionary_budget;
 mod edit_learning_runtime;
+mod eval_cmd;
 mod headless;
 mod hotkey;
 mod hotkey_validate;
