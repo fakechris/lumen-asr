@@ -4,6 +4,10 @@
 //! - Always record edit events at the store layer.
 //! - Generate *candidates* here; promote only on user confirm (or optional N threshold).
 
+pub mod leak;
+
+pub use leak::{clean_with_contrast, detect_term_echo, EchoCleaned, EchoConfig, EchoRun};
+
 use chrono::{DateTime, Utc};
 use lumen_core::{DictEntryKind, DictEntrySource};
 use serde::{Deserialize, Serialize};

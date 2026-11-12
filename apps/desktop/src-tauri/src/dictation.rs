@@ -1344,6 +1344,10 @@ pub async fn stop_and_transcribe_inner(
         let text = realtime_final
             .expect("realtime_used implies a final transcript")
             .expect("checked non-empty");
+        // INV-1806: a no-speech stretch can make the recognizer write the
+        // injected dictionary back out ("…嗯。Lumen、Tauri。"); contrast the
+        // same audio without hot words and drop only unspoken terms.
+        let text = guard_realtime_hotword_echo(state, text, &samples_16k).await;
         let mut result = AsrResult::new(text, AsrEngineId::Other);
         result.engine_label = label.clone();
         AsrRun {
@@ -2403,6 +2407,79 @@ async fn finish_realtime(
             Some(Err(error))
         }
     }
+}
+
+/// INV-1806: clean a hot-word echo out of a realtime transcript. The same
+/// audio is transcribed once more by a local engine **without** any
+/// dictionary injected, and only terms the contrast pass does not contain
+/// are removed — a term the user really said (sentence-final included)
+/// survives. Fails open: no dictionary, no detection, no local engine, or
+/// a contrast error all return the text unchanged.
+async fn guard_realtime_hotword_echo(
+    state: &AppState,
+    text: String,
+    samples_16k: &[f32],
+) -> String {
+    let hotwords = state
+        .store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(|store| store.list_dictionary().ok())
+        .map(|entries| realtime_hotwords_from_entries(&entries))
+        .unwrap_or_default();
+    if hotwords.is_empty() || text.trim().is_empty() {
+        return text;
+    }
+    let Some(run) = lumen_dictionary::detect_term_echo(&text, &hotwords) else {
+        return text;
+    };
+    let (provider_cfg, engine_kind) = {
+        let cfg = state.config.lock().unwrap_or_else(|e| e.into_inner());
+        let engine = *state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        (cfg.asr.provider.clone(), engine)
+    };
+    let Some(kind) = dictation_local_engine_kind(&provider_cfg, engine_kind) else {
+        tracing::debug!("echo detected but no local engine for a contrast pass; keeping text");
+        return text;
+    };
+    let engine = match local_asr_engine(state, kind) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::debug!(%error, "echo contrast engine unavailable; keeping text");
+            return text;
+        }
+    };
+    let contrast = match engine
+        .transcribe(AsrRequest::new(samples_16k.to_vec(), 16_000))
+        .await
+    {
+        Ok(result) => result.text,
+        Err(error) => {
+            tracing::warn!(%error, "echo contrast transcription failed; keeping text");
+            return text;
+        }
+    };
+    let cleaned = realtime_echo_clean(&text, &run, &contrast);
+    if !cleaned.removed.is_empty() {
+        tracing::info!(
+            removed = ?cleaned.removed,
+            kept = ?cleaned.kept,
+            "removed hot-word echo from realtime transcript"
+        );
+    }
+    cleaned.text
+}
+
+/// Pure seam of [`guard_realtime_hotword_echo`]: detection has already
+/// fired; apply the contrast decision. Separate so tests cover the exact
+/// pipeline the guard runs without an engine.
+pub(crate) fn realtime_echo_clean(
+    text: &str,
+    run: &lumen_dictionary::EchoRun,
+    contrast: &str,
+) -> lumen_dictionary::EchoCleaned {
+    lumen_dictionary::clean_with_contrast(text, run, contrast)
 }
 
 /// Surfaced (and matched for the one extra retry cycle in `run_asr`) when a
@@ -3808,5 +3885,41 @@ mod attempt_metric_tests {
             ..VadConfig::default()
         };
         assert_eq!(resolve_silero_model_path(&vad), None);
+    }
+
+    /// INV-1806 A3: the sauc realtime text pipeline end to end — a final
+    /// transcript with the injected dictionary echoed after a pause, a
+    /// contrast pass without the terms, echo gone, spoken tail kept.
+    #[test]
+    fn realtime_echo_pipeline_removes_only_unspoken_terms() {
+        let hotwords: Vec<String> = ["Lumen", "Tauri", "sherpa-onnx", "欧阳明远"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let text = "我们下周三开会讨论预算，问了欧阳明远。嗯。Lumen、Tauri、sherpa-onnx。";
+        let run = lumen_dictionary::detect_term_echo(text, &hotwords)
+            .expect("echo run detected in realtime transcript");
+        // Contrast pass (no hot words injected) heard the person and the
+        // sentence-final term, not the echoed list.
+        let contrast = "我们下周三开会讨论预算，问了欧阳明远 Lumen";
+        let cleaned = realtime_echo_clean(text, &run, contrast);
+        assert_eq!(
+            cleaned.text,
+            "我们下周三开会讨论预算，问了欧阳明远。嗯。Lumen。"
+        );
+        assert_eq!(cleaned.removed, vec!["Tauri", "sherpa-onnx"]);
+        assert_eq!(cleaned.kept, vec!["Lumen"]);
+    }
+
+    /// INV-1806 A4: a transcript whose chained terms were all really said
+    /// is byte-for-byte unchanged — zero false deletions.
+    #[test]
+    fn realtime_echo_pipeline_keeps_fully_spoken_runs() {
+        let hotwords: Vec<String> = ["Lumen", "Tauri"].iter().map(|s| s.to_string()).collect();
+        let text = "演示开始。Lumen、Tauri。";
+        let run = lumen_dictionary::detect_term_echo(text, &hotwords).unwrap();
+        let cleaned = realtime_echo_clean(text, &run, "演示开始 Lumen 和 Tauri");
+        assert_eq!(cleaned.text, text);
+        assert!(cleaned.removed.is_empty());
     }
 }
