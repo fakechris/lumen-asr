@@ -2628,10 +2628,9 @@ fn run_meeting_processing(
     });
 }
 
-/// Upper bound on dictionary **terms** fed to the post-ASR correction pass. The
-/// per-segment fuzzy scan is O(terms × text), so cap the list to keep correction
-/// bounded on large dictionaries. `list_dictionary` returns most-recently-updated
-/// first, so the cap keeps the freshest terms.
+/// Upper bound on dictionary **terms** fed to the post-ASR correction pass.
+/// Kept today's value; the selection itself now runs through the shared
+/// injection policy (INV-1803) — see `lumen_dictionary::MEETING_HOTWORDS`.
 const MAX_MEETING_HOTWORDS: usize = 128;
 
 /// Build the meeting's post-ASR correction view from the user's confirmed
@@ -2643,7 +2642,14 @@ const MAX_MEETING_HOTWORDS: usize = 128;
 fn meeting_correction_dict(store: &Store) -> CorrectionDict {
     let entries = store.list_dictionary().unwrap_or_default();
     let (mut terms, replacements) = split_for_injection(&entries);
-    terms.truncate(MAX_MEETING_HOTWORDS);
+    // INV-1803: same policy object as every other dictionary injection
+    // site — cap + most-recently-modified ordering (list_dictionary is
+    // already newest-first; the policy makes that explicit and shared).
+    let allowed: std::collections::HashSet<String> =
+        lumen_dictionary::select_hotword_terms(&entries, lumen_dictionary::MEETING_HOTWORDS)
+            .into_iter()
+            .collect();
+    terms.retain(|term| allowed.contains(term));
     CorrectionDict::new(terms, replacements)
 }
 
