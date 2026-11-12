@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 
 /// Keychain service shared by every provider credential.
 #[cfg(target_os = "macos")]
+#[cfg_attr(test, allow(dead_code))]
 const KEYCHAIN_SERVICE: &str = "com.lumenopen.asr.credentials";
 
 /// One credential slot in [`crate::config::AppConfig`].
@@ -137,6 +138,21 @@ pub fn load_slot(
     value: &mut String,
 ) -> LoadOutcome {
     if !value.is_empty() {
+        // Migration policy (INV-1817 review): a key found in the file may
+        // only fill an EMPTY keychain slot. An existing entry is the
+        // official build's credential and wins — a local build's file key
+        // (written while it had no Keychain) must never overwrite it.
+        if let Ok(Some(stored)) = store.get(slot.clone()) {
+            if stored != *value {
+                tracing::info!(
+                    account = %slot.account(),
+                    "keychain already holds a different key; keeping it over the file value"
+                );
+                sync.set(&slot, SlotSync::Known(stored.clone()));
+                *value = stored;
+                return LoadOutcome::Migrated;
+            }
+        }
         return match store.set(slot.clone(), value) {
             Ok(()) => {
                 sync.set(&slot, SlotSync::Known(value.clone()));
@@ -215,11 +231,37 @@ pub fn save_slot(
 }
 
 /// The credential store for this platform, or `None` to keep keys in the file.
+///
+/// On macOS the Keychain is only used by **official release builds**
+/// (`LUMEN_OFFICIAL_BUILD=1` set by the release workflow; any other
+/// value is not official). Every local
+/// build is ad-hoc signed, and an ad-hoc signature changes on each
+/// rebuild — a Keychain ACL cannot recognize the next binary, so every
+/// key read would prompt for the login password (and "Always Allow"
+/// cannot stick). Local and test builds therefore keep API keys in the
+/// 0600 config file, exactly like non-macOS platforms. `LUMEN_KEYCHAIN=1`
+/// forces the Keychain on (to exercise that path on a dev build), `=0`
+/// forces it off. Test binaries are additionally hard-short-circuited:
+/// they never touch the real Keychain even when `LUMEN_KEYCHAIN=1`
+/// leaks into a test run.
 pub fn platform_store() -> Option<&'static dyn SecretStore> {
     #[cfg(target_os = "macos")]
     {
-        static STORE: macos::KeychainStore = macos::KeychainStore;
-        Some(&STORE)
+        #[cfg(test)]
+        {
+            None
+        }
+        #[cfg(not(test))]
+        {
+            if !keychain_enabled(
+                option_env!("LUMEN_OFFICIAL_BUILD").is_some(),
+                std::env::var_os("LUMEN_KEYCHAIN").as_deref(),
+            ) {
+                return None;
+            }
+            static STORE: macos::KeychainStore = macos::KeychainStore;
+            Some(&STORE)
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -227,7 +269,21 @@ pub fn platform_store() -> Option<&'static dyn SecretStore> {
     }
 }
 
+/// Pure decision core of the Keychain policy, split out for tests.
 #[cfg(target_os = "macos")]
+fn keychain_enabled(official_build: bool, override_flag: Option<&std::ffi::OsStr>) -> bool {
+    match override_flag {
+        Some(value) if value == "1" => return true,
+        Some(value) if value == "0" => return false,
+        _ => {}
+    }
+    official_build
+}
+
+#[cfg(target_os = "macos")]
+// Under `cfg(test)` the Keychain backend is hard-short-circuited away, so
+// its items read as dead code to the test build; keep the module intact.
+#[cfg_attr(test, allow(dead_code))]
 mod macos {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -321,6 +377,70 @@ pub(crate) mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn file_key_never_overwrites_an_existing_keychain_entry() {
+        // Migration policy (INV-1817 review): the file value may only
+        // fill an EMPTY slot; an existing stored key wins on load.
+        let store = FakeStore::default();
+        store
+            .set(SecretSlot::CorrectorApiKey, "release-key")
+            .unwrap();
+        let sync = SecretSync::default();
+        let mut field = "dev-key".to_string();
+        let outcome = load_slot(&store, &sync, SecretSlot::CorrectorApiKey, &mut field);
+        assert_eq!(field, "release-key", "stored credential wins");
+        assert_eq!(outcome, LoadOutcome::Migrated);
+        // Same value: plain no-op write path stays.
+        let mut same = "release-key".to_string();
+        assert_eq!(
+            load_slot(&store, &sync, SecretSlot::CorrectorApiKey, &mut same),
+            LoadOutcome::Migrated
+        );
+        // Empty slot: the file value migrates in.
+        let mut fresh = "dev-key".to_string();
+        assert_eq!(
+            load_slot(&store, &sync, SecretSlot::AsrApiKeyLegacy, &mut fresh),
+            LoadOutcome::Migrated
+        );
+        assert_eq!(
+            store.get(SecretSlot::AsrApiKeyLegacy).unwrap().as_deref(),
+            Some("dev-key")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_biniversals_never_get_the_real_keychain() {
+        // Hard short-circuit: a test binary must never read or write the
+        // login Keychain, whatever the build type or LUMEN_KEYCHAIN says.
+        assert!(platform_store().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_policy_off_for_local_builds_and_overridable() {
+        use super::keychain_enabled;
+        use std::ffi::OsStr;
+        assert!(
+            !keychain_enabled(false, None),
+            "local (ad-hoc, ever-changing) builds never touch the Keychain"
+        );
+        assert!(
+            keychain_enabled(true, None),
+            "official release builds use it"
+        );
+        assert!(
+            keychain_enabled(false, Some(OsStr::new("1"))),
+            "explicit opt-in"
+        );
+        assert!(
+            !keychain_enabled(true, Some(OsStr::new("0"))),
+            "explicit opt-out"
+        );
+        // Unrecognized values fall back to the build type.
+        assert!(!keychain_enabled(false, Some(OsStr::new("yes"))));
+    }
 
     /// In-memory store; `fail` makes every call error to model a locked or
     /// unavailable Keychain.

@@ -3,6 +3,7 @@ mod asr_models;
 mod asr_prewarm;
 mod audio_convert;
 mod capsule;
+mod chunked_asr;
 mod commands;
 mod config;
 #[cfg(target_os = "macos")]
@@ -17,6 +18,7 @@ mod detection_stats;
 mod dictation;
 mod dictionary_budget;
 mod edit_learning_runtime;
+mod eval_cmd;
 mod headless;
 mod hotkey;
 mod hotkey_validate;
@@ -465,6 +467,10 @@ pub struct AppState {
     /// Live realtime dictation run for the active recording (streaming cloud
     /// ASR). `None` when realtime is off, unsupported, or not recording.
     pub realtime: parking_lot::Mutex<Option<crate::realtime_asr::RealtimeHandle>>,
+    /// Background chunked transcription for the active recording (local
+    /// batch engines only; INV-1807). Mutually exclusive with `realtime`
+    /// by provider: only one of the two is ever spawned.
+    pub chunked: parking_lot::Mutex<Option<crate::chunked_asr::ChunkedWorker>>,
     /// Cloud realtime pumps for the active meeting recording.
     pub meeting_realtime: parking_lot::Mutex<Option<crate::meeting_realtime::MeetingRealtimeOwner>>,
     /// Fan-out drop-counter handles retained across the active recording so
@@ -703,6 +709,7 @@ pub fn run() {
         .manage(AppState {
             store,
             realtime: parking_lot::Mutex::new(None),
+            chunked: parking_lot::Mutex::new(None),
             meeting_realtime: parking_lot::Mutex::new(None),
             meeting_audio_diag: std::sync::Mutex::new(None),
             edit_learning,
