@@ -6,11 +6,15 @@
 
 pub mod injection;
 pub mod leak;
+pub mod matcher;
 
 pub use injection::{
     select_hotword_terms, InjectionProfile, MentionMatcher, MEETING_HOTWORDS, REALTIME_HOTWORDS,
 };
 pub use leak::{clean_with_contrast, detect_term_echo, EchoCleaned, EchoConfig, EchoRun};
+pub use matcher::{
+    alias_is_safe, correct, Correction, CorrectionReport, CorrectionTier, VocabTerm,
+};
 
 use chrono::{DateTime, Utc};
 use lumen_core::{DictEntryKind, DictEntrySource};
