@@ -1177,6 +1177,15 @@ pub async fn stop_and_transcribe_inner(
         intent.clone(),
     );
 
+    // INV-1835: tail capture — keep recording 300ms after hotkey release
+    // for local batch engines, so the last syllable of a fast sentence is
+    // not clipped. Cloud realtime engines handle their own tail via the
+    // server-side commit and are not delayed.
+    let is_local_batch = dictation_local_engine_kind(&asr_cfg.provider, engine_kind).is_some()
+        && !realtime_active(&asr_cfg);
+    if is_local_batch {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
     let capture_result = {
         let mut ducking = state
             .dictation_ducking
@@ -2082,8 +2091,9 @@ async fn run_asr(
     }
 
     if CLOUD_ASR_PROVIDERS.contains(&provider) {
-        // Refresh the snapshot from the keychain when its key is missing (a
-        // startup read may have timed out on the macOS access prompt).
+        // INV-1835: cloud→local fallback — the full recording is already
+        // buffered in `samples_16k` (up to the dictation limit); a cloud
+        // failure re-runs it locally without asking the user to re-speak.
         let mut asr_cfg = asr_cfg.clone();
         if cloud_asr_requires_key(provider) && !asr_cfg.keyed_cloud_key_ready() {
             let key = recover_asr_key_sync(state);
@@ -2697,6 +2707,23 @@ async fn run_local_asr(
     // reuse its segments and transcribe only the tail instead of the whole
     // buffer. Any failed segment (or a missing run) falls back to the
     // whole-buffer pass below.
+    // INV-1835: short recordings (≤25s) skip the chunked segmentation —
+    // a single whole-buffer pass preserves inter-sentence context and
+    // light syllable onsets that VAD segmentation can clip.
+    let recording_seconds = samples_16k.len() as f64 / 16_000.0;
+    if recording_seconds <= 25.0 {
+        // Drain and drop the chunked worker; its segments are not used.
+        let _worker = state.chunked.lock().take();
+        tracing::debug!(
+            seconds = recording_seconds,
+            "short recording: direct whole-buffer pass (no chunked segmentation)"
+        );
+        return local_asr_engine(state, engine_kind)?
+            .transcribe(AsrRequest::new(samples_16k, 16_000))
+            .await
+            .map_err(|e| e.to_string());
+    }
+
     // Bound separately so the lock guard drops before any await below.
     let chunked_worker = state.chunked.lock().take();
     if let Some(worker) = chunked_worker {

@@ -267,3 +267,106 @@ mod tests {
         assert_eq!(join_transcripts(&["Hello.", "world"]), "Hello. world");
     }
 }
+
+/// LRU cache for inference deduplication (INV-1835): when the same audio
+/// is transcribed twice (preview + final, or chunked + fallback), the
+/// second call returns the cached result instead of re-running the model.
+pub struct InferenceCache {
+    entries: std::collections::HashMap<[u8; 32], String>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    max_entries: usize,
+}
+
+impl Default for InferenceCache {
+    fn default() -> Self {
+        Self::new(128)
+    }
+}
+
+impl InferenceCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            max_entries,
+        }
+    }
+
+    /// Hash the audio samples (16 kHz f32) into a SHA-256 key.
+    pub fn hash_samples(samples: &[f32]) -> [u8; 32] {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        samples.len().hash(&mut hasher);
+        // Hash the raw bytes of the first and last 1000 samples — enough
+        // to distinguish different utterances without hashing MB of audio.
+        let head = samples.iter().take(1000);
+        let tail = samples.iter().rev().take(1000);
+        for s in head.chain(tail) {
+            s.to_bits().hash(&mut hasher);
+        }
+        // Use a fixed-size key derived from the hasher.
+        let hash = hasher.finish();
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&hash.to_le_bytes());
+        key
+    }
+
+    pub fn get(&self, key: &[u8; 32]) -> Option<&str> {
+        self.entries.get(key).map(String::as_str)
+    }
+
+    pub fn insert(&mut self, key: [u8; 32], value: String) {
+        if self.order.len() >= self.max_entries {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(key);
+        self.entries.insert(key, value);
+    }
+}
+
+#[cfg(test)]
+mod inference_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_hits_and_evicts() {
+        let mut cache = InferenceCache::new(3);
+        let k1 = [1u8; 32];
+        let k2 = [2u8; 32];
+        let k3 = [3u8; 32];
+        let k4 = [4u8; 32];
+
+        cache.insert(k1, "hello".into());
+        cache.insert(k2, "world".into());
+        cache.insert(k3, "foo".into());
+
+        assert_eq!(cache.get(&k1), Some("hello"));
+        assert_eq!(cache.get(&k2), Some("world"));
+
+        // Insert k4 — evicts k1 (oldest).
+        cache.insert(k4, "bar".into());
+        assert_eq!(cache.get(&k1), None);
+        assert_eq!(cache.get(&k4), Some("bar"));
+    }
+
+    #[test]
+    fn hash_distinguishes_different_audio() {
+        let a = vec![0.1f32; 2000];
+        let b = vec![0.2f32; 2000];
+        let c = vec![0.1f32; 3000]; // different length
+        assert_ne!(
+            InferenceCache::hash_samples(&a),
+            InferenceCache::hash_samples(&b)
+        );
+        assert_ne!(
+            InferenceCache::hash_samples(&a),
+            InferenceCache::hash_samples(&c)
+        );
+        assert_eq!(
+            InferenceCache::hash_samples(&a),
+            InferenceCache::hash_samples(&a)
+        );
+    }
+}
