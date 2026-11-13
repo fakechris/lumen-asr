@@ -2506,6 +2506,7 @@ dependencies = [
  "blake3",
  "chrono",
  "cpal",
+ "flate2",
  "futures-util",
  "ico",
  "lumen-asr",
