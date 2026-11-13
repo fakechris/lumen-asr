@@ -2,9 +2,9 @@
 //! utterance boundaries from `meeting_live`, persist as a sidecar, and use them
 //! to prevent/rescue offline single-speaker diarization collapse.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 use crate::assemble::DiarTurn;
 
@@ -46,7 +46,10 @@ pub fn live_diar_sidecar_path(audio_path: &Path) -> PathBuf {
 }
 
 /// Persist the live diarization summary next to the meeting audio.
-pub fn write_live_diar_summary(audio_path: &Path, summary: &LiveDiarSessionSummary) -> std::io::Result<()> {
+pub fn write_live_diar_summary(
+    audio_path: &Path,
+    summary: &LiveDiarSessionSummary,
+) -> std::io::Result<()> {
     let sidecar_path = live_diar_sidecar_path(audio_path);
     let json = serde_json::to_string_pretty(summary)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -174,10 +177,7 @@ mod tests {
 
     #[test]
     fn does_not_modify_already_separated_offline_turns() {
-        let raw_turns = vec![
-            DiarTurn::new(0.0, 10.0, 0),
-            DiarTurn::new(10.0, 20.0, 1),
-        ];
+        let raw_turns = vec![DiarTurn::new(0.0, 10.0, 0), DiarTurn::new(10.0, 20.0, 1)];
         let summary = LiveDiarSessionSummary {
             clusters: vec![
                 LiveClusterSnapshot {

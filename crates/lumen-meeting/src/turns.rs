@@ -138,7 +138,6 @@ mod tests {
         assert_eq!(out[2].speaker, 0);
     }
 
-
     #[test]
     fn absorbs_leading_short_into_next() {
         let turns = vec![t(0.0, 0.4, 1), t(0.4, 30.0, 0)];
