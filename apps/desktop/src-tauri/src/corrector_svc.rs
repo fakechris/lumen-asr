@@ -225,17 +225,44 @@ pub async fn run_correct_with_intent_and_context(
     }
 
     let temperature = level.temperature();
+
+    // INV-1832: skip the model for very short texts (<12 chars) —
+    // the round-trip overhead exceeds the benefit and short inputs
+    // are where models most often hallucinate. Placed AFTER the build
+    // check so build failures still surface their reason.
+    let is_short = text.trim().chars().count() < 12;
+
     match build_corrector(&app.corrector) {
+        Ok(c) if is_short => {
+            let mut r = preprocess_only(text, &dict);
+            r.engine = CorrectorEngineId::None;
+            r
+        }
         Ok(c) => {
-            correct_or_fallback_with_context(
-                c.as_ref(),
-                text,
-                dict,
-                context_json.map(str::to_owned),
-                system,
-                temperature,
+            // INV-1832: 4-second hard deadline — "text goes in at a
+            // fixed time no matter what the service is doing".
+            let dict_for_fallback = dict.clone();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                correct_or_fallback_with_context(
+                    c.as_ref(),
+                    text,
+                    dict,
+                    context_json.map(str::to_owned),
+                    system,
+                    temperature,
+                ),
             )
             .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!("corrector timed out after 4s; using pre-corrector text");
+                    let mut r = preprocess_only(text, &dict_for_fallback);
+                    r.fallback_reason = Some(CorrectorFallbackReason::Timeout);
+                    r
+                }
+            }
         }
         Err(_) => {
             tracing::warn!(

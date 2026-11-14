@@ -5,9 +5,14 @@
 
 mod openai_compat;
 mod preprocess;
+pub mod verifier;
 
 pub use openai_compat::{output_token_budget, OpenAiCompatConfig, OpenAiCompatCorrector};
 pub use preprocess::preprocess;
+pub use verifier::{
+    count_cleanup, digits_preserved, is_refusal, lcs_recall, verify_output, CleanupCount,
+    VerifyVerdict,
+};
 
 use async_trait::async_trait;
 use lumen_core::CorrectorEngineId;
@@ -66,6 +71,8 @@ pub enum CorrectorFallbackReason {
     ContextExcessiveShrink,
     ContextLowOverlap,
     ContextExcessiveEditDistance,
+    /// INV-1832: LCS recall / digit preservation / refusal detection.
+    VerifierRejected,
     /// Legacy aggregate category kept for deserializing older records.
     ContextIntegrityRejected,
     BuildFailed,
@@ -100,6 +107,7 @@ impl CorrectorFallbackReason {
             Self::ContextLowOverlap => "context_low_overlap",
             Self::ContextExcessiveEditDistance => "context_excessive_edit_distance",
             Self::ContextIntegrityRejected => "context_integrity_rejected",
+            Self::VerifierRejected => "verifier_rejected",
             Self::BuildFailed => "build_failed",
             Self::Other => "other",
         }
@@ -250,6 +258,10 @@ pub async fn correct_or_fallback_with_context(
         system_prompt.push_str(lumen_prompts::context_safety_system_instruction());
     }
 
+    // INV-1832: cleanup-count logging — counts only, never the text.
+    let cleanup_before = verifier::count_cleanup(&pre);
+    let cleanup_after_snapshot = cleanup_before; // updated after the call
+
     match corrector
         .correct(CorrectRequest {
             text: pre.clone(),
@@ -286,7 +298,24 @@ pub async fn correct_or_fallback_with_context(
                 // Non-context path: general output protection.
                 match validate_general_integrity(&pre, &r.text, lumen_prompts::CleanupLevel::Medium)
                 {
-                    Ok(()) => r,
+                    Ok(()) => {
+                        // INV-1832: LCS recall + digit preservation + refusal
+                        // detection on top of the structural checks.
+                        match verifier::verify_output(&pre, &r.text, 0.65) {
+                            verifier::VerifyVerdict::Pass => r,
+                            verifier::VerifyVerdict::Fail(reason) => {
+                                tracing::info!(%reason, "corrector output rejected by verifier");
+                                CorrectResult {
+                                    text: pre,
+                                    engine: corrector.id(),
+                                    model_applied: false,
+                                    fallback_reason: Some(
+                                        CorrectorFallbackReason::VerifierRejected,
+                                    ),
+                                }
+                            }
+                        }
+                    }
                     Err(reason) => CorrectResult {
                         text: pre,
                         engine: corrector.id(),
