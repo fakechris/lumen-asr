@@ -1004,7 +1004,7 @@ dependencies = [
 [[package]]
 name = "diar-rs"
 version = "0.1.0"
-source = "git+https://github.com/fakechris/lumen-suite.git?rev=5858800c940707387fdfa830ab5f0cc9f9b41ddd#5858800c940707387fdfa830ab5f0cc9f9b41ddd"
+source = "git+https://github.com/fakechris/lumen-suite.git?rev=2add2293bf4d1754490bbab9462ed5bf2335cdc6#2add2293bf4d1754490bbab9462ed5bf2335cdc6"
 dependencies = [
  "byteorder",
  "cc",
