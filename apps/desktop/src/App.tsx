@@ -2786,6 +2786,14 @@ function SettingsPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  function qwenInstalled(status: AsrModelStatus) {
+    setAsrProvider("local_qwen");
+    setSavedAsrProvider("local_qwen");
+    setAsrModels(status);
+    setAsrCustomPath(status.activeModelDir);
+    onSaved();
+  }
+
   const settingsTabs: { id: typeof settingsTab; label: string; hint: string }[] = [
     { id: "speech", label: "语音识别", hint: "听写/会议引擎 · 凭据 · 实时" },
     { id: "meeting", label: "会议", hint: "检测 · 格式 · 纪要 · 看护" },
@@ -2814,8 +2822,8 @@ function SettingsPanel({
           switches and its completion still refreshes app health; hidden
           unless the speech tab is active. */}
       <div style={{ display: settingsTab === "speech" ? "block" : "none" }}>
-        <QwenDownloadRow target="qwen" onError={onError} onSaved={onSaved} />
-        <QwenDownloadRow target="fourier" onError={onError} onSaved={onSaved} />
+        <QwenDownloadRow target="qwen" onError={onError} onInstalled={qwenInstalled} />
+        <QwenDownloadRow target="fourier" onError={onError} onInstalled={qwenInstalled} />
       </div>
 
       {settingsTab === "general" && (
@@ -4608,11 +4616,11 @@ function SettingsPanel({
 function QwenDownloadRow({
   target,
   onError,
-  onSaved,
+  onInstalled,
 }: {
   target: "qwen" | "fourier";
   onError: (e: string | null) => void;
-  onSaved: () => void;
+  onInstalled: (status: AsrModelStatus) => void;
 }) {
   const models = useMeetingModels();
   const fourier = target === "fourier";
@@ -4621,12 +4629,12 @@ function QwenDownloadRow({
   const otherBusy = models.active !== null && !downloading;
   const wasDownloading = useRef(false);
   useEffect(() => {
-    if (wasDownloading.current && !downloading && installed) {
+    if (wasDownloading.current && !downloading && installed && models.status) {
       // The download command also switches the active engine to Qwen.
-      onSaved();
+      onInstalled(models.status);
     }
     wasDownloading.current = downloading;
-  }, [downloading, installed, onSaved]);
+  }, [downloading, installed, models.status, onInstalled]);
   if (installed) return null;
   return (
     <div className="onboard-status" style={{ marginBottom: 12 }}>
