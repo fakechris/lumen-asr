@@ -3865,6 +3865,17 @@ function SettingsPanel({
                   </button>
                 </div>
               ))}
+            {asrProvider === "local_qwen" && (
+              <details>
+                <summary>英语听写：Oruk Fourier 2B</summary>
+                <p className="muted-text">
+                  此模型由 Oruk 提供，仅限非商业使用（CC BY-NC 4.0），下载大小为 2.41 GB。
+                  使用 Hugging Face CLI 下载后，在下方粘贴完整目录并点击“验证并使用”。
+                </p>
+                <pre style={{ overflowX: "auto" }}><code>{`hf download oruk/oruk-fourier-2b --revision 3fda023e157ce7986f137f76fcf326ed6e08fa73 --include 'onnx/sherpa-int8/*' --local-dir "$HOME/Models/oruk-fourier-2b"
+echo "$HOME/Models/oruk-fourier-2b/onnx/sherpa-int8"`}</code></pre>
+              </details>
+            )}
             <div className="form-row" style={{ marginTop: 10 }}>
               <input
                 className="input"

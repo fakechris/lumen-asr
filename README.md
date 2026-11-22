@@ -236,6 +236,15 @@ In the app, open **Settings → Speech recognition** to select an engine, choose
 
 Qwen3-ASR runs in-process via sherpa-onnx (no Python runtime); Settings → Speech recognition offers a one-click download of the pinned model package.
 
+For English dictation, the same engine can load the optional [Oruk Fourier 2B](https://huggingface.co/oruk/oruk-fourier-2b) INT8 pack. The 2.41 GB download is separate from the app and licensed by Oruk under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/). With the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) installed:
+
+```sh
+hf download oruk/oruk-fourier-2b --revision 3fda023e157ce7986f137f76fcf326ed6e08fa73 \
+    --include 'onnx/sherpa-int8/*' --local-dir "$HOME/Models/oruk-fourier-2b"
+```
+
+In **Settings → Speech recognition**, select the local Qwen provider. Paste the absolute path to `onnx/sherpa-int8` inside the downloaded directory and click **验证并使用** (Verify and use). Keep both `.onnx.data` files next to their graphs. The original multilingual pack remains selectable.
+
 #### 5. Choose AI cleanup (recommended path)
 
 **Principle:** local first; go online when quality matters more than privacy.
