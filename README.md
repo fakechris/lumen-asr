@@ -236,6 +236,8 @@ In the app, open **Settings → Speech recognition** to select an engine, choose
 
 Qwen3-ASR runs in-process via sherpa-onnx (no Python runtime); Settings → Speech recognition offers a one-click download of the pinned model package.
 
+For English dictation, choose **Settings → Speech recognition → 下载 Oruk Fourier 2B 英语模型**. Lumen downloads the optional 2.41 GB [Fourier 2B](https://huggingface.co/oruk/oruk-fourier-2b) pack from Oruk, verifies it and selects it for local dictation. You can switch back to another installed model using the local Qwen model picker. The English weights are licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
+
 #### 5. Choose AI cleanup (recommended path)
 
 **Principle:** local first; go online when quality matters more than privacy.

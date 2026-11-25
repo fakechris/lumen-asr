@@ -28,6 +28,7 @@ const IS_WINDOWS = navigator.userAgent.includes("Windows");
 const MODEL_LABELS: Record<ModelTarget, string> = {
   sensevoice: "SenseVoice（听写）",
   qwen: "Qwen3-ASR（听写，高准确率）",
+  fourier: "Oruk Fourier 2B（英语听写）",
   offline: "Paraformer 离线（会议）",
   streaming: "Paraformer 流式（会议）",
 };

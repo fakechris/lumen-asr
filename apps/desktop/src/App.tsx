@@ -13,7 +13,7 @@ import { ThemeToggle } from "./ThemeToggle";
 import { ChordCaptureChip } from "./ChordCaptureChip";
 import { MeetingPanel } from "./MeetingPanel";
 import { IdentityPanel } from "./IdentityPanel";
-import { MeetingModelsProvider, useMeetingModels } from "./meetingModels";
+import { isModelTargetReady, MeetingModelsProvider, useMeetingModels } from "./meetingModels";
 import {
   acknowledgeWindowsMicrophoneNotice,
   hasAcknowledgedWindowsMicrophoneNotice,
@@ -2786,6 +2786,14 @@ function SettingsPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  function qwenInstalled(status: AsrModelStatus) {
+    setAsrProvider("local_qwen");
+    setSavedAsrProvider("local_qwen");
+    setAsrModels(status);
+    setAsrCustomPath(status.activeModelDir);
+    onSaved();
+  }
+
   const settingsTabs: { id: typeof settingsTab; label: string; hint: string }[] = [
     { id: "speech", label: "语音识别", hint: "听写/会议引擎 · 凭据 · 实时" },
     { id: "meeting", label: "会议", hint: "检测 · 格式 · 纪要 · 看护" },
@@ -2814,7 +2822,8 @@ function SettingsPanel({
           switches and its completion still refreshes app health; hidden
           unless the speech tab is active. */}
       <div style={{ display: settingsTab === "speech" ? "block" : "none" }}>
-        <QwenDownloadRow onError={onError} onSaved={onSaved} />
+        <QwenDownloadRow target="qwen" onError={onError} onInstalled={qwenInstalled} />
+        <QwenDownloadRow target="fourier" onError={onError} onInstalled={qwenInstalled} />
       </div>
 
       {settingsTab === "general" && (
@@ -4605,29 +4614,34 @@ function SettingsPanel({
  * app-level download queue (single-flight, cancellable); hides itself once the
  * model is installed. */
 function QwenDownloadRow({
+  target,
   onError,
-  onSaved,
+  onInstalled,
 }: {
+  target: "qwen" | "fourier";
   onError: (e: string | null) => void;
-  onSaved: () => void;
+  onInstalled: (status: AsrModelStatus) => void;
 }) {
   const models = useMeetingModels();
-  const downloading = models.active === "qwen";
+  const fourier = target === "fourier";
+  const installed = isModelTargetReady(models.status, target);
+  const downloading = models.active === target;
   const otherBusy = models.active !== null && !downloading;
   const wasDownloading = useRef(false);
   useEffect(() => {
-    if (wasDownloading.current && !downloading && models.status?.qwenReady) {
+    if (wasDownloading.current && !downloading && installed && models.status) {
       // The download command also switches the active engine to Qwen.
-      onSaved();
+      onInstalled(models.status);
     }
     wasDownloading.current = downloading;
-  }, [downloading, models.status, onSaved]);
-  if (models.status?.qwenReady) return null;
+  }, [downloading, installed, models.status, onInstalled]);
+  if (installed) return null;
   return (
     <div className="onboard-status" style={{ marginBottom: 12 }}>
       <div className="muted-text">
-        Qwen3-ASR 是本地高准确率引擎（sherpa-onnx，自动识别语种，无需 Python）。模型包约 838
-        MB，下载完成后会自动切换为当前引擎。
+        {fourier
+          ? "Oruk Fourier 2B：本地英语听写，2.41 GB。由 Oruk 按 CC BY-NC 4.0 提供，仅限非商业使用，安装后切换为当前引擎。"
+          : "Qwen3-ASR 是本地高准确率引擎（sherpa-onnx，自动识别语种，无需 Python）。模型包约 838 MB，下载完成后会自动切换为当前引擎。"}
       </div>
       {downloading && models.progress && (
         <p className="muted-text">
@@ -4653,14 +4667,14 @@ function QwenDownloadRow({
             disabled={otherBusy}
             onClick={() => {
               onError(null);
-              models.enqueue(["qwen"]);
+              models.enqueue([target]);
             }}
           >
-            下载 Qwen3-ASR 模型
+            {fourier ? "下载 Oruk Fourier 2B 英语模型" : "下载 Qwen3-ASR 模型"}
           </button>
         )}
       </div>
-      {models.error && <p className="meeting-model-error">{models.error}</p>}
+      {models.error && models.failed.includes(target) && <p className="meeting-model-error">{models.error}</p>}
     </div>
   );
 }

@@ -70,6 +70,8 @@ export type AsrModelStatus = {
   whisperReady: boolean;
   whisperDir: string;
   qwenReady: boolean;
+  standardQwenReady: boolean;
+  fourierReady: boolean;
   qwenDir: string;
   paraformerOfflineReady: boolean;
   paraformerOfflineDir: string;
@@ -313,8 +315,8 @@ export const api = {
       input: { path, engine },
     }),
   startAsrModelDownload: () => invoke<AsrModelStatus>("start_asr_model_download"),
-  downloadQwen3Sherpa: () =>
-    invoke<AsrModelStatus>("start_qwen3_sherpa_download"),
+  downloadQwen3Sherpa: (preset: "standard" | "fourier" = "standard") =>
+    invoke<AsrModelStatus>("start_qwen3_sherpa_download", { preset }),
   downloadParaformerOffline: () =>
     invoke<AsrModelStatus>("start_paraformer_offline_download"),
   downloadParaformerStreaming: () =>

@@ -36,6 +36,8 @@ pub struct AsrModelStatus {
     pub whisper_ready: bool,
     pub whisper_dir: String,
     pub qwen_ready: bool,
+    pub standard_qwen_ready: bool,
+    pub fourier_ready: bool,
     pub qwen_dir: String,
     /// Offline Paraformer (meeting transcription): word-level timestamps.
     pub paraformer_offline_ready: bool,
@@ -134,6 +136,10 @@ pub fn check_asr_model_status(state: State<'_, AppState>) -> Result<AsrModelStat
         } else {
             crate::display_path(&wh)
         },
+        standard_qwen_ready: qwen_ready(&lumen_asr::shared_qwen3_sherpa_dir(None)),
+        fourier_ready: lumen_asr::fourier_sherpa_ready(
+            &lumen_models_dir().join(lumen_asr::FOURIER_SHERPA_DIR),
+        ),
         qwen_ready: qwen_ready(&qw_live) || qwen_ready(&qw),
         qwen_dir: if qwen_ready(&qw_live) {
             crate::display_path(&qw_live)
@@ -348,12 +354,22 @@ fn download_sensevoice(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(installed)
 }
 
-/// Install the sherpa-onnx Qwen3-ASR package (~838 MiB, sha256-pinned and
-/// verified by lumen-models before extraction) and switch dictation to it —
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QwenPreset {
+    Standard,
+    Fourier,
+}
+
+/// Install the selected sherpa-onnx Qwen package (sha256-pinned and
+/// verified by lumen-models before activation) and switch dictation to it —
 /// Qwen is the recommended dictation engine once installed, mirroring the
 /// SenseVoice download flow.
 #[tauri::command]
-pub async fn start_qwen3_sherpa_download(app: AppHandle) -> Result<AsrModelStatus, String> {
+pub async fn start_qwen3_sherpa_download(
+    app: AppHandle,
+    preset: Option<QwenPreset>,
+) -> Result<AsrModelStatus, String> {
     if DOWNLOAD_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("download already running".into());
     }
@@ -361,9 +377,19 @@ pub async fn start_qwen3_sherpa_download(app: AppHandle) -> Result<AsrModelStatu
 
     let app_for_dl = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        download_qwen3_sherpa_package(&lumen_models_dir(), &DOWNLOAD_CANCEL, |p| {
+        let report = |p: lumen_asr::DownloadProgress| {
             emit_progress(&app_for_dl, &p.phase, &p.message, p.bytes, p.total)
-        })
+        };
+        match preset.unwrap_or(QwenPreset::Standard) {
+            QwenPreset::Standard => {
+                download_qwen3_sherpa_package(&lumen_models_dir(), &DOWNLOAD_CANCEL, report)
+            }
+            QwenPreset::Fourier => lumen_asr::download_fourier_sherpa_package(
+                &lumen_models_dir(),
+                &DOWNLOAD_CANCEL,
+                report,
+            ),
+        }
         .map_err(|error| error.to_string())
     })
     .await;
