@@ -7,10 +7,10 @@
 	<key>NSAccessibilityUsageDescription</key>
 	<string>Lumen ASR needs Accessibility permission to paste transcribed text into other apps.</string>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>Lumen ASR 需要采集系统音频，以便在会议录音中同步记录远端参会者的声音（仅在本机处理，不会上传）。</string>
+	<string>Lumen ASR 需要采集系统音频，以便在会议录音中同步记录远端参会者的声音。默认仅在本机处理；只有你开启云端会议转写时，才会发送到你配置的语音服务。</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
-	<string>Lumen ASR 需要读取日历中当前的会议日程，以便自动为录音命名并在笔记中记录参会人（只读，仅在本机处理，不会上传）。</string>
+	<string>Lumen ASR 需要读取日历中当前的会议日程，以便自动为录音命名并在笔记中记录参会人（只读，保存在本机；生成会议纪要时，笔记会随逐字稿发送给你配置的 AI 服务）。</string>
 	<key>NSCalendarsUsageDescription</key>
-	<string>Lumen ASR 需要读取日历中当前的会议日程，以便自动为录音命名并在笔记中记录参会人（只读，仅在本机处理，不会上传）。</string>
+	<string>Lumen ASR 需要读取日历中当前的会议日程，以便自动为录音命名并在笔记中记录参会人（只读，保存在本机；生成会议纪要时，笔记会随逐字稿发送给你配置的 AI 服务）。</string>
 </dict>
 </plist>
