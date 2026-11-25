@@ -36,7 +36,7 @@
 1. **Install** — download the latest Apple Silicon DMG or Windows x64 installer from [GitHub Releases](https://github.com/fakechris/lumen-asr/releases) (verify with `SHA256SUMS.txt`); to build from source on macOS instead, run `./dev-install.sh --open`
 2. **Grant permissions** — microphone, plus Accessibility on macOS (needed to paste into other apps)
 3. **Hold the hotkey, speak, release** — default **Alt+Space** on macOS, **Ctrl+Shift+Space** on Windows. Text is inserted into the focused field; if a target refuses input, the text stays on the clipboard and Lumen tells you
-4. **Meetings** — open the Meetings tab and start a recording (or import a file); when it ends you get a transcript with speakers and structured minutes
+4. **Meetings** — open the Meetings tab and start a recording (or import a file); when it ends you get a transcript with speakers, plus structured minutes when an AI corrector is configured (a local recap otherwise)
 
 Details and engine choices below.
 
@@ -223,7 +223,7 @@ The default remains **SenseVoice** via sherpa-onnx. Lumen keeps a separate model
 | **MiniMax** | Cloud transcription; also usable for cloud meeting transcription | API key |
 | **Custom** | Any OpenAI-compatible transcription endpoint | Endpoint, model, API key |
 
-If a cloud request fails or times out, dictation falls back to the local engine.
+If a cloud request times out or cannot connect and a local SenseVoice or Whisper model is installed, dictation falls back to it; other cloud errors are reported as errors.
 
 Shared local model root:
 
@@ -279,7 +279,7 @@ Config file (advanced):
 
 1. Open the **Meetings** tab → **Start meeting** (or accept the prompt when a call starts), or **Import file**.
 2. While recording, the live transcript shows speaker labels; you can rename the title and speakers on the fly.
-3. When you stop, **draft minutes** from the live transcript appear within seconds; the offline pipeline then produces the authoritative transcript (diarization, per-turn ASR, cleanup) and the final minutes, replacing the draft.
+3. When you stop, **draft minutes** from the live transcript appear within seconds if a corrector is configured; the offline pipeline then produces the authoritative transcript (diarization, per-turn ASR, cleanup) and, with a corrector configured, the final minutes, replacing the draft.
 4. In the library, search everything with ⌘F, or switch to **问会议** and ask e.g. *“What did we decide about the budget last Tuesday?”* — every claim cites a meeting and time; click to jump there.
 
 Minutes need a configured corrector. Without one you still get the transcript and a keyword-based local recap labelled as such. Recording other participants may require their consent where you live.
@@ -362,7 +362,7 @@ not paused; this option does not change the system mute switch.
 1. **安装** —— 从 [GitHub Releases](https://github.com/fakechris/lumen-asr/releases) 下载最新的 Apple Silicon DMG 或 Windows x64 安装包（用 `SHA256SUMS.txt` 校验）；macOS 上也可以源码构建（`./dev-install.sh --open`）
 2. **授权** —— 麦克风，macOS 上再加辅助功能（用于向其他应用粘贴）
 3. **按住快捷键说话，松开** —— macOS 默认 **Alt+Space**（⌥空格），Windows 默认 **Ctrl+Shift+Space**。文本插入到当前焦点输入框；目标拒绝输入时，文本留在剪贴板并提示你
-4. **会议** —— 打开「会议」页开始录音（或导入文件），结束后得到带说话人的逐字稿和结构化纪要
+4. **会议** —— 打开「会议」页开始录音（或导入文件），结束后得到带说话人的逐字稿；配置了 AI 修正器时还有结构化纪要，否则是本地摘要
 
 细节与引擎选择见下文。
 
@@ -536,7 +536,7 @@ npm run tauri dev
 | **MiniMax** | 在线转写；也可用于云端会议转写 | API Key |
 | **自定义** | 任意 OpenAI 兼容转写接口 | 接口地址、模型、API Key |
 
-云端请求失败或超时时，听写会回退到本地引擎。
+云端请求超时或连接失败、且本机装有 SenseVoice 或 Whisper 模型时，听写会回退到本地引擎；其他云端错误会直接报错。
 
 本地模型共享根目录：
 
@@ -591,7 +591,7 @@ Qwen3-ASR 通过 sherpa-onnx 在进程内运行（无需 Python runtime）；设
 
 1. 打开 **会议** 页 → **开始会议**（或在通话开始时接受提示），也可以 **导入文件**。
 2. 录音中，实时稿会显示说话人标签；可以随时改会议标题和说话人名字。
-3. 停止后几秒内先出一版基于实时稿的 **草稿纪要**；随后离线流程生成权威逐字稿（说话人分离、逐段识别、整理）和正式纪要，自动替换草稿。
+3. 停止后，如果配置了修正器，几秒内先出一版基于实时稿的 **草稿纪要**；随后离线流程生成权威逐字稿（说话人分离、逐段识别、整理）；配置了修正器时再生成正式纪要，自动替换草稿。
 4. 在会议库里用 ⌘F 搜索一切内容，或切到 **问会议** 直接提问，比如“上周二关于预算定了什么？”——每条结论都标注出处会议和时间点，点击即可跳转。
 
 生成纪要需要配置修正器；未配置时仍会得到逐字稿，以及明确标注的本地摘要。录下其他参会者的声音前，请按当地法规取得对方同意。

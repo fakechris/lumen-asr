@@ -59,7 +59,9 @@ configures:
   (OpenAI-compatible, Volcengine or MiniMax), the recorded dictation audio and
   request metadata are sent to the endpoint configured by the user; in the
   opt-in realtime mode the audio is streamed while you speak. If the cloud
-  request fails, dictation falls back to the local engine.
+  request times out or cannot connect and a local SenseVoice or Whisper model
+  is installed, the same audio is transcribed locally instead; other cloud
+  errors are reported without a local retry.
 - **Cloud correction or translation:** when a user selects a networked
   OpenAI-compatible corrector, transcript text and correction instructions are
   sent to the configured endpoint.

@@ -23,13 +23,14 @@ dictation and a round of reliability and safety work across the dictation path.
 - Local model prewarm on record (first dictation after launch: SenseVoice ~0.8 s → ~0.02 s, Qwen3-ASR ~3.1 s → ~0.5 s on Apple Silicon), Bluetooth-headset fallback to the built-in mic, Silero VAD auto-stop.
 
 **Privacy & data**
-- Release builds keep provider API keys in the macOS Keychain; existing plaintext keys are migrated on first launch.
+- macOS release builds keep provider API keys in the Keychain; existing plaintext keys are migrated on first launch (Windows keeps them in the config file).
 - History export (Markdown / JSONL) and optional retention; optional retention window for sealed context snapshots (off by default).
 - The [privacy policy](https://github.com/fakechris/lumen-asr/blob/main/PRIVACY.md) now covers meetings, voiceprints, calendar access and cloud meeting transcription.
 
 ### Upgrading from v0.3.x
 
-- On first launch your API keys move from `config.toml` into the Keychain. Because builds are ad-hoc signed, macOS may ask for Keychain access after an upgrade; allow it. If the prompt is dismissed, the key is not lost — it is read again on the next launch.
+- **macOS:** on first launch your API keys move from `config.toml` into the Keychain. Because builds are ad-hoc signed, macOS may ask for Keychain access after an upgrade; allow it. If the prompt is dismissed, the key is not lost — it is read again on the next launch.
+- **Windows:** API keys stay in `config.toml` in your application-data directory, as before.
 - Existing meeting recordings stay as they are; new recordings use Ogg-Opus.
 - History and context retention are off by default; nothing is deleted by the upgrade.
 
