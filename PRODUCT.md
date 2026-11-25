@@ -3,6 +3,12 @@
 > Locked product decisions for Lumen ASR.  
 > Date: 2026-07-09
 
+> **Status (v0.4.0, 2026-11-24):** this is the original MVP specification and is
+> kept as a record of the locked decisions. The product has since grown beyond
+> several MVP non-goals (cloud ASR, meetings with diarization and minutes,
+> realtime dictation). The current feature set is described in the
+> [README](./README.md) and [release notes](./docs/RELEASE_NOTES.md).
+
 ## 1. One-liner
 
 Hold a hotkey, speak, get polished text into the focused app — **local-first**, privacy-friendly, with a personal dictionary that learns from your edits.
